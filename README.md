@@ -5,6 +5,13 @@ Kho mã nguồn nghiên cứu cho đề tài khoa học:
 
 Kiến trúc đề xuất **SBi-FAGAT** (*Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network*) thực hiện dự đoán sớm đa nhiệm gồm quy mô lan truyền cuối kỳ ($y_{\text{size}}$), mức độ phân cực cộng đồng ($y_{\text{polar}}$) và phân loại tin đồn (trên bộ PHEME) chỉ từ bài đăng gốc và cửa sổ sớm $K = 20$ phản hồi đầu tiên theo thời gian.
 
+> **Mới bắt đầu hoặc chưa rành GNN/NLP?**  
+> Đọc [Hướng dẫn Nghiên cứu Dễ hiểu từ Con số 0](docs/huong_dan_nghien_cuu_de_hieu.md) và chạy thử minh họa trên máy CPU trong 5 giây (không cần GPU hay tải dữ liệu lớn):
+> ```bash
+> python -m scripts.demo_research_walkthrough
+> python -m scripts.benchmark_efficiency
+> ```
+
 ---
 
 ## 1. Quản trị Dự án & Năm Luật Thép
@@ -30,16 +37,19 @@ Kiến trúc đề xuất **SBi-FAGAT** (*Stance-Guided Bidirectional Frequency-
 ├── configs/                    # Chứa tệp cấu hình thực nghiệm (giữ chỗ .gitkeep)
 ├── data/                       # Dữ liệu local (raw/interim/processed bị ignore trên Git)
 ├── docs/
+│   ├── huong_dan_nghien_cuu_de_hieu.md  # Giải thích đề tài, ký hiệu & code từ con số 0
 │   ├── literature_review.md    # Tổng quan công trình nền tảng đã xác minh
 │   └── math_spec.md            # Đặc tả toán học SBi-FAGAT & Hợp đồng dữ liệu
 ├── paper/
 │   ├── references.bib          # Thư viện trích dẫn chuẩn BibTeX
 │   └── figures/                # Thư mục xuất biểu đồ vector phục vụ bài báo
 ├── scripts/
-│   ├── run_phase2.sh           # Pipeline tải PHEME, thu thập VN & trích xuất NLP .pt
-│   ├── compute_kappa.py        # Tính đồng thuận Cohen's Kappa cho 300 cặp gán nhãn
-│   ├── run_experiments.py      # Huấn luyện đa mô hình qua 5 seeds & kiểm định thống kê
-│   ├── run_ablation.py         # Thực nghiệm cắt bỏ thành phần & quét cửa sổ K
+│   ├── run_phase2.sh           # Pipeline Frozen-Teacher Zero-Leakage & xuất NLP .pt
+│   ├── compute_kappa.py        # Tính Cohen's Kappa, Machine-vs-Gold & RumourEval SDQC
+│   ├── benchmark_efficiency.py # Đo #Params, tốc độ suy luận/huấn luyện & RAM/VRAM 8 mô hình
+│   ├── demo_research_walkthrough.py # Demo minh họa cơ chế GCN vs SBi-FAGAT trên CPU (<5s)
+│   ├── run_experiments.py      # Huấn luyện 8 mô hình qua 5 seeds & kiểm định thống kê
+│   ├── run_ablation.py         # Thực nghiệm cắt bỏ thành phần & quét cửa sổ K đồng bộ
 │   └── run_upfd_extension.py   # Thực nghiệm mở rộng trên UPFD GossipCop
 ├── src/
 │   ├── data/                   # schema.py, pheme_loader.py, arctic_shift_vn.py, pyg_dataset.py

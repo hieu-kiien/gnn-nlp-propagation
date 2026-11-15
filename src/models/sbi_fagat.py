@@ -16,6 +16,7 @@ Implements the core architecture specified in `docs/math_spec.md` using
 
 from __future__ import annotations
 
+import math
 from typing import Any, Literal
 
 import torch
@@ -93,7 +94,11 @@ class StanceGuidedFAConv(MessagePassing):
         nn.init.xavier_uniform_(self.lin.weight)
         nn.init.xavier_uniform_(self.lin_root.weight)
         nn.init.zeros_(self.lin_root.bias)
-        nn.init.xavier_uniform_(self.att)
+        node_att_dim = 2 * self.hidden_dim
+        nn.init.xavier_uniform_(self.att[:, :node_att_dim])
+        if self.edge_dim > 0:
+            edge_scale = 1.0 / math.sqrt(float(self.edge_dim))
+            nn.init.constant_(self.att[:, node_att_dim:], edge_scale)
 
     def forward(
         self,

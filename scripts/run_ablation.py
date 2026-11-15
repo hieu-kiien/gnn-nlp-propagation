@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import warnings
 from pathlib import Path
 
 import torch
@@ -35,13 +36,14 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--min-total-replies", type=int, default=0)
+    parser.add_argument("--min-total-replies", type=int, default=21)
     parser.add_argument(
-        "--polar-target-mode", choices=["full", "future_only"], default="full"
+        "--polar-target-mode", choices=["full", "future_only"], default="future_only"
     )
     parser.add_argument(
         "--label-scheme", choices=["veracity4", "binary"], default="veracity4"
     )
+    parser.add_argument("--comparator-model", type=str, default="auto")
     parser.add_argument("--output-table", type=Path, default=None)
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--figures-dir", type=Path, default=None)
@@ -150,12 +152,30 @@ def main() -> None:
     del train_ds, val_ds, test_ds, train_loader, val_loader, test_loader
     gc.collect()
 
-    # Part 2: Early Horizon Sensitivity K in {10, 20, 30, 50} reusing loaded tables/tensors
+    # Part 2: Early Horizon Sensitivity K in {10, 20, 30, 50} on a common cascade subset
+    k_horizons_sorted = sorted(args.horizons)
+    common_min_replies = max(int(args.min_total_replies), max(k_horizons_sorted) + 1)
+    k_common_kwargs = dict(common_ds_kwargs)
+    k_common_kwargs["min_total_replies"] = common_min_replies
+
+    probe_splits = [
+        len(EarlyCascadeDataset(k_horizon=k_horizons_sorted[-1], split=sp, **k_common_kwargs))
+        for sp in ("train", "val", "test")
+    ]
+    used_common_filter = all(cnt >= 1 for cnt in probe_splits)
+    if not used_common_filter:
+        warnings.warn(
+            f"Common K-horizon filter min_total_replies={common_min_replies} produced empty split "
+            f"{probe_splits}; falling back to min_total_replies={args.min_total_replies}.",
+            stacklevel=1,
+        )
+        k_common_kwargs["min_total_replies"] = args.min_total_replies
+
     k_curve_results: dict[int, dict[str, dict[str, tuple[float, float]]]] = {}
-    for k in sorted(args.horizons):
-        k_train = EarlyCascadeDataset(k_horizon=k, split="train", **common_ds_kwargs)
-        k_val = EarlyCascadeDataset(k_horizon=k, split="val", **common_ds_kwargs)
-        k_test = EarlyCascadeDataset(k_horizon=k, split="test", **common_ds_kwargs)
+    for k in k_horizons_sorted:
+        k_train = EarlyCascadeDataset(k_horizon=k, split="train", **k_common_kwargs)
+        k_val = EarlyCascadeDataset(k_horizon=k, split="val", **k_common_kwargs)
+        k_test = EarlyCascadeDataset(k_horizon=k, split="test", **k_common_kwargs)
 
         k_res = run_multi_seed_benchmark(
             {
@@ -171,7 +191,7 @@ def main() -> None:
             lr=args.lr,
             patience=args.patience,
             reference_model="SBiFAGAT",
-            comparator_model="BiGCN",
+            comparator_model=args.comparator_model,
             device=device,
         )
         k_curve_results[k] = k_res["summary_stats"]
@@ -185,6 +205,7 @@ def main() -> None:
         out_json,
         extra={
             "k_horizon": args.k_horizon,
+            "k_curve_common_min_replies": k_common_kwargs["min_total_replies"],
             "k_curve": {
                 str(k): {
                     model_name: {

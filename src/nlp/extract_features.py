@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import math
 from collections import deque
 from pathlib import Path
@@ -260,6 +261,15 @@ def validate_feature_tensors(payload: Mapping[str, Any]) -> None:
             if not math.isfinite(fval):
                 raise ValueError(f"Non-finite value in '{dict_name}' for '{key}': {val!r}")
 
+    if "node_root_stance" in payload:
+        nrs = payload["node_root_stance"]
+        if not isinstance(nrs, Mapping):
+            raise ValueError("node_root_stance must be a mapping")
+        for key, val in nrs.items():
+            fval = float(val)
+            if not math.isfinite(fval) or fval < -1.0 - 1e-5 or fval > 1.0 + 1e-5:
+                raise ValueError(f"Invalid node_root_stance value for '{key}': {val!r}")
+
 
 def extract_and_save_features(
     *,
@@ -272,6 +282,7 @@ def extract_and_save_features(
     tokenizer: Any | None = None,
     hostility_scorer: HostilityTeacherScorer | None = None,
     stance_scorer: NLIStanceTeacherScorer | None = None,
+    scored_cache_json: Path | None = None,
     vihsd_ckpt: Path | None = None,
     batch_size: int = 32,
     max_length: int = 256,
@@ -293,10 +304,23 @@ def extract_and_save_features(
     node_text_by_id = dict(zip(node_ids, node_texts))
     node_id_to_idx = {nid: idx for idx, nid in enumerate(node_ids)}
 
+    cascade_root_id: dict[str, str] = {}
+    for r in node_rows:
+        if bool(r.get("is_root")) or int(r.get("depth", -1)) == 0:
+            cascade_root_id[str(r["cascade_id"])] = str(r["node_id"])
+
     edge_ids = [str(r["edge_id"]) for r in edge_rows]
     edge_id_to_idx = {eid: idx for idx, eid in enumerate(edge_ids)}
     parent_texts = [node_text_by_id[str(r["source_id"])] for r in edge_rows]
     reply_texts = [node_text_by_id[str(r["target_id"])] for r in edge_rows]
+    edge_target_ids = [str(r["target_id"]) for r in edge_rows]
+    edge_root_ids = [
+        cascade_root_id.get(str(r["cascade_id"]), str(r["source_id"])) for r in edge_rows
+    ]
+    edge_root_texts = [
+        node_text_by_id.get(rid, node_text_by_id[str(r["source_id"])])
+        for rid, r in zip(edge_root_ids, edge_rows)
+    ]
 
     loaded_ckpt_model: DualHeadCrossEncoder | None = cross_encoder
     loaded_ckpt_tok: Any | None = tokenizer
@@ -347,8 +371,47 @@ def extract_and_save_features(
         )
         node_features_770 = torch.cat([node_embeddings, meta_2d], dim=1)
 
-    # 3. 2D Edge vectors e_uv = [s_uv, h_uv]
-    if loaded_ckpt_model is not None:
+    # 3. 2D Edge vectors e_uv = [s_uv, h_uv] & direct (root, reply) stance node_root_stance
+    node_root_stance: dict[str, float] = {}
+    if scored_cache_json is not None:
+        cache_file = Path(scored_cache_json)
+        if not cache_file.exists():
+            raise FileNotFoundError(f"Scored cache JSON not found: {cache_file}")
+        raw_cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        if not isinstance(raw_cache, list):
+            raise ValueError(f"Expected JSON list in {cache_file}")
+        cache_by_eid = {
+            str(item["edge_id"]): item
+            for item in raw_cache
+            if isinstance(item, dict) and item.get("edge_id") is not None
+        }
+        missing_eids = [eid for eid in edge_ids if eid not in cache_by_eid]
+        if missing_eids:
+            raise ValueError(
+                f"scored_cache_json {cache_file} is missing {len(missing_eids)} edges "
+                f"(first: {missing_eids[0]!r}); re-run dual_edge_scorer --score-only."
+            )
+        s_list: list[float] = []
+        h_list: list[float] = []
+        pred_labels_list: list[str] = []
+        for idx, eid in enumerate(edge_ids):
+            entry = cache_by_eid[eid]
+            s_val = float(entry["s_uv"])
+            h_val = float(entry["h_uv"])
+            s_list.append(s_val)
+            h_list.append(h_val)
+            if "pred_label" in entry and entry["pred_label"] is not None:
+                pred_labels_list.append(str(entry["pred_label"]))
+            else:
+                lbl = "support" if s_val >= 0.1 else ("oppose" if s_val <= -0.1 else "neutral")
+                pred_labels_list.append(lbl)
+            root_s_raw = entry.get("root_s_uv", s_val)
+            root_s_clamped = max(-1.0, min(1.0, float(root_s_raw)))
+            node_root_stance[edge_target_ids[idx]] = root_s_clamped
+        s_arr = s_list
+        h_arr = h_list
+        pred_labels = pred_labels_list
+    elif loaded_ckpt_model is not None:
         edge_tok = loaded_ckpt_tok if loaded_ckpt_tok is not None else active_tok
         edge_pred = encode_edges_with_cross_encoder(
             parent_texts,
@@ -362,6 +425,25 @@ def extract_and_save_features(
         s_arr = edge_pred["s_uv"]
         h_arr = edge_pred["h_uv"]
         pred_labels = edge_pred["pred_label"]
+        deep_idx = [
+            i for i, r in enumerate(edge_rows) if str(r["source_id"]) != edge_root_ids[i]
+        ]
+        for i in range(len(edge_ids)):
+            node_root_stance[edge_target_ids[i]] = max(-1.0, min(1.0, float(s_arr[i])))
+        if deep_idx:
+            deep_pred = encode_edges_with_cross_encoder(
+                [edge_root_texts[i] for i in deep_idx],
+                [reply_texts[i] for i in deep_idx],
+                cross_encoder=loaded_ckpt_model,
+                tokenizer=edge_tok,
+                batch_size=batch_size,
+                max_length=max_length,
+                device=target_device,
+            )
+            for pos, i in enumerate(deep_idx):
+                node_root_stance[edge_target_ids[i]] = max(
+                    -1.0, min(1.0, float(deep_pred["s_uv"][pos]))
+                )
     else:
         # Sequential teacher inference keeps peak VRAM minimal on 16GB GPUs
         if hostility_scorer is not None:
@@ -381,14 +463,37 @@ def extract_and_save_features(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        deep_idx = [
+            i for i, r in enumerate(edge_rows) if str(r["source_id"]) != edge_root_ids[i]
+        ]
         if stance_scorer is not None:
             nli_out = stance_scorer.score_pairs(
                 parent_texts, reply_texts, batch_size=max(1, batch_size // 2), max_length=max_length
+            )
+            root_nli_out = (
+                stance_scorer.score_pairs(
+                    [edge_root_texts[i] for i in deep_idx],
+                    [reply_texts[i] for i in deep_idx],
+                    batch_size=max(1, batch_size // 2),
+                    max_length=max_length,
+                )
+                if deep_idx
+                else None
             )
         else:
             tmp_nli = NLIStanceTeacherScorer(device=target_device)
             nli_out = tmp_nli.score_pairs(
                 parent_texts, reply_texts, batch_size=max(1, batch_size // 2), max_length=max_length
+            )
+            root_nli_out = (
+                tmp_nli.score_pairs(
+                    [edge_root_texts[i] for i in deep_idx],
+                    [reply_texts[i] for i in deep_idx],
+                    batch_size=max(1, batch_size // 2),
+                    max_length=max_length,
+                )
+                if deep_idx
+                else None
             )
             del tmp_nli
             gc.collect()
@@ -397,6 +502,13 @@ def extract_and_save_features(
 
         s_arr = nli_out["s_uv"]
         pred_labels = nli_out["pred_label"]
+        for i in range(len(edge_ids)):
+            node_root_stance[edge_target_ids[i]] = max(-1.0, min(1.0, float(s_arr[i])))
+        if deep_idx and root_nli_out is not None:
+            for pos, i in enumerate(deep_idx):
+                node_root_stance[edge_target_ids[i]] = max(
+                    -1.0, min(1.0, float(root_nli_out["s_uv"][pos]))
+                )
 
     if len(edge_ids) > 0:
         s_t = torch.as_tensor(s_arr, dtype=torch.float32).clamp(-1.0, 1.0)
@@ -431,6 +543,7 @@ def extract_and_save_features(
         "edge_hostility": edge_hostility_map,
         "edge_oppose_flag": edge_oppose_flag,
         "edge_pred_label": edge_pred_label,
+        "node_root_stance": node_root_stance,
     }
     if node_features_770 is not None:
         payload["node_features_770"] = node_features_770
@@ -452,6 +565,7 @@ def main() -> None:
     parser.add_argument("--interim-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--cross-encoder-ckpt", type=Path, default=None)
+    parser.add_argument("--scored-cache-json", type=Path, default=None)
     parser.add_argument("--vihsd-dir", type=Path, default=Path("checkpoints/visobert_vihsd"))
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-length", type=int, default=256)
@@ -467,6 +581,7 @@ def main() -> None:
         interim_dir=interim,
         output_dir=output,
         cross_encoder_ckpt=args.cross_encoder_ckpt,
+        scored_cache_json=args.scored_cache_json,
         vihsd_ckpt=args.vihsd_dir,
         batch_size=args.batch_size,
         max_length=args.max_length,

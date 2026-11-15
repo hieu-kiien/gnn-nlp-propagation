@@ -149,6 +149,24 @@ def build_markdown_table(
             b_cells.append("--" if math.isnan(bv) else f"{bv:.4e}")
         lines.append("| " + " | ".join(b_cells) + " |")
 
+    adj_p_values = benchmark_result.get("adjusted_p_values", {})
+    if adj_p_values:
+        cmp_model = benchmark_result.get("comparator_model", "BiGCN")
+        a_cells = [f"Holm-Bonf adj p ({ref_model} vs. {cmp_model})"]
+        for key, _, _ in metrics:
+            av = adj_p_values.get(key, float("nan"))
+            a_cells.append("--" if math.isnan(av) else f"{av:.4e}")
+        lines.append("| " + " | ".join(a_cells) + " |")
+
+    adj_boot_values = benchmark_result.get("adjusted_bootstrap_p_values", {})
+    if adj_boot_values:
+        cmp_model = benchmark_result.get("comparator_model", "BiGCN")
+        ab_cells = [f"Holm-Bonf bootstrap p ({ref_model} vs. {cmp_model})"]
+        for key, _, _ in metrics:
+            abv = adj_boot_values.get(key, float("nan"))
+            ab_cells.append("--" if math.isnan(abv) else f"{abv:.4e}")
+        lines.append("| " + " | ".join(ab_cells) + " |")
+
     return "\n".join(lines)
 
 
@@ -210,6 +228,22 @@ def export_latex_table(
             b_cells.append("--" if math.isnan(bv) else f"{bv:.2e}")
         p_row_str = p_row_str + " & ".join(b_cells) + r" \\" + "\n"
 
+    adj_p_values = benchmark_result.get("adjusted_p_values", {})
+    if adj_p_values:
+        a_cells = [f"Holm-Bonferroni $p$ ({ref_model} vs. {cmp_model})"]
+        for key, _, _ in metrics:
+            av = adj_p_values.get(key, float("nan"))
+            a_cells.append("--" if math.isnan(av) else f"{av:.2e}")
+        p_row_str = p_row_str + " & ".join(a_cells) + r" \\" + "\n"
+
+    adj_boot_values = benchmark_result.get("adjusted_bootstrap_p_values", {})
+    if adj_boot_values:
+        ab_cells = [f"Holm-Bonf Bootstrap $p$ ({ref_model} vs. {cmp_model})"]
+        for key, _, _ in metrics:
+            abv = adj_boot_values.get(key, float("nan"))
+            ab_cells.append("--" if math.isnan(abv) else f"{abv:.2e}")
+        p_row_str = p_row_str + " & ".join(ab_cells) + r" \\" + "\n"
+
     latex = (
         "\\begin{table}[t]\n"
         "\\centering\n"
@@ -254,9 +288,17 @@ def serialize_benchmark_json(
             k: (None if math.isnan(v) else v)
             for k, v in benchmark_result.get("p_values", {}).items()
         },
+        "adjusted_p_values": {
+            k: (None if math.isnan(v) else v)
+            for k, v in benchmark_result.get("adjusted_p_values", {}).items()
+        },
         "bootstrap_p_values": {
             k: (None if math.isnan(v) else v)
             for k, v in benchmark_result.get("bootstrap_p_values", {}).items()
+        },
+        "adjusted_bootstrap_p_values": {
+            k: (None if math.isnan(v) else v)
+            for k, v in benchmark_result.get("adjusted_bootstrap_p_values", {}).items()
         },
         "raw_results": benchmark_result["raw_results"],
     }

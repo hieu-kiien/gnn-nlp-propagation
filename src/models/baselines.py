@@ -1,12 +1,14 @@
 """Baseline models and shared multi-task components for SBi-FAGAT evaluation.
 
-Implements four standardized baselines sharing `hidden_dim = 128` and identical
+Implements standardized baselines sharing `hidden_dim = 128` and identical
 multi-task prediction heads (`y_size`, `y_polar`, `rumor_logits`):
   1. `TextMLP`: Mean-pooled NLP embeddings + MLP (graph-agnostic baseline).
-  2. `StandardGCN`: Undirected 2-layer GCN (Kipf & Welling, ICLR 2017).
-  3. `StandardGATv2`: Edge-sign-free dynamic GATv2 (Brody et al., ICLR 2022).
-  4. `BiGCN`: Top-Down + Bottom-Up GCN with DropEdge and Root Feature
-     Enhancement (Bian et al., AAAI 2020), without conflict gating.
+  2. `TemporalStanceMLP`: Root + mean-pooled node/temporal MLP fused with pooled 2D `[s_uv, h_uv]` stats (no GNN).
+  3. `StandardGCN`: Undirected 2-layer GCN (Kipf & Welling, ICLR 2017).
+  4. `StandardGATv2`: Edge-sign-free dynamic GATv2 (Brody et al., ICLR 2022).
+  5. `EdgeGATv2`: Edge-aware GATv2 consuming 2D `[s_uv, h_uv]` (or latent edge MLP).
+  6. `FAGCNBaseline`: Frequency-adaptive signed GCN using PyG `FAConv` (Bo et al., AAAI 2021).
+  7. `BiGCN`: Top-Down + Bottom-Up GCN with DropEdge and Root Feature Enhancement (Bian et al., AAAI 2020).
 """
 
 from __future__ import annotations
@@ -119,6 +121,78 @@ class TextMLP(nn.Module):
         _, batch_vec = resolve_root_indices(data, x.size(0))
         node_emb = self.encoder(x)
         graph_emb = global_mean_pool(node_emb, batch_vec)
+        return self.head(graph_emb, node_emb)
+
+
+class TemporalStanceMLP(nn.Module):
+    """Non-graph ablation baseline fusing node temporal features and pooled 2D edge statistics.
+
+    Uses identical inputs to `SBiFAGAT` (770-d node embeddings + root representation +
+    aggregate `[s_uv, h_uv]` mean/std/min/max statistics) without message passing,
+    isolating how much performance comes from graph propagation vs. scalar NLP features.
+    """
+
+    def __init__(
+        self,
+        in_dim: int = 770,
+        hidden_dim: int = 128,
+        edge_dim: int = 2,
+        num_rumor_classes: int = 4,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.edge_dim = edge_dim
+        self.node_encoder = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(2 * hidden_dim + 4 * edge_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.head = MultiTaskHead(hidden_dim, hidden_dim, num_rumor_classes, dropout)
+
+    def forward(self, data: Any) -> dict[str, Tensor]:
+        x = data.x.float()
+        root_idx, batch_vec = resolve_root_indices(data, x.size(0))
+        num_graphs = int(root_idx.size(0))
+
+        node_emb = self.node_encoder(x)
+        h_root = node_emb[root_idx]
+        h_pool = global_mean_pool(node_emb, batch_vec, size=num_graphs)
+
+        e_mean = torch.zeros((num_graphs, self.edge_dim), device=x.device, dtype=node_emb.dtype)
+        e_std = torch.zeros_like(e_mean)
+        e_min = torch.zeros_like(e_mean)
+        e_max = torch.zeros_like(e_mean)
+
+        raw_edge_index = getattr(data, "edge_index_td", getattr(data, "edge_index", None))
+        edge_attr = getattr(data, "edge_attr", None)
+        if (
+            edge_attr is not None
+            and raw_edge_index is not None
+            and edge_attr.numel() > 0
+            and raw_edge_index.numel() > 0
+        ):
+            edge_batch = batch_vec[raw_edge_index[0]]
+            for g in range(num_graphs):
+                mask = edge_batch == g
+                if mask.any():
+                    eg = edge_attr[mask, : self.edge_dim].float()
+                    e_mean[g] = eg.mean(dim=0)
+                    e_std[g] = eg.std(dim=0, unbiased=False) if eg.size(0) >= 2 else 0.0
+                    e_min[g] = eg.min(dim=0).values
+                    e_max[g] = eg.max(dim=0).values
+
+        fused_in = torch.cat([h_root, h_pool, e_mean, e_std, e_min, e_max], dim=-1)
+        graph_emb = self.fusion(fused_in)
         return self.head(graph_emb, node_emb)
 
 

@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import tarfile
+import tempfile
 import unicodedata
 from collections import deque
 from datetime import datetime, timezone
@@ -514,22 +515,42 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Download and parse PHEME dataset from Figshare (6392078).")
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw/pheme"))
     parser.add_argument("--output-dir", type=Path, default=Path("data/interim/pheme"))
+    parser.add_argument("--extract-dir", type=Path, default=None)
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--max-threads", type=int, default=None)
     args = parser.parse_args()
 
-    extract_dir = args.raw_dir / "extracted"
-    if not args.skip_download:
+    default_extract_dir = args.raw_dir / "extracted"
+    if args.extract_dir is not None:
+        extract_dir = args.extract_dir
+        if not args.skip_download:
+            archive_path = download_pheme_from_figshare(raw_dir=args.raw_dir)
+            if not (extract_dir / "all-rnr-annotated-threads").exists():
+                extract_pheme_archive(archive_path, extract_dir)
+        parse_root = extract_dir if _find_event_directories(extract_dir) else args.raw_dir
+        nodes_path, edges_path = process_pheme_dataset(
+            raw_root=parse_root,
+            output_dir=args.output_dir,
+            max_threads=args.max_threads,
+        )
+    elif args.skip_download or (default_extract_dir / "all-rnr-annotated-threads").exists():
+        parse_root = default_extract_dir if _find_event_directories(default_extract_dir) else args.raw_dir
+        nodes_path, edges_path = process_pheme_dataset(
+            raw_root=parse_root,
+            output_dir=args.output_dir,
+            max_threads=args.max_threads,
+        )
+    else:
         archive_path = download_pheme_from_figshare(raw_dir=args.raw_dir)
-        if not (extract_dir / "all-rnr-annotated-threads").exists():
-            extract_pheme_archive(archive_path, extract_dir)
-
-    parse_root = extract_dir if _find_event_directories(extract_dir) else args.raw_dir
-    nodes_path, edges_path = process_pheme_dataset(
-        raw_root=parse_root,
-        output_dir=args.output_dir,
-        max_threads=args.max_threads,
-    )
+        with tempfile.TemporaryDirectory(prefix="pheme_extract_") as tmp_dir:
+            tmp_extract = Path(tmp_dir)
+            extract_pheme_archive(archive_path, tmp_extract)
+            parse_root = tmp_extract if _find_event_directories(tmp_extract) else args.raw_dir
+            nodes_path, edges_path = process_pheme_dataset(
+                raw_root=parse_root,
+                output_dir=args.output_dir,
+                max_threads=args.max_threads,
+            )
     print(f"Saved validated PHEME Parquet tables: {nodes_path}, {edges_path}")
 
 

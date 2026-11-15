@@ -22,6 +22,7 @@ from src.models.baselines import (
     FAGCNBaseline,
     StandardGATv2,
     StandardGCN,
+    TemporalStanceMLP,
     TextMLP,
 )
 from src.models.sbi_fagat import SBiFAGAT
@@ -32,7 +33,13 @@ from src.training.reporting import (
     export_latex_table,
     serialize_benchmark_json,
 )
-from src.training.trainer import compute_paired_ttest, run_multi_seed_benchmark
+from src.training.trainer import (
+    compute_paired_bootstrap_pvalue,
+    compute_paired_ttest,
+    holm_bonferroni_adjust,
+    run_multi_seed_benchmark,
+    select_best_comparator,
+)
 from src.utils.seed import OFFICIAL_SEEDS
 from src.utils.visualize import plot_cascade_heatmap, plot_umap_polarization
 
@@ -154,9 +161,9 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--min-total-replies", type=int, default=0)
+    parser.add_argument("--min-total-replies", type=int, default=21)
     parser.add_argument(
-        "--polar-target-mode", choices=["full", "future_only"], default="full"
+        "--polar-target-mode", choices=["full", "future_only"], default="future_only"
     )
     parser.add_argument(
         "--label-scheme", choices=["veracity4", "binary"], default="veracity4"
@@ -164,6 +171,7 @@ def main() -> None:
     parser.add_argument(
         "--eval-protocol", choices=["inductive", "loo"], default="inductive"
     )
+    parser.add_argument("--comparator-model", type=str, default="auto")
     parser.add_argument("--output-table", type=Path, default=None)
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--figures-dir", type=Path, default=None)
@@ -180,6 +188,9 @@ def main() -> None:
     num_cls = 2 if args.label_scheme == "binary" else 4
     model_factories = {
         "TextMLP": lambda: TextMLP(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls),
+        "TemporalStanceMLP": lambda: TemporalStanceMLP(
+            in_dim=in_dim, hidden_dim=h_dim, edge_dim=2, num_rumor_classes=num_cls
+        ),
         "StandardGCN": lambda: StandardGCN(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls),
         "StandardGATv2": lambda: StandardGATv2(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls),
         "EdgeGATv2": lambda: EdgeGATv2(in_dim=in_dim, hidden_dim=h_dim, edge_dim=2, num_rumor_classes=num_cls),
@@ -209,7 +220,7 @@ def main() -> None:
             lr=args.lr,
             patience=args.patience,
             reference_model="SBiFAGAT",
-            comparator_model="BiGCN",
+            comparator_model=args.comparator_model,
             device=device,
         )
     else:
@@ -256,7 +267,7 @@ def main() -> None:
                 lr=args.lr,
                 patience=args.patience,
                 reference_model="SBiFAGAT",
-                comparator_model="BiGCN",
+                comparator_model=args.comparator_model,
                 device=device,
             )
             for m_name, m_stats in fold_res["summary_stats"].items():
@@ -276,10 +287,22 @@ def main() -> None:
                     else (float("nan"), float("nan"))
                 )
             summary_stats[m_name] = agg
+        cmp_name = (
+            select_best_comparator(summary_stats, reference_model="SBiFAGAT")
+            if args.comparator_model == "auto"
+            else args.comparator_model
+        )
         p_vals = {
             k: compute_paired_ttest(
                 [r[k] for r in fold_raw["SBiFAGAT"]],
-                [r[k] for r in fold_raw["BiGCN"]],
+                [r[k] for r in fold_raw[cmp_name]],
+            )
+            for k in metric_keys
+        }
+        boot_p_vals = {
+            k: compute_paired_bootstrap_pvalue(
+                [r[k] for r in fold_raw["SBiFAGAT"]],
+                [r[k] for r in fold_raw[cmp_name]],
             )
             for k in metric_keys
         }
@@ -288,21 +311,25 @@ def main() -> None:
             "raw_results": fold_raw,
             "summary_stats": summary_stats,
             "p_values": p_vals,
+            "adjusted_p_values": holm_bonferroni_adjust(p_vals),
+            "bootstrap_p_values": boot_p_vals,
+            "adjusted_bootstrap_p_values": holm_bonferroni_adjust(boot_p_vals),
             "reference_model": "SBiFAGAT",
-            "comparator_model": "BiGCN",
+            "comparator_model": cmp_name,
             "models": last_bundle["models"],
         }
 
     print(f"\n=== Main Benchmark Results (5 Seeds, K={args.k_horizon}, {args.eval_protocol}) ===")
     print(build_markdown_table(result, active_metrics))
 
+    cmp_caption = str(result.get("comparator_model") or "BiGCN").replace("_", "\\_")
     export_latex_table(
         result,
         out_table,
         caption=(
             f"Early Cascade Size, Polarization, and Rumor Prediction at $K={args.k_horizon}$ "
             f"({args.eval_protocol.upper()}, Mean $\\pm$ Std). Stars indicate significance "
-            "vs. BiGCN ($^{*}p<0.05$, $^{**}p<0.01$)."
+            f"vs. {cmp_caption} ($^{{*}}p<0.05$, $^{{**}}p<0.01$)."
         ),
         label="tab:main_results",
         metrics=active_metrics,

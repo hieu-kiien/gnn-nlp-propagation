@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -22,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import pyarrow.parquet as pq
 import requests
 
 from src.data.schema import (
@@ -54,7 +56,9 @@ def hash_author_sha256(author: str | None) -> str | None:
     cleaned = author.strip()
     if not cleaned or cleaned.lower() in {"[deleted]", "[removed]", "automoderator"}:
         return None
-    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
+    salt = os.environ.get("SBIF_HASH_SALT", "")
+    payload = f"{salt}{cleaned}" if salt else cleaned
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def normalize_social_text_nfc(text: str) -> str:
@@ -655,12 +659,19 @@ def main() -> None:
     parser.add_argument("--min-depth", type=int, default=3)
     parser.add_argument("--min-vi-ratio", type=float, default=0.25)
     parser.add_argument("--before", type=str, default="7d")
+    parser.add_argument(
+        "--before-epoch",
+        type=int,
+        default=None,
+        help="Optional explicit UTC Unix epoch cursor for reproducible snapshots (overrides --before).",
+    )
     parser.add_argument("--max-pages-per-sub", type=int, default=100)
     parser.add_argument("--output-dir", type=Path, default=Path("data/interim/vn"))
     parser.add_argument("--checkpoint-jsonl", type=Path, default=None)
     parser.add_argument("--allow-partial", action="store_true")
     args = parser.parse_args()
 
+    before_cursor: str | int = args.before_epoch if args.before_epoch is not None else args.before
     nodes_path, edges_path = crawl_arctic_shift_discussions(
         output_dir=args.output_dir,
         subreddits=args.subreddits,
@@ -668,13 +679,15 @@ def main() -> None:
         min_comments=args.min_comments,
         min_depth=args.min_depth,
         min_vi_ratio=args.min_vi_ratio,
-        initial_before=args.before,
+        initial_before=before_cursor,
         max_pages_per_sub=args.max_pages_per_sub,
         checkpoint_jsonl=args.checkpoint_jsonl,
         allow_partial=args.allow_partial,
     )
+    n_nodes = pq.read_metadata(nodes_path).num_rows
+    n_edges = pq.read_metadata(edges_path).num_rows
     print(
-        f"Saved validated Vietnamese discussion trees ({len(nodes_path.parent.name)} output -> "
+        f"Saved validated Vietnamese discussion trees ({n_nodes} nodes, {n_edges} edges -> "
         f"target {args.target_count}): {nodes_path}, {edges_path}"
     )
 

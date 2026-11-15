@@ -16,24 +16,23 @@ if [[ "${RUN_PHEME}" -eq 1 ]]; then
     echo "[Phase 2 - PHEME 1/3] Downloading & parsing PHEME cascades..."
     "${PYTHON_BIN}" -m src.data.pheme_loader --output-dir data/interim/pheme
 
-    echo "[Phase 2 - PHEME 2/3] Teacher scoring, blind audit CSV, and topic-disjoint Cross-Encoder distillation (en)..."
+    echo "[Phase 2 - PHEME 2/3] Frozen teacher scoring & blind human audit export (en)..."
     "${PYTHON_BIN}" -m src.nlp.dual_edge_scorer \
         --lang en \
         --interim-dir data/interim/pheme \
         --scored-cache-json data/interim/pheme/scored_pairs.json \
-        --output-dir checkpoints/dual_ce_en \
         --audit-csv data/interim/human_audit_en_300.csv \
-        --epochs "${EPOCHS}" \
+        --pilot-csv data/interim/pilot_calibration_en_30.csv \
         --batch-size "${BATCH_SIZE}" \
-        --export-audit \
-        --distill
+        --score-only \
+        --export-audit
 
-    echo "[Phase 2 - PHEME 3/3] Extracting frozen node embeddings & edge attributes..."
+    echo "[Phase 2 - PHEME 3/3] Extracting frozen node embeddings & edge attributes from teacher cache..."
     "${PYTHON_BIN}" -m src.nlp.extract_features \
         --dataset pheme \
         --interim-dir data/interim/pheme \
         --output-dir data/processed/pheme \
-        --cross-encoder-ckpt checkpoints/dual_ce_en \
+        --scored-cache-json data/interim/pheme/scored_pairs.json \
         --batch-size "$((BATCH_SIZE * 2))" \
         --k-horizon 20
 fi
@@ -46,26 +45,26 @@ if [[ "${RUN_VN}" -eq 1 ]]; then
         --checkpoint-jsonl data/interim/vn/crawl_checkpoint.jsonl \
         --allow-partial
 
-    echo "[Phase 2 - VN 2/3] Fine-tuning ViSoBERT-ViHSD, teacher scoring, audit export, and topic-disjoint distillation (vi)..."
+    echo "[Phase 2 - VN 2/3] Fine-tuning ViSoBERT-ViHSD, frozen teacher scoring & blind audit export (vi)..."
     "${PYTHON_BIN}" -m src.nlp.dual_edge_scorer \
         --lang vi \
         --interim-dir data/interim/vn \
         --vihsd-dir checkpoints/visobert_vihsd \
         --scored-cache-json data/interim/vn/scored_pairs.json \
-        --output-dir checkpoints/dual_ce_vi \
         --audit-csv data/interim/human_audit_300.csv \
+        --pilot-csv data/interim/pilot_calibration_30.csv \
         --epochs "${EPOCHS}" \
         --batch-size "${BATCH_SIZE}" \
         --train-vihsd \
-        --export-audit \
-        --distill
+        --score-only \
+        --export-audit
 
-    echo "[Phase 2 - VN 3/3] Extracting frozen node embeddings & edge attributes..."
+    echo "[Phase 2 - VN 3/3] Extracting frozen node embeddings & edge attributes from teacher cache..."
     "${PYTHON_BIN}" -m src.nlp.extract_features \
         --dataset vn \
         --interim-dir data/interim/vn \
         --output-dir data/processed/vn \
-        --cross-encoder-ckpt checkpoints/dual_ce_vi \
+        --scored-cache-json data/interim/vn/scored_pairs.json \
         --vihsd-dir checkpoints/visobert_vihsd \
         --batch-size "$((BATCH_SIZE * 2))" \
         --k-horizon 20

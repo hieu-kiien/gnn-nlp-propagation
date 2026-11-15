@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Callable, Literal, Sequence
+import math
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.stats import ttest_rel
+from scipy.stats import spearmanr, ttest_rel
+from sklearn.metrics import f1_score, roc_auc_score
 from torch_geometric.loader import DataLoader
 
 from src.training.metrics import compute_multitask_loss, evaluate_predictions
@@ -179,7 +181,7 @@ def train_and_evaluate_single_seed(
     weight_decay: float = 1e-4,
     patience: int = 10,
     alpha_size: float = 1.0,
-    alpha_polar: float = 1.0,
+    alpha_polar: float = 4.0,
     alpha_rumor: float = 1.0,
     use_class_weights: bool = True,
     classification_only: bool = False,
@@ -298,40 +300,224 @@ def compute_paired_bootstrap_pvalue(
     return float(min(1.0, 2.0 * min(p_left, p_right)))
 
 
+_LOWER_IS_BETTER: frozenset[str] = frozenset(
+    {"msle", "mae", "rmse_size", "rmse", "mae_polar", "loss"}
+)
+_COMPARATOR_RANK_METRICS: tuple[str, ...] = (
+    "msle",
+    "mae",
+    "r2_size",
+    "rmse",
+    "mae_polar",
+    "r2_polar",
+    "pearson_r",
+    "spearman_polar",
+    "macro_f1",
+    "accuracy",
+    "auc_roc",
+)
+_COMPARATOR_TIE_PRIORITY: dict[str, int] = {
+    "BiGCN": 0,
+    "FAGCN": 1,
+    "EdgeGATv2": 2,
+    "TemporalStanceMLP": 3,
+    "StandardGATv2": 4,
+    "StandardGCN": 5,
+    "TextMLP": 6,
+}
+
+
+def holm_bonferroni_adjust(p_values: Mapping[str, float]) -> dict[str, float]:
+    """Apply Holm-Bonferroni step-down family-wise error adjustment to p-values."""
+    adjusted: dict[str, float] = {k: float(v) for k, v in p_values.items()}
+    valid = [
+        (k, float(v))
+        for k, v in p_values.items()
+        if v is not None and not math.isnan(float(v)) and math.isfinite(float(v))
+    ]
+    if not valid:
+        return adjusted
+    m = len(valid)
+    valid.sort(key=lambda kv: kv[1])
+    running_max = 0.0
+    for rank, (k, raw_p) in enumerate(valid):
+        scaled = min(1.0, max(0.0, float(m - rank) * raw_p))
+        running_max = max(running_max, scaled)
+        adjusted[k] = running_max
+    return adjusted
+
+
+def select_best_comparator(
+    summary_stats: Mapping[str, Mapping[str, tuple[float, float]]],
+    *,
+    reference_model: str = "SBiFAGAT",
+) -> str:
+    """Choose the strongest competing baseline by average rank across non-NaN metrics."""
+    candidates = [m for m in summary_stats.keys() if m != reference_model]
+    if not candidates:
+        return "BiGCN"
+
+    ranks_by_model: dict[str, list[float]] = {c: [] for c in candidates}
+    for metric in _COMPARATOR_RANK_METRICS:
+        scored: list[tuple[str, float]] = []
+        for c in candidates:
+            stat = summary_stats.get(c, {}).get(metric)
+            if stat is not None and not math.isnan(float(stat[0])):
+                scored.append((c, float(stat[0])))
+        if len(scored) < 2:
+            continue
+        reverse = metric not in _LOWER_IS_BETTER
+        scored.sort(key=lambda kv: kv[1], reverse=reverse)
+        for rank_idx, (c, _) in enumerate(scored):
+            ranks_by_model[c].append(float(rank_idx))
+
+    if not any(ranks_by_model.values()):
+        return min(candidates, key=lambda c: (_COMPARATOR_TIE_PRIORITY.get(c, 99), c))
+
+    return min(
+        candidates,
+        key=lambda c: (
+            float(np.mean(ranks_by_model[c])) if ranks_by_model[c] else float("inf"),
+            -len(ranks_by_model[c]),
+            _COMPARATOR_TIE_PRIORITY.get(c, 99),
+            c,
+        ),
+    )
+
+
+def _boot_pvalue_from_diffs(diffs: np.ndarray) -> float:
+    arr = np.asarray(diffs, dtype=np.float64)
+    arr = arr[~np.isnan(arr)]
+    if arr.size < 2:
+        return float("nan")
+    if np.allclose(arr, 0.0):
+        return 1.0
+    p_left = float(np.mean(arr <= 0.0))
+    p_right = float(np.mean(arr >= 0.0))
+    return float(min(1.0, 2.0 * min(p_left, p_right)))
+
+
+def _vec_r2(y_true: np.ndarray, y_pred: np.ndarray, idx_mat: np.ndarray) -> np.ndarray:
+    yt_b = y_true[idx_mat]
+    yp_b = y_pred[idx_mat]
+    ss_res = np.sum((yt_b - yp_b) ** 2, axis=1)
+    ss_tot = np.sum((yt_b - np.mean(yt_b, axis=1, keepdims=True)) ** 2, axis=1)
+    out = np.zeros(idx_mat.shape[0], dtype=np.float64)
+    mask = ss_tot > 1e-12
+    out[mask] = 1.0 - ss_res[mask] / ss_tot[mask]
+    return out
+
+
+def _vec_pearson(y_true: np.ndarray, y_pred: np.ndarray, idx_mat: np.ndarray) -> np.ndarray:
+    yt_b = y_true[idx_mat]
+    yp_b = y_pred[idx_mat]
+    yt_c = yt_b - np.mean(yt_b, axis=1, keepdims=True)
+    yp_c = yp_b - np.mean(yp_b, axis=1, keepdims=True)
+    denom = np.sqrt(np.sum(yt_c**2, axis=1) * np.sum(yp_c**2, axis=1))
+    out = np.zeros(idx_mat.shape[0], dtype=np.float64)
+    mask = denom > 1e-12
+    out[mask] = np.sum(yt_c[mask] * yp_c[mask], axis=1) / denom[mask]
+    return out
+
+
+def _safe_auc_from_probs(truth: np.ndarray, probs: np.ndarray) -> float:
+    unique_cls = np.unique(truth)
+    if unique_cls.size < 2 or probs.ndim != 2:
+        return float("nan")
+    try:
+        if probs.shape[1] == 2:
+            return float(roc_auc_score(truth, probs[:, 1]))
+        if unique_cls.size == probs.shape[1]:
+            return float(roc_auc_score(truth, probs, multi_class="ovr", average="macro"))
+        cls_aucs = [
+            float(roc_auc_score((truth == c).astype(np.int64), probs[:, int(c)]))
+            for c in unique_cls
+            if int(c) < probs.shape[1]
+        ]
+        return float(np.mean(cls_aucs)) if cls_aucs else float("nan")
+    except ValueError:
+        return float("nan")
+
+
 def _compute_sample_level_bootstrap_pvalues(
     preds_ref: Sequence[dict[str, Any]],
     preds_cmp: Sequence[dict[str, Any]],
     *,
     metric_keys: Sequence[str],
     seed: int = 42,
+    n_resamples: int = 2000,
+    n_stat_resamples: int = 500,
 ) -> dict[str, float]:
-    """Paired bootstrap across held-out test cascades (using seed-averaged predictions)."""
+    """Paired bootstrap across held-out test cascades for all regression & classification metrics."""
     if not preds_ref or not preds_cmp:
-        return {}
+        return {k: float("nan") for k in metric_keys}
     y_size_true = np.asarray(preds_ref[0]["y_size_true"], dtype=np.float64)
     y_polar_true = np.asarray(preds_ref[0]["y_polar_true"], dtype=np.float64)
-    if y_size_true.size < 2:
-        return {}
+    n = int(y_size_true.size)
+    if n < 2:
+        return {k: float("nan") for k in metric_keys}
 
     ref_size = np.mean([p["y_size_pred"] for p in preds_ref], axis=0)
     cmp_size = np.mean([p["y_size_pred"] for p in preds_cmp], axis=0)
     ref_polar = np.mean([p["y_polar_pred"] for p in preds_ref], axis=0)
     cmp_polar = np.mean([p["y_polar_pred"] for p in preds_cmp], axis=0)
 
+    rng = np.random.default_rng(seed)
+    idx_fast = rng.integers(0, n, size=(n_resamples, n))
+    idx_stat = idx_fast[: min(n_resamples, n_stat_resamples)]
+
     out: dict[str, float] = {}
-    out["msle"] = compute_paired_bootstrap_pvalue(
-        (ref_size - y_size_true) ** 2, (cmp_size - y_size_true) ** 2, seed=seed
+    se_ref_size = (ref_size - y_size_true) ** 2
+    se_cmp_size = (cmp_size - y_size_true) ** 2
+    se_ref_polar = (ref_polar - y_polar_true) ** 2
+    se_cmp_polar = (cmp_polar - y_polar_true) ** 2
+
+    out["msle"] = _boot_pvalue_from_diffs(
+        se_ref_size[idx_fast].mean(axis=1) - se_cmp_size[idx_fast].mean(axis=1)
     )
-    out["rmse_size"] = out["msle"]
+    out["rmse_size"] = _boot_pvalue_from_diffs(
+        np.sqrt(se_ref_size[idx_fast].mean(axis=1)) - np.sqrt(se_cmp_size[idx_fast].mean(axis=1))
+    )
     out["mae"] = compute_paired_bootstrap_pvalue(
-        np.abs(ref_size - y_size_true), np.abs(cmp_size - y_size_true), seed=seed + 1
+        np.abs(ref_size - y_size_true), np.abs(cmp_size - y_size_true), n_resamples=n_resamples, seed=seed + 1
     )
-    out["rmse"] = compute_paired_bootstrap_pvalue(
-        (ref_polar - y_polar_true) ** 2, (cmp_polar - y_polar_true) ** 2, seed=seed + 2
+    out["rmse"] = _boot_pvalue_from_diffs(
+        np.sqrt(se_ref_polar[idx_fast].mean(axis=1)) - np.sqrt(se_cmp_polar[idx_fast].mean(axis=1))
     )
     out["mae_polar"] = compute_paired_bootstrap_pvalue(
-        np.abs(ref_polar - y_polar_true), np.abs(cmp_polar - y_polar_true), seed=seed + 3
+        np.abs(ref_polar - y_polar_true), np.abs(cmp_polar - y_polar_true), n_resamples=n_resamples, seed=seed + 3
     )
+
+    out["r2_size"] = _boot_pvalue_from_diffs(
+        _vec_r2(y_size_true, ref_size, idx_stat) - _vec_r2(y_size_true, cmp_size, idx_stat)
+    )
+    out["r2_polar"] = _boot_pvalue_from_diffs(
+        _vec_r2(y_polar_true, ref_polar, idx_stat) - _vec_r2(y_polar_true, cmp_polar, idx_stat)
+    )
+    out["pearson_r"] = _boot_pvalue_from_diffs(
+        _vec_pearson(y_polar_true, ref_polar, idx_stat)
+        - _vec_pearson(y_polar_true, cmp_polar, idx_stat)
+    )
+
+    if "spearman_size" in metric_keys:
+        sp_size_diffs: list[float] = []
+        for b_idx in idx_stat:
+            yt = y_size_true[b_idx]
+            pr, pc = ref_size[b_idx], cmp_size[b_idx]
+            sr = float(spearmanr(yt, pr).statistic) if np.std(yt) > 1e-12 and np.std(pr) > 1e-12 else 0.0
+            sc = float(spearmanr(yt, pc).statistic) if np.std(yt) > 1e-12 and np.std(pc) > 1e-12 else 0.0
+            sp_size_diffs.append((0.0 if math.isnan(sr) else sr) - (0.0 if math.isnan(sc) else sc))
+        out["spearman_size"] = _boot_pvalue_from_diffs(np.asarray(sp_size_diffs, dtype=np.float64))
+
+    if "spearman_polar" in metric_keys:
+        sp_polar_diffs: list[float] = []
+        for b_idx in idx_stat:
+            yt = y_polar_true[b_idx]
+            pr, pc = ref_polar[b_idx], cmp_polar[b_idx]
+            sr = float(spearmanr(yt, pr).statistic) if np.std(yt) > 1e-12 and np.std(pr) > 1e-12 else 0.0
+            sc = float(spearmanr(yt, pc).statistic) if np.std(yt) > 1e-12 and np.std(pc) > 1e-12 else 0.0
+            sp_polar_diffs.append((0.0 if math.isnan(sr) else sr) - (0.0 if math.isnan(sc) else sc))
+        out["spearman_polar"] = _boot_pvalue_from_diffs(np.asarray(sp_polar_diffs, dtype=np.float64))
 
     ref_logits_list = [p["rumor_logits"] for p in preds_ref if p.get("rumor_logits") is not None]
     cmp_logits_list = [p["rumor_logits"] for p in preds_cmp if p.get("rumor_logits") is not None]
@@ -339,7 +525,9 @@ def _compute_sample_level_bootstrap_pvalues(
     if ref_logits_list and cmp_logits_list and y_rumor_raw is not None:
         y_rumor_arr = np.asarray(y_rumor_raw, dtype=np.int64).reshape(-1)
         valid = y_rumor_arr >= 0
-        if np.sum(valid) >= 2:
+        n_cls_samples = int(np.sum(valid))
+        if n_cls_samples >= 2:
+            truth_v = y_rumor_arr[valid]
             ref_probs = np.mean(
                 [torch.softmax(torch.as_tensor(lg), dim=-1).numpy() for lg in ref_logits_list],
                 axis=0,
@@ -348,9 +536,36 @@ def _compute_sample_level_bootstrap_pvalues(
                 [torch.softmax(torch.as_tensor(lg), dim=-1).numpy() for lg in cmp_logits_list],
                 axis=0,
             )[valid]
-            ref_correct = (np.argmax(ref_probs, axis=-1) == y_rumor_arr[valid]).astype(np.float64)
-            cmp_correct = (np.argmax(cmp_probs, axis=-1) == y_rumor_arr[valid]).astype(np.float64)
-            out["accuracy"] = compute_paired_bootstrap_pvalue(ref_correct, cmp_correct, seed=seed + 4)
+            ref_pred_cls = np.argmax(ref_probs, axis=-1)
+            cmp_pred_cls = np.argmax(cmp_probs, axis=-1)
+            out["accuracy"] = compute_paired_bootstrap_pvalue(
+                (ref_pred_cls == truth_v).astype(np.float64),
+                (cmp_pred_cls == truth_v).astype(np.float64),
+                n_resamples=n_resamples,
+                seed=seed + 4,
+            )
+            idx_cls = rng.integers(0, n_cls_samples, size=(min(n_resamples, n_stat_resamples), n_cls_samples))
+            if "macro_f1" in metric_keys:
+                f1_diffs: list[float] = []
+                for b_idx in idx_cls:
+                    tb = truth_v[b_idx]
+                    f1_r = float(f1_score(tb, ref_pred_cls[b_idx], average="macro", zero_division=0))
+                    f1_c = float(f1_score(tb, cmp_pred_cls[b_idx], average="macro", zero_division=0))
+                    f1_diffs.append(f1_r - f1_c)
+                out["macro_f1"] = _boot_pvalue_from_diffs(np.asarray(f1_diffs, dtype=np.float64))
+            if "auc_roc" in metric_keys:
+                auc_diffs: list[float] = []
+                for b_idx in idx_cls:
+                    tb = truth_v[b_idx]
+                    ar = _safe_auc_from_probs(tb, ref_probs[b_idx])
+                    ac = _safe_auc_from_probs(tb, cmp_probs[b_idx])
+                    if not (math.isnan(ar) or math.isnan(ac)):
+                        auc_diffs.append(ar - ac)
+                out["auc_roc"] = (
+                    _boot_pvalue_from_diffs(np.asarray(auc_diffs, dtype=np.float64))
+                    if len(auc_diffs) >= 2
+                    else float("nan")
+                )
 
     for k in metric_keys:
         out.setdefault(k, float("nan"))
@@ -369,12 +584,12 @@ def run_multi_seed_benchmark(
     weight_decay: float = 1e-4,
     patience: int = 10,
     alpha_size: float = 1.0,
-    alpha_polar: float = 1.0,
+    alpha_polar: float = 4.0,
     alpha_rumor: float = 1.0,
     use_class_weights: bool = True,
     classification_only: bool = False,
     reference_model: str = "SBiFAGAT",
-    comparator_model: str = "BiGCN",
+    comparator_model: str = "auto",
     device: torch.device | str | None = None,
 ) -> dict[str, Any]:
     """Run all models over the official 5 random seeds and compute paired t-tests & bootstrap p-values."""
@@ -396,6 +611,7 @@ def run_multi_seed_benchmark(
         "spearman_polar",
         "macro_f1",
         "accuracy",
+        "auc_roc",
         "loss",
     )
 
@@ -441,16 +657,22 @@ def run_multi_seed_benchmark(
                 agg[key] = (mean_v, std_v)
         summary_stats[model_name] = agg
 
+    effective_comparator = (
+        select_best_comparator(summary_stats, reference_model=reference_model)
+        if comparator_model == "auto"
+        else comparator_model
+    )
+
     p_values: dict[str, float] = {}
     bootstrap_p_values: dict[str, float] = {}
-    if reference_model in raw_results and comparator_model in raw_results:
+    if reference_model in raw_results and effective_comparator in raw_results:
         for key in metric_keys:
             ref_scores = [r[key] for r in raw_results[reference_model]]
-            cmp_scores = [r[key] for r in raw_results[comparator_model]]
+            cmp_scores = [r[key] for r in raw_results[effective_comparator]]
             p_values[key] = compute_paired_ttest(ref_scores, cmp_scores)
         bootstrap_p_values = _compute_sample_level_bootstrap_pvalues(
             model_predictions.get(reference_model, []),
-            model_predictions.get(comparator_model, []),
+            model_predictions.get(effective_comparator, []),
             metric_keys=metric_keys,
         )
 
@@ -459,8 +681,10 @@ def run_multi_seed_benchmark(
         "raw_results": raw_results,
         "summary_stats": summary_stats,
         "p_values": p_values,
+        "adjusted_p_values": holm_bonferroni_adjust(p_values),
         "bootstrap_p_values": bootstrap_p_values,
+        "adjusted_bootstrap_p_values": holm_bonferroni_adjust(bootstrap_p_values),
         "reference_model": reference_model,
-        "comparator_model": comparator_model,
+        "comparator_model": effective_comparator,
         "models": trained_last_models,
     }

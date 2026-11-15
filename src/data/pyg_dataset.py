@@ -231,9 +231,8 @@ def leave_one_event_out_splits(
         )
 
     rng = random.Random(seed)
-    shuffled = list(topics)
-    rng.shuffle(shuffled)
-    ordered = sorted(shuffled)
+    ordered = sorted(topics)
+    rng.shuffle(ordered)
 
     folds: list[dict[str, Any]] = []
     for idx, test_topic in enumerate(ordered):
@@ -325,16 +324,16 @@ def _compute_root_aligned_stances(
     edge_lookup: Mapping[tuple[str, str], Mapping[str, Any]],
     stance_map: Mapping[Any, Any] | None,
     *,
+    root_stance_map: Mapping[Any, Any] | None = None,
     excluded_pairs: set[tuple[str, str]] | None = None,
     neutral_eps: float = 0.1,
 ) -> list[float]:
     """Propagate local parent-child stances into root-aligned orientations via BFS.
 
-    Reconciles nested replies (depth >= 2) relative to the root narrative: disagreeing
-    with an opposer aligns positively with the root (+), whereas agreeing with an opposer
-    remains negative (-). If `excluded_pairs` is supplied (for `future_only` polarization),
-    only edges outside `excluded_pairs` contribute to the returned stance list while BFS
-    still propagates parent orientations through the full tree.
+    When direct `(root, reply)` NLI stance scores (`root_stance_map`) are provided,
+    they are used directly for any reply `v` present in `root_stance_map`, eliminating
+    multi-hop sign-product drift on deep replies while falling back to signed parent
+    propagation (`parent_sign * s_uv`) when `root_stance_map` is absent.
     """
     node_orientations: dict[str, float] = {root_id: 1.0}
     aligned_stances: list[float] = []
@@ -348,7 +347,10 @@ def _compute_root_aligned_stances(
             edge_row = edge_lookup.get((u, v))
             eid = str(edge_row["edge_id"]) if edge_row is not None else f"{u}->{v}"
             s_uv = float(min(1.0, max(-1.0, _lookup_edge_scalar(stance_map, eid, u, v, 0.0))))
-            aligned = float(min(1.0, max(-1.0, parent_sign * s_uv)))
+            if root_stance_map is not None and v in root_stance_map:
+                aligned = float(min(1.0, max(-1.0, float(root_stance_map[v]))))
+            else:
+                aligned = float(min(1.0, max(-1.0, parent_sign * s_uv)))
             if v not in node_orientations:
                 node_orientations[v] = aligned
                 queue.append(v)
@@ -356,6 +358,60 @@ def _compute_root_aligned_stances(
                 aligned_stances.append(aligned)
 
     return aligned_stances
+
+
+def compute_bimodality_coefficient(stances: Sequence[float]) -> float:
+    """Compute Sarle's Bimodality Coefficient BC in [0, 1] (> 0.555 indicates bimodal split).
+
+    Independent construct-validity companion to `y_polar` (Pfister et al., 2013).
+    """
+    if len(stances) < 4:
+        return 0.0
+    arr = np.clip(np.asarray(stances, dtype=np.float64), -1.0, 1.0)
+    n = int(arr.size)
+    diff = arr - float(np.mean(arr))
+    m2 = float(np.mean(diff**2))
+    if m2 <= 1e-12:
+        return 0.0
+    m3 = float(np.mean(diff**3))
+    m4 = float(np.mean(diff**4))
+    b1 = m3 / (m2**1.5)
+    g1 = math.sqrt(n * (n - 1)) / float(n - 2) * b1
+    g2_raw = m4 / (m2**2) - 3.0
+    g2 = ((n - 1) / float((n - 2) * (n - 3))) * ((n + 1) * g2_raw + 6.0)
+    finite_sample_norm = 3.0 * ((n - 1) ** 2) / float((n - 2) * (n - 3))
+    denom = max(g2 + finite_sample_norm, g1**2 + 1.0)
+    if denom <= 1e-12:
+        return 0.0
+    return float(min(1.0, max(0.0, (g1**2 + 1.0) / denom)))
+
+
+def compute_signed_assortativity(
+    edge_pairs: Sequence[tuple[str, str]],
+    node_stance: Mapping[str, float],
+    *,
+    root_id: str | None = None,
+) -> float:
+    """Compute scalar Newman assortativity r in [-1, 1] of parent-child stances across edges."""
+    u_vals: list[float] = []
+    v_vals: list[float] = []
+    for src, dst in edge_pairs:
+        s_u = node_stance.get(src, 1.0 if (root_id is not None and src == root_id) else None)
+        s_v = node_stance.get(dst)
+        if s_u is None or s_v is None:
+            continue
+        u_vals.append(float(s_u))
+        v_vals.append(float(s_v))
+    if len(u_vals) < 2:
+        return 0.0
+    u_arr = np.asarray(u_vals, dtype=np.float64)
+    v_arr = np.asarray(v_vals, dtype=np.float64)
+    if float(np.std(u_arr)) <= 1e-12 or float(np.std(v_arr)) <= 1e-12:
+        return 0.0
+    r = float(np.corrcoef(u_arr, v_arr)[0, 1])
+    if math.isnan(r):
+        return 0.0
+    return float(min(1.0, max(-1.0, r)))
 
 
 def _compute_full_tree_polarization(
@@ -493,6 +549,7 @@ class EarlyCascadeDataset(Dataset):
         node_emb_map = _resolve_node_embeddings(nlp_features)
         stance_map = nlp_features.get("edge_stance")
         hostility_map = nlp_features.get("edge_hostility")
+        root_stance_map = nlp_features.get("node_root_stance")
 
         nodes_by_cascade: dict[str, list[dict[str, Any]]] = {}
         for row in nodes_table.to_pylist():
@@ -571,12 +628,14 @@ class EarlyCascadeDataset(Dataset):
                 children_adj=children_adj,
                 edge_lookup=edge_lookup,
                 stance_map=stance_map,
+                root_stance_map=root_stance_map,
                 excluded_pairs=kept_pair_set if self.polar_target_mode == "future_only" else None,
             )
             y_polar_val = _compute_full_tree_polarization(
                 aligned_stances,
                 lambda_polar=self.lambda_polar,
             )
+            y_bimodality_val = compute_bimodality_coefficient(aligned_stances)
 
             # 3. Leakage-free causal node features on V_K only (fixed TEMPORAL_REF_SECONDS horizon)
             delays_k = [
@@ -658,6 +717,7 @@ class EarlyCascadeDataset(Dataset):
                 root_index=torch.tensor([0], dtype=torch.long),
                 y_size=torch.tensor([y_size_val], dtype=torch.float32),
                 y_polar=torch.tensor([y_polar_val], dtype=torch.float32),
+                y_bimodality=torch.tensor([y_bimodality_val], dtype=torch.float32),
                 y_rumor=torch.tensor([y_rumor_val], dtype=torch.long),
                 cascade_id=cid,
                 topic_id=topic_id,
@@ -697,6 +757,7 @@ class UPFDAdapterTransform:
             root_index=torch.tensor([0], dtype=torch.long),
             y_size=y_size,
             y_polar=y_polar,
+            y_bimodality=torch.tensor([0.0], dtype=torch.float32),
             y_rumor=y_cls,
             y=y_cls,
         )

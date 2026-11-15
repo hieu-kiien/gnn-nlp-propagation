@@ -44,6 +44,12 @@ from transformers import (
 )
 
 from contextlib import nullcontext
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(iterable: Any, **_kwargs: Any) -> Any:
+        return iterable
+
 from src.data.pyg_dataset import inductive_topic_split
 from src.data.schema import load_cascade_parquet
 from src.utils.seed import seed_everything
@@ -471,6 +477,8 @@ def export_stratified_human_audit_csv(
     output_csv: Path = Path("data/interim/human_audit_300.csv"),
     *,
     machine_key_csv: Path | None = None,
+    pilot_csv: Path | None = None,
+    pilot_samples: int = 30,
     n_samples: int = 300,
     seed: int = 42,
 ) -> Path:
@@ -528,25 +536,52 @@ def export_stratified_human_audit_csv(
         "annotator_1_hostility",
         "annotator_2_hostility",
         "notes",
+        "gold_adjudicated_stance",
+        "gold_adjudicated_hostility",
     ]
-    with out_path.open("w", encoding="utf-8-sig", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=blind_fieldnames)
-        writer.writeheader()
-        for idx, row in enumerate(selected):
-            writer.writerow(
-                {
-                    "sample_id": f"audit_{idx + 1:03d}",
-                    "cascade_id": str(row.get("cascade_id") or ""),
-                    "edge_id": str(row.get("edge_id") or ""),
-                    "parent_text": str(row.get("parent_text") or ""),
-                    "reply_text": str(row.get("reply_text") or ""),
-                    "annotator_1_stance": "",
-                    "annotator_2_stance": "",
-                    "annotator_1_hostility": "",
-                    "annotator_2_hostility": "",
-                    "notes": "",
-                }
-            )
+
+    def _write_blind_csv(csv_dest: Path, rows_to_write: Sequence[Mapping[str, Any]], prefix: str) -> None:
+        csv_dest.parent.mkdir(parents=True, exist_ok=True)
+        with csv_dest.open("w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=blind_fieldnames)
+            writer.writeheader()
+            for idx, row in enumerate(rows_to_write):
+                writer.writerow(
+                    {
+                        "sample_id": f"{prefix}_{idx + 1:03d}",
+                        "cascade_id": str(row.get("cascade_id") or ""),
+                        "edge_id": str(row.get("edge_id") or ""),
+                        "parent_text": str(row.get("parent_text") or ""),
+                        "reply_text": str(row.get("reply_text") or ""),
+                        "annotator_1_stance": "",
+                        "annotator_2_stance": "",
+                        "annotator_1_hostility": "",
+                        "annotator_2_hostility": "",
+                        "notes": "",
+                        "gold_adjudicated_stance": "",
+                        "gold_adjudicated_hostility": "",
+                    }
+                )
+
+    _write_blind_csv(out_path, selected, prefix="audit")
+
+    if pilot_csv is not None and pilot_samples > 0:
+        pilot_selected: list[dict[str, Any]] = []
+        while len(pilot_selected) < pilot_samples:
+            added_pilot = False
+            for lbl in STANCE_LABELS:
+                if len(pilot_selected) >= pilot_samples:
+                    break
+                idx = offsets[lbl]
+                if idx < len(buckets[lbl]):
+                    pilot_selected.append(buckets[lbl][idx])
+                    offsets[lbl] += 1
+                    added_pilot = True
+            if not added_pilot:
+                break
+        if pilot_selected:
+            rng.shuffle(pilot_selected)
+            _write_blind_csv(Path(pilot_csv), pilot_selected, prefix="pilot")
 
     if machine_key_csv is not None:
         key_path = Path(machine_key_csv)
@@ -909,17 +944,26 @@ def extract_parent_reply_pairs_from_parquet(interim_dir: Path) -> list[dict[str,
     node_rows = nodes_tbl.to_pylist()
     node_text_by_id = {str(row["node_id"]): str(row["text"]) for row in node_rows}
     node_topic_by_id = {str(row["node_id"]): str(row["topic_id"]) for row in node_rows}
+    cascade_root_id: dict[str, str] = {}
+    for row in node_rows:
+        if bool(row.get("is_root")):
+            cascade_root_id[str(row["cascade_id"])] = str(row["node_id"])
+
     pairs: list[dict[str, Any]] = []
     for edge in edges_tbl.to_pylist():
+        cid = str(edge["cascade_id"])
         src = str(edge["source_id"])
         tgt = str(edge["target_id"])
+        root_id = cascade_root_id.get(cid, src)
         pairs.append(
             {
                 "edge_id": str(edge["edge_id"]),
-                "cascade_id": str(edge["cascade_id"]),
+                "cascade_id": cid,
                 "topic_id": node_topic_by_id[src],
+                "root_id": root_id,
                 "parent_id": src,
                 "target_id": tgt,
+                "root_text": node_text_by_id.get(root_id, node_text_by_id[src]),
                 "parent_text": node_text_by_id[src],
                 "reply_text": node_text_by_id[tgt],
             }
@@ -962,6 +1006,13 @@ def split_pairs_by_inductive_topics(
     return {"train": train_pairs, "val": val_pairs, "test": test_pairs}
 
 
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(path)
+
+
 def _score_pairs_with_teachers(
     pairs: list[dict[str, Any]],
     *,
@@ -969,40 +1020,110 @@ def _score_pairs_with_teachers(
     vihsd_ckpt: Path | None = None,
     batch_size: int = 16,
     allow_untrained_fallback: bool = False,
+    cache_path: Path | None = None,
+    checkpoint_every: int = 500,
 ) -> list[dict[str, Any]]:
-    """Run Hostility & NLI teachers sequentially so VRAM stays well below 16GB."""
+    """Run Hostility & NLI teachers sequentially with shard checkpointing for 16GB GPUs."""
     if not pairs:
         return pairs
 
+    chunk_size = max(1, int(checkpoint_every))
+    cached_by_eid: dict[str, dict[str, Any]] = {}
+    if cache_path is not None and Path(cache_path).exists():
+        try:
+            loaded_cache = json.loads(Path(cache_path).read_text(encoding="utf-8"))
+            if isinstance(loaded_cache, list):
+                for item in loaded_cache:
+                    eid = str(item.get("edge_id") or "")
+                    if eid:
+                        cached_by_eid[eid] = item
+        except (OSError, json.JSONDecodeError):
+            cached_by_eid = {}
+
+    for p in pairs:
+        eid = str(p.get("edge_id") or "")
+        cached = cached_by_eid.get(eid)
+        if cached is not None:
+            for field in ("h_uv", "s_uv", "stance_probs", "pred_label", "root_s_uv"):
+                if field in cached:
+                    p[field] = cached[field]
+
     # Stage 1: Hostility intensity h_uv
-    host_scorer = HostilityTeacherScorer(
-        lang=lang,
-        model_name_or_path=vihsd_ckpt if lang == "vi" else None,
-        allow_untrained_fallback=allow_untrained_fallback,
-    )
-    h_scores = host_scorer.score_texts([p["reply_text"] for p in pairs], batch_size=batch_size * 2)
-    del host_scorer
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    need_host_idx = [i for i, p in enumerate(pairs) if "h_uv" not in p]
+    if need_host_idx:
+        host_scorer = HostilityTeacherScorer(
+            lang=lang,
+            model_name_or_path=vihsd_ckpt if lang == "vi" else None,
+            allow_untrained_fallback=allow_untrained_fallback,
+        )
+        chunk_starts = range(0, len(need_host_idx), chunk_size)
+        for start in tqdm(chunk_starts, desc=f"Hostility teacher ({lang})"):
+            idx_slice = need_host_idx[start : start + chunk_size]
+            h_scores = host_scorer.score_texts(
+                [pairs[i]["reply_text"] for i in idx_slice],
+                batch_size=batch_size * 2,
+            )
+            for pos, i in enumerate(idx_slice):
+                pairs[i]["h_uv"] = float(h_scores[pos])
+            if cache_path is not None:
+                _atomic_write_json(Path(cache_path), pairs)
+        del host_scorer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    # Stage 2: NLI stance score s_uv
-    nli_scorer = NLIStanceTeacherScorer()
-    nli_out = nli_scorer.score_pairs(
-        [p["parent_text"] for p in pairs],
-        [p["reply_text"] for p in pairs],
-        batch_size=batch_size,
-    )
-    del nli_scorer
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # Stage 2: NLI stance score s_uv + direct (root -> reply) root_s_uv for depth >= 2
+    need_nli_idx = [
+        i for i, p in enumerate(pairs) if "s_uv" not in p or "root_s_uv" not in p
+    ]
+    if need_nli_idx:
+        nli_scorer = NLIStanceTeacherScorer()
+        chunk_starts = range(0, len(need_nli_idx), chunk_size)
+        for start in tqdm(chunk_starts, desc=f"NLI stance teacher ({lang})"):
+            idx_slice = need_nli_idx[start : start + chunk_size]
+            need_edge_pos = [i for i in idx_slice if "s_uv" not in pairs[i]]
+            if need_edge_pos:
+                nli_out = nli_scorer.score_pairs(
+                    [pairs[i]["parent_text"] for i in need_edge_pos],
+                    [pairs[i]["reply_text"] for i in need_edge_pos],
+                    batch_size=batch_size,
+                )
+                for pos, i in enumerate(need_edge_pos):
+                    pairs[i]["s_uv"] = float(nli_out["s_uv"][pos])
+                    pairs[i]["stance_probs"] = nli_out["stance_probs"][pos].tolist()
+                    pairs[i]["pred_label"] = nli_out["pred_label"][pos]
 
-    for idx, p in enumerate(pairs):
-        p["h_uv"] = float(h_scores[idx])
-        p["s_uv"] = float(nli_out["s_uv"][idx])
-        p["stance_probs"] = nli_out["stance_probs"][idx].tolist()
-        p["pred_label"] = nli_out["pred_label"][idx]
+            deep_indices: list[int] = []
+            for i in idx_slice:
+                if "root_s_uv" in pairs[i]:
+                    continue
+                root_txt = pairs[i].get("root_text")
+                root_id = str(pairs[i].get("root_id") or "")
+                parent_id = str(pairs[i].get("parent_id") or "")
+                is_deep = bool(root_txt) and (
+                    (root_id and parent_id and root_id != parent_id)
+                    or str(root_txt) != str(pairs[i].get("parent_text") or "")
+                )
+                if is_deep:
+                    deep_indices.append(i)
+                else:
+                    pairs[i]["root_s_uv"] = float(pairs[i]["s_uv"])
+
+            if deep_indices:
+                root_out = nli_scorer.score_pairs(
+                    [str(pairs[i]["root_text"]) for i in deep_indices],
+                    [str(pairs[i]["reply_text"]) for i in deep_indices],
+                    batch_size=batch_size,
+                )
+                for pos, i in enumerate(deep_indices):
+                    pairs[i]["root_s_uv"] = float(root_out["s_uv"][pos])
+
+            if cache_path is not None:
+                _atomic_write_json(Path(cache_path), pairs)
+        del nli_scorer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return pairs
 
@@ -1014,15 +1135,18 @@ def main() -> None:
     parser.add_argument("--vihsd-dir", type=Path, default=Path("checkpoints/visobert_vihsd"))
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--audit-csv", type=Path, default=None)
+    parser.add_argument("--pilot-csv", type=Path, default=None)
     parser.add_argument("--machine-key-csv", type=Path, default=None)
     parser.add_argument("--scored-cache-json", type=Path, default=None)
     parser.add_argument("--train-vihsd", action="store_true")
+    parser.add_argument("--score-only", action="store_true")
     parser.add_argument("--export-audit", action="store_true")
     parser.add_argument("--distill", action="store_true")
     parser.add_argument("--sanity-check-shuffle", action="store_true")
     parser.add_argument("--allow-untrained-vihsd", action="store_true")
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--max-pairs", type=int, default=None)
+    parser.add_argument("--checkpoint-every", type=int, default=500)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=16)
     args = parser.parse_args()
@@ -1042,32 +1166,28 @@ def main() -> None:
             batch_size=args.batch_size,
         )
 
-    if args.export_audit or args.distill:
-        if args.scored_cache_json is not None and args.scored_cache_json.exists():
-            scored = json.loads(args.scored_cache_json.read_text(encoding="utf-8"))
-        else:
-            pairs = extract_parent_reply_pairs_from_parquet(args.interim_dir)
-            if args.max_pairs is not None:
-                pairs = pairs[: args.max_pairs]
-            scored = _score_pairs_with_teachers(
-                pairs,
-                lang=args.lang,
-                vihsd_ckpt=args.vihsd_dir,
-                batch_size=args.batch_size,
-                allow_untrained_fallback=args.allow_untrained_vihsd,
-            )
-            if args.scored_cache_json is not None:
-                args.scored_cache_json.parent.mkdir(parents=True, exist_ok=True)
-                args.scored_cache_json.write_text(
-                    json.dumps(scored, ensure_ascii=False),
-                    encoding="utf-8",
-                )
+    if args.score_only or args.export_audit or args.distill:
+        pairs = extract_parent_reply_pairs_from_parquet(args.interim_dir)
+        if args.max_pairs is not None:
+            pairs = pairs[: args.max_pairs]
+        scored = _score_pairs_with_teachers(
+            pairs,
+            lang=args.lang,
+            vihsd_ckpt=args.vihsd_dir,
+            batch_size=args.batch_size,
+            allow_untrained_fallback=args.allow_untrained_vihsd,
+            cache_path=args.scored_cache_json,
+            checkpoint_every=args.checkpoint_every,
+        )
+        if args.scored_cache_json is not None:
+            _atomic_write_json(args.scored_cache_json, scored)
 
         if args.export_audit:
             csv_path = export_stratified_human_audit_csv(
                 scored,
                 output_csv=audit_csv,
                 machine_key_csv=machine_key_csv,
+                pilot_csv=args.pilot_csv,
             )
             print(f"Exported blind stratified human audit CSV: {csv_path} (key: {machine_key_csv})")
 

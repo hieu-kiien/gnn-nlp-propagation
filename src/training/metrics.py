@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.stats import pearsonr, spearmanr
-from sklearn.metrics import accuracy_score, f1_score, r2_score
+from sklearn.metrics import accuracy_score, f1_score, r2_score, roc_auc_score
 from torch import Tensor
 
 
@@ -123,14 +123,37 @@ def evaluate_predictions(
 
     macro_f1 = float("nan")
     accuracy = float("nan")
+    auc_roc = float("nan")
     if y_rumor_true is not None and rumor_logits is not None:
         y_rumor_arr = np.asarray(y_rumor_true, dtype=np.int64).reshape(-1)
         valid_mask = y_rumor_arr >= 0
         if np.any(valid_mask):
-            preds = np.argmax(np.asarray(rumor_logits)[valid_mask], axis=-1)
+            logits_valid = np.asarray(rumor_logits, dtype=np.float64)[valid_mask]
+            preds = np.argmax(logits_valid, axis=-1)
             truth = y_rumor_arr[valid_mask]
             macro_f1 = float(f1_score(truth, preds, average="macro", zero_division=0))
             accuracy = float(accuracy_score(truth, preds))
+
+            probs = torch.softmax(torch.as_tensor(logits_valid, dtype=torch.float64), dim=-1).numpy()
+            unique_cls = np.unique(truth)
+            if unique_cls.size >= 2 and probs.ndim == 2:
+                try:
+                    if probs.shape[1] == 2:
+                        auc_roc = float(roc_auc_score(truth, probs[:, 1]))
+                    elif unique_cls.size == probs.shape[1]:
+                        auc_roc = float(
+                            roc_auc_score(truth, probs, multi_class="ovr", average="macro")
+                        )
+                    else:
+                        cls_aucs = [
+                            float(roc_auc_score((truth == c).astype(np.int64), probs[:, int(c)]))
+                            for c in unique_cls
+                            if int(c) < probs.shape[1]
+                        ]
+                        if cls_aucs:
+                            auc_roc = float(np.mean(cls_aucs))
+                except ValueError:
+                    auc_roc = float("nan")
 
     return {
         "msle": msle,
@@ -145,4 +168,5 @@ def evaluate_predictions(
         "spearman_polar": spearman_polar,
         "macro_f1": macro_f1,
         "accuracy": accuracy,
+        "auc_roc": auc_roc,
     }
