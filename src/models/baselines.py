@@ -1,0 +1,473 @@
+"""Baseline models and shared multi-task components for SBi-FAGAT evaluation.
+
+Implements four standardized baselines sharing `hidden_dim = 128` and identical
+multi-task prediction heads (`y_size`, `y_polar`, `rumor_logits`):
+  1. `TextMLP`: Mean-pooled NLP embeddings + MLP (graph-agnostic baseline).
+  2. `StandardGCN`: Undirected 2-layer GCN (Kipf & Welling, ICLR 2017).
+  3. `StandardGATv2`: Edge-sign-free dynamic GATv2 (Brody et al., ICLR 2022).
+  4. `BiGCN`: Top-Down + Bottom-Up GCN with DropEdge and Root Feature
+     Enhancement (Bian et al., AAAI 2020), without conflict gating.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+from torch_geometric.nn import FAConv, GATv2Conv, GCNConv, global_mean_pool
+from torch_geometric.utils import dropout_edge, to_undirected
+
+
+def resolve_root_indices(data: Any, num_nodes: int) -> tuple[Tensor, Tensor]:
+    """Resolve per-graph root node indices and batch assignment vector safely."""
+    device = data.x.device
+    if hasattr(data, "batch") and data.batch is not None:
+        batch_vec = data.batch.long()
+    else:
+        batch_vec = torch.zeros(num_nodes, dtype=torch.long, device=device)
+
+    if hasattr(data, "root_index") and data.root_index is not None:
+        root_idx = data.root_index.view(-1).long().to(device)
+    elif hasattr(data, "ptr") and data.ptr is not None:
+        root_idx = data.ptr[:-1].long().to(device)
+    else:
+        num_graphs = int(batch_vec.max().item()) + 1 if batch_vec.numel() > 0 else 1
+        roots = []
+        for g in range(num_graphs):
+            matches = (batch_vec == g).nonzero(as_tuple=False)
+            roots.append(int(matches[0].item()) if matches.numel() > 0 else 0)
+        root_idx = torch.tensor(roots, dtype=torch.long, device=device)
+
+    return root_idx, batch_vec
+
+
+def broadcast_root_features(h: Tensor, root_idx: Tensor, batch_vec: Tensor) -> Tensor:
+    """Broadcast each graph's root feature vector to all nodes in that graph."""
+    return h[root_idx][batch_vec]
+
+
+class MultiTaskHead(nn.Module):
+    """Shared multi-task head predicting cascade size, polarization, and rumor class."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int = 128,
+        num_rumor_classes: int = 4,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.size_head = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.polar_head = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.rumor_head = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_rumor_classes),
+        )
+
+    def forward(self, graph_emb: Tensor, node_emb: Tensor) -> dict[str, Tensor]:
+        y_size_pred = F.softplus(self.size_head(graph_emb)).squeeze(-1)
+        y_polar_pred = torch.sigmoid(self.polar_head(graph_emb)).squeeze(-1)
+        rumor_logits = self.rumor_head(graph_emb)
+        return {
+            "y_size_pred": y_size_pred,
+            "y_polar_pred": y_polar_pred,
+            "rumor_logits": rumor_logits,
+            "graph_emb": graph_emb,
+            "node_emb": node_emb,
+        }
+
+
+class TextMLP(nn.Module):
+    """Graph-agnostic baseline: mean-pools node NLP representations into an MLP."""
+
+    def __init__(
+        self,
+        in_dim: int = 770,
+        hidden_dim: int = 128,
+        num_rumor_classes: int = 4,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+        self.head = MultiTaskHead(hidden_dim, hidden_dim, num_rumor_classes, dropout)
+
+    def forward(self, data: Any) -> dict[str, Tensor]:
+        x = data.x.float()
+        _, batch_vec = resolve_root_indices(data, x.size(0))
+        node_emb = self.encoder(x)
+        graph_emb = global_mean_pool(node_emb, batch_vec)
+        return self.head(graph_emb, node_emb)
+
+
+class StandardGCN(nn.Module):
+    """Standard undirected GCN baseline (Kipf & Welling, ICLR 2017)."""
+
+    def __init__(
+        self,
+        in_dim: int = 770,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+        num_rumor_classes: int = 4,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.convs = nn.ModuleList(
+            [GCNConv(hidden_dim, hidden_dim) for _ in range(num_layers)]
+        )
+        self.norms = nn.ModuleList(
+            [nn.LayerNorm(hidden_dim) for _ in range(num_layers)]
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.head = MultiTaskHead(2 * hidden_dim, hidden_dim, num_rumor_classes, dropout)
+
+    def forward(self, data: Any) -> dict[str, Tensor]:
+        x = data.x.float()
+        root_idx, batch_vec = resolve_root_indices(data, x.size(0))
+        raw_edge_index = getattr(data, "edge_index_td", data.edge_index)
+        edge_index = (
+            to_undirected(raw_edge_index, num_nodes=x.size(0))
+            if raw_edge_index.numel() > 0
+            else raw_edge_index
+        )
+
+        h = self.input_proj(x)
+        for conv, norm in zip(self.convs, self.norms):
+            h = norm(F.relu(conv(h, edge_index)))
+            h = self.dropout(h)
+
+        graph_emb = torch.cat([h[root_idx], global_mean_pool(h, batch_vec)], dim=-1)
+        return self.head(graph_emb, h)
+
+
+class StandardGATv2(nn.Module):
+    """Dynamic GATv2 baseline without edge stance signals (Brody et al., ICLR 2022)."""
+
+    def __init__(
+        self,
+        in_dim: int = 770,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+        heads: int = 4,
+        num_rumor_classes: int = 4,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if hidden_dim % heads != 0:
+            raise ValueError(
+                f"hidden_dim ({hidden_dim}) must be divisible by heads ({heads})"
+            )
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+        )
+        head_dim = hidden_dim // heads
+        self.convs = nn.ModuleList(
+            [
+                GATv2Conv(
+                    hidden_dim,
+                    head_dim,
+                    heads=heads,
+                    concat=True,
+                    dropout=dropout,
+                    add_self_loops=True,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.norms = nn.ModuleList(
+            [nn.LayerNorm(hidden_dim) for _ in range(num_layers)]
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.head = MultiTaskHead(2 * hidden_dim, hidden_dim, num_rumor_classes, dropout)
+
+    def forward(self, data: Any) -> dict[str, Tensor]:
+        x = data.x.float()
+        root_idx, batch_vec = resolve_root_indices(data, x.size(0))
+        raw_edge_index = getattr(data, "edge_index_td", data.edge_index)
+        edge_index = (
+            to_undirected(raw_edge_index, num_nodes=x.size(0))
+            if raw_edge_index.numel() > 0
+            else raw_edge_index
+        )
+
+        h = self.input_proj(x)
+        for conv, norm in zip(self.convs, self.norms):
+            h = norm(F.elu(conv(h, edge_index)))
+            h = self.dropout(h)
+
+        graph_emb = torch.cat([h[root_idx], global_mean_pool(h, batch_vec)], dim=-1)
+        return self.head(graph_emb, h)
+
+
+class _BiGCNBranch(nn.Module):
+    """Single directional GCN branch with DropEdge & Root Feature Enhancement."""
+
+    def __init__(self, hidden_dim: int, num_layers: int, drop_edge_p: float, dropout: float) -> None:
+        super().__init__()
+        self.drop_edge_p = drop_edge_p
+        self.convs = nn.ModuleList([GCNConv(hidden_dim, hidden_dim) for _ in range(num_layers)])
+        self.root_projs = nn.ModuleList(
+            [nn.Linear(2 * hidden_dim, hidden_dim) for _ in range(num_layers)]
+        )
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        h0: Tensor,
+        edge_index: Tensor,
+        root_idx: Tensor,
+        batch_vec: Tensor,
+    ) -> Tensor:
+        if self.training and self.drop_edge_p > 0.0 and edge_index.numel() > 0:
+            edge_index, _ = dropout_edge(
+                edge_index, p=self.drop_edge_p, force_undirected=False, training=True
+            )
+        root_anchor = broadcast_root_features(h0, root_idx, batch_vec)
+        h = h0
+        for conv, root_proj, norm in zip(self.convs, self.root_projs, self.norms):
+            h_conv = F.relu(conv(h, edge_index))
+            h = norm(F.relu(root_proj(torch.cat([h_conv, root_anchor], dim=-1))))
+            h = self.dropout(h)
+        return h
+
+
+class BiGCN(nn.Module):
+    """Bi-Directional GCN baseline (Bian et al., AAAI 2020) without conflict gating."""
+
+    def __init__(
+        self,
+        in_dim: int = 770,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+        num_rumor_classes: int = 4,
+        drop_edge_p: float = 0.1,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.td_branch = _BiGCNBranch(hidden_dim, num_layers, drop_edge_p, dropout)
+        self.bu_branch = _BiGCNBranch(hidden_dim, num_layers, drop_edge_p, dropout)
+        self.head = MultiTaskHead(2 * hidden_dim, hidden_dim, num_rumor_classes, dropout)
+
+    def forward(self, data: Any) -> dict[str, Tensor]:
+        x = data.x.float()
+        root_idx, batch_vec = resolve_root_indices(data, x.size(0))
+        edge_index_td = getattr(data, "edge_index_td", data.edge_index)
+        edge_index_bu = getattr(
+            data,
+            "edge_index_bu",
+            edge_index_td[[1, 0], :] if edge_index_td.numel() > 0 else edge_index_td,
+        )
+
+        h0 = self.input_proj(x)
+        h_td = self.td_branch(h0, edge_index_td, root_idx, batch_vec)
+        h_bu = self.bu_branch(h0, edge_index_bu, root_idx, batch_vec)
+
+        node_emb = 0.5 * (h_td + h_bu)
+        graph_emb = torch.cat(
+            [global_mean_pool(h_td, batch_vec), global_mean_pool(h_bu, batch_vec)],
+            dim=-1,
+        )
+        return self.head(graph_emb, node_emb)
+
+
+class _BaselineLatentEdgeMLP(nn.Module):
+    """Shared 2-layer latent edge inferrer matching SBiFAGAT's UPFD capacity."""
+
+    def __init__(self, in_dim: int, hidden_dim: int = 128, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(3 * in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
+        if edge_index.numel() == 0:
+            return x.new_zeros((0, 2))
+        src, dst = edge_index[0], edge_index[1]
+        pair_feat = torch.cat([x[src], x[dst], x[src] - x[dst]], dim=-1)
+        raw = self.net(pair_feat)
+        return torch.cat([torch.tanh(raw[:, 0:1]), torch.sigmoid(raw[:, 1:2])], dim=-1)
+
+
+class EdgeGATv2(nn.Module):
+    """Edge-aware GATv2 baseline receiving 2D `[s_uv, h_uv]` (or latent edge features)."""
+
+    def __init__(
+        self,
+        in_dim: int = 770,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+        heads: int = 4,
+        edge_dim: int = 2,
+        num_rumor_classes: int = 4,
+        dropout: float = 0.1,
+        use_latent_edge_mlp: bool = False,
+    ) -> None:
+        super().__init__()
+        if hidden_dim % heads != 0:
+            raise ValueError(
+                f"hidden_dim ({hidden_dim}) must be divisible by heads ({heads})"
+            )
+        self.edge_dim = edge_dim
+        self.use_latent_edge_mlp = use_latent_edge_mlp
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.latent_edge_mlp = (
+            _BaselineLatentEdgeMLP(in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout)
+            if use_latent_edge_mlp
+            else None
+        )
+        head_dim = hidden_dim // heads
+        self.convs = nn.ModuleList(
+            [
+                GATv2Conv(
+                    hidden_dim,
+                    head_dim,
+                    heads=heads,
+                    concat=True,
+                    edge_dim=edge_dim,
+                    dropout=dropout,
+                    add_self_loops=True,
+                    fill_value=0.0,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+        self.dropout = nn.Dropout(dropout)
+        self.head = MultiTaskHead(2 * hidden_dim, hidden_dim, num_rumor_classes, dropout)
+
+    def _prepare_edge_attr(self, x: Tensor, edge_index: Tensor, data: Any) -> Tensor:
+        if self.latent_edge_mlp is not None:
+            return self.latent_edge_mlp(x, edge_index)
+        raw_attr = getattr(data, "edge_attr", None)
+        if raw_attr is None:
+            raw_attr = getattr(data, "edge_stance", None)
+        if raw_attr is None:
+            return x.new_zeros((edge_index.size(1), self.edge_dim))
+        attr = raw_attr.float()
+        if attr.dim() == 1:
+            attr = attr.unsqueeze(-1)
+        if attr.size(1) < self.edge_dim:
+            attr = F.pad(attr, (0, self.edge_dim - attr.size(1)))
+        elif attr.size(1) > self.edge_dim:
+            attr = attr[:, : self.edge_dim]
+        return attr
+
+    def forward(self, data: Any) -> dict[str, Tensor]:
+        x = data.x.float()
+        root_idx, batch_vec = resolve_root_indices(data, x.size(0))
+        raw_edge_index = getattr(data, "edge_index_td", data.edge_index)
+        raw_edge_attr = self._prepare_edge_attr(x, raw_edge_index, data)
+        if raw_edge_index.numel() > 0:
+            edge_index, edge_attr = to_undirected(
+                raw_edge_index,
+                edge_attr=raw_edge_attr,
+                num_nodes=x.size(0),
+                reduce="mean",
+            )
+        else:
+            edge_index = raw_edge_index
+            edge_attr = raw_edge_attr
+
+        h = self.input_proj(x)
+        for conv, norm in zip(self.convs, self.norms):
+            h = norm(F.elu(conv(h, edge_index, edge_attr=edge_attr)))
+            h = self.dropout(h)
+
+        graph_emb = torch.cat([h[root_idx], global_mean_pool(h, batch_vec)], dim=-1)
+        return self.head(graph_emb, h)
+
+
+class FAGCNBaseline(nn.Module):
+    """Frequency Adaptation GCN baseline (Bo et al., AAAI 2021) using PyG `FAConv`."""
+
+    def __init__(
+        self,
+        in_dim: int = 770,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+        num_rumor_classes: int = 4,
+        eps: float = 0.5,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.convs = nn.ModuleList(
+            [
+                FAConv(
+                    channels=hidden_dim,
+                    eps=eps,
+                    dropout=dropout,
+                    add_self_loops=True,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+        self.dropout = nn.Dropout(dropout)
+        self.head = MultiTaskHead(2 * hidden_dim, hidden_dim, num_rumor_classes, dropout)
+
+    def forward(self, data: Any) -> dict[str, Tensor]:
+        x = data.x.float()
+        root_idx, batch_vec = resolve_root_indices(data, x.size(0))
+        raw_edge_index = getattr(data, "edge_index_td", data.edge_index)
+        edge_index = (
+            to_undirected(raw_edge_index, num_nodes=x.size(0))
+            if raw_edge_index.numel() > 0
+            else raw_edge_index
+        )
+
+        h0 = self.input_proj(x)
+        h = h0
+        for conv, norm in zip(self.convs, self.norms):
+            h = norm(F.elu(conv(h, h0, edge_index)))
+            h = self.dropout(h)
+
+        graph_emb = torch.cat([h[root_idx], global_mean_pool(h, batch_vec)], dim=-1)
+        return self.head(graph_emb, h)

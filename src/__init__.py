@@ -1,0 +1,1 @@
+"""SBi-FAGAT research package."""

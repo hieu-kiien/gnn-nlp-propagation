@@ -1,0 +1,10 @@
+[project]
+name = "sbi-fagat"
+version = "0.1.0"
+description = "Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network for early cascade size and polarization prediction"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra -q"

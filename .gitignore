@@ -1,0 +1,41 @@
+# Python cache, bytecode & test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+
+# Virtual environments, IDE & OS files
+.venv/
+venv/
+env/
+.env
+.env.*
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Datasets, checkpoints, weights & run logs (keep .gitkeep placeholders)
+data/raw/*
+!data/raw/.gitkeep
+data/interim/*
+!data/interim/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+checkpoints/
+outputs/
+results/
+logs/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.parquet
