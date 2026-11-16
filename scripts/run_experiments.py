@@ -152,11 +152,33 @@ def _export_diagnostic_figures(
         )
 
 
+def _infer_edge_dim(data_dir: Path, nlp_features: dict[str, Any] | None = None) -> int:
+    feats = nlp_features
+    if feats is None:
+        feat_path = data_dir / "nlp_features.pt"
+        if feat_path.exists():
+            feats = torch.load(feat_path, map_location="cpu", weights_only=False)
+    if feats is not None:
+        if "edge_dim" in feats:
+            return int(feats["edge_dim"])
+        raw_attr = feats.get("edge_attr")
+        if isinstance(raw_attr, torch.Tensor) and raw_attr.ndim == 2 and raw_attr.size(1) in {2, 4}:
+            return int(raw_attr.size(1))
+    return 2
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run 5-seed benchmark for SBi-FAGAT and baselines.")
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--k-horizon", type=int, default=20)
     parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--edge-dim", type=int, choices=[2, 4], default=None)
+    parser.add_argument("--eps", type=float, default=0.5)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--v2", action="store_true", help="Enable v2 burst stats + uncertainty + 0.05 NLL reg.")
+    parser.add_argument("--use-cascade-stats", action="store_true")
+    parser.add_argument("--predict-uncertainty", action="store_true")
+    parser.add_argument("--lambda-uncertainty", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -185,18 +207,35 @@ def main() -> None:
 
     in_dim = TOTAL_NODE_FEATURE_DIM
     h_dim = args.hidden_dim
+    edge_dim = args.edge_dim if args.edge_dim is not None else _infer_edge_dim(args.data_dir)
+    use_stats = bool(args.use_cascade_stats or args.v2)
+    use_unc = bool(args.predict_uncertainty or args.v2)
+    lam_unc = (
+        float(args.lambda_uncertainty)
+        if args.lambda_uncertainty is not None
+        else (0.05 if use_unc else 0.0)
+    )
     num_cls = 2 if args.label_scheme == "binary" else 4
     model_factories = {
-        "TextMLP": lambda: TextMLP(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls),
+        "TextMLP": lambda: TextMLP(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls, dropout=args.dropout),
         "TemporalStanceMLP": lambda: TemporalStanceMLP(
-            in_dim=in_dim, hidden_dim=h_dim, edge_dim=2, num_rumor_classes=num_cls
+            in_dim=in_dim, hidden_dim=h_dim, edge_dim=edge_dim, num_rumor_classes=num_cls, dropout=args.dropout
         ),
-        "StandardGCN": lambda: StandardGCN(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls),
-        "StandardGATv2": lambda: StandardGATv2(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls),
-        "EdgeGATv2": lambda: EdgeGATv2(in_dim=in_dim, hidden_dim=h_dim, edge_dim=2, num_rumor_classes=num_cls),
-        "FAGCN": lambda: FAGCNBaseline(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls),
-        "BiGCN": lambda: BiGCN(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls),
-        "SBiFAGAT": lambda: SBiFAGAT(in_dim=in_dim, hidden_dim=h_dim, edge_dim=2, num_rumor_classes=num_cls),
+        "StandardGCN": lambda: StandardGCN(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls, dropout=args.dropout),
+        "StandardGATv2": lambda: StandardGATv2(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls, dropout=args.dropout),
+        "EdgeGATv2": lambda: EdgeGATv2(in_dim=in_dim, hidden_dim=h_dim, edge_dim=edge_dim, num_rumor_classes=num_cls, dropout=args.dropout),
+        "FAGCN": lambda: FAGCNBaseline(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls, eps=args.eps, dropout=args.dropout),
+        "BiGCN": lambda: BiGCN(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls, dropout=args.dropout),
+        "SBiFAGAT": lambda: SBiFAGAT(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
+        ),
     }
 
     if args.eval_protocol == "inductive":
@@ -219,6 +258,7 @@ def main() -> None:
             epochs=args.epochs,
             lr=args.lr,
             patience=args.patience,
+            lambda_uncertainty=lam_unc,
             reference_model="SBiFAGAT",
             comparator_model=args.comparator_model,
             device=device,
@@ -266,6 +306,7 @@ def main() -> None:
                 epochs=args.epochs,
                 lr=args.lr,
                 patience=args.patience,
+                lambda_uncertainty=lam_unc,
                 reference_model="SBiFAGAT",
                 comparator_model=args.comparator_model,
                 device=device,

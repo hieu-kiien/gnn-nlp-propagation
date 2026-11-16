@@ -46,6 +46,7 @@ BINARY_RUMOR_LABEL_TO_IDX: dict[str, int] = {
 NLP_NODE_DIM: int = 768
 TEMPORAL_DEPTH_DIM: int = 2
 TOTAL_NODE_FEATURE_DIM: int = NLP_NODE_DIM + TEMPORAL_DEPTH_DIM  # 770
+CASCADE_STATS_DIM: int = 8
 
 
 class CascadeData(Data):
@@ -440,6 +441,92 @@ def _compute_full_tree_polarization(
     return float(min(1.0, max(0.0, y_polar)))
 
 
+def compute_early_cascade_burst_stats(
+    kept_nodes: Sequence[Mapping[str, Any]],
+    delays_k: Sequence[float],
+    depth_map: Mapping[str, int],
+    edge_attr_rows: Sequence[Sequence[float]],
+    *,
+    k_horizon: int = 20,
+    substantive_min_tokens: int = 8,
+) -> torch.Tensor:
+    """Compute leakage-free 8D `[1, 8]` early burst-velocity & structural descriptor strictly from V_K.
+
+    Features (all bounded in [0, 1]):
+      0. `elapsed_span_norm`: log-normalized time to reach the K-th reply
+      1. `mean_interarrival_norm`: log-normalized mean gap between consecutive early replies
+      2. `burst_acceleration`: 1 / (1 + exp(-(log1p(early_gap) - log1p(late_gap)))) (>0.5 means accelerating)
+      3. `root_direct_ratio`: fraction of V_K replies directly replying to the root post
+      4. `max_depth_norm`: maximum topological depth inside V_K divided by k_horizon
+      5. `unique_user_ratio`: distinct reply author ratio (high -> broad crowd, low -> 2-user duel)
+      6. `substantive_text_ratio`: fraction of V_K replies with >= 8 tokens (low -> empty chatter warning)
+      7. `one_sided_hostility_index`: |mean(s_uv)| * mean(h_uv) catching early hostile echo chambers
+    """
+    if not kept_nodes or len(kept_nodes) <= 1:
+        return torch.zeros((1, CASCADE_STATS_DIM), dtype=torch.float32)
+
+    denom_t = math.log1p(TEMPORAL_REF_SECONDS)
+    reply_nodes = kept_nodes[1:]
+    root_id = str(kept_nodes[0]["node_id"])
+    reply_delays = sorted(max(0.0, float(d)) for d in delays_k[1:])
+
+    elapsed_span_norm = min(1.0, math.log1p(max(reply_delays)) / denom_t) if reply_delays else 0.0
+    if len(reply_delays) >= 2:
+        gaps = [max(0.0, reply_delays[i] - reply_delays[i - 1]) for i in range(1, len(reply_delays))]
+        mean_gap = float(sum(gaps)) / float(len(gaps))
+        mean_interarrival_norm = min(1.0, math.log1p(mean_gap) / denom_t)
+        if len(gaps) >= 2:
+            mid = len(gaps) // 2
+            first_gap = float(sum(gaps[:mid])) / float(max(1, mid))
+            second_gap = float(sum(gaps[mid:])) / float(max(1, len(gaps) - mid))
+            diff_log = math.log1p(first_gap) - math.log1p(second_gap)
+            diff_log = max(-20.0, min(20.0, diff_log))
+            burst_acceleration = 1.0 / (1.0 + math.exp(-diff_log))
+        else:
+            burst_acceleration = 0.5
+    else:
+        mean_interarrival_norm = elapsed_span_norm
+        burst_acceleration = 0.5
+
+    root_direct_count = sum(1 for n in reply_nodes if str(n.get("parent_id")) == root_id)
+    root_direct_ratio = float(root_direct_count) / float(len(reply_nodes))
+
+    max_depth = max((int(depth_map.get(str(n["node_id"]), 0)) for n in reply_nodes), default=0)
+    max_depth_norm = min(1.0, float(max_depth) / float(max(1, k_horizon)))
+
+    hashed_users = [str(n["user_id_hash"]) for n in reply_nodes if n.get("user_id_hash")]
+    if hashed_users:
+        unique_user_ratio = min(1.0, float(len(set(hashed_users))) / float(len(reply_nodes)))
+    else:
+        unique_user_ratio = 1.0
+
+    substantive_count = sum(
+        1 for n in reply_nodes if len(str(n.get("text") or "").split()) >= substantive_min_tokens
+    )
+    substantive_text_ratio = float(substantive_count) / float(len(reply_nodes))
+
+    if edge_attr_rows:
+        s_vals = [float(r[0]) for r in edge_attr_rows]
+        h_vals = [float(r[1]) for r in edge_attr_rows]
+        mean_s = float(sum(s_vals)) / float(len(s_vals))
+        mean_h = float(sum(h_vals)) / float(len(h_vals))
+        one_sided_hostility_index = min(1.0, max(0.0, abs(mean_s) * mean_h))
+    else:
+        one_sided_hostility_index = 0.0
+
+    vec = [
+        elapsed_span_norm,
+        mean_interarrival_norm,
+        burst_acceleration,
+        root_direct_ratio,
+        max_depth_norm,
+        unique_user_ratio,
+        substantive_text_ratio,
+        one_sided_hostility_index,
+    ]
+    return torch.tensor([vec], dtype=torch.float32)
+
+
 class EarlyCascadeDataset(Dataset):
     """PyG Dataset building early-truncated (`K` replies) bidirectional signed graphs.
 
@@ -549,7 +636,22 @@ class EarlyCascadeDataset(Dataset):
         node_emb_map = _resolve_node_embeddings(nlp_features)
         stance_map = nlp_features.get("edge_stance")
         hostility_map = nlp_features.get("edge_hostility")
+        irr_map = nlp_features.get("edge_irrationality")
+        con_map = nlp_features.get("edge_constructive")
         root_stance_map = nlp_features.get("node_root_stance")
+
+        raw_feat_edge_attr = nlp_features.get("edge_attr")
+        use_4d_edges = bool(
+            irr_map is not None
+            or con_map is not None
+            or int(nlp_features.get("edge_dim", 2)) == 4
+            or (
+                isinstance(raw_feat_edge_attr, torch.Tensor)
+                and raw_feat_edge_attr.ndim == 2
+                and raw_feat_edge_attr.size(1) == 4
+            )
+        )
+        active_edge_dim = 4 if use_4d_edges else 2
 
         nodes_by_cascade: dict[str, list[dict[str, Any]]] = {}
         for row in nodes_table.to_pylist():
@@ -637,6 +739,18 @@ class EarlyCascadeDataset(Dataset):
             )
             y_bimodality_val = compute_bimodality_coefficient(aligned_stances)
 
+            target_toxicity_scores: list[float] = []
+            for e in c_edges:
+                pair = (str(e["source_id"]), str(e["target_id"]))
+                if self.polar_target_mode == "future_only" and pair in kept_pair_set:
+                    continue
+                eid_t = str(e["edge_id"])
+                h_t = max(0.0, min(1.0, _lookup_edge_scalar(hostility_map, eid_t, pair[0], pair[1], 0.0)))
+                r_t = max(0.0, min(1.0, _lookup_edge_scalar(irr_map, eid_t, pair[0], pair[1], 0.0)))
+                target_toxicity_scores.append(0.6 * h_t + 0.4 * r_t)
+            mean_tox = float(np.mean(target_toxicity_scores)) if target_toxicity_scores else 0.0
+            y_toxic_polar_val = float(min(1.0, max(0.0, 0.5 * y_polar_val + 0.5 * mean_tox)))
+
             # 3. Leakage-free causal node features on V_K only (fixed TEMPORAL_REF_SECONDS horizon)
             delays_k = [
                 max(0.0, (n["created_at_utc"] - root_ts).total_seconds())
@@ -692,7 +806,16 @@ class EarlyCascadeDataset(Dataset):
 
                 td_src.append(u_idx)
                 td_dst.append(v_idx)
-                edge_attr_rows.append([s_uv, h_uv])
+                if use_4d_edges:
+                    r_uv = float(
+                        min(1.0, max(0.0, _lookup_edge_scalar(irr_map, eid, src_id, dst_id, 0.05)))
+                    )
+                    c_uv = float(
+                        min(1.0, max(0.0, _lookup_edge_scalar(con_map, eid, src_id, dst_id, 0.50)))
+                    )
+                    edge_attr_rows.append([s_uv, h_uv, r_uv, c_uv])
+                else:
+                    edge_attr_rows.append([s_uv, h_uv])
                 edge_stance_rows.append([s_uv])
                 kept_edge_pairs.append((src_id, dst_id))
 
@@ -704,8 +827,16 @@ class EarlyCascadeDataset(Dataset):
             else:
                 edge_index_td = torch.empty((2, 0), dtype=torch.long)
                 edge_index_bu = torch.empty((2, 0), dtype=torch.long)
-                edge_attr = torch.empty((0, 2), dtype=torch.float32)
+                edge_attr = torch.empty((0, active_edge_dim), dtype=torch.float32)
                 edge_stance = torch.empty((0, 1), dtype=torch.float32)
+
+            cascade_stats = compute_early_cascade_burst_stats(
+                kept_nodes=kept_nodes,
+                delays_k=delays_k,
+                depth_map=depth_map,
+                edge_attr_rows=edge_attr_rows,
+                k_horizon=self.k_horizon,
+            )
 
             data = CascadeData(
                 x=x,
@@ -714,9 +845,11 @@ class EarlyCascadeDataset(Dataset):
                 edge_index_bu=edge_index_bu,
                 edge_attr=edge_attr,
                 edge_stance=edge_stance,
+                cascade_stats=cascade_stats,
                 root_index=torch.tensor([0], dtype=torch.long),
                 y_size=torch.tensor([y_size_val], dtype=torch.float32),
                 y_polar=torch.tensor([y_polar_val], dtype=torch.float32),
+                y_toxic_polar=torch.tensor([y_toxic_polar_val], dtype=torch.float32),
                 y_bimodality=torch.tensor([y_bimodality_val], dtype=torch.float32),
                 y_rumor=torch.tensor([y_rumor_val], dtype=torch.long),
                 cascade_id=cid,
@@ -747,6 +880,11 @@ class UPFDAdapterTransform:
         y_size = torch.tensor([math.log1p(max(0, num_nodes - 1))], dtype=torch.float32)
         y_polar = torch.tensor([0.0], dtype=torch.float32)
 
+        stats = torch.zeros((1, CASCADE_STATS_DIM), dtype=torch.float32)
+        if edge_index_td.numel() > 0 and num_nodes > 1:
+            root_direct = float((edge_index_td[0] == 0).sum().item()) / float(max(1, num_nodes - 1))
+            stats[0, 3] = min(1.0, max(0.0, root_direct))
+
         return CascadeData(
             x=data.x.float(),
             edge_index=edge_index_td,
@@ -754,9 +892,11 @@ class UPFDAdapterTransform:
             edge_index_bu=edge_index_bu,
             edge_attr=torch.zeros((edge_index_td.size(1), 2), dtype=torch.float32),
             edge_stance=torch.zeros((edge_index_td.size(1), 1), dtype=torch.float32),
+            cascade_stats=stats,
             root_index=torch.tensor([0], dtype=torch.long),
             y_size=y_size,
             y_polar=y_polar,
+            y_toxic_polar=torch.tensor([0.0], dtype=torch.float32),
             y_bimodality=torch.tensor([0.0], dtype=torch.float32),
             y_rumor=y_cls,
             y=y_cls,

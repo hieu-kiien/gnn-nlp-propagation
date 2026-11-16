@@ -32,6 +32,10 @@ def main() -> None:
     parser.add_argument("--k-horizon", type=int, default=20)
     parser.add_argument("--horizons", type=int, nargs="+", default=list(SUPPORTED_HORIZONS))
     parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--edge-dim", type=int, choices=[2, 4], default=None)
+    parser.add_argument("--v2", action="store_true")
+    parser.add_argument("--use-cascade-stats", action="store_true")
+    parser.add_argument("--predict-uncertainty", action="store_true")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -69,6 +73,14 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     in_dim = TOTAL_NODE_FEATURE_DIM
     h_dim = args.hidden_dim
+    edge_dim = args.edge_dim or int(
+        nlp_features.get("edge_dim", nlp_features["edge_attr"].size(1) if nlp_features["edge_attr"].ndim == 2 else 2)
+    )
+    if edge_dim not in {2, 4}:
+        edge_dim = 2
+    use_stats = bool(args.use_cascade_stats or args.v2)
+    use_unc = bool(args.predict_uncertainty or args.v2)
+    lam_unc = 0.05 if use_unc else 0.0
     num_cls = 2 if args.label_scheme == "binary" else 4
 
     common_ds_kwargs = {
@@ -94,32 +106,99 @@ def main() -> None:
 
     ablation_factories = {
         "SBiFAGAT (Full)": lambda: SBiFAGAT(
-            in_dim=in_dim, hidden_dim=h_dim, edge_dim=2, num_rumor_classes=num_cls
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
         "w/o Stance Score (s_uv=0)": lambda: SBiFAGAT(
-            in_dim=in_dim, hidden_dim=h_dim, edge_dim=2, num_rumor_classes=num_cls, ablate_stance=True
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            ablate_stance=True,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
         "w/o Hostility Score (h_uv=0)": lambda: SBiFAGAT(
-            in_dim=in_dim, hidden_dim=h_dim, edge_dim=2, num_rumor_classes=num_cls, ablate_hostility=True
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            ablate_hostility=True,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
         "w/o Edge Signals (s_uv=0, h_uv=0)": lambda: SBiFAGAT(
             in_dim=in_dim,
             hidden_dim=h_dim,
-            edge_dim=2,
+            edge_dim=edge_dim,
             num_rumor_classes=num_cls,
             ablate_stance=True,
             ablate_hostility=True,
+            ablate_irrationality=(edge_dim == 4),
+            ablate_constructive=(edge_dim == 4),
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
         "w/o Conflict Gate (Sigmoid)": lambda: SBiFAGAT(
-            in_dim=in_dim, hidden_dim=h_dim, edge_dim=2, num_rumor_classes=num_cls, gate_mode="sigmoid"
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            gate_mode="sigmoid",
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
         "w/o Bottom-Up": lambda: SBiFAGAT(
-            in_dim=in_dim, hidden_dim=h_dim, edge_dim=2, num_rumor_classes=num_cls, use_bottom_up=False
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            use_bottom_up=False,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
         "w/o Attention Readout (Mean)": lambda: SBiFAGAT(
-            in_dim=in_dim, hidden_dim=h_dim, edge_dim=2, num_rumor_classes=num_cls, readout_mode="mean"
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            readout_mode="mean",
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
     }
+    if edge_dim == 4:
+        ablation_factories["w/o Irrationality (r_uv=0)"] = lambda: SBiFAGAT(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            ablate_irrationality=True,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
+        )
+        ablation_factories["w/o Constructive (c_uv=0)"] = lambda: SBiFAGAT(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            ablate_constructive=True,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
+        )
+    if use_stats:
+        ablation_factories["w/o Burst Stats"] = lambda: SBiFAGAT(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            use_cascade_stats=False,
+            predict_uncertainty=use_unc,
+        )
 
     ablation_res = run_multi_seed_benchmark(
         ablation_factories,
@@ -130,6 +209,7 @@ def main() -> None:
         epochs=args.epochs,
         lr=args.lr,
         patience=args.patience,
+        lambda_uncertainty=lam_unc,
         reference_model="SBiFAGAT (Full)",
         comparator_model="w/o Stance Score (s_uv=0)",
         device=device,
@@ -181,7 +261,14 @@ def main() -> None:
             {
                 "StandardGCN": lambda: StandardGCN(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls),
                 "BiGCN": lambda: BiGCN(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls),
-                "SBiFAGAT": lambda: SBiFAGAT(in_dim=in_dim, hidden_dim=h_dim, edge_dim=2, num_rumor_classes=num_cls),
+                "SBiFAGAT": lambda: SBiFAGAT(
+                    in_dim=in_dim,
+                    hidden_dim=h_dim,
+                    edge_dim=edge_dim,
+                    num_rumor_classes=num_cls,
+                    use_cascade_stats=use_stats,
+                    predict_uncertainty=use_unc,
+                ),
             },
             DataLoader(k_train, batch_size=args.batch_size, shuffle=True),
             DataLoader(k_val, batch_size=args.batch_size, shuffle=False),
@@ -190,6 +277,7 @@ def main() -> None:
             epochs=args.epochs,
             lr=args.lr,
             patience=args.patience,
+            lambda_uncertainty=lam_unc,
             reference_model="SBiFAGAT",
             comparator_model=args.comparator_model,
             device=device,

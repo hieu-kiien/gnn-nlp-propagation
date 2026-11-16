@@ -52,7 +52,7 @@ def broadcast_root_features(h: Tensor, root_idx: Tensor, batch_vec: Tensor) -> T
 
 
 class MultiTaskHead(nn.Module):
-    """Shared multi-task head predicting cascade size, polarization, and rumor class."""
+    """Shared multi-task head predicting cascade size, polarization, rumor class, and uncertainty."""
 
     def __init__(
         self,
@@ -60,16 +60,32 @@ class MultiTaskHead(nn.Module):
         hidden_dim: int = 128,
         num_rumor_classes: int = 4,
         dropout: float = 0.1,
+        cascade_feat_dim: int = 0,
+        predict_uncertainty: bool = False,
     ) -> None:
         super().__init__()
+        self.cascade_feat_dim = int(cascade_feat_dim)
+        self.predict_uncertainty = bool(predict_uncertainty)
+        if self.cascade_feat_dim > 0:
+            stats_out_dim = max(16, hidden_dim // 2)
+            self.cascade_proj = nn.Sequential(
+                nn.Linear(self.cascade_feat_dim, stats_out_dim),
+                nn.GELU(),
+                nn.LayerNorm(stats_out_dim),
+            )
+            reg_in_dim = in_dim + stats_out_dim
+        else:
+            self.cascade_proj = None
+            reg_in_dim = in_dim
+
         self.size_head = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+            nn.Linear(reg_in_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
         self.polar_head = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+            nn.Linear(reg_in_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
@@ -80,18 +96,55 @@ class MultiTaskHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_rumor_classes),
         )
+        if self.predict_uncertainty:
+            self.uncertainty_head = nn.Sequential(
+                nn.Linear(reg_in_dim, max(32, hidden_dim // 2)),
+                nn.GELU(),
+                nn.Linear(max(32, hidden_dim // 2), 2),
+            )
+        else:
+            self.uncertainty_head = None
 
-    def forward(self, graph_emb: Tensor, node_emb: Tensor) -> dict[str, Tensor]:
-        y_size_pred = F.softplus(self.size_head(graph_emb)).squeeze(-1)
-        y_polar_pred = torch.sigmoid(self.polar_head(graph_emb)).squeeze(-1)
+    def forward(
+        self,
+        graph_emb: Tensor,
+        node_emb: Tensor,
+        cascade_stats: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        if self.cascade_proj is not None:
+            if cascade_stats is None:
+                stats_t = graph_emb.new_zeros((graph_emb.size(0), self.cascade_feat_dim))
+            else:
+                stats_t = cascade_stats.float().to(graph_emb.device)
+                if stats_t.dim() == 1:
+                    stats_t = stats_t.view(graph_emb.size(0), -1)
+                if stats_t.size(-1) < self.cascade_feat_dim:
+                    stats_t = F.pad(stats_t, (0, self.cascade_feat_dim - stats_t.size(-1)))
+                elif stats_t.size(-1) > self.cascade_feat_dim:
+                    stats_t = stats_t[:, : self.cascade_feat_dim]
+            reg_emb = torch.cat([graph_emb, self.cascade_proj(stats_t)], dim=-1)
+        else:
+            reg_emb = graph_emb
+
+        y_size_pred = F.softplus(self.size_head(reg_emb)).squeeze(-1)
+        y_polar_pred = torch.sigmoid(self.polar_head(reg_emb)).squeeze(-1)
         rumor_logits = self.rumor_head(graph_emb)
-        return {
+        result: dict[str, Tensor] = {
             "y_size_pred": y_size_pred,
             "y_polar_pred": y_polar_pred,
             "rumor_logits": rumor_logits,
             "graph_emb": graph_emb,
             "node_emb": node_emb,
         }
+        if self.uncertainty_head is not None:
+            raw_logvars = self.uncertainty_head(reg_emb).clamp(-6.0, 3.0)
+            size_logvar = raw_logvars[:, 0]
+            polar_logvar = raw_logvars[:, 1]
+            confidence = torch.exp(-0.5 * polar_logvar.clamp(min=0.0)).clamp(0.0, 1.0)
+            result["size_logvar"] = size_logvar
+            result["polar_logvar"] = polar_logvar
+            result["confidence_score"] = confidence
+        return result
 
 
 class TextMLP(nn.Module):
@@ -181,11 +234,18 @@ class TemporalStanceMLP(nn.Module):
             and edge_attr.numel() > 0
             and raw_edge_index.numel() > 0
         ):
+            attr = edge_attr.float()
+            if attr.dim() == 1:
+                attr = attr.unsqueeze(-1)
+            if attr.size(1) < self.edge_dim:
+                attr = F.pad(attr, (0, self.edge_dim - attr.size(1)))
+            elif attr.size(1) > self.edge_dim:
+                attr = attr[:, : self.edge_dim]
             edge_batch = batch_vec[raw_edge_index[0]]
             for g in range(num_graphs):
                 mask = edge_batch == g
                 if mask.any():
-                    eg = edge_attr[mask, : self.edge_dim].float()
+                    eg = attr[mask]
                     e_mean[g] = eg.mean(dim=0)
                     e_std[g] = eg.std(dim=0, unbiased=False) if eg.size(0) >= 2 else 0.0
                     e_min[g] = eg.min(dim=0).values
@@ -382,27 +442,36 @@ class BiGCN(nn.Module):
 class _BaselineLatentEdgeMLP(nn.Module):
     """Shared 2-layer latent edge inferrer matching SBiFAGAT's UPFD capacity."""
 
-    def __init__(self, in_dim: int, hidden_dim: int = 128, dropout: float = 0.1) -> None:
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int = 128,
+        edge_dim: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
         super().__init__()
+        self.edge_dim = int(edge_dim)
         self.net = nn.Sequential(
             nn.Linear(3 * in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 2),
+            nn.Linear(hidden_dim, self.edge_dim),
         )
 
     def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
         if edge_index.numel() == 0:
-            return x.new_zeros((0, 2))
+            return x.new_zeros((0, self.edge_dim))
         src, dst = edge_index[0], edge_index[1]
         pair_feat = torch.cat([x[src], x[dst], x[src] - x[dst]], dim=-1)
         raw = self.net(pair_feat)
-        return torch.cat([torch.tanh(raw[:, 0:1]), torch.sigmoid(raw[:, 1:2])], dim=-1)
+        if self.edge_dim == 1:
+            return torch.tanh(raw[:, 0:1])
+        return torch.cat([torch.tanh(raw[:, 0:1]), torch.sigmoid(raw[:, 1:])], dim=-1)
 
 
 class EdgeGATv2(nn.Module):
-    """Edge-aware GATv2 baseline receiving 2D `[s_uv, h_uv]` (or latent edge features)."""
+    """Edge-aware GATv2 baseline receiving `[s_uv, h_uv]` or 4D edge features."""
 
     def __init__(
         self,
@@ -428,7 +497,9 @@ class EdgeGATv2(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
         self.latent_edge_mlp = (
-            _BaselineLatentEdgeMLP(in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout)
+            _BaselineLatentEdgeMLP(
+                in_dim=in_dim, hidden_dim=hidden_dim, edge_dim=edge_dim, dropout=dropout
+            )
             if use_latent_edge_mlp
             else None
         )

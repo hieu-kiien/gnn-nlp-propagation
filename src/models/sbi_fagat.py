@@ -34,32 +34,39 @@ from src.models.baselines import (
 
 
 class LatentConflictMLP(nn.Module):
-    """Infer 2D latent edge signals `[s_hat, h_hat]` from endpoint node features.
+    """Infer 2D `[s_hat, h_hat]` or 4D `[s_hat, h_hat, r_hat, c_hat]` latent edge signals.
 
     Used on benchmarks like UPFD where raw reply text is unavailable and only
     node embeddings (e.g., 768-d BERT) are provided.
     """
 
-    def __init__(self, in_dim: int, hidden_dim: int = 128, dropout: float = 0.1) -> None:
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int = 128,
+        edge_dim: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
         super().__init__()
+        self.edge_dim = int(edge_dim)
         self.net = nn.Sequential(
             nn.Linear(3 * in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 2),
+            nn.Linear(hidden_dim, self.edge_dim),
         )
 
     def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
         if edge_index.numel() == 0:
-            return x.new_zeros((0, 2))
+            return x.new_zeros((0, self.edge_dim))
         src, dst = edge_index[0], edge_index[1]
         x_u, x_v = x[src], x[dst]
         pair_feat = torch.cat([x_u, x_v, x_u - x_v], dim=-1)
         raw = self.net(pair_feat)
-        s_hat = torch.tanh(raw[:, 0:1])
-        h_hat = torch.sigmoid(raw[:, 1:2])
-        return torch.cat([s_hat, h_hat], dim=-1)
+        if self.edge_dim == 1:
+            return torch.tanh(raw[:, 0:1])
+        return torch.cat([torch.tanh(raw[:, 0:1]), torch.sigmoid(raw[:, 1:])], dim=-1)
 
 
 class StanceGuidedFAConv(MessagePassing):
@@ -175,8 +182,13 @@ class SBiFAGAT(nn.Module):
         use_bottom_up: bool = True,
         ablate_stance: bool = False,
         ablate_hostility: bool = False,
+        ablate_irrationality: bool = False,
+        ablate_constructive: bool = False,
         use_latent_edge_mlp: bool = False,
         readout_mode: Literal["attention", "mean"] = "attention",
+        use_cascade_stats: bool = False,
+        cascade_feat_dim: int = 8,
+        predict_uncertainty: bool = False,
     ) -> None:
         super().__init__()
         if readout_mode not in {"attention", "mean"}:
@@ -188,9 +200,14 @@ class SBiFAGAT(nn.Module):
         self.use_bottom_up = use_bottom_up
         self.ablate_stance = ablate_stance
         self.ablate_hostility = ablate_hostility
+        self.ablate_irrationality = ablate_irrationality
+        self.ablate_constructive = ablate_constructive
         self.use_latent_edge_mlp = use_latent_edge_mlp
         self.gate_mode = gate_mode
         self.readout_mode = readout_mode
+        self.use_cascade_stats = bool(use_cascade_stats)
+        self.cascade_feat_dim = int(cascade_feat_dim)
+        self.predict_uncertainty = bool(predict_uncertainty)
 
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
@@ -199,7 +216,9 @@ class SBiFAGAT(nn.Module):
         )
 
         self.latent_edge_mlp = (
-            LatentConflictMLP(in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout)
+            LatentConflictMLP(
+                in_dim=in_dim, hidden_dim=hidden_dim, edge_dim=edge_dim, dropout=dropout
+            )
             if use_latent_edge_mlp
             else None
         )
@@ -241,7 +260,14 @@ class SBiFAGAT(nn.Module):
             if (use_bottom_up and readout_mode == "attention")
             else None
         )
-        self.head = MultiTaskHead(4 * hidden_dim, hidden_dim, num_rumor_classes, dropout)
+        self.head = MultiTaskHead(
+            4 * hidden_dim,
+            hidden_dim,
+            num_rumor_classes,
+            dropout,
+            cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+            predict_uncertainty=self.predict_uncertainty,
+        )
 
     def _prepare_edge_attr(
         self,
@@ -268,12 +294,21 @@ class SBiFAGAT(nn.Module):
                 elif edge_attr.size(1) > self.edge_dim:
                     edge_attr = edge_attr[:, : self.edge_dim]
 
-        if self.ablate_stance or self.ablate_hostility:
+        if (
+            self.ablate_stance
+            or self.ablate_hostility
+            or self.ablate_irrationality
+            or self.ablate_constructive
+        ):
             edge_attr = edge_attr.clone()
             if self.ablate_stance and edge_attr.size(1) >= 1:
                 edge_attr[:, 0] = 0.0
             if self.ablate_hostility and edge_attr.size(1) >= 2:
                 edge_attr[:, 1] = 0.0
+            if self.ablate_irrationality and edge_attr.size(1) >= 3:
+                edge_attr[:, 2] = 0.0
+            if self.ablate_constructive and edge_attr.size(1) >= 4:
+                edge_attr[:, 3] = 0.0
 
         return edge_attr
 
@@ -327,12 +362,83 @@ class SBiFAGAT(nn.Module):
             node_emb = h_td
 
         graph_emb = torch.cat([z_root_td, z_att_td, z_root_bu, z_att_bu], dim=-1)
-        outputs = self.head(graph_emb, node_emb)
+        c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
+        outputs = self.head(graph_emb, node_emb, cascade_stats=c_stats)
         return outputs, gamma_td_layers, gamma_bu_layers
 
     def forward(self, data: Any) -> dict[str, Tensor]:
         outputs, _, _ = self._encode_graphs(data)
         return outputs
+
+    @torch.no_grad()
+    def predict_with_diagnostics(self, data: Any, *, top_k_edges: int = 5) -> dict[str, Any]:
+        """Run inference and emit interpretable forecasts, confidence flags, and trigger edges."""
+        was_training = self.training
+        self.eval()
+        try:
+            outputs, gamma_td_layers, gamma_bu_layers = self._encode_graphs(data)
+        finally:
+            self.train(was_training)
+
+        y_size = outputs["y_size_pred"].detach().cpu()
+        y_polar = outputs["y_polar_pred"].detach().cpu()
+        rumor_probs = torch.softmax(outputs["rumor_logits"].detach().cpu(), dim=-1)
+
+        if "confidence_score" in outputs:
+            conf = outputs["confidence_score"].detach().cpu()
+        else:
+            conf = torch.full_like(y_polar, 0.75)
+
+        c_stats = getattr(data, "cascade_stats", None)
+        if c_stats is not None and c_stats.numel() >= 7:
+            stats_2d = c_stats.detach().cpu().float().view(-1, self.cascade_feat_dim)
+            substantive_ratio = stats_2d[:, 6]
+            one_sided_host = stats_2d[:, 7]
+        else:
+            substantive_ratio = torch.ones_like(y_polar)
+            one_sided_host = torch.zeros_like(y_polar)
+
+        low_signal = (substantive_ratio < 0.35) | (conf < 0.45)
+
+        gamma_td = gamma_td_layers[-1].detach().cpu() if gamma_td_layers else torch.zeros(0)
+        gamma_bu = gamma_bu_layers[-1].detach().cpu() if gamma_bu_layers else torch.zeros_like(gamma_td)
+        edge_imp = 0.5 * (gamma_td.abs() + gamma_bu.abs()) if gamma_bu_layers else gamma_td.abs()
+        top_edges: list[dict[str, Any]] = []
+        if edge_imp.numel() > 0:
+            raw_attr = getattr(data, "edge_attr", None)
+            attr_cpu = raw_attr.detach().cpu() if raw_attr is not None else None
+            order = torch.argsort(edge_imp, descending=True)[: max(1, int(top_k_edges))]
+            edge_pairs = getattr(data, "edge_pairs", None)
+            for idx_t in order:
+                e_i = int(idx_t.item())
+                item: dict[str, Any] = {
+                    "edge_idx": e_i,
+                    "importance": float(edge_imp[e_i].item()),
+                    "gamma_td": float(gamma_td[e_i].item()),
+                }
+                if edge_pairs is not None and e_i < len(edge_pairs):
+                    item["pair"] = edge_pairs[e_i]
+                if attr_cpu is not None and e_i < attr_cpu.size(0):
+                    item["s_uv"] = float(attr_cpu[e_i, 0].item())
+                    if attr_cpu.size(1) >= 2:
+                        item["h_uv"] = float(attr_cpu[e_i, 1].item())
+                    if attr_cpu.size(1) >= 3:
+                        item["r_uv"] = float(attr_cpu[e_i, 2].item())
+                    if attr_cpu.size(1) >= 4:
+                        item["c_uv"] = float(attr_cpu[e_i, 3].item())
+                top_edges.append(item)
+
+        return {
+            "y_size_pred": y_size,
+            "predicted_total_replies": torch.expm1(y_size).clamp(min=0.0),
+            "y_polar_pred": y_polar,
+            "rumor_probs": rumor_probs,
+            "confidence_score": conf,
+            "substantive_text_ratio": substantive_ratio,
+            "one_sided_hostility_index": one_sided_host,
+            "low_signal_warning": low_signal,
+            "top_trigger_edges": top_edges,
+        }
 
     @torch.no_grad()
     def extract_edge_gates(self, data: Any) -> dict[str, Any]:

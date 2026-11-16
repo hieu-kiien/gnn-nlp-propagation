@@ -5,10 +5,12 @@ Kho mã nguồn nghiên cứu cho đề tài khoa học:
 
 Kiến trúc đề xuất **SBi-FAGAT** (*Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network*) thực hiện dự đoán sớm đa nhiệm gồm quy mô lan truyền cuối kỳ ($y_{\text{size}}$), mức độ phân cực cộng đồng ($y_{\text{polar}}$) và phân loại tin đồn (trên bộ PHEME) chỉ từ bài đăng gốc và cửa sổ sớm $K = 20$ phản hồi đầu tiên theo thời gian.
 
-> **Mới bắt đầu hoặc chưa rành GNN/NLP?**  
-> Đọc [Hướng dẫn Nghiên cứu Dễ hiểu từ Con số 0](docs/huong_dan_nghien_cuu_de_hieu.md) và chạy thử minh họa trên máy CPU trong 5 giây (không cần GPU hay tải dữ liệu lớn):
+> **Mới bắt đầu hoặc chạy song song 2 người trên Kaggle `GPU T4 x 2` (32 GB VRAM)?**  
+> - Đọc [Hướng dẫn Chạy Song Song trên Kaggle T4 x 2 (v2)](docs/huong_dan_chay_song_song_kaggle_t4x2.md) và mở 2 sổ tay sẵn dùng trong `notebooks/` (`kaggle_member1_nlp_and_vn_t4x2.ipynb`, `kaggle_member2_gnn_and_en_t4x2.ipynb`).
+> - Đọc [Hướng dẫn Nghiên cứu Dễ hiểu từ Con số 0](docs/huong_dan_nghien_cuu_de_hieu.md) và chạy thử minh họa trên máy CPU (<5 giây):
 > ```bash
 > python -m scripts.demo_research_walkthrough
+> python -m scripts.predict_live_thread --demo-offline
 > python -m scripts.benchmark_efficiency
 > ```
 
@@ -33,17 +35,24 @@ Kiến trúc đề xuất **SBi-FAGAT** (*Stance-Guided Bidirectional Frequency-
 ├── GEMINI.md                   # Quy tắc hệ thống & 5 Luật Thép dự án
 ├── pyproject.toml              # Khai báo package (sbi-fagat) & cấu hình pytest
 ├── requirements.txt            # Thư viện Python (>=3.10), PyTorch, PyG, Transformers
+├── requirements-kaggle-t4x2.txt # Bổ sung PEFT/bitsandbytes/TRL cho Qwen3.8-27B QLoRA T4x2
 ├── run_all.sh                  # Pipeline kiểm thử + thực nghiệm Giai đoạn 3 & UPFD
 ├── configs/                    # Chứa tệp cấu hình thực nghiệm (giữ chỗ .gitkeep)
 ├── data/                       # Dữ liệu local (raw/interim/processed bị ignore trên Git)
 ├── docs/
+│   ├── huong_dan_chay_song_song_kaggle_t4x2.md # Hướng dẫn chia 2 người chạy Kaggle T4x2
 │   ├── huong_dan_nghien_cuu_de_hieu.md  # Giải thích đề tài, ký hiệu & code từ con số 0
 │   ├── literature_review.md    # Tổng quan công trình nền tảng đã xác minh
 │   └── math_spec.md            # Đặc tả toán học SBi-FAGAT & Hợp đồng dữ liệu
+├── notebooks/
+│   ├── kaggle_member1_nlp_and_vn_t4x2.ipynb # Sổ tay Thành viên 1 (Track VN / NLP)
+│   └── kaggle_member2_gnn_and_en_t4x2.ipynb # Sổ tay Thành viên 2 (Track EN / GNN)
 ├── paper/
 │   ├── references.bib          # Thư viện trích dẫn chuẩn BibTeX
 │   └── figures/                # Thư mục xuất biểu đồ vector phục vụ bài báo
 ├── scripts/
+│   ├── kaggle_parallel_runner.py # Điều phối chạy song song 4 role + auto_loop Kaggle T4x2
+│   ├── predict_live_thread.py  # Dự báo trực tiếp từ URL/ID bài viết thật trên mạng
 │   ├── run_phase2.sh           # Pipeline Frozen-Teacher Zero-Leakage & xuất NLP .pt
 │   ├── compute_kappa.py        # Tính Cohen's Kappa, Machine-vs-Gold & RumourEval SDQC
 │   ├── benchmark_efficiency.py # Đo #Params, tốc độ suy luận/huấn luyện & RAM/VRAM 8 mô hình
@@ -53,9 +62,9 @@ Kiến trúc đề xuất **SBi-FAGAT** (*Stance-Guided Bidirectional Frequency-
 │   └── run_upfd_extension.py   # Thực nghiệm mở rộng trên UPFD GossipCop
 ├── src/
 │   ├── data/                   # schema.py, pheme_loader.py, arctic_shift_vn.py, pyg_dataset.py
-│   ├── nlp/                    # dual_edge_scorer.py, extract_features.py
+│   ├── nlp/                    # qwen_teacher.py, dual_edge_scorer.py, extract_features.py
 │   ├── models/                 # baselines.py, sbi_fagat.py
-│   ├── training/               # metrics.py, trainer.py, reporting.py
+│   ├── training/               # metrics.py, trainer.py, auto_loop.py, reporting.py
 │   └── utils/                  # seed.py, visualize.py
 └── tests/                      # Bộ unit test (schema, tree, no_leakage, overfit, viz...)
 ```

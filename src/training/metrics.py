@@ -19,13 +19,14 @@ def compute_multitask_loss(
     alpha_size: float = 1.0,
     alpha_polar: float = 1.0,
     alpha_rumor: float = 1.0,
+    lambda_uncertainty: float = 0.0,
     huber_delta: float | None = None,
     huber_delta_size: float = 1.0,
     huber_delta_polar: float = 0.15,
     class_weights: Tensor | None = None,
     classification_only: bool = False,
 ) -> Tensor:
-    """Compute multi-task Huber + Cross-Entropy loss (or classification-only for UPFD)."""
+    """Compute multi-task Huber + Cross-Entropy loss (plus optional uncertainty NLL)."""
     logits = outputs["rumor_logits"]
     ce_weight = (
         class_weights.to(device=logits.device, dtype=logits.dtype)
@@ -45,9 +46,19 @@ def compute_multitask_loss(
     y_size = batch.y_size.view(-1).float()
     y_polar = batch.y_polar.view(-1).float()
 
-    loss_size = F.huber_loss(outputs["y_size_pred"].view(-1), y_size, delta=d_size)
-    loss_polar = F.huber_loss(outputs["y_polar_pred"].view(-1), y_polar, delta=d_polar)
+    y_size_pred = outputs["y_size_pred"].view(-1)
+    y_polar_pred = outputs["y_polar_pred"].view(-1)
+
+    loss_size = F.huber_loss(y_size_pred, y_size, delta=d_size)
+    loss_polar = F.huber_loss(y_polar_pred, y_polar, delta=d_polar)
     total_loss = alpha_size * loss_size + alpha_polar * loss_polar
+
+    if lambda_uncertainty > 0.0 and "size_logvar" in outputs and "polar_logvar" in outputs:
+        s_lv = outputs["size_logvar"].view(-1).clamp(-6.0, 3.0)
+        p_lv = outputs["polar_logvar"].view(-1).clamp(-6.0, 3.0)
+        nll_size = 0.5 * (torch.exp(-s_lv) * (y_size_pred - y_size) ** 2 + s_lv)
+        nll_polar = 0.5 * (torch.exp(-p_lv) * (y_polar_pred - y_polar) ** 2 + p_lv)
+        total_loss = total_loss + float(lambda_uncertainty) * (nll_size.mean() + nll_polar.mean())
 
     y_rumor = getattr(batch, "y_rumor", None)
     if y_rumor is not None:

@@ -1,0 +1,6 @@
+-r requirements.txt
+peft>=0.11.0
+bitsandbytes>=0.43.0
+trl>=0.9.0
+accelerate>=0.30.0
+huggingface_hub>=0.24.0

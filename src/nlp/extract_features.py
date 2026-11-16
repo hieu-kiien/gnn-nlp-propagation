@@ -41,6 +41,7 @@ from src.nlp.dual_edge_scorer import (
     _normalize_nfc,
     load_tokenizer_safe,
 )
+from src.nlp.qwen_teacher import DISCOURSE_BEHAVIOR_LABELS
 
 
 def compute_masked_mean_pooling(last_hidden_state: Tensor, attention_mask: Tensor) -> Tensor:
@@ -114,12 +115,18 @@ def encode_edges_with_cross_encoder(
     n_edges = len(parent_texts)
     if n_edges != len(reply_texts):
         raise ValueError("parent_texts and reply_texts must have equal length")
+    ce_edge_dim = int(getattr(cross_encoder, "edge_dim", 2))
     if n_edges == 0:
-        return {
+        empty_res: dict[str, Any] = {
             "s_uv": np.zeros((0,), dtype=np.float32),
             "h_uv": np.zeros((0,), dtype=np.float32),
             "pred_label": [],
         }
+        if ce_edge_dim == 4:
+            empty_res["r_uv"] = np.zeros((0,), dtype=np.float32)
+            empty_res["c_uv"] = np.zeros((0,), dtype=np.float32)
+            empty_res["behavior_label"] = []
+        return empty_res
 
     target_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _freeze_module(cross_encoder).to(target_device)
@@ -127,7 +134,10 @@ def encode_edges_with_cross_encoder(
 
     all_s: list[Tensor] = []
     all_h: list[Tensor] = []
+    all_r: list[Tensor] = []
+    all_c: list[Tensor] = []
     all_probs: list[Tensor] = []
+    all_b_probs: list[Tensor] = []
 
     for start in range(0, n_edges, batch_size):
         u_batch = [_normalize_nfc(t) for t in parent_texts[start : start + batch_size]]
@@ -146,12 +156,22 @@ def encode_edges_with_cross_encoder(
         all_s.append(out["s_uv"].cpu().to(dtype=torch.float32))
         all_h.append(out["h_uv"].cpu().to(dtype=torch.float32))
         all_probs.append(out["stance_probs"].cpu().to(dtype=torch.float32))
+        if ce_edge_dim == 4 and "r_uv" in out:
+            all_r.append(out["r_uv"].cpu().to(dtype=torch.float32))
+            all_c.append(out["c_uv"].cpu().to(dtype=torch.float32))
+            all_b_probs.append(out["behavior_probs"].cpu().to(dtype=torch.float32))
 
     s_np = torch.cat(all_s, dim=0).numpy()
     h_np = torch.cat(all_h, dim=0).numpy()
     probs_np = torch.cat(all_probs, dim=0).numpy()
     labels = [STANCE_LABELS[int(i)] for i in probs_np.argmax(axis=-1)]
-    return {"s_uv": s_np, "h_uv": h_np, "pred_label": labels}
+    res: dict[str, Any] = {"s_uv": s_np, "h_uv": h_np, "pred_label": labels}
+    if ce_edge_dim == 4 and all_r:
+        res["r_uv"] = torch.cat(all_r, dim=0).numpy()
+        res["c_uv"] = torch.cat(all_c, dim=0).numpy()
+        bp_np = torch.cat(all_b_probs, dim=0).numpy()
+        res["behavior_label"] = [DISCOURSE_BEHAVIOR_LABELS[int(i)] for i in bp_np.argmax(axis=-1)]
+    return res
 
 
 def compute_leakage_free_node_metadata(
@@ -227,8 +247,8 @@ def validate_feature_tensors(payload: Mapping[str, Any]) -> None:
 
     if not isinstance(node_emb, Tensor) or node_emb.ndim != 2 or node_emb.size(1) != 768:
         raise ValueError(f"node_embeddings must have shape [N, 768], got {tuple(node_emb.shape)}")
-    if not isinstance(edge_attr, Tensor) or edge_attr.ndim != 2 or edge_attr.size(1) != 2:
-        raise ValueError(f"edge_attr must have shape [E, 2], got {tuple(edge_attr.shape)}")
+    if not isinstance(edge_attr, Tensor) or edge_attr.ndim != 2 or edge_attr.size(1) not in {2, 4}:
+        raise ValueError(f"edge_attr must have shape [E, 2] or [E, 4], got {tuple(edge_attr.shape)}")
 
     tensors_to_check: list[tuple[str, Tensor]] = [
         ("node_embeddings", node_emb),
@@ -253,8 +273,15 @@ def validate_feature_tensors(payload: Mapping[str, Any]) -> None:
             raise ValueError("edge_stance values out of bounds [-1, 1]")
         if bool((h_vals < -1e-5).any() or (h_vals > 1.0 + 1e-5).any()):
             raise ValueError("edge_hostility values out of bounds [0, 1]")
+        if edge_attr.size(1) == 4:
+            r_vals = edge_attr[:, 2]
+            c_vals = edge_attr[:, 3]
+            if bool((r_vals < -1e-5).any() or (r_vals > 1.0 + 1e-5).any()):
+                raise ValueError("edge_irrationality values out of bounds [0, 1]")
+            if bool((c_vals < -1e-5).any() or (c_vals > 1.0 + 1e-5).any()):
+                raise ValueError("edge_constructive values out of bounds [0, 1]")
 
-    for dict_name in ("edge_stance", "edge_hostility"):
+    for dict_name in ("edge_stance", "edge_hostility", "edge_irrationality", "edge_constructive"):
         mapping = payload.get(dict_name, {})
         for key, val in mapping.items():
             fval = float(val)
@@ -284,15 +311,20 @@ def extract_and_save_features(
     stance_scorer: NLIStanceTeacherScorer | None = None,
     scored_cache_json: Path | None = None,
     vihsd_ckpt: Path | None = None,
+    edge_dim: int | None = None,
+    include_root_context: bool = False,
+    node_backbone: str | None = None,
     batch_size: int = 32,
     max_length: int = 256,
     k_horizon: int = 20,
     device: torch.device | None = None,
     include_node_features_770: bool = False,
 ) -> Path:
-    """Extract frozen 768-d node embeddings, optional 770-d early features, and 2D edge `[s_uv, h_uv]`."""
+    """Extract frozen 768-d node embeddings and 2D/4D edge attributes (`[s, h]` or `[s, h, r, c]`)."""
+    if edge_dim is not None and edge_dim not in {2, 4}:
+        raise ValueError(f"edge_dim must be 2 or 4, got {edge_dim}")
     lang = "en" if dataset == "pheme" else "vi"
-    default_backbone = ROBERTA_BASE_MODEL_NAME if lang == "en" else VISOBERT_MODEL_NAME
+    default_backbone = node_backbone or (ROBERTA_BASE_MODEL_NAME if lang == "en" else VISOBERT_MODEL_NAME)
     target_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     nodes_tbl, edges_tbl = load_cascade_parquet(interim_dir, validate=True)
@@ -371,8 +403,13 @@ def extract_and_save_features(
         )
         node_features_770 = torch.cat([node_embeddings, meta_2d], dim=1)
 
-    # 3. 2D Edge vectors e_uv = [s_uv, h_uv] & direct (root, reply) stance node_root_stance
+    # 3. 2D or 4D Edge vectors & direct (root, reply) stance node_root_stance
     node_root_stance: dict[str, float] = {}
+    r_arr: Any | None = None
+    c_arr: Any | None = None
+    behavior_labels: list[str] | None = None
+    effective_edge_dim = int(edge_dim) if edge_dim is not None else 2
+
     if scored_cache_json is not None:
         cache_file = Path(scored_cache_json)
         if not cache_file.exists():
@@ -391,15 +428,44 @@ def extract_and_save_features(
                 f"scored_cache_json {cache_file} is missing {len(missing_eids)} edges "
                 f"(first: {missing_eids[0]!r}); re-run dual_edge_scorer --score-only."
             )
+        has_4d_in_cache = any(
+            "r_uv" in cache_by_eid[eid] or "c_uv" in cache_by_eid[eid]
+            for eid in edge_ids
+        )
+        if edge_dim is None and has_4d_in_cache:
+            effective_edge_dim = 4
+
         s_list: list[float] = []
         h_list: list[float] = []
+        r_list: list[float] = []
+        c_list: list[float] = []
         pred_labels_list: list[str] = []
+        beh_labels_list: list[str] = []
         for idx, eid in enumerate(edge_ids):
             entry = cache_by_eid[eid]
             s_val = float(entry["s_uv"])
             h_val = float(entry["h_uv"])
             s_list.append(s_val)
             h_list.append(h_val)
+            if effective_edge_dim == 4:
+                r_val = float(entry.get("r_uv", 0.05))
+                c_val = float(entry.get("c_uv", 0.50))
+                r_list.append(r_val)
+                c_list.append(c_val)
+                blbl = str(entry.get("behavior_label") or "")
+                if blbl not in DISCOURSE_BEHAVIOR_LABELS:
+                    if s_val > 0.15:
+                        blbl = "support"
+                    elif s_val < -0.15:
+                        if h_val >= 0.65:
+                            blbl = "hostile_conflict"
+                        elif r_val >= 0.55:
+                            blbl = "irrational_fallacy"
+                        else:
+                            blbl = "constructive_oppose"
+                    else:
+                        blbl = "neutral"
+                beh_labels_list.append(blbl)
             if "pred_label" in entry and entry["pred_label"] is not None:
                 pred_labels_list.append(str(entry["pred_label"]))
             else:
@@ -411,10 +477,20 @@ def extract_and_save_features(
         s_arr = s_list
         h_arr = h_list
         pred_labels = pred_labels_list
+        if effective_edge_dim == 4:
+            r_arr = r_list
+            c_arr = c_list
+            behavior_labels = beh_labels_list
     elif loaded_ckpt_model is not None:
+        if edge_dim is None:
+            effective_edge_dim = int(getattr(loaded_ckpt_model, "edge_dim", 2))
         edge_tok = loaded_ckpt_tok if loaded_ckpt_tok is not None else active_tok
+        pair_parents = [
+            f"{r[:220]} | {p}" if (include_root_context and r and r != p) else p
+            for r, p in zip(edge_root_texts, parent_texts)
+        ]
         edge_pred = encode_edges_with_cross_encoder(
-            parent_texts,
+            pair_parents,
             reply_texts,
             cross_encoder=loaded_ckpt_model,
             tokenizer=edge_tok,
@@ -425,6 +501,10 @@ def extract_and_save_features(
         s_arr = edge_pred["s_uv"]
         h_arr = edge_pred["h_uv"]
         pred_labels = edge_pred["pred_label"]
+        if effective_edge_dim == 4:
+            r_arr = edge_pred.get("r_uv", np.zeros(len(edge_ids), dtype=np.float32))
+            c_arr = edge_pred.get("c_uv", np.full(len(edge_ids), 0.5, dtype=np.float32))
+            behavior_labels = edge_pred.get("behavior_label")
         deep_idx = [
             i for i, r in enumerate(edge_rows) if str(r["source_id"]) != edge_root_ids[i]
         ]
@@ -513,14 +593,30 @@ def extract_and_save_features(
     if len(edge_ids) > 0:
         s_t = torch.as_tensor(s_arr, dtype=torch.float32).clamp(-1.0, 1.0)
         h_t = torch.as_tensor(h_arr, dtype=torch.float32).clamp(0.0, 1.0)
-        edge_attr = torch.stack([s_t, h_t], dim=-1)
+        if effective_edge_dim == 4:
+            r_t = (
+                torch.as_tensor(r_arr, dtype=torch.float32).clamp(0.0, 1.0)
+                if r_arr is not None
+                else torch.zeros_like(h_t)
+            )
+            c_t = (
+                torch.as_tensor(c_arr, dtype=torch.float32).clamp(0.0, 1.0)
+                if c_arr is not None
+                else torch.full_like(h_t, 0.5)
+            )
+            edge_attr = torch.stack([s_t, h_t, r_t, c_t], dim=-1)
+        else:
+            edge_attr = torch.stack([s_t, h_t], dim=-1)
     else:
-        edge_attr = torch.empty((0, 2), dtype=torch.float32)
+        edge_attr = torch.empty((0, effective_edge_dim), dtype=torch.float32)
 
     edge_stance_map: dict[str, float] = {}
     edge_hostility_map: dict[str, float] = {}
+    edge_irrational_map: dict[str, float] = {}
+    edge_constructive_map: dict[str, float] = {}
     edge_oppose_flag: dict[str, bool] = {}
     edge_pred_label: dict[str, str] = {}
+    edge_behavior_label: dict[str, str] = {}
 
     for idx, eid in enumerate(edge_ids):
         s_val = float(edge_attr[idx, 0].item())
@@ -530,10 +626,16 @@ def extract_and_save_features(
         edge_hostility_map[eid] = h_val
         edge_oppose_flag[eid] = lbl == "oppose"
         edge_pred_label[eid] = lbl
+        if effective_edge_dim == 4:
+            edge_irrational_map[eid] = float(edge_attr[idx, 2].item())
+            edge_constructive_map[eid] = float(edge_attr[idx, 3].item())
+            if behavior_labels is not None and idx < len(behavior_labels):
+                edge_behavior_label[eid] = str(behavior_labels[idx])
 
     payload: dict[str, Any] = {
         "dataset": dataset,
         "lang": lang,
+        "edge_dim": effective_edge_dim,
         "k_horizon_metadata": int(k_horizon),
         "node_embeddings": node_embeddings,
         "node_id_to_idx": node_id_to_idx,
@@ -545,6 +647,11 @@ def extract_and_save_features(
         "edge_pred_label": edge_pred_label,
         "node_root_stance": node_root_stance,
     }
+    if effective_edge_dim == 4:
+        payload["edge_irrationality"] = edge_irrational_map
+        payload["edge_constructive"] = edge_constructive_map
+        if edge_behavior_label:
+            payload["edge_behavior_label"] = edge_behavior_label
     if node_features_770 is not None:
         payload["node_features_770"] = node_features_770
 
@@ -559,7 +666,7 @@ def extract_and_save_features(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract clean frozen NLP node embeddings & 2D edge features into data/processed/."
+        description="Extract clean frozen NLP node embeddings & 2D/4D edge features into data/processed/."
     )
     parser.add_argument("--dataset", choices=["pheme", "vn"], required=True)
     parser.add_argument("--interim-dir", type=Path, default=None)
@@ -567,6 +674,9 @@ def main() -> None:
     parser.add_argument("--cross-encoder-ckpt", type=Path, default=None)
     parser.add_argument("--scored-cache-json", type=Path, default=None)
     parser.add_argument("--vihsd-dir", type=Path, default=Path("checkpoints/visobert_vihsd"))
+    parser.add_argument("--edge-dim", type=int, choices=[2, 4], default=None)
+    parser.add_argument("--node-backbone", type=str, default=None)
+    parser.add_argument("--include-root-context", action="store_true")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--k-horizon", type=int, default=20)
@@ -583,6 +693,9 @@ def main() -> None:
         cross_encoder_ckpt=args.cross_encoder_ckpt,
         scored_cache_json=args.scored_cache_json,
         vihsd_ckpt=args.vihsd_dir,
+        edge_dim=args.edge_dim,
+        node_backbone=args.node_backbone,
+        include_root_context=bool(args.include_root_context),
         batch_size=args.batch_size,
         max_length=args.max_length,
         k_horizon=args.k_horizon,
