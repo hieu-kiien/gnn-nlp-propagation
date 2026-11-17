@@ -1433,6 +1433,7 @@ def main() -> None:
     parser.add_argument("--allow-untrained-vihsd", action="store_true")
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--max-pairs", type=int, default=None)
+    parser.add_argument("--max-teacher-pairs", type=int, default=None)
     parser.add_argument("--checkpoint-every", type=int, default=250)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -1467,6 +1468,25 @@ def main() -> None:
         pairs = extract_parent_reply_pairs_from_parquet(args.interim_dir)
         if args.max_pairs is not None:
             pairs = pairs[: args.max_pairs]
+
+        presplit_train_count: int | None = None
+        if (
+            args.teacher_backend == "qwen_qlora"
+            and args.max_teacher_pairs is not None
+            and len(pairs) > args.max_teacher_pairs
+        ):
+            # Budget Teacher scoring strictly inside train + val topics (ZERO test-topic leakage)
+            topic_splits = split_pairs_by_inductive_topics(pairs, split_seed=args.split_seed)
+            rng_budget = random.Random(args.split_seed)
+            tr_pool = list(topic_splits["train"])
+            va_pool = list(topic_splits["val"])
+            rng_budget.shuffle(tr_pool)
+            rng_budget.shuffle(va_pool)
+            tr_quota = min(len(tr_pool), max(1, int(round(0.82 * args.max_teacher_pairs))))
+            va_quota = min(len(va_pool), max(1, int(args.max_teacher_pairs) - tr_quota))
+            pairs = tr_pool[:tr_quota] + va_pool[:va_quota]
+            presplit_train_count = tr_quota
+
         scored = _score_pairs_with_teachers(
             pairs,
             lang=args.lang,
@@ -1492,15 +1512,21 @@ def main() -> None:
             print(f"Exported blind stratified human audit CSV: {csv_path} (key: {machine_key_csv})")
 
         if args.distill:
-            topic_splits = split_pairs_by_inductive_topics(
-                scored, split_seed=args.split_seed
-            )
+            if presplit_train_count is not None:
+                train_distill = scored[:presplit_train_count]
+                val_distill = scored[presplit_train_count:]
+            else:
+                topic_splits = split_pairs_by_inductive_topics(
+                    scored, split_seed=args.split_seed
+                )
+                train_distill = topic_splits["train"]
+                val_distill = topic_splits["val"]
             student_backbone = args.student_backbone or (
                 VISOBERT_MODEL_NAME if args.lang == "vi" else EN_DEBERTA_MODEL_NAME
             )
             report = distill_dual_cross_encoder(
-                topic_splits["train"],
-                topic_splits["val"],
+                train_distill,
+                val_distill,
                 output_dir=out_dir,
                 lang=args.lang,
                 model_name=student_backbone,

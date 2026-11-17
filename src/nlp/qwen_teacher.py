@@ -37,6 +37,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 QWEN_TEACHER_MODEL_ID: str = "Qwen/Qwen3.8-27B"
+QWEN_KAGGLE_4BIT_MODEL_ID: str = "unsloth/Qwen3.8-27B-unsloth-bnb-4bit"
 EN_DEBERTA_MODEL_NAME: str = "microsoft/deberta-v3-base"
 
 DISCOURSE_BEHAVIOR_LABELS: tuple[str, ...] = (
@@ -831,6 +832,70 @@ def _freeze_vision_modules_for_text_qlora(model: torch.nn.Module) -> list[str]:
     return frozen
 
 
+def _resolve_text_lora_target_modules(model: torch.nn.Module) -> list[str]:
+    """Resolve existing text-backbone linear layer names (including Qwen3.5 linear_attn)."""
+    candidates = (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "in_proj_qkv",
+        "in_proj_z",
+        "out_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    )
+    found: set[str] = set()
+    for name, mod in model.named_modules():
+        low = name.lower()
+        if any(tag in low for tag in ("visual", "vision_tower", "vision_model", "merger")):
+            continue
+        leaf = name.split(".")[-1]
+        if leaf in candidates and (
+            isinstance(mod, torch.nn.Linear) or "linear" in type(mod).__name__.lower()
+        ):
+            found.add(leaf)
+    ordered = [c for c in candidates if c in found]
+    return ordered if ordered else ["q_proj", "v_proj"]
+
+
+def _load_qwen_backbone_model(model_name_or_path: str, load_cfg: Mapping[str, Any]) -> Any:
+    """Load Qwen3.8-27B (`Qwen3_5ForConditionalGeneration`) or CausalLM safely in 4-bit."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    hf_cfg = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+    cfg_kwargs: dict[str, Any] = {k: v for k, v in load_cfg.items() if v is not None}
+    if getattr(hf_cfg, "quantization_config", None) is not None:
+        cfg_kwargs.pop("quantization_config", None)
+
+    archs = [str(a) for a in (getattr(hf_cfg, "architectures", None) or [])]
+    m_type = str(getattr(hf_cfg, "model_type", "") or "").lower()
+    is_vlm = m_type in {"qwen3_5", "qwen2_5_vl", "qwen3_vl"} or any(
+        "ConditionalGeneration" in a for a in archs
+    )
+    if is_vlm:
+        for cls_name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
+            try:
+                import transformers
+
+                loader_cls = getattr(transformers, cls_name, None)
+                if loader_cls is not None:
+                    return loader_cls.from_pretrained(
+                        model_name_or_path,
+                        trust_remote_code=True,
+                        **cfg_kwargs,
+                    )
+            except Exception:
+                continue
+
+    return AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        trust_remote_code=True,
+        **cfg_kwargs,
+    )
+
+
 def _load_external_vihsd_subset(limit: int = 800, seed: int = 42) -> list[dict[str, Any]]:
     try:
         from datasets import load_dataset
@@ -903,7 +968,7 @@ def finetune_qwen_qlora(
     active_model = model
 
     if tok is None or active_model is None:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoTokenizer
 
         if tok is None:
             tok = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
@@ -911,11 +976,7 @@ def finetune_qwen_qlora(
             tok.pad_token = tok.eos_token
         if active_model is None:
             load_cfg = build_t4x2_loading_config()
-            active_model = AutoModelForCausalLM.from_pretrained(
-                model_name_or_path,
-                trust_remote_code=True,
-                **{k: v for k, v in load_cfg.items() if v is not None},
-            )
+            active_model = _load_qwen_backbone_model(model_name_or_path, load_cfg)
             if hasattr(active_model, "config") and hasattr(active_model.config, "use_cache"):
                 active_model.config.use_cache = False
 
@@ -927,16 +988,8 @@ def finetune_qwen_qlora(
             from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
             active_model = prepare_model_for_kbit_training(active_model, use_gradient_checkpointing=True)
-            # Match text attention/MLP linear projections explicitly without touching vision modules
-            text_target_modules = [
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ]
+            # Match text attention/MLP/linear_attn projections explicitly without touching vision modules
+            text_target_modules = _resolve_text_lora_target_modules(active_model)
             lora_cfg = LoraConfig(
                 r=lora_r,
                 lora_alpha=lora_alpha,
@@ -944,7 +997,7 @@ def finetune_qwen_qlora(
                 bias="none",
                 task_type="CAUSAL_LM",
                 target_modules=text_target_modules,
-                exclude_modules=".*(visual|vision_tower|vision_model).*",
+                exclude_modules=".*(visual|vision_tower|vision_model|merger).*",
             )
             try:
                 active_model = get_peft_model(active_model, lora_cfg)
@@ -1079,7 +1132,7 @@ class QwenBehavioralTeacherScorer:
         model: Any | None = None,
         tokenizer: Any | None = None,
         custom_generate_fn: Callable[[Sequence[str]], Sequence[str]] | None = None,
-        max_new_tokens: int = 160,
+        max_new_tokens: int = 96,
         batch_size: int = 8,
     ) -> None:
         self.model_name_or_path = str(model_name_or_path)
@@ -1092,7 +1145,7 @@ class QwenBehavioralTeacherScorer:
         self.tokenizer = tokenizer
 
         if self.custom_generate_fn is None and self.model is None:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from transformers import AutoTokenizer
 
             tok_source = (
                 str(self.adapter_dir)
@@ -1107,11 +1160,7 @@ class QwenBehavioralTeacherScorer:
             self.tokenizer.padding_side = "left"
 
             load_cfg = build_t4x2_loading_config()
-            base_model = AutoModelForCausalLM.from_pretrained(
-                self.model_name_or_path,
-                trust_remote_code=True,
-                **{k: v for k, v in load_cfg.items() if v is not None},
-            )
+            base_model = _load_qwen_backbone_model(self.model_name_or_path, load_cfg)
             if self.adapter_dir is not None and self.adapter_dir.exists():
                 try:
                     from peft import PeftModel

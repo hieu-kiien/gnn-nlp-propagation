@@ -36,9 +36,11 @@ from src.nlp.dual_edge_scorer import (
 from src.nlp.extract_features import extract_and_save_features, validate_feature_tensors
 from src.nlp.qwen_teacher import (
     DISCOURSE_BEHAVIOR_LABELS,
+    QWEN_KAGGLE_4BIT_MODEL_ID,
     QWEN_TEACHER_MODEL_ID,
     QwenBehavioralTeacherScorer,
     _freeze_vision_modules_for_text_qlora,
+    _resolve_text_lora_target_modules,
     build_qlora_gold_examples,
     build_t4x2_loading_config,
     parse_behavioral_teacher_json,
@@ -153,12 +155,16 @@ def test_qwen_scorer_mock_and_vision_tower_freeze() -> None:
             super().__init__()
             self.visual = torch.nn.Linear(4, 4)
             self.q_proj = torch.nn.Linear(4, 4)
+            self.in_proj_qkv = torch.nn.Linear(4, 12)
+            self.out_proj = torch.nn.Linear(4, 4)
 
     vlm = _ToyVLM()
     frozen = _freeze_vision_modules_for_text_qlora(vlm)
     assert any("visual" in n for n in frozen)
     assert all(not p.requires_grad for p in vlm.visual.parameters())
     assert all(p.requires_grad for p in vlm.q_proj.parameters())
+    targets = _resolve_text_lora_target_modules(vlm)
+    assert "q_proj" in targets and "in_proj_qkv" in targets and "out_proj" in targets
 
     def _mock_gen(prompts):
         return [
@@ -308,13 +314,32 @@ def test_dual_head_4d_distill_audit_and_extract(tmp_path: Path) -> None:
     reloaded, _ = DualHeadCrossEncoder.load_checkpoint(ckpt_dir)
     assert reloaded.edge_dim == 4
 
-    # Feature extraction using checkpoint directly -> validated 4D nlp_features.pt
+    # Feature extraction using checkpoint + partial scored_cache_json (simulating --max-teacher-pairs budget):
+    # Must NOT fail on unscored test edges and must still compute all 4D edge_attr via Student CE
+    partial_cache_path = interim_dir / "partial_scored_pairs.json"
+    partial_cache_path.write_text(json.dumps(pairs_cache[:6]), encoding="utf-8")
+
+    # Cache-only WITHOUT Cross-Encoder still enforces strict completeness check
+    with pytest.raises(ValueError, match="missing"):
+        extract_and_save_features(
+            dataset="vn",
+            interim_dir=interim_dir,
+            output_dir=tmp_path / "should_fail",
+            cross_encoder_ckpt=None,
+            scored_cache_json=partial_cache_path,
+            node_encoder=enc,
+            tokenizer=tok,
+            batch_size=8,
+            device=torch.device("cpu"),
+        )
+
     proc_dir = tmp_path / "processed"
     pt_path = extract_and_save_features(
         dataset="vn",
         interim_dir=interim_dir,
         output_dir=proc_dir,
         cross_encoder_ckpt=ckpt_dir,
+        scored_cache_json=partial_cache_path,
         node_encoder=enc,
         tokenizer=tok,
         edge_dim=4,
@@ -324,7 +349,7 @@ def test_dual_head_4d_distill_audit_and_extract(tmp_path: Path) -> None:
     )
     payload = torch.load(pt_path, map_location="cpu", weights_only=False)
     validate_feature_tensors(payload)
-    assert payload["edge_attr"].shape[1] == 4
+    assert payload["edge_attr"].shape == (len(edge_rows), 4)
     assert "edge_irrationality" in payload
     assert "edge_constructive" in payload
 
@@ -520,4 +545,5 @@ def test_auto_loop_live_predictor_smoke_runner_and_notebooks(tmp_path: Path) -> 
         assert len(nb_json["cells"]) >= 5
         joined_src = "\n".join("".join(c.get("source", [])) for c in nb_json["cells"])
         assert QWEN_TEACHER_MODEL_ID in joined_src
+        assert QWEN_KAGGLE_4BIT_MODEL_ID in joined_src
         assert "scripts.kaggle_parallel_runner" in joined_src

@@ -410,7 +410,65 @@ def extract_and_save_features(
     behavior_labels: list[str] | None = None
     effective_edge_dim = int(edge_dim) if edge_dim is not None else 2
 
-    if scored_cache_json is not None:
+    if loaded_ckpt_model is not None:
+        # System-1 Student Cross-Encoder scores ALL edges cleanly (even when test edges were omitted from Teacher budget)
+        if edge_dim is None:
+            effective_edge_dim = int(getattr(loaded_ckpt_model, "edge_dim", 2))
+        edge_tok = loaded_ckpt_tok if loaded_ckpt_tok is not None else active_tok
+        pair_parents = [
+            f"{r[:220]} | {p}" if (include_root_context and r and r != p) else p
+            for r, p in zip(edge_root_texts, parent_texts)
+        ]
+        edge_pred = encode_edges_with_cross_encoder(
+            pair_parents,
+            reply_texts,
+            cross_encoder=loaded_ckpt_model,
+            tokenizer=edge_tok,
+            batch_size=batch_size,
+            max_length=max_length,
+            device=target_device,
+        )
+        s_arr = edge_pred["s_uv"]
+        h_arr = edge_pred["h_uv"]
+        pred_labels = edge_pred["pred_label"]
+        if effective_edge_dim == 4:
+            r_arr = edge_pred.get("r_uv", np.zeros(len(edge_ids), dtype=np.float32))
+            c_arr = edge_pred.get("c_uv", np.full(len(edge_ids), 0.5, dtype=np.float32))
+            behavior_labels = edge_pred.get("behavior_label")
+        deep_idx = [
+            i for i, r in enumerate(edge_rows) if str(r["source_id"]) != edge_root_ids[i]
+        ]
+        for i in range(len(edge_ids)):
+            node_root_stance[edge_target_ids[i]] = max(-1.0, min(1.0, float(s_arr[i])))
+        if deep_idx:
+            deep_pred = encode_edges_with_cross_encoder(
+                [edge_root_texts[i] for i in deep_idx],
+                [reply_texts[i] for i in deep_idx],
+                cross_encoder=loaded_ckpt_model,
+                tokenizer=edge_tok,
+                batch_size=batch_size,
+                max_length=max_length,
+                device=target_device,
+            )
+            for pos, i in enumerate(deep_idx):
+                node_root_stance[edge_target_ids[i]] = max(
+                    -1.0, min(1.0, float(deep_pred["s_uv"][pos]))
+                )
+        if scored_cache_json is not None and Path(scored_cache_json).exists():
+            raw_cache = json.loads(Path(scored_cache_json).read_text(encoding="utf-8"))
+            if isinstance(raw_cache, list):
+                cache_by_eid = {
+                    str(item["edge_id"]): item
+                    for item in raw_cache
+                    if isinstance(item, dict) and item.get("edge_id") is not None
+                }
+                for idx, eid in enumerate(edge_ids):
+                    entry = cache_by_eid.get(eid)
+                    if entry is not None and "root_s_uv" in entry:
+                        node_root_stance[edge_target_ids[idx]] = max(
+                            -1.0, min(1.0, float(entry["root_s_uv"]))
+                        )
+    elif scored_cache_json is not None:
         cache_file = Path(scored_cache_json)
         if not cache_file.exists():
             raise FileNotFoundError(f"Scored cache JSON not found: {cache_file}")
@@ -481,49 +539,6 @@ def extract_and_save_features(
             r_arr = r_list
             c_arr = c_list
             behavior_labels = beh_labels_list
-    elif loaded_ckpt_model is not None:
-        if edge_dim is None:
-            effective_edge_dim = int(getattr(loaded_ckpt_model, "edge_dim", 2))
-        edge_tok = loaded_ckpt_tok if loaded_ckpt_tok is not None else active_tok
-        pair_parents = [
-            f"{r[:220]} | {p}" if (include_root_context and r and r != p) else p
-            for r, p in zip(edge_root_texts, parent_texts)
-        ]
-        edge_pred = encode_edges_with_cross_encoder(
-            pair_parents,
-            reply_texts,
-            cross_encoder=loaded_ckpt_model,
-            tokenizer=edge_tok,
-            batch_size=batch_size,
-            max_length=max_length,
-            device=target_device,
-        )
-        s_arr = edge_pred["s_uv"]
-        h_arr = edge_pred["h_uv"]
-        pred_labels = edge_pred["pred_label"]
-        if effective_edge_dim == 4:
-            r_arr = edge_pred.get("r_uv", np.zeros(len(edge_ids), dtype=np.float32))
-            c_arr = edge_pred.get("c_uv", np.full(len(edge_ids), 0.5, dtype=np.float32))
-            behavior_labels = edge_pred.get("behavior_label")
-        deep_idx = [
-            i for i, r in enumerate(edge_rows) if str(r["source_id"]) != edge_root_ids[i]
-        ]
-        for i in range(len(edge_ids)):
-            node_root_stance[edge_target_ids[i]] = max(-1.0, min(1.0, float(s_arr[i])))
-        if deep_idx:
-            deep_pred = encode_edges_with_cross_encoder(
-                [edge_root_texts[i] for i in deep_idx],
-                [reply_texts[i] for i in deep_idx],
-                cross_encoder=loaded_ckpt_model,
-                tokenizer=edge_tok,
-                batch_size=batch_size,
-                max_length=max_length,
-                device=target_device,
-            )
-            for pos, i in enumerate(deep_idx):
-                node_root_stance[edge_target_ids[i]] = max(
-                    -1.0, min(1.0, float(deep_pred["s_uv"][pos]))
-                )
     else:
         # Sequential teacher inference keeps peak VRAM minimal on 16GB GPUs
         if hostility_scorer is not None:

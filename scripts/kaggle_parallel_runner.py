@@ -46,6 +46,7 @@ from src.nlp.dual_edge_scorer import (
 from src.nlp.extract_features import extract_and_save_features
 from src.nlp.qwen_teacher import (
     EN_DEBERTA_MODEL_NAME,
+    QWEN_KAGGLE_4BIT_MODEL_ID,
     QWEN_TEACHER_MODEL_ID,
     QwenBehavioralTeacherScorer,
 )
@@ -509,8 +510,10 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             "--export-audit",
             "--distill",
         ]
-        if lang == "vi":
+        if lang == "vi" and use_legacy_bootstrap:
             scorer_cmd.append("--train-vihsd")
+        if not use_legacy_bootstrap:
+            scorer_cmd.extend(["--max-teacher-pairs", str(args.max_teacher_pairs)])
         if not args.skip_qlora and not use_legacy_bootstrap:
             scorer_cmd.append("--train-qwen-qlora")
         _run_cmd(scorer_cmd, cwd=work_dir)
@@ -671,8 +674,9 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, default=None)
     parser.add_argument("--processed-dir", type=Path, default=None)
     parser.add_argument("--vn-target-count", type=int, default=1500)
+    parser.add_argument("--max-teacher-pairs", type=int, default=6000)
     parser.add_argument("--before-epoch", type=int, default=None)
-    parser.add_argument("--teacher-model", type=str, default=QWEN_TEACHER_MODEL_ID)
+    parser.add_argument("--teacher-model", type=str, default=QWEN_KAGGLE_4BIT_MODEL_ID)
     parser.add_argument("--k-horizon", type=int, default=20)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--epochs-qlora", type=int, default=1)
