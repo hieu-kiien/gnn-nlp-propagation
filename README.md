@@ -40,6 +40,7 @@ Kiến trúc đề xuất **SBi-FAGAT** (*Stance-Guided Bidirectional Frequency-
 ├── configs/                    # Chứa tệp cấu hình thực nghiệm (giữ chỗ .gitkeep)
 ├── data/                       # Dữ liệu local (raw/interim/processed bị ignore trên Git)
 ├── docs/
+│   ├── project-management/     # Hồ sơ quản trị dự án, kiểm toán kỹ thuật & lộ trình P0-P4
 │   ├── huong_dan_chay_song_song_kaggle_t4x2.md # Hướng dẫn chia 2 người chạy Kaggle T4x2
 │   ├── huong_dan_nghien_cuu_de_hieu.md  # Giải thích đề tài, ký hiệu & code từ con số 0
 │   ├── literature_review.md    # Tổng quan công trình nền tảng đã xác minh
@@ -73,7 +74,7 @@ Kiến trúc đề xuất **SBi-FAGAT** (*Stance-Guided Bidirectional Frequency-
 
 ## 3. Hướng dẫn Cài đặt Nhanh
 
-Yêu cầu hệ thống: **Python 3.10+**, Git. Nếu chạy trên máy có GPU NVIDIA hoặc Colab/Kaggle, cài đặt PyTorch tương thích phiên bản CUDA trước khi cài các gói còn lại.
+Yêu cầu hệ thống: **Python 3.10+**, Git. Nếu chạy trên máy có GPU NVIDIA hoặc Colab/Kaggle, cài đặt PyTorch tương thích phiên bản CUDA trước khi cài các gói còn lại. Trên Windows, `tzdata` được tự động cài đặt cùng `requirements.txt` để hỗ trợ phân tích định dạng UTC của PyArrow.
 
 ### Windows (PowerShell)
 
@@ -83,7 +84,7 @@ cd gnn-nlp-propagation
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 pytest
 ```
 
@@ -108,11 +109,34 @@ pytest
 !pytest
 ```
 
-Khi chạy toàn bộ pipeline xử lý dữ liệu/NLP và thực nghiệm GNN (trên môi trường bash hỗ trợ GPU):
+### Chạy Pipeline Thực nghiệm (Profile v1 vs. Profile v2)
+
+Dự án cung cấp 2 chế độ thực nghiệm qua biến môi trường `PIPELINE_VERSION`:
 
 ```bash
+# 1. Profile v1 (Mặc định - Chuẩn bài báo, Frozen NLI Teacher, 2D edges [s_uv, c_uv]):
 bash scripts/run_phase2.sh
 bash run_all.sh
+
+# 2. Profile v2 (Mở rộng - Qwen QLoRA Teacher, 4D edges, 8D burst stats, MC Dropout):
+export PIPELINE_VERSION=v2
+bash scripts/run_phase2.sh
+bash run_all.sh
+```
+
+### Dự báo Luồng Trực tiếp (Live Thread Predictor)
+
+Để đảm bảo tính trung thực khoa học, `scripts/predict_live_thread.py` yêu cầu checkpoint đã huấn luyện khi phân tích bài đăng thật:
+
+```bash
+# Chạy demo offline CPU không cần checkpoint (<3 giây):
+python -m scripts.predict_live_thread --demo-offline
+
+# Dự báo luồng Reddit thật (bắt buộc truyền checkpoint):
+python -m scripts.predict_live_thread --url "https://reddit.com/r/VietNam/comments/..." --checkpoint checkpoints/best_sbi_fagat.pt
+
+# Chạy kiểm thử cấu trúc (dry-run) bằng trọng số ngẫu nhiên:
+python -m scripts.predict_live_thread --url "https://reddit.com/r/..." --allow-untrained
 ```
 
 ---

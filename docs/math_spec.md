@@ -12,7 +12,7 @@ Tài liệu này trình bày đánh giá thiết kế tổng quan (theo chuẩn 
 
 ### 0.2. Hiện trạng & Điểm mù Kỹ thuật
 - Các mô hình chuỗi thời gian/đồ thị lan truyền truyền thống (*DeepCas*, *GCN*, *GATv2*, *Bi-GCN*) bỏ qua thái độ đồng tình hay phản bác giữa từng cặp bình luận và dùng bộ lọc trung bình (low-pass) làm nhòa sự đối lập giữa hai phe.
-- Các thước đo phân cực cấu trúc (như *RWC*) đòi hỏi đồ thị lớn đã trưởng thành, bị suy biến khi chỉ quan sát một cây nhỏ có $\le 21$ nút. Chi tiết đối sánh 12 công trình nền tảng được tổng hợp tại [docs/literature_review.md](file:///d:/1.%20LapTrinh/4_AI/docs/literature_review.md).
+- Các thước đo phân cực cấu trúc (như *RWC* hay *Modularity*) đòi hỏi đồ thị mạng lưới bạn bè/người theo dõi quy mô lớn đã trưởng thành, bị suy biến khi chỉ quan sát một cây hội thoại nhỏ có $\le 21$ nút (mã nguồn vì vậy không tính RWC/Modularity mà triển khai hệ số lưỡng cực *Sarle's Bimodality Coefficient* và *Signed Newman Assortativity* trên cây). Chi tiết đối sánh 12 công trình nền tảng được tổng hợp tại [docs/literature_review.md](literature_review.md).
 
 ### 0.3. Phương pháp Đề xuất & Phương án Thay thế bị Bác bỏ
 - **Ý tưởng cốt lõi**: Kết hợp bộ mã hóa ngữ nghĩa đơn câu đóng băng trên từng nút, mô hình suy luận cặp câu (Cross-Encoder) để gán tín hiệu lập trường $s_{uv} \in [-1, 1]$ và độ gay gắt $h_{uv} \in [0, 1]$ cho từng cạnh trả lời, rồi đưa trực tiếp cặp tín hiệu này vào cổng thích ứng tần số có dấu $\gamma_{uv} \in (-1, 1)$ trên hai nhánh cây có hướng độc lập Top-Down ($\text{TD}$) và Bottom-Up ($\text{BU}$).
@@ -30,7 +30,7 @@ Tài liệu này trình bày đánh giá thiết kế tổng quan (theo chuẩn 
 - **Chi phí tính toán**: Giai đoạn NLP Phase 2 đạt đỉnh ~3.0–4.0 GB VRAM (~35–60 phút trên Colab T4 / ~1.5–3 giờ trên Kaggle P100, có cache `scored_pairs.json` và `crawl_checkpoint.jsonl`); giai đoạn GNN Phase 3 dùng $< 0.5$ GB VRAM (~45–75 phút cho cả benchmark 7 mô hình × 5 seeds, LOO và Ablation). Dung lượng lưu trữ `.pt` giảm ~326 MB trên PHEME nhờ bỏ tensor `node_features_770` dư thừa theo mặc định.
 - **Các Cổng Nghiệm thu Bắt buộc**:
   - **Gate 0 (Contract & Integrity)**: `pytest` xác nhận mọi cây có 1 gốc duy nhất, nhân quả UTC, zero topic overlap Train/Val/Test.
-  - **Gate 1 (ViHSD & Human Audit)**: `uitnlp/visobert` đạt Val Macro-F1 $\ge 0.60$ trên `UIT-ViHSD`; kiểm định mù 300 cặp $(u, v)$ đạt Cohen's $\kappa \ge 0.60$.
+  - **Gate 1 (ViHSD & Human Audit)**: `uitnlp/visobert` đạt Val Macro-F1 $\ge 0.60$ trên `UIT-ViHSD`; kiểm định mù 300 cặp $(u, v)$ bởi 2 người gán nhãn độc lập để tính Cohen's $\kappa$ (mục tiêu tham khảo nội bộ $\kappa \ge 0.60$, báo cáo minh bạch mức độ đồng thuận thực tế mà không tự gán ngưỡng chính thức nếu chưa phê duyệt).
   - **Gate 2 (Distillation & Anti-Cheating)**: Student khớp Teacher trên Val split với Pearson $r(s) \ge 0.70$, và `--sanity-check-shuffle` đẩy sai số tăng mạnh về ngưỡng ngẫu nhiên.
   - **Gate 3 (Statistical Benchmark)**: 5 hạt giống $\mathcal{S} = \{42, 100, 2024, 777, 999\}$ + LOO (PHEME), kiểm định `ttest_rel` và Paired Bootstrap theo mẫu Test so sánh công bằng với `EdgeGATv2` và `FAGCN`.
 
@@ -86,7 +86,7 @@ $$\mathcal{E}_K = \left\{(u, v) \in \mathcal{E}_{\text{full}} \;\middle|\; u \in
 ### 2.2. Tiên đề Chống Rò rỉ Dữ liệu (*Zero Data Leakage*)
 Để bảo đảm tính hợp lệ khoa học tuyệt đối trong dự đoán sớm:
 1. **Chia tập theo chủ đề/sự kiện (*Inductive Topic Split* & *Leave-One-Event-Out*)**: Tập dữ liệu các cây $\mathcal{D}$ được phân hoạch theo `topic_id`:
-   - Trên mạng xã hội Việt Nam (Arctic Shift `r/vozforums`, `r/VietNam`): `topic_id` gom nhóm các bài viết cùng tuần ISO (`YYYY-Www`) và từ khóa chủ đạo để tránh tách cùng sự kiện sang hai tập, chia 70/15/15 với $\mathcal{T}_{\text{train}} \cap \mathcal{T}_{\text{val}} = \mathcal{T}_{\text{train}} \cap \mathcal{T}_{\text{test}} = \mathcal{T}_{\text{val}} \cap \mathcal{T}_{\text{test}} = \emptyset$.
+   - Trên mạng xã hội Việt Nam (Arctic Shift `r/vozforums`, `r/VietNam`): `topic_id` gom nhóm các bài viết cùng tuần ISO (`YYYY-Www`) và từ khóa tiêu đề (gọi là *Heuristic Temporal-Keyword Grouped Inductive Split*). Giao thức này ngăn chặn rò rỉ thời gian giữa các chuỗi thảo luận diễn ra đồng thời trong tuần, nhưng không đảm bảo độc lập hoàn toàn về mặt ngữ nghĩa như các sự kiện tin tức lớn; chia 70/15/15 với $\mathcal{T}_{\text{train}} \cap \mathcal{T}_{\text{val}} = \mathcal{T}_{\text{train}} \cap \mathcal{T}_{\text{test}} = \mathcal{T}_{\text{val}} \cap \mathcal{T}_{\text{test}} = \emptyset$.
    - Trên PHEME (9 sự kiện lệch kích thước): hỗ trợ cả *Inductive Topic Split* cân bằng lớp (`64` hoán vị tất định) lẫn giao thức chuẩn **Leave-One-Event-Out (LOO)** qua từng sự kiện giữ lại.
 2. **Cô lập tuyệt đối quá trình chưng cất Cross-Encoder**: Việc chưng cất `DualHeadCrossEncoder` chỉ được phép nhìn thấy các cạnh thuộc $\mathcal{T}_{\text{train}}$ và kiểm thử dừng sớm trên $\mathcal{T}_{\text{val}}$; toàn bộ các chủ đề $\mathcal{T}_{\text{test}}$ bị cô lập hoàn toàn.
 3. **Cô lập đầu vào nhân quả ở chân trời $K$**: Toàn bộ vector đặc trưng nút (bao gồm $\tilde{\Delta t}_v$ chuẩn hóa theo hằng số cố định $T_{\text{ref}}$), ma trận kề, thuộc tính cạnh $\mathbf{a}_{uv}$ chỉ tính trên $\mathcal{G}_K$; các biến hậu nghiệm ($N_{\text{total}}$, $y_{\text{size}}$, $y_{\text{polar}}$) tuyệt đối chỉ dùng để tính Loss.

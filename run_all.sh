@@ -8,21 +8,32 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 UPFD_ROOT="${UPFD_ROOT:-data/raw/upfd}"
 MIN_TOTAL_REPLIES="${MIN_TOTAL_REPLIES:-21}"
 POLAR_MODE="${POLAR_MODE:-future_only}"
+PIPELINE_VERSION="${PIPELINE_VERSION:-v1}"
+
+EXTRA_FLAGS=()
+if [[ "${PIPELINE_VERSION}" == "v2" ]]; then
+    EXTRA_FLAGS+=("--v2" "--edge-dim" "4")
+    echo ">>> PIPELINE_VERSION=v2 selected: Enabling 4D edge attributes, 8D burst stats, and uncertainty head."
+else
+    echo ">>> PIPELINE_VERSION=v1 selected (default): Running 2D edge attributes foundation."
+fi
 
 echo "[1/4] Running full pytest verification suite..."
 "${PYTHON_BIN}" -m pytest tests/ -vv -o addopts=""
 
 run_dataset_suite() {
     local ddir="$1"
-    echo ">>> Benchmarking dataset: ${ddir} (min_total_replies=${MIN_TOTAL_REPLIES}, polar_mode=${POLAR_MODE})"
+    echo ">>> Benchmarking dataset: ${ddir} (min_total_replies=${MIN_TOTAL_REPLIES}, polar_mode=${POLAR_MODE}, pipeline=${PIPELINE_VERSION})"
     "${PYTHON_BIN}" -m scripts.run_experiments \
         --data-dir "${ddir}" \
         --min-total-replies "${MIN_TOTAL_REPLIES}" \
-        --polar-target-mode "${POLAR_MODE}"
+        --polar-target-mode "${POLAR_MODE}" \
+        "${EXTRA_FLAGS[@]}"
     "${PYTHON_BIN}" -m scripts.run_ablation \
         --data-dir "${ddir}" \
         --min-total-replies "${MIN_TOTAL_REPLIES}" \
-        --polar-target-mode "${POLAR_MODE}"
+        --polar-target-mode "${POLAR_MODE}" \
+        "${EXTRA_FLAGS[@]}"
 }
 
 echo "[2/4] Discovering processed datasets..."

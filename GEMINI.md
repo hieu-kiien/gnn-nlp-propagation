@@ -18,3 +18,10 @@ Kiến trúc đề xuất: **SBi-FAGAT** (Stance-Guided Bidirectional Frequency-
    - Bật Mixed Precision (`torch.cuda.amp`) khi tinh chỉnh Transformer.
    - Mọi thực nghiệm chính thức phải chạy lặp lại trên đúng 5 hạt giống ngẫu nhiên: `[42, 100, 2024, 777, 999]`.
 5. KIỂM THỬ TRƯỚC KHI BÀN GIAO (TEST-GATED): Sau khi viết bất kỳ module nào, bắt buộc phải viết file kiểm thử `pytest` tương ứng, tự chạy trên terminal, đọc log sửa sạch lỗi rồi mới được báo cáo hoàn thành và dừng chờ người dùng nghiệm thu.
+
+## 3. Quy chuẩn Kỹ thuật & Quyết định Kiến trúc (ADRs)
+- **Profile v1 vs. Profile v2:** Giữ Profile v1 làm mặc định ổn định (`PIPELINE_VERSION=v1`); Profile v2 (`PIPELINE_VERSION=v2` hoặc `--v2`) chỉ kích hoạt khi có chỉ định rõ ràng và cấu hình phần cứng phù hợp.
+- **Bảo mật danh tính & Giả danh hóa (Pseudonymization):** Dùng thuật ngữ "Pseudonymization" thay vì "Anonymization" khi băm định danh tác giả bằng SHA-256. Bắt buộc hỗ trợ salt qua `SBIF_HASH_SALT` và ghi cảnh báo nguy cơ tái nhận diện khi không có salt.
+- **Bản chất nhãn phân cực $y_{\text{polar}}$:** Nhãn $y_{\text{polar}}$ là nhãn bạc (silver-standard) suy biến từ phân phối lập trường do mô hình NLP sinh trên tương tác tương lai, không phải ground-truth do con người gắn nhãn.
+- **Bảo vệ suy luận trực tiếp (Live Predictor):** Chặn chạy suy luận trên bài đăng thật nếu thiếu checkpoint đã huấn luyện; chỉ cho phép dry-run khi người dùng truyền cờ `--allow-untrained` hoặc `--demo-offline`.
+- **Chia tập dữ liệu tiếng Việt:** Phân định rõ là *Heuristic Temporal-Keyword Grouped Inductive Split*, phản ánh trung thực bản chất gom cụm theo tuần và từ khóa tiêu đề thay vì sự kiện xã hội độc lập hoàn toàn.

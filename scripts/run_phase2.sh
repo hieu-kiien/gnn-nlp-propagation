@@ -11,6 +11,17 @@ RUN_VN="${RUN_VN:-1}"
 VN_TARGET_COUNT="${VN_TARGET_COUNT:-500}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 EPOCHS="${EPOCHS:-3}"
+PIPELINE_VERSION="${PIPELINE_VERSION:-v1}"
+
+TEACHER_BACKEND="legacy_nli"
+EDGE_DIM="2"
+if [[ "${PIPELINE_VERSION}" == "v2" ]]; then
+    TEACHER_BACKEND="qwen_qlora"
+    EDGE_DIM="4"
+    echo ">>> PIPELINE_VERSION=v2 selected: Using Qwen 4-bit teacher backend with 4D edge attributes."
+else
+    echo ">>> PIPELINE_VERSION=v1 selected (default): Using legacy NLI teacher backend with 2D edge attributes."
+fi
 
 if [[ "${RUN_PHEME}" -eq 1 ]]; then
     echo "[Phase 2 - PHEME 1/3] Downloading & parsing PHEME cascades..."
@@ -23,6 +34,8 @@ if [[ "${RUN_PHEME}" -eq 1 ]]; then
         --scored-cache-json data/interim/pheme/scored_pairs.json \
         --audit-csv data/interim/human_audit_en_300.csv \
         --pilot-csv data/interim/pilot_calibration_en_30.csv \
+        --teacher-backend "${TEACHER_BACKEND}" \
+        --edge-dim "${EDGE_DIM}" \
         --batch-size "${BATCH_SIZE}" \
         --score-only \
         --export-audit
@@ -33,6 +46,7 @@ if [[ "${RUN_PHEME}" -eq 1 ]]; then
         --interim-dir data/interim/pheme \
         --output-dir data/processed/pheme \
         --scored-cache-json data/interim/pheme/scored_pairs.json \
+        --edge-dim "${EDGE_DIM}" \
         --batch-size "$((BATCH_SIZE * 2))" \
         --k-horizon 20
 fi
@@ -53,6 +67,8 @@ if [[ "${RUN_VN}" -eq 1 ]]; then
         --scored-cache-json data/interim/vn/scored_pairs.json \
         --audit-csv data/interim/human_audit_300.csv \
         --pilot-csv data/interim/pilot_calibration_30.csv \
+        --teacher-backend "${TEACHER_BACKEND}" \
+        --edge-dim "${EDGE_DIM}" \
         --epochs "${EPOCHS}" \
         --batch-size "${BATCH_SIZE}" \
         --train-vihsd \
@@ -66,6 +82,7 @@ if [[ "${RUN_VN}" -eq 1 ]]; then
         --output-dir data/processed/vn \
         --scored-cache-json data/interim/vn/scored_pairs.json \
         --vihsd-dir checkpoints/visobert_vihsd \
+        --edge-dim "${EDGE_DIM}" \
         --batch-size "$((BATCH_SIZE * 2))" \
         --k-horizon 20
 fi

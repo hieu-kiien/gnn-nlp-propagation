@@ -289,6 +289,8 @@ def predict_live_cascade(
     cross_encoder_ckpt: Path | None = None,
     gnn_ckpt: Path | None = None,
     lang: str = "vi",
+    allow_untrained: bool = False,
+    is_demo: bool = False,
 ) -> dict[str, Any]:
     """Build cascade graph, score early behavior, run SBiFAGAT, and emit live forecast report."""
     built = build_vn_cascade_from_thread(
@@ -429,9 +431,17 @@ def predict_live_cascade(
         edge_pairs=kept_pairs,
     )
 
-    # Load GNN checkpoint if present; otherwise build calibrated untuned architecture for structural inspection
-    if gnn_ckpt is not None and Path(gnn_ckpt).exists():
-        payload = torch.load(Path(gnn_ckpt), map_location="cpu", weights_only=False)
+    # Load GNN checkpoint if present; otherwise check authorization before untuned inspection
+    if gnn_ckpt is not None:
+        gnn_path = Path(gnn_ckpt)
+        if not gnn_path.is_file():
+            raise FileNotFoundError(f"Checkpoint GNN không tồn tại tại đường dẫn: {gnn_path}")
+        try:
+            payload = torch.load(gnn_path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            raise ValueError(f"Tệp checkpoint GNN tại '{gnn_path}' bị lỗi hoặc không thể đọc: {exc}") from exc
+        if not isinstance(payload, Mapping) or "model_state_dict" not in payload:
+            raise ValueError(f"Checkpoint GNN tại '{gnn_path}' thiếu trường 'model_state_dict'.")
         cfg = payload.get("config", {})
         gnn_model = SBiFAGAT(
             in_dim=int(payload.get("in_dim", TOTAL_NODE_FEATURE_DIM)),
@@ -446,6 +456,14 @@ def predict_live_cascade(
         gnn_model.load_state_dict(payload["model_state_dict"])
         checkpoint_loaded = True
     else:
+        is_demo_post = bool(is_demo or str(post.get("id", "")).startswith("demo_"))
+        if not allow_untrained and not is_demo_post:
+            raise RuntimeError(
+                "Không tìm thấy checkpoint mô hình GNN đã huấn luyện (--gnn-ckpt). "
+                "Để ngăn ngừa kết quả ngẫu nhiên chưa huấn luyện bị hiểu nhầm là dự báo khoa học thực tế, "
+                "hãy cung cấp đường dẫn checkpoint hợp lệ qua --gnn-ckpt, hoặc truyền cờ --allow-untrained "
+                "(hoặc dùng --demo-offline) nếu bạn chỉ muốn chạy thử nghiệm kiểm tra cấu trúc pipeline."
+            )
         gnn_model = SBiFAGAT(
             in_dim=TOTAL_NODE_FEATURE_DIM,
             hidden_dim=128,
@@ -521,7 +539,7 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
         "=" * 78,
         f"Bai goc      : {result['root_title']}",
         f"Cua so quan sat (V_K): {result['k_observed']} binh luan dau tien",
-        f"Trang thai GNN       : {'Da nap checkpoint huan luyen' if result['checkpoint_loaded'] else 'Che do khoi dong nhanh (chua nap checkpoint)'}",
+        f"Trang thai GNN       : {'Da nap checkpoint huan luyen' if result['checkpoint_loaded'] else 'CHE DO KIEM THU CAU TRUC (CHUA NAP CHECKPOINT - KHONG CO GIA TRI DU BAO)'}",
         "",
         "[1] PHAN LOAI 5 NHOM HANH VI TRONG 20 BINH LUAN DAU:",
     ]
@@ -530,6 +548,11 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
         lines.append(f"  - {BEHAVIOR_LABEL_VI.get(lbl, lbl):38s}: {cnt} binh luan")
 
     bm = result["early_burst_metrics"]
+    sec3_header = (
+        "[3] DU BAO TUONG LAI & DO TU TIN:"
+        if result["checkpoint_loaded"]
+        else "[3] DU BAO TUONG LAI: [CANH BAO: CHUA NAP CHECKPOINT - CAC CHI SO BEN DUOI LA NGAU NHIEN]"
+    )
     lines.extend(
         [
             "",
@@ -538,7 +561,7 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
             f"  - Ty le cau co noi dung thuc chat          : {bm['substantive_text_ratio']:.1%}",
             f"  - Chi so kich dong 1 chieu                 : {bm['one_sided_hostility_index']:.3f}",
             "",
-            "[3] DU BAO TUONG LAI & DO TU TIN:",
+            sec3_header,
             f"  - Quy mo binh luan cuoi ky du kien         : ~{result['predicted_total_replies']:.1f} binh luan",
             f"  - Chi so phan cuc du kien [0..1]           : {result['predicted_polarization_score']:.4f}",
             f"  - Danh gia cuc dien                        : {result['predicted_regime']}",
@@ -579,6 +602,11 @@ def main() -> None:
     parser.add_argument("--thread-id", type=str, default=None)
     parser.add_argument("--input-json", type=Path, default=None)
     parser.add_argument("--demo-offline", action="store_true")
+    parser.add_argument(
+        "--allow-untrained",
+        action="store_true",
+        help="Cho phép chạy với trọng số ngẫu nhiên chưa nạp checkpoint (chỉ phục vụ kiểm tra cấu trúc kỹ thuật).",
+    )
     parser.add_argument("--cross-encoder-ckpt", type=Path, default=None)
     parser.add_argument("--gnn-ckpt", type=Path, default=None)
     parser.add_argument("--k-horizon", type=int, default=20)
@@ -603,6 +631,8 @@ def main() -> None:
         cross_encoder_ckpt=args.cross_encoder_ckpt,
         gnn_ckpt=args.gnn_ckpt,
         lang=args.lang,
+        allow_untrained=args.allow_untrained,
+        is_demo=args.demo_offline,
     )
     print(_format_report_vi(res))
     if args.output_json is not None:

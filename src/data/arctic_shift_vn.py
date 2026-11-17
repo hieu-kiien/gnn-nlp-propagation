@@ -18,6 +18,7 @@ import re
 import sys
 import time
 import unicodedata
+import warnings
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,15 +50,49 @@ _VN_DIACRITIC_RE = re.compile(
 )
 
 
-def hash_author_sha256(author: str | None) -> str | None:
-    """Anonymize an author handle immediately with SHA-256 (returns None for deleted/bots)."""
+_SALT_WARNING_EMITTED = False
+
+
+def hash_author_sha256(author: str | None, salt: str | None = None) -> str | None:
+    """Pseudonymize an author handle with SHA-256 (returns None for deleted/bots).
+
+    Note: SHA-256 without a secret salt provides pseudonymization (reversible via
+    dictionary / rainbow-table attacks for known usernames) rather than full anonymization.
+    If `salt` is not provided, reads `os.environ.get('SBIF_HASH_SALT')` or
+    `data/interim/.author_hash_salt.secret` if present.
+    """
     if author is None:
         return None
     cleaned = author.strip()
     if not cleaned or cleaned.lower() in {"[deleted]", "[removed]", "automoderator"}:
         return None
-    salt = os.environ.get("SBIF_HASH_SALT", "")
-    payload = f"{salt}{cleaned}" if salt else cleaned
+
+    effective_salt = salt
+    if effective_salt is None:
+        effective_salt = os.environ.get("SBIF_HASH_SALT")
+    if effective_salt is None:
+        secret_file = Path("data/interim/.author_hash_salt.secret")
+        if secret_file.is_file():
+            try:
+                effective_salt = secret_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                effective_salt = None
+
+    if not effective_salt:
+        global _SALT_WARNING_EMITTED
+        if not _SALT_WARNING_EMITTED:
+            warnings.warn(
+                "SBIF_HASH_SALT is unset or empty: Author IDs are pseudonymized using unsalted SHA-256, "
+                "which is vulnerable to dictionary / rainbow-table re-identification. "
+                "Set SBIF_HASH_SALT in your environment or data/interim/.author_hash_salt.secret for salted pseudonymization.",
+                UserWarning,
+                stacklevel=2,
+            )
+            _SALT_WARNING_EMITTED = True
+        payload = cleaned
+    else:
+        payload = f"{effective_salt}{cleaned}"
+
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
