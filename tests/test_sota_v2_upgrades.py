@@ -16,6 +16,7 @@ import json
 import math
 import subprocess
 import sys
+import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -82,9 +83,14 @@ class _ToyDigitTokenizer:
         self._digit_map = {"1": 10, "2": 11, "3": 12, "4": 13, "5": 14}
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        if text in self._digit_map:
-            return [self._digit_map[text]]
-        return [20 + (abs(hash(tok)) % 15) for tok in str(text).split()] or [2]
+        if text.strip() in self._digit_map:
+            return [self._digit_map[text.strip()]]
+        return [
+            self._digit_map[tok]
+            if tok in self._digit_map
+            else (20 + (zlib.crc32(tok.encode("utf-8")) % 12))
+            for tok in str(text).split()
+        ] or [2]
 
     def apply_chat_template(
         self,
@@ -93,7 +99,7 @@ class _ToyDigitTokenizer:
         add_generation_prompt: bool = False,
         enable_thinking: bool = False,
     ) -> str:
-        text = " | ".join(f"{m['role']}:{m['content']}" for m in messages)
+        text = " | ".join(f"{m['role']}: {m['content']}" for m in messages)
         if add_generation_prompt:
             text += " | assistant:"
         return text
@@ -126,7 +132,7 @@ class _ToyCausalLogitLM(nn.Module):
     def __init__(self, target_digit_idx: int = 2) -> None:
         super().__init__()
         self.embed = nn.Embedding(64, 8)
-        self.proj = nn.Linear(8, 32)
+        self.proj = nn.Linear(8, 64)
         self.target_digit_idx = target_digit_idx  # 0..4 maps to '1'..'5' (token 10..14)
         self.seen_labels: list[torch.Tensor] = []
 
