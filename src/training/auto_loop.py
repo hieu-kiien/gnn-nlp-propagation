@@ -139,8 +139,13 @@ def run_self_auditing_validation_loop(
         }
         candidate_results.append(entry)
 
-        cur_loss = float(val_metrics["loss"])
-        if best_entry is None or cur_loss < float(best_entry["val_metrics"]["loss"]):
+        cur_loss = float(val_metrics.get("task_loss", val_metrics["loss"]))
+        best_score = (
+            float(best_entry["val_metrics"].get("task_loss", best_entry["val_metrics"]["loss"]))
+            if best_entry is not None
+            else float("inf")
+        )
+        if best_entry is None or cur_loss < best_score:
             best_entry = entry
             best_model = model
 

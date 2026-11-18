@@ -20,13 +20,14 @@ def compute_multitask_loss(
     alpha_polar: float = 1.0,
     alpha_rumor: float = 1.0,
     lambda_uncertainty: float = 0.0,
+    beta_nll: float = 0.5,
     huber_delta: float | None = None,
     huber_delta_size: float = 1.0,
     huber_delta_polar: float = 0.15,
     class_weights: Tensor | None = None,
     classification_only: bool = False,
 ) -> Tensor:
-    """Compute multi-task Huber + Cross-Entropy loss (plus optional uncertainty NLL)."""
+    """Compute multi-task Huber + Cross-Entropy loss (plus optional beta-NLL uncertainty)."""
     logits = outputs["rumor_logits"]
     ce_weight = (
         class_weights.to(device=logits.device, dtype=logits.dtype)
@@ -54,10 +55,15 @@ def compute_multitask_loss(
     total_loss = alpha_size * loss_size + alpha_polar * loss_polar
 
     if lambda_uncertainty > 0.0 and "size_logvar" in outputs and "polar_logvar" in outputs:
+        # Seitzer et al. (ICLR 2022) beta-NLL with detached residuals so uncertainty cannot corrupt means
         s_lv = outputs["size_logvar"].view(-1).clamp(-6.0, 3.0)
         p_lv = outputs["polar_logvar"].view(-1).clamp(-6.0, 3.0)
-        nll_size = 0.5 * (torch.exp(-s_lv) * (y_size_pred - y_size) ** 2 + s_lv)
-        nll_polar = 0.5 * (torch.exp(-p_lv) * (y_polar_pred - y_polar) ** 2 + p_lv)
+        err_size_sq = (y_size_pred.detach() - y_size) ** 2
+        err_polar_sq = (y_polar_pred.detach() - y_polar) ** 2
+        w_s = torch.exp(float(beta_nll) * s_lv).detach() if beta_nll > 0.0 else 1.0
+        w_p = torch.exp(float(beta_nll) * p_lv).detach() if beta_nll > 0.0 else 1.0
+        nll_size = 0.5 * w_s * (torch.exp(-s_lv) * err_size_sq + s_lv)
+        nll_polar = 0.5 * w_p * (torch.exp(-p_lv) * err_polar_sq + p_lv)
         total_loss = total_loss + float(lambda_uncertainty) * (nll_size.mean() + nll_polar.mean())
 
     y_rumor = getattr(batch, "y_rumor", None)
@@ -95,6 +101,7 @@ def evaluate_predictions(
     y_polar_pred: np.ndarray,
     y_rumor_true: np.ndarray | None = None,
     rumor_logits: np.ndarray | None = None,
+    y_bimodality_true: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Compute size (MSLE/RMSE/MAE/R^2/Spearman), polarization (RMSE/MAE/R^2/Pearson/Spearman), and rumor metrics.
 
@@ -166,7 +173,7 @@ def evaluate_predictions(
                 except ValueError:
                     auc_roc = float("nan")
 
-    return {
+    out: dict[str, float] = {
         "msle": msle,
         "mae": mae,
         "rmse_size": rmse_size,
@@ -181,3 +188,8 @@ def evaluate_predictions(
         "accuracy": accuracy,
         "auc_roc": auc_roc,
     }
+    if y_bimodality_true is not None:
+        bc_arr = np.asarray(y_bimodality_true, dtype=np.float64).reshape(-1)
+        if bc_arr.size >= 2 and bc_arr.size == y_polar_true.size:
+            out["construct_corr_bc"] = _safe_spearman(y_polar_true, bc_arr)
+    return out

@@ -10,7 +10,12 @@ from pathlib import Path
 import torch
 from torch_geometric.loader import DataLoader
 
-from src.data.pyg_dataset import EarlyCascadeDataset, SUPPORTED_HORIZONS, TOTAL_NODE_FEATURE_DIM
+from src.data.pyg_dataset import (
+    DEFAULT_FORECAST_MIN_REPLIES,
+    EarlyCascadeDataset,
+    SUPPORTED_HORIZONS,
+    TOTAL_NODE_FEATURE_DIM,
+)
 from src.data.schema import load_cascade_parquet
 from src.models.baselines import BiGCN, StandardGCN
 from src.models.sbi_fagat import SBiFAGAT
@@ -33,14 +38,17 @@ def main() -> None:
     parser.add_argument("--horizons", type=int, nargs="+", default=list(SUPPORTED_HORIZONS))
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--edge-dim", type=int, choices=[2, 4], default=None)
+    parser.add_argument("--eps", type=float, default=0.5)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--v2", action="store_true")
     parser.add_argument("--use-cascade-stats", action="store_true")
     parser.add_argument("--predict-uncertainty", action="store_true")
+    parser.add_argument("--lambda-uncertainty", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--min-total-replies", type=int, default=21)
+    parser.add_argument("--min-total-replies", type=int, default=DEFAULT_FORECAST_MIN_REPLIES)
     parser.add_argument(
         "--polar-target-mode", choices=["full", "future_only"], default="future_only"
     )
@@ -80,7 +88,11 @@ def main() -> None:
         edge_dim = 2
     use_stats = bool(args.use_cascade_stats or args.v2)
     use_unc = bool(args.predict_uncertainty or args.v2)
-    lam_unc = 0.05 if use_unc else 0.0
+    lam_unc = (
+        float(args.lambda_uncertainty)
+        if args.lambda_uncertainty is not None
+        else (0.05 if use_unc else 0.0)
+    )
     num_cls = 2 if args.label_scheme == "binary" else 4
 
     common_ds_kwargs = {
@@ -110,6 +122,8 @@ def main() -> None:
             hidden_dim=h_dim,
             edge_dim=edge_dim,
             num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
         ),
@@ -118,6 +132,8 @@ def main() -> None:
             hidden_dim=h_dim,
             edge_dim=edge_dim,
             num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
             ablate_stance=True,
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
@@ -127,6 +143,8 @@ def main() -> None:
             hidden_dim=h_dim,
             edge_dim=edge_dim,
             num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
             ablate_hostility=True,
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
@@ -136,6 +154,8 @@ def main() -> None:
             hidden_dim=h_dim,
             edge_dim=edge_dim,
             num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
             ablate_stance=True,
             ablate_hostility=True,
             ablate_irrationality=(edge_dim == 4),
@@ -148,6 +168,8 @@ def main() -> None:
             hidden_dim=h_dim,
             edge_dim=edge_dim,
             num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
             gate_mode="sigmoid",
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
@@ -157,6 +179,8 @@ def main() -> None:
             hidden_dim=h_dim,
             edge_dim=edge_dim,
             num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
             use_bottom_up=False,
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
@@ -166,6 +190,8 @@ def main() -> None:
             hidden_dim=h_dim,
             edge_dim=edge_dim,
             num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
             readout_mode="mean",
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
@@ -177,6 +203,8 @@ def main() -> None:
             hidden_dim=h_dim,
             edge_dim=edge_dim,
             num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
             ablate_irrationality=True,
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
@@ -186,6 +214,8 @@ def main() -> None:
             hidden_dim=h_dim,
             edge_dim=edge_dim,
             num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
             ablate_constructive=True,
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
@@ -196,6 +226,8 @@ def main() -> None:
             hidden_dim=h_dim,
             edge_dim=edge_dim,
             num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
             use_cascade_stats=False,
             predict_uncertainty=use_unc,
         )
@@ -259,13 +291,27 @@ def main() -> None:
 
         k_res = run_multi_seed_benchmark(
             {
-                "StandardGCN": lambda: StandardGCN(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls),
-                "BiGCN": lambda: BiGCN(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls),
+                "StandardGCN": lambda: StandardGCN(
+                    in_dim=in_dim,
+                    hidden_dim=h_dim,
+                    num_rumor_classes=num_cls,
+                    dropout=args.dropout,
+                    use_cascade_stats=use_stats,
+                ),
+                "BiGCN": lambda: BiGCN(
+                    in_dim=in_dim,
+                    hidden_dim=h_dim,
+                    num_rumor_classes=num_cls,
+                    dropout=args.dropout,
+                    use_cascade_stats=use_stats,
+                ),
                 "SBiFAGAT": lambda: SBiFAGAT(
                     in_dim=in_dim,
                     hidden_dim=h_dim,
                     edge_dim=edge_dim,
                     num_rumor_classes=num_cls,
+                    eps=args.eps,
+                    dropout=args.dropout,
                     use_cascade_stats=use_stats,
                     predict_uncertainty=use_unc,
                 ),

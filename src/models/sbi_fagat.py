@@ -27,46 +27,11 @@ from torch_geometric.nn import MessagePassing, global_mean_pool
 from torch_geometric.utils import degree, softmax
 
 from src.models.baselines import (
+    LatentConflictMLP,
     MultiTaskHead,
     broadcast_root_features,
     resolve_root_indices,
 )
-
-
-class LatentConflictMLP(nn.Module):
-    """Infer 2D `[s_hat, h_hat]` or 4D `[s_hat, h_hat, r_hat, c_hat]` latent edge signals.
-
-    Used on benchmarks like UPFD where raw reply text is unavailable and only
-    node embeddings (e.g., 768-d BERT) are provided.
-    """
-
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int = 128,
-        edge_dim: int = 2,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.edge_dim = int(edge_dim)
-        self.net = nn.Sequential(
-            nn.Linear(3 * in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, self.edge_dim),
-        )
-
-    def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
-        if edge_index.numel() == 0:
-            return x.new_zeros((0, self.edge_dim))
-        src, dst = edge_index[0], edge_index[1]
-        x_u, x_v = x[src], x[dst]
-        pair_feat = torch.cat([x_u, x_v, x_u - x_v], dim=-1)
-        raw = self.net(pair_feat)
-        if self.edge_dim == 1:
-            return torch.tanh(raw[:, 0:1])
-        return torch.cat([torch.tanh(raw[:, 0:1]), torch.sigmoid(raw[:, 1:])], dim=-1)
 
 
 class StanceGuidedFAConv(MessagePassing):
@@ -103,7 +68,16 @@ class StanceGuidedFAConv(MessagePassing):
         nn.init.zeros_(self.lin_root.bias)
         node_att_dim = 2 * self.hidden_dim
         nn.init.xavier_uniform_(self.att[:, :node_att_dim])
-        if self.edge_dim > 0:
+        if self.edge_dim == 4:
+            with torch.no_grad():
+                self.att[:, node_att_dim:].copy_(
+                    torch.tensor(
+                        [[0.5, -0.25, -0.25, 0.25]],
+                        dtype=self.att.dtype,
+                        device=self.att.device,
+                    )
+                )
+        elif self.edge_dim > 0:
             edge_scale = 1.0 / math.sqrt(float(self.edge_dim))
             nn.init.constant_(self.att[:, node_att_dim:], edge_scale)
 
@@ -123,7 +97,8 @@ class StanceGuidedFAConv(MessagePassing):
             deg_out = degree(src, num_nodes=num_nodes, dtype=z.dtype)
             deg_in = degree(dst, num_nodes=num_nodes, dtype=z.dtype)
             edge_norm = ((deg_out[src] + 1.0) * (deg_in[dst] + 1.0)).pow(-0.5)
-            cat_feat = torch.cat([z[src], z[dst], edge_attr], dim=-1)
+            z_gate = F.layer_norm(z, (self.hidden_dim,))
+            cat_feat = torch.cat([z_gate[src], z_gate[dst], edge_attr], dim=-1)
             score = (cat_feat * self.att).sum(dim=-1)
             gamma = torch.tanh(score) if self.gate_mode == "tanh" else torch.sigmoid(score)
             edge_weight = edge_norm * gamma
@@ -137,8 +112,9 @@ class StanceGuidedFAConv(MessagePassing):
             m = torch.zeros_like(z)
             gamma = z.new_zeros((0,))
 
-        out = self.norm(F.elu(self.eps * h_0 + m + self.lin_root(h_root_broadcast)))
-        out = self.dropout(out)
+        raw = 0.5 * h + self.eps * h_0 + m + self.lin_root(h_root_broadcast)
+        sym_act = raw + 0.2 * torch.tanh(raw)
+        out = self.dropout(self.norm(sym_act))
         return out, gamma
 
     def message(

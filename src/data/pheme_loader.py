@@ -29,6 +29,7 @@ from src.data.schema import (
     build_nodes_table,
     save_cascade_parquet,
 )
+from src.utils.text import normalize_nfc
 
 FIGSHARE_ARTICLE_API = "https://api.figshare.com/v2/articles/6392078"
 PHEME_ARCHIVE_FILENAME = "PHEME_veracity.tar.bz2"
@@ -41,7 +42,7 @@ def _sha256_hex(value: str) -> str:
 
 
 def _normalize_text_nfc(text: str) -> str:
-    return unicodedata.normalize("NFC", text).replace("\x00", "").strip()
+    return normalize_nfc(text)
 
 
 def compute_hashes(file_path: Path) -> tuple[str, str]:

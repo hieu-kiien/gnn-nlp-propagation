@@ -22,17 +22,21 @@ Tài liệu này trình bày đánh giá thiết kế tổng quan (theo chuẩn 
   3. *Chỉ dùng teacher NLI không tách kiểm soát chưng cất*: Việc giữ `DualHeadCrossEncoder` chưng cất cô lập chỉ trên $\mathcal{T}_{\text{train}}$ (tuyệt đối không chạm $\mathcal{T}_{\text{test}}$) cho phép kiểm định tổng quát hóa lẫn chạy kiểm chứng phản chứng `--sanity-check-shuffle`, trong khi vectơ nút $\mathbf{e}_v$ luôn lấy từ backbone đơn câu đóng băng gốc.
 
 ### 0.4. Rủi ro, Giới hạn & Biện pháp Kiểm soát
-1. **Tuần hoàn nhãn $y_{\text{polar}}$ và suy biến cây nhỏ $N_{\text{total}} \le K$**: Nếu cho các cây $\le 20$ bình luận vào bài toán dự đoán ở ngưỡng $K=20$, $\mathcal{G}_K \equiv \mathcal{G}_{\text{full}}$. Do đó cấu hình thực nghiệm chính thức lọc `min_total_replies >= 21` ($N_{\text{total}} > K$) và hỗ trợ chế độ `polar_target_mode = "future_only"` tính $y_{\text{polar}}$ thuần túy trên các tương tác *tương lai* $\mathcal{E}_{\text{full}} \setminus \mathcal{E}_K$, công bố minh bạch đây là *silver-standard Cross-Encoder polarization* kèm kiểm định tay 300 cặp bởi 2 người gán nhãn (Cohen's $\kappa$).
-2. **Độ lệch miền ngôn ngữ & nhiễu FP16**: Tiếng lóng/châm biếm mạng xã hội Việt Nam làm suy giảm NLI đa ngữ (giảm thiểu nhờ `uitnlp/visobert` chuẩn hóa Unicode NFC giữ emoji và đối chiếu Cohen's $\kappa$); `mDeBERTa-v3` có nguy cơ tràn FP16 trên GPU đời cũ (khắc phục bằng cơ chế phát hiện non-finite logits và fallback tự động sang FP32 từng batch).
-3. **Ẩn danh PII & Bot-burst**: Mọi mã tác giả `author` được băm một chiều SHA-256 ngay khi thu thập; ngưỡng độ dài chuỗi cố định `max_length = 256`.
+1. **Tuần hoàn nhãn $y_{\text{polar}}$, suy biến phương sai tại $N=21$ và lệch phân hoạch giữa Distillation–GNN**:
+   - Nếu lấy `min_total_replies = 21` với $K=20$ và `polar_target_mode="future_only"`, mỗi cây biên $N_{\text{total}}=21$ chỉ còn đúng **1 bình luận tương lai**, làm $\sigma_{\tilde{s}}^2 = 0$ và ép `4 p_+ p_- = 0` giả tạo. Hệ thống nay mặc định `DEFAULT_FORECAST_MIN_REPLIES = 25` ($\ge 5$ bình luận tương lai) kèm phân hoạch chủ đề **chuẩn hóa duy nhất** `topic_splits.json` dùng chung từ `dual_edge_scorer.py` tới `EarlyCascadeDataset` (chặn tuyệt đối rò rỉ khi có nhiều cascade cùng `topic_id` qua ngưỡng lọc khác nhau).
+   - Trên dữ liệu Việt Nam, `cluster_vn_cascade_topics` gộp các chủ đề liên thông theo tương đồng cosin TF-IDF ($> 0.55$) trong cửa sổ trượt 14 ngày. Trong giao thức LOO trên PHEME, `edge_source="teacher"` cô lập Student Cross-Encoder khỏi mọi fold giữ lại.
+2. **Chất lượng nhãn Teacher 4D & Tránh sập phương sai dị biến (*heteroscedastic NLL*)**:
+   - Teacher `Qwen/Qwen3.8-27B` QLoRA (hoặc `Qwen/Qwen3-8B` trên GPU 16GB đơn) dùng **G-Eval Single-Pass Logit Scoring** (`scoring_mode="logit"` đọc logit 1 lượt trên chữ số `1..5` + kỳ vọng prototype `[s_uv, h_uv, r_uv, c_uv]`) giúp **0% lỗi JSON** và tăng tốc 10–20$\times$.
+   - Đầu bất định dùng **$\beta$-NLL** ($\beta=0.5$, Seitzer et al., ICLR 2022) với phần dư tách gradient `detach()`, biên log-phương sai mượt `-6 + 9*sigmoid(...)`, và điểm tự tin $\exp(-\hat{\sigma}_{\text{polar}} / 0.25)$ trong $(0, 1]$ kèm dừng sớm thuần `task_loss`.
+3. **Ẩn danh PII & Công bằng 8 mô hình**: Mọi mã tác giả `author` được băm SHA-256 trước khi xuất; đặc trưng tốc độ `cascade_stats` (8 chiều) được mở công bằng cho **cả 8 mô hình** khi bật `--v2`.
 
-### 0.5. Chi phí Hạ tầng (16GB VRAM), Lộ trình & Cổng Nghiệm thu (Exam Gates)
-- **Chi phí tính toán**: Giai đoạn NLP Phase 2 đạt đỉnh ~3.0–4.0 GB VRAM (~35–60 phút trên Colab T4 / ~1.5–3 giờ trên Kaggle P100, có cache `scored_pairs.json` và `crawl_checkpoint.jsonl`); giai đoạn GNN Phase 3 dùng $< 0.5$ GB VRAM (~45–75 phút cho cả benchmark 7 mô hình × 5 seeds, LOO và Ablation). Dung lượng lưu trữ `.pt` giảm ~326 MB trên PHEME nhờ bỏ tensor `node_features_770` dư thừa theo mặc định.
+### 0.5. Chi phí Hạ tầng (16GB VRAM / Kaggle `T4 x 2`), Lộ trình & Cổng Nghiệm thu
+- **Chi phí tính toán**: `Qwen/Qwen3.8-27B` NF4 chạy 4-bit phân mảnh tự động trên Kaggle `T4 x 2` với QLoRA có mặt nạ prompt (`labels[:prompt_len] = -100`) và G-Eval 1-pass logit (~15–25 phút thay vì 12–20 giờ sinh chuỗi 96 token); Student 4D `ViSoBERT`/`DeBERTa-v3-base` + `node_embeddings` lưu sẵn xuống `.pt` nên toàn bộ pha GNN Phase 3 chỉ dùng $< 0.5$ GB VRAM.
 - **Các Cổng Nghiệm thu Bắt buộc**:
-  - **Gate 0 (Contract & Integrity)**: `pytest` xác nhận mọi cây có 1 gốc duy nhất, nhân quả UTC, zero topic overlap Train/Val/Test.
-  - **Gate 1 (ViHSD & Human Audit)**: `uitnlp/visobert` đạt Val Macro-F1 $\ge 0.60$ trên `UIT-ViHSD`; kiểm định mù 300 cặp $(u, v)$ bởi 2 người gán nhãn độc lập để tính Cohen's $\kappa$ (mục tiêu tham khảo nội bộ $\kappa \ge 0.60$, báo cáo minh bạch mức độ đồng thuận thực tế mà không tự gán ngưỡng chính thức nếu chưa phê duyệt).
-  - **Gate 2 (Distillation & Anti-Cheating)**: Student khớp Teacher trên Val split với Pearson $r(s) \ge 0.70$, và `--sanity-check-shuffle` đẩy sai số tăng mạnh về ngưỡng ngẫu nhiên.
-  - **Gate 3 (Statistical Benchmark)**: 5 hạt giống $\mathcal{S} = \{42, 100, 2024, 777, 999\}$ + LOO (PHEME), kiểm định `ttest_rel` và Paired Bootstrap theo mẫu Test so sánh công bằng với `EdgeGATv2` và `FAGCN`.
+  - **Gate 0 (Contract & Split Parity)**: `pytest` xác nhận mọi cây có 1 gốc duy nhất, nhân quả UTC, `topic_splits.json` đồng nhất giữa Teacher distillation và GNN.
+  - **Gate 1 (ViHSD & Human Audit)**: kiểm định mù 300 cặp $(u, v)$ cả stance 3 lớp lẫn `behavior` 5 lớp (`compute_kappa.py`).
+  - **Gate 2 (Distillation & Anti-Cheating)**: `fallback_rate <= max_fallback_rate`, Student khớp Teacher 4D trên Val split và `--sanity-check-shuffle` đẩy sai số về ngẫu nhiên.
+  - **Gate 3 (Statistical Benchmark)**: 5 hạt giống $\mathcal{S} = \{42, 100, 2024, 777, 999\}$ với `alpha_polar = 4.0`, `EarlyStopping` theo `task_loss`, LOO cô lập `edge_source="teacher"`, kiểm định `ttest_rel` + Paired Bootstrap **từng seed rồi lấy trung bình trên $S$ seeds** kèm điều chỉnh Holm-Bonferroni.
 
 ---
 
@@ -75,7 +79,7 @@ Gọi $N_{\text{total}} = |\mathcal{V}_{\text{full}}| - 1$ là tổng số tươ
 
 $$t_{v_1} \le t_{v_2} \le \dots \le t_{v_{N_{\text{total}}}}$$
 
-Với ngưỡng quan sát sớm $K \in \{10, 20, 30, 50\}$ (mặc định $K = 20$) và bộ lọc dự báo sớm chuẩn $N_{\text{total}} \ge \texttt{min\_total\_replies} = 21 > K$ (bảo đảm phần tương lai $\mathcal{V}_{\text{full}} \setminus \mathcal{V}_K \neq \emptyset$), cây lan truyền sớm $\mathcal{G}_K = (\mathcal{V}_K, \mathcal{E}_K)$ được trích xuất theo đúng thứ tự thời gian:
+Với ngưỡng quan sát sớm $K \in \{10, 20, 30, 50\}$ (mặc định $K = 20$) và bộ lọc dự báo sớm chuẩn $N_{\text{total}} \ge \texttt{min\_total\_replies} = 25$ (bảo đảm $\ge 5$ bình luận tương lai ngoài $K=20$ để tránh suy biến phương sai tại $N=21$), cây lan truyền sớm $\mathcal{G}_K = (\mathcal{V}_K, \mathcal{E}_K)$ được trích xuất theo đúng thứ tự thời gian:
 
 $$\mathcal{V}_K = \{r\} \cup \left\{v_1, v_2, \dots, v_{\min(K, N_{\text{total}})}\right\}$$
 
@@ -85,45 +89,25 @@ $$\mathcal{E}_K = \left\{(u, v) \in \mathcal{E}_{\text{full}} \;\middle|\; u \in
 
 ### 2.2. Tiên đề Chống Rò rỉ Dữ liệu (*Zero Data Leakage*)
 Để bảo đảm tính hợp lệ khoa học tuyệt đối trong dự đoán sớm:
-1. **Chia tập theo chủ đề/sự kiện (*Inductive Topic Split* & *Leave-One-Event-Out*)**: Tập dữ liệu các cây $\mathcal{D}$ được phân hoạch theo `topic_id`:
-   - Trên mạng xã hội Việt Nam (Arctic Shift `r/vozforums`, `r/VietNam`): `topic_id` gom nhóm các bài viết cùng tuần ISO (`YYYY-Www`) và từ khóa tiêu đề (gọi là *Heuristic Temporal-Keyword Grouped Inductive Split*). Giao thức này ngăn chặn rò rỉ thời gian giữa các chuỗi thảo luận diễn ra đồng thời trong tuần, nhưng không đảm bảo độc lập hoàn toàn về mặt ngữ nghĩa như các sự kiện tin tức lớn; chia 70/15/15 với $\mathcal{T}_{\text{train}} \cap \mathcal{T}_{\text{val}} = \mathcal{T}_{\text{train}} \cap \mathcal{T}_{\text{test}} = \mathcal{T}_{\text{val}} \cap \mathcal{T}_{\text{test}} = \emptyset$.
-   - Trên PHEME (9 sự kiện lệch kích thước): hỗ trợ cả *Inductive Topic Split* cân bằng lớp (`64` hoán vị tất định) lẫn giao thức chuẩn **Leave-One-Event-Out (LOO)** qua từng sự kiện giữ lại.
-2. **Cô lập tuyệt đối quá trình chưng cất Cross-Encoder**: Việc chưng cất `DualHeadCrossEncoder` chỉ được phép nhìn thấy các cạnh thuộc $\mathcal{T}_{\text{train}}$ và kiểm thử dừng sớm trên $\mathcal{T}_{\text{val}}$; toàn bộ các chủ đề $\mathcal{T}_{\text{test}}$ bị cô lập hoàn toàn.
-3. **Cô lập đầu vào nhân quả ở chân trời $K$**: Toàn bộ vector đặc trưng nút (bao gồm $\tilde{\Delta t}_v$ chuẩn hóa theo hằng số cố định $T_{\text{ref}}$), ma trận kề, thuộc tính cạnh $\mathbf{a}_{uv}$ chỉ tính trên $\mathcal{G}_K$; các biến hậu nghiệm ($N_{\text{total}}$, $y_{\text{size}}$, $y_{\text{polar}}$) tuyệt đối chỉ dùng để tính Loss.
+1. **Chia tập chuẩn hóa theo chủ đề/sự kiện (`topic_splits.json`)**:
+   - Phân hoạch được tính một lần từ đồ thị nguồn sau lọc `min_total_replies` và chia sẻ đồng nhất cho `dual_edge_scorer.py`, `extract_features.py` và `EarlyCascadeDataset` (chặn hoàn toàn lệch chủ đề giữa distillation và GNN).
+   - Trên mạng xã hội Việt Nam (`r/vozforums`, `r/VietNam`): `cluster_vn_cascade_topics` gom nhóm các cây có tương đồng TF-IDF $> 0.55$ trong cửa sổ trượt $14$ ngày (kết hợp từ khóa tiêu đề & tuần ISO, gọi là *Heuristic Temporal-Keyword / TF-IDF Grouped Inductive Split* nhằm chặn rò rỉ chuỗi thảo luận cùng sự kiện trong cửa sổ thời gian dù không bảo đảm độc lập ngữ nghĩa tuyệt đối như các tin tức lớn), chia 70/15/15 với $\mathcal{T}_{\text{train}} \cap \mathcal{T}_{\text{val}} = \mathcal{T}_{\text{train}} \cap \mathcal{T}_{\text{test}} = \mathcal{T}_{\text{val}} \cap \mathcal{T}_{\text{test}} = \emptyset$.
+   - Trên PHEME: hỗ trợ cả *Inductive Topic Split* cân bằng lớp lẫn **Leave-One-Event-Out (LOO)** với `edge_source="teacher"` cô lập Student khỏi mọi fold giữ lại.
+2. **Cô lập tuyệt đối quá trình chưng cất Cross-Encoder & QLoRA**: Teacher QLoRA chỉ hiệu chỉnh trên nguồn ngoài độc lập (`UIT-ViHSD`, `RumourEval`, 25 rubric anchors cân bằng 5 lớp); Student `DualHeadCrossEncoder` chỉ chưng cất trên $\mathcal{T}_{\text{train}}$, không chạm $\mathcal{T}_{\text{test}}$.
+3. **Cô lập đầu vào nhân quả ở chân trời $K$**: Toàn bộ vector đặc trưng nút, ma trận kề, thuộc tính cạnh $\mathbf{a}_{uv}$ và vector tốc độ sớm 8 chiều `cascade_stats` chỉ tính trên $\mathcal{G}_K$; biến hậu nghiệm ($N_{\text{total}}$, $y_{\text{size}}$, $y_{\text{polar}}$) tuyệt đối chỉ dùng tính Loss.
 
 ---
 
-## 3. Trích xuất Đặc trưng NLP Ngoại tuyến (Cross-Encoder & Đặc trưng Nút)
+## 3. Trích xuất Đặc trưng NLP Ngoại tuyến (Teacher 4D & Student Cross-Encoder)
 
-Nhằm vận hành gọn nhẹ trong giới hạn VRAM 16GB (Colab T4 / Kaggle P100), giai đoạn mã hóa ngôn ngữ tự nhiên chạy ngoại tuyến một lần (bật Mixed Precision `torch.cuda.amp`) và lưu sẵn các tensor đặc trưng xuống ổ cứng (`.pt`).
+Nhằm vận hành gọn nhẹ trong giới hạn VRAM 16GB / Kaggle `T4 x 2`, giai đoạn mã hóa ngôn ngữ tự nhiên chạy ngoại tuyến một lần (bật Mixed Precision `torch.amp`) và lưu sẵn xuống `.pt`.
 
-### 3.1. Nhánh NLP Mở Kép ($s_{uv}, h_{uv}$) & Chưng cất Cross-Encoder Thống nhất
-Để bảo đảm khả năng tái lập hoàn toàn không phụ thuộc API trả phí, tín hiệu cạnh $\mathbf{e}_{uv} = [s_{uv}, h_{uv}]^\top$ được gán nhãn khởi tạo từ cặp mô hình thầy (teachers) mã nguồn mở trên Hugging Face Hub trước khi chưng cất về Cross-Encoder thống nhất 2 đầu:
-
-1. **Tín hiệu Lập trường cặp câu ($s_{uv} \in [-1, 1]$)**: Sử dụng mô hình suy luận ngôn ngữ tự nhiên đa ngữ `MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7` đọc cặp `(cha u, phản hồi v)`:
-
-$$s_{uv}^{\text{teacher}} = P(\text{entailment} \mid u, v) - P(\text{contradiction} \mid u, v) \in [-1, 1]$$
-
-2. **Tín hiệu Độ gay gắt ngôn từ (*hostility intensity*, $h_{uv} \in [0, 1]$)**:
-   - Tiếng Việt: Tinh chỉnh `uitnlp/visobert` (12 tầng, SentencePiece hỗ trợ nguyên vẹn emoji và từ lóng sau chuẩn hóa Unicode NFC) trên bộ 3 lớp `ura-hcmut/UIT-ViHSD` ($\{\text{Clean}, \text{Offensive}, \text{Hate}\}$): $h_{uv}^{\text{teacher}} = P(\text{Offensive} \mid v) + P(\text{Hate} \mid v)$.
-   - Tiếng Anh (**PHEME**): Sử dụng `cardiffnlp/twitter-roberta-base-offensive` với $h_{uv}^{\text{teacher}} = P(\text{offensive} \mid v)$.
-
-3. **Chưng cất Cross-Encoder Thống nhất 2 Đầu (`DualHeadCrossEncoder`)**:
-   Sử dụng xương sống `uitnlp/visobert` (tiếng Việt) hoặc `roberta-base` (PHEME), kích thước ẩn $768$. Với mỗi cạnh $(u, v) \in \mathcal{E}_{\text{train}}$, tạo chuỗi đầu vào cặp văn bản chuẩn (`txt_u`, `txt_v`, giới hạn `max_length = 256`):
-
-$$\mathbf{X}_{uv} = \left[\texttt{<s>} \;\; \operatorname{Tok}(\texttt{txt}_u) \;\; \texttt{</s></s>} \;\; \operatorname{Tok}(\texttt{txt}_v) \;\; \texttt{</s>}\right]$$
-
-Đưa vector biểu diễn token đầu chuỗi $\mathbf{c}_{uv} = \operatorname{PLM}_{\texttt{<s>}}(\mathbf{X}_{uv}) \in \mathbb{R}^{768}$ qua hai đầu tuyến tính song song:
-
-$$\mathbf{z}_{uv} = \mathbf{W}_{\text{cls}} \operatorname{Dropout}(\mathbf{c}_{uv}) + \mathbf{b}_{\text{cls}} \in \mathbb{R}^{3}, \quad \mathbf{p}_{uv} = \operatorname{Softmax}(\mathbf{z}_{uv}) = \left[\, P(\text{support} \mid u, v), \; P(\text{neutral} \mid u, v), \; P(\text{oppose} \mid u, v) \,\right]^\top$$
-
-$$s_{uv} = P(\text{support} \mid u, v) - P(\text{oppose} \mid u, v) \in [-1, 1], \qquad h_{uv} = \sigma\left(\mathbf{w}_{h}^\top \operatorname{Dropout}(\mathbf{c}_{uv}) + b_h\right) \in [0, 1]$$
-
-và huấn luyện tối đa $3$ epoch (`batch_size=16`, `AdamW`, gradient clipping `1.0`) bằng hàm mất mát chưng cất kết hợp strictly trên $\mathcal{T}_{\text{train}}$ (chọn model trên $\mathcal{T}_{\text{val}}$):
-
-$$\mathcal{L}_{\text{distill}} = 0.5\,\operatorname{KL}\left(\log \mathbf{p}_{uv} \,\|\, \mathbf{p}_{uv}^{\text{teacher}}\right) + \operatorname{SmoothL1}\left(s_{uv}, s_{uv}^{\text{teacher}}\right) + \operatorname{SmoothL1}\left(h_{uv}, h_{uv}^{\text{teacher}}\right)$$
-
-Mỗi cạnh được biểu diễn bởi **vector thuộc tính cạnh 2 chiều** $\mathbf{a}_{uv} = [s_{uv}, h_{uv}]^\top \in [-1, 1] \times [0, 1]$.
+### 3.1. Nhánh Teacher G-Eval 4D & Chưng cất Cross-Encoder Thống nhất
+Hệ thống hỗ trợ Teacher 4 chiều mặc định (`qwen_qlora`, `edge_dim=4`) và nhánh 2 chiều dự phòng (`legacy_nli`, `edge_dim=2`):
+1. **G-Eval Single-Pass Logit Teacher (`Qwen/Qwen3.8-27B` QLoRA, Kaggle `T4 x 2`, hoặc `Qwen/Qwen3-8B` GPU 16GB đơn)**:
+   Với bộ ba $(r, u, v)$, chỉ thực hiện **1 lượt forward** trích xác suất softmax $q \in \Delta^4$ trên 5 token chữ số `1..5` (`support`, `neutral`, `constructive_oppose`, `irrational_fallacy`, `hostile_conflict`) và chiếu kỳ vọng ra vector hành vi 4D $\mathbf{a}_{uv} = [s_{uv}, h_{uv}, r_{uv}, c_{uv}]^\top \in [-1, 1] \times [0, 1]^3$.
+2. **Chưng cất Cross-Encoder Thống nhất (`DualHeadCrossEncoder`)**:
+   Sử dụng `uitnlp/visobert` (`vi`) hoặc `microsoft/deberta-v3-base` (`en`, chuyển tiếp an toàn `token_type_ids`). Tùy chọn `--include-root-context` ghép ngữ cảnh gốc `root[:220] | parent` vào vế trái. Ngoài 2 đầu $(s_{uv}, h_{uv})$, nhánh 4D bổ sung đầu hành vi 5 lớp ($\mathbf{z}_{\text{beh}}$), độ vô lý $r_{uv}$ và tính xây dựng $c_{uv}$ chưng cất bằng `KL + SmoothL1` trên $\mathcal{T}_{\text{train}}$.
 
 ### 3.2. Biểu diễn Đặc trưng Nút Khởi tạo $\mathbf{h}_v^{(0)}$
 Mỗi nút $v \in \mathcal{V}_K$ được gán ba thành phần đặc trưng không rò rỉ dữ liệu:
@@ -162,31 +146,34 @@ $$\mathcal{E}_K^{\text{BU}} = \left\{(v \to u) \;\middle|\; (u, v) \in \mathcal{
 
 Trên cả hai nhánh, khởi tạo trạng thái tầng $0$ giống nhau: $\mathbf{h}_v^{(0, \text{TD})} = \mathbf{h}_v^{(0, \text{BU})} = \mathbf{h}_v^{(0)}$ cho mọi $v \in \mathcal{V}_K$.
 
-### 4.2. Cổng Thích ứng Tần số Không-Trạng-Thái Dẫn hướng bởi $\mathbf{a}_{uv}$
-Tại tầng $l \in \{1, \dots, L\}$ ($L=2$ mặc định) của nhánh $\delta \in \{\text{TD}, \text{BU}\}$, xét cạnh có hướng $(u \to v) \in \mathcal{E}_K^\delta$ mang vector thuộc tính $\mathbf{a}_{uv}^\delta = [s_{uv}, h_{uv}]^\top$ (trong mã nguồn là biến `edge_attr`). Cổng thích ứng tần số đơn đầu ($M=1$) tính không-trạng-thái (*stateless* trước khi gọi `MessagePassing.propagate`):
+### 4.2. Cổng Thích ứng Tần số Tiền-Chuẩn hóa Dẫn hướng bởi $\mathbf{a}_{uv}$
+Tại tầng $l \in \{1, \dots, L\}$ ($L=2$ mặc định) của nhánh $\delta \in \{\text{TD}, \text{BU}\}$, xét cạnh có hướng $(u \to v) \in \mathcal{E}_K^\delta$ mang vector thuộc tính $\mathbf{a}_{uv}^\delta = [s_{uv}, h_{uv}, r_{uv}, c_{uv}]^\top \in \mathbb{R}^4$ (hoặc 2D $[s_{uv}, h_{uv}]^\top$, biến `edge_attr`). Cổng thích ứng tần số thực hiện **Pre-Norm** trước tích vô hướng (Platonov et al., ICLR 2023) và khởi tạo trọng số cạnh 4D theo tiền nghiệm miền `[+0.5, -0.25, -0.25, +0.25]` (`[1/sqrt(2), 1/sqrt(2)]` cho 2D):
 
-$$\mathbf{z}_u^{(l, \delta)} = \mathbf{W}^{(l, \delta)} \mathbf{h}_u^{(l-1, \delta)}, \quad \mathbf{z}_v^{(l, \delta)} = \mathbf{W}^{(l, \delta)} \mathbf{h}_v^{(l-1, \delta)}, \quad \mathbf{W}^{(l, \delta)} \in \mathbb{R}^{d \times d}$$
+$$\mathbf{z}_u^{(l, \delta)} = \mathbf{W}^{(l, \delta)} \mathbf{h}_u^{(l-1, \delta)}, \quad \tilde{\mathbf{z}}_u^{(l, \delta)} = \operatorname{LayerNorm}\left(\mathbf{z}_u^{(l, \delta)}\right), \quad \mathbf{W}^{(l, \delta)} \in \mathbb{R}^{d \times d}$$
 
-$$\gamma_{uv}^{(l, \delta)} = \tanh\left(\left(\mathbf{a}_{\text{att}}^{(l, \delta)}\right)^\top \left[\mathbf{z}_u^{(l, \delta)} \;\middle\|\; \mathbf{z}_v^{(l, \delta)} \;\middle\|\; \mathbf{a}_{uv}^\delta\right]\right) \in (-1, 1)$$
+$$\gamma_{uv}^{(l, \delta)} = \tanh\left(\left(\mathbf{a}_{\text{att}}^{(l, \delta)}\right)^\top \left[\tilde{\mathbf{z}}_u^{(l, \delta)} \;\middle\|\; \tilde{\mathbf{z}}_v^{(l, \delta)} \;\middle\|\; \mathbf{a}_{uv}^\delta\right]\right) \in (-1, 1)$$
 
-trong đó $\mathbf{a}_{\text{att}}^{(l, \delta)} \in \mathbb{R}^{2d + 2}$ là vector trọng số chú ý có dấu. Các biến thể cắt bỏ trong nghiên cứu Ablation gồm:
-- `w/o Stance Score`: gán $s_{uv} = 0$, giữ $h_{uv}$.
-- `w/o Hostility Score`: gán $h_{uv} = 0$, giữ $s_{uv}$.
-- `w/o Edge Signals`: gán đồng thời $s_{uv} = 0, h_{uv} = 0$.
+trong đó $\mathbf{a}_{\text{att}}^{(l, \delta)} \in \mathbb{R}^{2d + d_{\text{edge}}}$ là vector trọng số chú ý có dấu. Các biến thể cắt bỏ trong nghiên cứu Ablation gồm:
+- `w/o Stance Score`: gán $s_{uv} = 0$.
+- `w/o Hostility Score`: gán $h_{uv} = 0$.
+- `w/o Irrationality` / `w/o Constructive`: gán $r_{uv} = 0$ hoặc $c_{uv} = 0$ (khi `edge_dim=4`).
+- `w/o Edge Signals`: gán đồng thời toàn bộ thành phần $\mathbf{a}_{uv} = \mathbf{0}$.
 - `w/o Conflict Gate`: thay $\tanh(\cdot)$ bằng $\sigma(\cdot) \in (0, 1)$, loại bỏ khả năng đảo dấu.
 - `w/o Bottom-Up`: tắt hoàn toàn nhánh $\text{BU}$, nhân đôi vectơ nhánh $\text{TD}$ ở readout để bảo toàn dung lượng đầu dự đoán.
 - `w/o Attention Readout`: thay Global Attention Readout bằng `global_mean_pool`.
 
-### 4.3. Phương trình Cập nhật Nút & Neo Đặc trưng Gốc
+### 4.3. Phương trình Cập nhật Nút Đối xứng Dấu & Neo Đặc trưng Gốc
 Thông điệp gom về nút $v$ theo hướng $\delta$ sử dụng chuẩn hóa bậc có hiệu chỉnh $+1$ (tương ứng thêm trọng số self-loop ảo tránh chia $0$ tại nút gốc/nút lá trên đồ thị có hướng):
 
 $$\mathbf{m}_v^{(l, \delta)} = \sum_{u \in \mathcal{N}_{\text{in}}^\delta(v)} \frac{\gamma_{uv}^{(l, \delta)}}{c_{uv}^\delta} \, \mathbf{z}_u^{(l, \delta)}, \qquad c_{uv}^\delta = \sqrt{\left(d_{\text{out}}^\delta(u) + 1\right)\left(d_{\text{in}}^\delta(v) + 1\right)}$$
 
 *(Lưu ý hình học có hướng: trên nhánh $\text{TD}$, nút gốc có $d_{\text{in}}^{\text{TD}}(r)=0 \implies \mathbf{m}_r^{(l,\text{TD})} = \mathbf{0}$, nên trạng thái lan truyền phản hồi về gốc $\mathbf{z}_{\text{root}}^{\text{BU}}$ chủ yếu do nhánh $\text{BU}$ đảm nhiệm, còn nhánh $\text{TD}$ tổng hợp lan truyền qua $\mathbf{z}_{\text{att}}^{\text{TD}}$.)*
 
-Kết hợp phần dư tầng $0$ ($\varepsilon = 0.5$) và neo nút gốc có bias cùng Dropout ($p=0.1$):
+Kết hợp kết nối thặng dư tầng trước ($0.5\,\mathbf{h}_v^{(l-1,\delta)}$), neo tầng $0$ ($\varepsilon = 0.5$), neo nút gốc và **hàm kích hoạt lẻ đối xứng dấu** $\phi_{\text{sym}}(x) = x + 0.2 \tanh(x)$ (bảo toàn đối xứng $+\mathbf{h}$ vs $-\mathbf{h}$ giữa hai phe đối lập thay cho ELU bất đối xứng):
 
-$$\mathbf{h}_v^{(l, \delta)} = \operatorname{Dropout}\left(\operatorname{LayerNorm}\left(\operatorname{ELU}\left(\varepsilon \mathbf{h}_v^{(0)} + \mathbf{m}_v^{(l, \delta)} + \mathbf{W}_{\text{root}}^{(l, \delta)} \mathbf{h}_r^{(0)} + \mathbf{b}_{\text{root}}^{(l, \delta)}\right)\right)\right)$$
+$$\mathbf{r}_v^{(l, \delta)} = 0.5\,\mathbf{h}_v^{(l-1, \delta)} + \varepsilon \mathbf{h}_v^{(0)} + \mathbf{m}_v^{(l, \delta)} + \mathbf{W}_{\text{root}}^{(l, \delta)} \mathbf{h}_r^{(0)} + \mathbf{b}_{\text{root}}^{(l, \delta)}$$
+
+$$\mathbf{h}_v^{(l, \delta)} = \operatorname{Dropout}\left(\operatorname{LayerNorm}\left(\phi_{\text{sym}}\left(\mathbf{r}_v^{(l, \delta)}\right)\right)\right)$$
 
 ### 4.4. Cơ chế Đóng–Mở Tín hiệu Có dấu trên Cây Có hướng
 Trên cây có hướng $\mathcal{G}_K^\delta$ (ma trận kề $\mathbf{A}_\delta$ dạng lũy linh có mọi trị riêng bằng $0$), ta không áp đặt phân tích phổ đối xứng vô hướng mà xét trực tiếp tác động hình học của dấu $\gamma_{uv}$ trước phép chuẩn hóa lớp trên một cạnh $(u \to v)$ truyền thông điệp $\mathbf{m}_{u \to v} = \frac{\gamma_{uv}}{c_{uv}} \mathbf{z}_u$:
@@ -232,32 +219,33 @@ $$y_{\text{polar}} = \lambda_p \, \sigma_{\tilde{s}}^2 + (1 - \lambda_p) \, \lef
 
 3. **Nhãn phân loại tin đồn cho PHEME ($y_{\text{rumor}}$)**: Hỗ trợ tách bạch cấu hình 4 lớp xác thực (`veracity4`: `non-rumor=0`, `true=1`, `false=2`, `unverified/rumor=3`) và 2 lớp nhị phân (`binary`: `non-rumor=0`, `rumor=1`). Dữ liệu tiếng Việt gán $y_{\text{rumor}} = -1$ (bỏ qua nhánh phân loại).
 
-### 5.3. Ba Nhánh Đầu ra & Hàm Mất mát Đa nhiệm
-Từ $\mathbf{z}_{\mathcal{G}_K} \in \mathbb{R}^{4d}$, các đầu MLP 2 tầng (`Linear(4d, d) -> GELU -> Dropout(0.1) -> Linear(d, out)`) dự đoán:
+### 5.3. Ba Nhánh Đầu ra, Đầu Tự tin $\beta$-NLL & Hàm Mất mát Đa nhiệm
+Từ biểu diễn đồ thị $\mathbf{z}_{\mathcal{G}_K} \in \mathbb{R}^{4d}$ (ghép nối thêm biểu diễn đặc trưng tốc độ sớm 8 chiều `cascade_stats` khi bật `--v2`, áp dụng công bằng cho cả 8 mô hình), các đầu MLP 2 tầng dự đoán:
 
-$$\hat{y}_{\text{size}} = \operatorname{Softplus}\left(\operatorname{MLP}_{\text{size}}(\mathbf{z}_{\mathcal{G}_K})\right) \in (0, \infty), \qquad \hat{y}_{\text{polar}} = \sigma\left(\operatorname{MLP}_{\text{polar}}(\mathbf{z}_{\mathcal{G}_K})\right) \in (0, 1)$$
+$$\hat{y}_{\text{size}} = \operatorname{Softplus}\left(\operatorname{MLP}_{\text{size}}(\mathbf{z}_{\text{reg}})\right) \in (0, \infty), \qquad \hat{y}_{\text{polar}} = \sigma\left(\operatorname{MLP}_{\text{polar}}(\mathbf{z}_{\text{reg}})\right) \in (0, 1)$$
 
 $$\hat{\mathbf{p}}_{\text{rumor}} = \operatorname{Softmax}\left(\operatorname{MLP}_{\text{rumor}}(\mathbf{z}_{\mathcal{G}_K})\right) \in \Delta^{C-1}$$
 
-Sử dụng Huber Loss tách ngưỡng riêng theo thang giá trị ($\delta_{\text{size}} = 1.0$, $\delta_{\text{polar}} = 0.15$) và Cross-Entropy có trọng số lớp $w_c$ tính theo nghịch đảo tần suất trên tập $\mathcal{D}_{\text{train}}$ (tối ưu bằng `AdamW` với `lr = 1e-3`, `weight_decay = 1e-4`, cắt gradient tối đa $5.0$):
+Khi bật `predict_uncertainty=True` (`--v2`), đầu bất định xuất log-phương sai giới hạn mượt $\log \hat{\sigma}_t^2 = -6 + 9\,\sigma(u_t) \in (-6, 3)$ và điểm tự tin hiệu chỉnh liên tục $c_{\text{conf}} = \exp(-\hat{\sigma}_{\text{polar}} / 0.25) \in (0, 1]$.
 
-$$\mathcal{L}_{\text{total}} = \alpha_{\text{size}} \mathcal{L}_{\delta_{\text{size}}}^{\text{Huber}}(\hat{y}_{\text{size}}, y_{\text{size}}) + \alpha_{\text{polar}} \mathcal{L}_{\delta_{\text{polar}}}^{\text{Huber}}(\hat{y}_{\text{polar}}, y_{\text{polar}}) + \mathbb{I}_{\text{PHEME}} \, \alpha_{\text{rumor}} \mathcal{L}_{\text{CE}}(\hat{\mathbf{p}}_{\text{rumor}}, y_{\text{rumor}}; \mathbf{w})$$
+Sử dụng Huber Loss tách ngưỡng ($\delta_{\text{size}} = 1.0$, $\delta_{\text{polar}} = 0.15$), Cross-Entropy có trọng số lớp $\mathbf{w}$, và thành phần **$\beta$-NLL** ($\beta = 0.5$, Seitzer et al., ICLR 2022) với sai số tách gradient $\operatorname{sg}(\hat{y}_t) - y_t$ ($\alpha_{\text{size}}=1.0, \alpha_{\text{polar}}=4.0, \alpha_{\text{rumor}}=1.0$ mặc định trong huấn luyện):
 
-### 5.4. Nhánh Mở rộng UPFD (`GossipCop` — Classification-Only)
-Trên bộ dữ liệu UPFD (`classification_only=True`, không có văn bản thô, không cắt $K=20$, không hồi quy $y_{\text{polar}}$), hàm mục tiêu rút gọn về $\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}}(\hat{\mathbf{p}}, y; \mathbf{w})$. Suy luận cặp cạnh ẩn từ cặp đặc trưng nút BERT $768$ chiều qua `LatentConflictMLP` (dùng chung kiến trúc 2 tầng `Linear -> LayerNorm -> GELU -> Dropout -> Linear` cho cả `SBiFAGAT (Latent)` và baseline cạnh `EdgeGATv2 (Latent)` để bảo đảm công bằng tham số).
+$$\mathcal{L}_{\text{task}} = \alpha_{\text{size}} \mathcal{L}_{\delta_{\text{size}}}^{\text{Huber}}(\hat{y}_{\text{size}}, y_{\text{size}}) + \alpha_{\text{polar}} \mathcal{L}_{\delta_{\text{polar}}}^{\text{Huber}}(\hat{y}_{\text{polar}}, y_{\text{polar}}) + \mathbb{I}_{\text{PHEME}} \, \alpha_{\text{rumor}} \mathcal{L}_{\text{CE}}(\hat{\mathbf{p}}_{\text{rumor}}, y_{\text{rumor}}; \mathbf{w})$$
+
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \lambda_{\text{unc}} \sum_{t \in \{\text{size}, \text{polar}\}} \frac{1}{2} \operatorname{sg}\left(\hat{\sigma}_t^{2\beta}\right) \left(\exp(-\log\hat{\sigma}_t^2)(\operatorname{sg}(\hat{y}_t) - y_t)^2 + \log\hat{\sigma}_t^2\right)$$
+
+### 5.4. Nhánh Mở rộng UPFD (`GossipCop` / `PolitiFact` — Classification-Only)
+Trên bộ dữ liệu UPFD (`classification_only=True`, hỗ trợ `--feature {bert,spacy,profile,content}`), hàm mục tiêu rút gọn về $\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}}(\hat{\mathbf{p}}, y; \mathbf{w})$. Suy luận cặp cạnh ẩn từ cặp đặc trưng nút qua `LatentConflictMLP` (dùng chung kiến trúc 2 tầng cho cả `SBiFAGAT (Latent)` và baseline cạnh `EdgeGATv2 (Latent)` để bảo đảm công bằng tham số).
 
 ---
 
 ## 6. Giao thức Lưu trữ `.pt`, Tối ưu 16GB VRAM & Bộ Độ đo Đánh giá
 
-- **Cấu trúc tệp ngoại tuyến `nlp_features.pt`**: Lưu trọn vẹn theo đồ thị đầy đủ để `EarlyCascadeDataset` cắt động cho mọi $K \in \{10, 20, 30, 50\}$:
+- **Cấu trúc tệp ngoại tuyến `nlp_features.pt`**: Lưu trọn vẹn theo đồ thị đầy đủ kèm `topic_splits.json` để `EarlyCascadeDataset` cắt động cho mọi $K \in \{10, 20, 30, 50\}$:
   - `node_embeddings [N_all, 768]` (từ encoder đơn câu đóng băng gốc) + `node_id_to_idx`
-  - `edge_attr [E_all, 2]` (ghép $[s_{uv}, h_{uv}]$) + `edge_id_to_idx`, `edge_stance`, `edge_hostility`, `edge_oppose_flag`, `edge_pred_label`
-  - Mặc định không ghi tensor dư thừa `node_features_770` (tiết kiệm ~326 MB trên PHEME), chỉ tạo động `[x_sem || t_norm || depth_norm]` kích thước $770$ theo $K$ lúc nạp batch.
+  - `edge_attr [E_all, 4]` (ghép $[s_{uv}, h_{uv}, r_{uv}, c_{uv}]$ hoặc `[E_all, 2]`) + `edge_id_to_idx`, `edge_stance`, `edge_hostility`, `edge_irrationality`, `edge_constructive`, `edge_oppose_flag`, `edge_pred_label`
+  - `teacher_edge_*` (nếu có cache Teacher): lưu cô lập để phục vụ giao thức LOO (`edge_source="teacher"`) mà không rò rỉ Student Cross-Encoder qua các fold.
 - **Tối ưu 16GB VRAM & Chạy lặp lại 5 Seeds**:
-  - Phase 2 chạy FP16 (`torch.amp` / fallback `torch.cuda.amp`) và giải phóng GPU trước Phase 3; Phase 3 dùng `batch_size = 32` (`64` trên UPFD), `epochs = 100`, `EarlyStopping(patience=10)`.
-  - Mọi thực nghiệm chạy độc lập trên $\mathcal{S} = \{42, 100, 2024, 777, 999\}$, báo cáo $\text{Mean} \pm \text{Std}$ gồm:
-    - Dự đoán quy mô: MSLE, RMSE, MAE, $R^2$, Spearman $\rho$.
-    - Dự đoán phân cực: RMSE, MAE, $R^2$, Pearson $r$, Spearman $\rho$.
-    - Phân loại (PHEME / UPFD): Macro-F1 và Accuracy.
-  - Kiểm định ý nghĩa thống kê với `BiGCN` (và/hoặc `EdgeGATv2`): `scipy.stats.ttest_rel` theo seeds/LOO folds kèm **Paired Bootstrap** trên tập mẫu Test.
+  - Phase 2 chạy FP16 (`torch.amp`) và giải phóng GPU trước Phase 3; Phase 3 dùng `batch_size = 32` (`64` trên UPFD), `epochs = 100`, `EarlyStopping(patience=10)` và xếp hạng `auto_loop` thuần theo $\mathcal{L}_{\text{task}}$ (không phụ thuộc quy mô $\lambda_{\text{unc}}$).
+  - Mọi thực nghiệm chạy độc lập trên $\mathcal{S} = \{42, 100, 2024, 777, 999\}$, báo cáo $\text{Mean} \pm \text{Std}$ cùng `construct_corr_bc` tùy chọn.
+  - Kiểm định ý nghĩa thống kê với đối thủ mạnh nhất (`--comparator-model auto`): `scipy.stats.ttest_rel` theo seeds/LOO folds kèm **Paired Bootstrap từng seed rồi lấy trung bình trên $S$ seeds** và hiệu chỉnh **Holm-Bonferroni**.

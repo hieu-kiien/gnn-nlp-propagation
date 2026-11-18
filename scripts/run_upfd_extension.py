@@ -23,9 +23,16 @@ from src.utils.seed import OFFICIAL_SEEDS
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run 5-seed UPFD GossipCop BERT extension benchmark.")
+    parser = argparse.ArgumentParser(description="Run 5-seed UPFD BERT/SpaCy/Profile/Content generalization benchmark.")
     parser.add_argument("--upfd-root", type=Path, default=Path("data/raw/upfd"))
     parser.add_argument("--dataset-name", type=str, default="gossipcop", choices=["gossipcop", "politifact"])
+    parser.add_argument(
+        "--feature",
+        type=str,
+        default="bert",
+        choices=["bert", "spacy", "profile", "content"],
+        help="UPFD PyG node feature representation.",
+    )
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -38,11 +45,11 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     transform = UPFDAdapterTransform()
 
-    train_ds = UPFD(root=str(args.upfd_root), name=args.dataset_name, feature="bert", split="train", transform=transform)
-    val_ds = UPFD(root=str(args.upfd_root), name=args.dataset_name, feature="bert", split="val", transform=transform)
-    test_ds = UPFD(root=str(args.upfd_root), name=args.dataset_name, feature="bert", split="test", transform=transform)
+    train_ds = UPFD(root=str(args.upfd_root), name=args.dataset_name, feature=args.feature, split="train", transform=transform)
+    val_ds = UPFD(root=str(args.upfd_root), name=args.dataset_name, feature=args.feature, split="val", transform=transform)
+    test_ds = UPFD(root=str(args.upfd_root), name=args.dataset_name, feature=args.feature, split="test", transform=transform)
 
-    in_dim = int(train_ds[0].x.size(-1))  # 768 for BERT
+    in_dim = int(train_ds[0].x.size(-1))
     h_dim = args.hidden_dim
 
     model_factories = {
@@ -80,14 +87,14 @@ def main() -> None:
         device=device,
     )
 
-    print(f"\n=== UPFD ({args.dataset_name}, BERT) Generalization Results (5 Seeds) ===")
+    print(f"\n=== UPFD ({args.dataset_name}, {args.feature}) Generalization Results (5 Seeds) ===")
     print(build_markdown_table(result, UPFD_METRICS))
 
     export_latex_table(
         result,
         args.output_table,
         caption=(
-            f"Generalization Benchmark on UPFD ({args.dataset_name}, BERT 768-d) Across 5 Random Seeds. "
+            f"Generalization Benchmark on UPFD ({args.dataset_name}, {args.feature.upper()} {in_dim}-d) Across 5 Random Seeds. "
             "SBi-FAGAT infers latent edge conflict vectors $\\mathbf{e}_{\\text{latent}} = "
             "\\mathrm{MLP}([\\mathbf{x}_u \\parallel \\mathbf{x}_v \\parallel \\mathbf{x}_u - \\mathbf{x}_v])$."
         ),
@@ -97,7 +104,7 @@ def main() -> None:
     serialize_benchmark_json(
         result,
         args.output_json,
-        extra={"dataset": f"UPFD-{args.dataset_name}", "feature": "bert"},
+        extra={"dataset": f"UPFD-{args.dataset_name}", "feature": args.feature, "in_dim": in_dim},
     )
 
 

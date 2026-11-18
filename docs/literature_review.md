@@ -175,24 +175,36 @@ $$\mathcal{L}_{\text{MLM}}(\theta) = -\sum_{i \in \mathcal{M}} \ln P_\theta\left
 ## 11. Kho Dữ liệu Chuẩn: PHEME & UPFD (`zubiaga2016analysing`, `kochkina2018pheme`, `dou2021upfd`)
 
 - **PHEME (`zubiaga2016analysing`, `kochkina2018pheme`)**:
-  - Arkaitz Zubiaga, Maria Liakata, Rob Procter, Geraldine Wong Sak Hoi, Peter Tolmie (*PLOS ONE*, March 2016): *Analysing How People Orient to and Spread Rumours in Social Media by Looking at Conversational Threads*.
+  - Arkaitz Zubiaga, Maria Liakata, Rob Procter, Geraldine Wong Sak Hoi, Peter Tolmie (*PLOS ONE*, Vol. 11, No. 3, `e0150989`, March 2016, DOI `10.1371/journal.pone.0150989`): *Analysing How People Orient to and Spread Rumours in Social Media by Looking at Conversational Threads*.
   - Elena Kochkina, Maria Liakata, Arkaitz Zubiaga (*Figshare 2018*, DOI `10.6084/m9.figshare.6392078`): *PHEME dataset for Rumour Detection and Veracity Classification* — 9 sự kiện tin tức nóng kèm cây phản hồi và nhãn tin đồn/xác thực.
 - **UPFD (`dou2021upfd`)**:
-  - Yingtong Dou, Kai Shu, Congying Xia, Philip S. Yu, Lichao Sun (*SIGIR '21*, DOI `10.1145/3404835.3462990` | `arXiv:2104.12259`): *User Preference-aware Fake News Detection* — cung cấp chuẩn kiểm chứng mở rộng liên miền (`GossipCop`, đặc trưng nút $768$ chiều cố định của bài gốc và $310$ chiều đặc trưng người dùng, phân loại nhị phân tin giả/thật).
+  - Yingtong Dou, Kai Shu, Congying Xia, Philip S. Yu, Lichao Sun (*SIGIR '21*, DOI `10.1145/3404835.3462990` | `arXiv:2104.12259`): *User Preference-aware Fake News Detection* — cung cấp chuẩn kiểm chứng mở rộng liên miền (`GossipCop` / `PolitiFact`, đặc trưng nút BERT 768 chiều/SpaCy/Profile/Content).
+- **SemEval RumourEval & TweetEval (`gorrell2019semeval`, `barbieri2020tweeteval`)**:
+  - `SemEval-2019 Task 7: RumourEval` (DOI `10.18653/v1/S19-2147`) & `TweetEval` (*Findings of EMNLP 2020*, DOI `10.18653/v1/2020.findings-emnlp.148`) cung cấp nguồn mẫu chuẩn ngoại tuyến hỗ trợ hiệu chỉnh QLoRA đa ngôn ngữ.
 
 ---
 
-## 12. Ma trận Đối sánh Tổng hợp: Khoảng trống Nghiên cứu & Đóng góp của SBi-FAGAT
+## 12. Các Công trình Nâng cấp SOTA cho SBi-FAGAT v2 (`liu2023geval`, `seitzer2022pitfalls`, `platonov2023critical`, `dettmers2023qlora`, `yang2025qwen3`, `pfister2013good`, `li2017deepcas`)
 
-| Công trình / Mô hình | Lan truyền 2 chiều (TD + BU) | Dấu cạnh liên tục $[-1, 1]$ | Bộ lọc thích ứng cao/thấp ($\gamma_{uv} \gtrless 0$) | Ngữ nghĩa Cross-Encoder (EN/VI) | Dự đoán sớm tại $K=20$ | Đa nhiệm Quy mô + Phân cực (+ Tin đồn) |
+1. **G-Eval Single-Pass Logit Scoring (`liu2023geval`)**: Yang Liu et al. (*EMNLP 2023*, pp. 2511–2522, DOI `10.18653/v1/2023.emnlp-main.153`, `arXiv:2303.16634`) đề xuất trích phân phối xác suất logit các nhãn chấm điểm trong 1 lượt forward để lấy giá trị kỳ vọng liên tục có tương quan với người đánh giá cao hơn sinh chuỗi rời rạc. Áp dụng vào `QwenBehavioralTeacherScorer` loại bỏ hoàn toàn lỗi cú pháp JSON và tăng tốc gán nhãn cạnh 4D lên 10–20$\times$.
+2. **QLoRA & Qwen3/3.8 (`dettmers2023qlora`, `yang2025qwen3`)**: Tim Dettmers et al. (*NeurIPS 2023*, `arXiv:2305.14314`) và Qwen Team (`arXiv:2505.09388`) cung cấp nền tảng lượng tử hóa NF4 + adapter bậc thấp (cho phép nạp `Qwen/Qwen3.8-27B` 4-bit trên Kaggle `T4 x 2` và `Qwen/Qwen3-8B` trên GPU 16GB đơn) với mặt nạ mất mát chỉ tính trên token phản hồi.
+3. **Beta-NLL Heteroscedastic Uncertainty (`seitzer2022pitfalls`)**: Maximilian Seitzer et al. (*ICLR 2022*, `arXiv:2203.09168`) chỉ ra Gaussian NLL chuẩn gây suy thoái học kỳ vọng ở các mẫu sai số cao và đề xuất gia trọng $\sigma^{2\beta}$ ($\beta = 0.5$) kèm tách gradient phần dư để dự đoán độ bất định không phá hỏng độ chính xác trung bình.
+4. **Đánh giá GNN dưới Heterophily (`platonov2023critical`)**: Oleg Platonov et al. (*ICLR 2023*, `arXiv:2302.11640`) chứng minh tầm quan trọng của tách phân hoạch nghiêm ngặt không trùng thực thể, tiền chuẩn hóa (Pre-Norm) và cơ chế kết nối dư khi cạnh mang tính dị biệt lập trường (*heterophily*).
+5. **DeepCas & Bimodality Coefficient (`li2017deepcas`, `pfister2013good`)**: Thành phần dự báo quy mô lan truyền theo cửa sổ sớm kế thừa bài toán từ *DeepCas* (*WWW '17*, `arXiv:1611.05373`), trong khi kiểm chứng phân đôi lập trường độc lập tham chiếu công thức *Sarle Bimodality Coefficient* của Pfister et al. (*Frontiers in Psychology 2013*, DOI `10.3389/fpsyg.2013.00700`).
+
+---
+
+## 13. Ma trận Đối sánh Tổng hợp: Khoảng trống Nghiên cứu & Đóng góp của SBi-FAGAT
+
+| Công trình / Mô hình | Lan truyền 2 chiều (TD + BU) | Hành vi & Dấu cạnh 4D | Bộ lọc đối xứng dấu ($\gamma_{uv} \gtrless 0$) | G-Eval Qwen Teacher $\to$ Cross-Encoder | Công bằng 8D Stats & $\beta$-NLL | Đa nhiệm Quy mô + Phân cực (+ Tin đồn) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **GCN** (`kipf2017semisupervised`) | Không (Vô hướng) | Không | Không (Thông thấp) | Không | Hạn chế | Không |
-| **GATv2** (`brody2022how`) | Không | Không | Không ($\alpha_{ij} > 0$) | Có thể nhận `edge_attr` | Hạn chế | Không |
+| **GCN** (`kipf2017semisupervised`) | Không (Vô hướng) | Không | Không (Thông thấp) | Không | Không | Không |
+| **GATv2** (`brody2022how`) | Không | Không | Không ($\alpha_{ij} > 0$) | Có thể nhận `edge_attr` | Không | Không |
 | **SGCN** (`derr2018signed`) | Không (Vô hướng) | Rời rạc $\{-1, +1\}$ | Cân bằng $B/U$ cứng | Không | Không | Không |
-| **Bi-GCN** (`bian2020rumor`) | **Có (TD + BU)** | Không | Không (Thông thấp) | Không | Có (Tin đồn) | Đơn nhiệm |
+| **Bi-GCN** (`bian2020rumor`) | **Có (TD + BU)** | Không | Không (Thông thấp) | Không | Không | Đơn nhiệm |
 | **FAGCN** (`bo2021beyond`) | Không (Vô hướng) | Ngầm định $\alpha_{ij}^G$ | **Có ($\tanh$)** | Không | Không | Không |
 | **RWC** (`garimella2018quantifying`) | Không | Không | Không (Bước đi ngẫu nhiên) | Không | Suy biến trên cây nhỏ | Chỉ đo phân cực |
-| **RoBERTa / ViSoBERT** (`liu2019roberta`, `nguyen2023visobert`) | Không | Có thể tinh chỉnh cặp câu | Không | **Nền tảng Cross-Encoder** | Mù cấu trúc cây | Cần kết hợp GNN |
-| **SBi-FAGAT (Đề xuất)** | **Có (TD + BU độc lập)** | **Có ($s_{uv} \in [-1, 1], h_{uv}$)** | **Có ($\gamma_{uv}$ dẫn hướng bởi $\mathbf{e}_{uv}$)** | **Có (RoBERTa + ViSoBERT)** | **Tối ưu cho $\mathcal{G}_{20}$** | **Đa nhiệm đồng thời** |
+| **DeBERTaV3 / ViSoBERT** (`he2023debertav3`, `nguyen2023visobert`) | Không | Tinh chỉnh cặp câu | Không | **Nền tảng Cross-Encoder 4D** | Mù cấu trúc cây | Cần kết hợp GNN |
+| **SBi-FAGAT v2 (Đề xuất)** | **Có (TD + BU độc lập)** | **Có ($[s, h, r, c]^\top$)** | **Pre-Norm + Kích hoạt lẻ đối xứng** | **G-Eval 1-Pass $\to$ Student** | **8 mô hình cùng Stats + $\beta$-NLL** | **Đa nhiệm + Độ tự tin** |
 
-**Kết luận tổng hợp**: SBi-FAGAT lấp đầy khoảng trống nghiên cứu bằng cách kết nối **tín hiệu lập trường và độ gay gắt cặp câu liên tục $\mathbf{e}_{uv} = [s_{uv}, h_{uv}]^\top$** (từ nhánh Cross-Encoder sử dụng `RoBERTa` cho PHEME tiếng Anh và `ViSoBERT` cho tiếng Việt) trực tiếp vào **cổng thích ứng tần số $\gamma_{uv}$** trên **hai nhánh đồ thị có hướng độc lập Top-Down và Bottom-Up**. Kiến trúc này vừa giữ được khả năng nắm bắt cấu trúc lan truyền/phản hồi hai chiều của Bi-GCN, vừa cho phép khuếch đại độ lệch giữa các phe đối lập theo cơ chế bộ lọc thích ứng tần số lấy cảm hứng từ FAGCN trên cấu trúc cây có hướng, đồng thời khắc phục hoàn toàn điểm mù cấu trúc nhỏ ($K=20$) của các thước đo phân cực truyền thống như RWC.
+**Kết luận tổng hợp**: SBi-FAGAT v2 lấp đầy khoảng trống nghiên cứu bằng cách kết nối **tín hiệu hành vi cặp câu 4 chiều $\mathbf{a}_{uv} = [s_{uv}, h_{uv}, r_{uv}, c_{uv}]^\top$** (từ Teacher G-Eval 1-pass `Qwen3.8-27B QLoRA` chưng cất về `DeBERTa-v3-base` / `ViSoBERT` trên phân hoạch chủ đề nhất quán `topic_splits.json`) trực tiếp vào **cổng thích ứng tần số tiền chuẩn hóa $\gamma_{uv}$ và hàm kích hoạt lẻ đối xứng dấu** trên **hai nhánh cây có hướng độc lập Top-Down và Bottom-Up**, được đánh giá công bằng trên cả 8 mô hình cùng `cascade_stats` và kiểm định $\beta$-NLL + Paired Bootstrap từng seed.

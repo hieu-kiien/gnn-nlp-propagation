@@ -1,56 +1,56 @@
 # SBi-FAGAT: Project Status & Module Verification Matrix
 
-**Last Audit Date:** Current Session  
-**Baseline Git Commit:** `f4be964b0307aee5032223760b3e9d1b3d39df8f`  
-**Test Suite Status:** 79/79 Passed across 11 test modules (100% Pass Rate)
+**Baseline Branch:** `main` (reconciled post-PR #1 `5820e71` + local v2 + 6 EGM fixes)  
+**Test Suite:** 12 test modules in `tests/` (see [TEST_REPORT.md](TEST_REPORT.md) for latest observed run)
 
 ---
 
 ## 1. Module Implementation & Verification Status
 
-| Module / Path | Purpose & Function | Implementation Status | Verification Level | Notes & Audit Remarks |
+| Module / Path | Purpose & Function | Status | Verification | Audit Remarks |
 | :--- | :--- | :--- | :--- | :--- |
-| `src/data/schema.py` | Data contract, Pydantic models (`PostNode`, `EdgeInteraction`, `CascadeTree`) | Fully Implemented | **VERIFIED & TESTED** | Passed unit tests (`test_schema.py`). Validates node and edge schema, enforces timestamp sorting and max $K=20$ constraints. |
-| `src/data/pheme_loader.py` | PHEME raw JSON parser, inductive event split generator | Fully Implemented | **VERIFIED & TESTED** | Passed unit tests (`test_pheme_loader.py`). True inductive split across 9 breaking news events. |
-| `src/data/arctic_shift_vn.py` | Reddit VN crawler/parser, pseudonymization, heuristic split | Fully Implemented | **VERIFIED & TESTED** | Updated during audit: converted author hash from "anonymization" to "pseudonymization" with salt support (`SBIF_HASH_SALT`). Grouped inductive split by week and title keyword. |
-| `src/data/pyg_dataset.py` | PyTorch Geometric `InMemoryDataset` conversion, burst stats | Fully Implemented | **VERIFIED & TESTED** | Passed unit tests (`test_pyg_dataset.py`). Zero-leakage verified: target labels are excluded from $X$ and edge attributes. |
-| `src/nlp/dual_edge_scorer.py` | NLI/stance scoring on edges ($u \to v$) | Fully Implemented | **VERIFIED & TESTED** | Passed unit tests. Supports `legacy_nli` (2D) and `qwen_qlora` (4D). |
-| `src/nlp/qwen_teacher.py` | Qwen LLM teacher for 5-class stance extraction | Fully Implemented | **READY / CODE AUDITED** | Implements 4-bit NF4 quantization loader. Requires GPU and downloaded Qwen checkpoint to run live distillation. |
-| `src/nlp/extract_features.py` | Batch feature extraction pipeline (text to `.pt`) | Fully Implemented | **VERIFIED & TESTED** | Passed unit tests (`test_pipeline_and_viz.py`). Extracts node and edge features offline. |
-| `src/models/sbi_fagat.py` | Proposed SBi-FAGAT model (bidirectional, frequency-adaptive) | Fully Implemented | **VERIFIED & TESTED** | Passed unit tests (`test_models.py`, `test_overfit.py`). Validated forward pass, low/high-pass attention, multi-task heads, and MC Dropout. |
-| `src/models/baselines.py` | GCN, GAT, BiGCN, BiGAT, FAGCN, StanceGCN, StanceGAT | Fully Implemented | **VERIFIED & TESTED** | Passed unit tests (`test_models.py`). All 7 baselines conform to uniform input/output interface. |
-| `src/training/metrics.py` | Metric calculations: MSE, MAE, Pearson $r$, Macro-F1, Acc | Fully Implemented | **VERIFIED & TESTED** | Passed unit tests (`test_metrics.py`). Robust handling of constant predictions. |
-| `src/training/trainer.py` | Unified multi-task trainer, early stopping, LR scheduler | Fully Implemented | **VERIFIED & TESTED** | Passed unit tests (`test_overfit.py`). Validated training convergence on synthetic tensors. |
-| `src/training/reporting.py` | Latex tables, markdown tables, bootstrap p-values | Fully Implemented | **VERIFIED & TESTED** | Bootstrap paired t-test and Wilcoxon signed-rank test implemented. |
-| `src/training/auto_loop.py` | Autonomous hyperparameter loop and trial orchestrator | Fully Implemented | **READY / CODE AUDITED** | Code audited. Runs training over parameter grids. |
-| `src/utils/seed.py` | Deterministic seeding (`torch`, `numpy`, `random`) | Fully Implemented | **VERIFIED & TESTED** | Enforces reproducible seeds `[42, 100, 2024, 777, 999]`. |
-| `src/utils/visualize.py` | UMAP embeddings, cascade tree plotting, loss curves | Fully Implemented | **VERIFIED & TESTED** | Passed unit tests (`test_pipeline_and_viz.py`). |
+| `src/data/schema.py` | Arrow/Parquet contract, Pydantic models (`NodeRecord`, `EdgeRecord`), zero-leakage & DAG checks | Implemented | Unit tested (`test_schema.py`) | Enforces UTC timestamps, `FORBIDDEN_LEAKAGE_COLUMNS`, acyclic trees, and temporal order. |
+| `src/data/pheme_loader.py` | PHEME Figshare downloader/parser (`PHEME_veracity.tar.bz2`), MD5/SHA-256 verification | Implemented | Unit tested (`test_pheme_tree.py`) | Reconstructs trees (`source-tweets`, `reactions`, `structure.json`); inductive event grouping. |
+| `src/data/arctic_shift_vn.py` | Arctic Shift Reddit VN parser, salted SHA-256 pseudonymization, `--before-epoch`, `cluster_vn_cascade_topics` | Implemented | Unit tested (`test_vn_tree.py`) | Supports `SBIF_HASH_SALT` and `.author_hash_salt.secret` with `UserWarning` fallback. |
+| `src/data/pyg_dataset.py` | `EarlyCascadeDataset`, `CascadeData`, `DEFAULT_FORECAST_MIN_REPLIES=25`, canonical `topic_splits.json`, 8D `cascade_stats` | Implemented | Unit tested (`test_no_leakage.py`, `test_egm_fixes.py`, `test_round2_research_fixes.py`) | Enforces $K \le 20$ truncation, `future_only` $y_{\text{polar}}$, and `edge_source="teacher"` LOO isolation. |
+| `src/nlp/dual_edge_scorer.py` | Hostility + Stance teachers (`legacy_nli`), `DualHeadCrossEncoder`, blind audit CSV exporter, LOO CV | Implemented | Unit tested (`test_nlp_and_features.py`, `test_sota_v2_upgrades.py`) | Supports 2D/4D edge distillation and `--sanity-check-shuffle` anti-cheating check. |
+| `src/nlp/qwen_teacher.py` | `Qwen/Qwen3.8-27B` QLoRA 1-pass G-Eval 5-class discourse teacher (`[s_uv, h_uv, r_uv, c_uv]`) | Implemented | Unit tested (`test_kaggle_t4x2_v2_pipeline.py`) | Includes FP16/4-bit NF4 loader, multimodal vision-tower freeze, and behavioral prototypes. |
+| `src/nlp/extract_features.py` | Offline frozen node (`[N, 770]`) and edge attribute exporter (`nlp_features.pt`) | Implemented | Unit tested (`test_nlp_and_features.py`, `test_pipeline_and_viz.py`) | Strict finite-tensor checks; separates NLP extraction from GNN training. |
+| `src/models/sbi_fagat.py` | Proposed `SBiFAGAT`, `StanceGuidedFAConv`, `GlobalAttentionReadout`, `extract_edge_gates` | Implemented | Unit tested (`test_overfit_batch.py`, `test_sota_v2_upgrades.py`, `test_egm_fixes.py`) | Supports 2D/4D edges, `tanh`/`sigmoid` gate, TD/BU, `cascade_stats`, and `beta-NLL` uncertainty. |
+| `src/models/baselines.py` | 7 fair baselines (`TextMLP`, `TemporalStanceMLP`, `StandardGCN`, `StandardGATv2`, `EdgeGATv2`, `FAGCNBaseline`, `BiGCN`) & `MultiTaskHead` | Implemented | Unit tested (`test_overfit_batch.py`, `test_egm_fixes.py`) | Uniform `hidden_dim=128` and shared `MultiTaskHead`. |
+| `src/training/metrics.py` | Huber + CE + $\beta$-NLL loss (`compute_multitask_loss`), RMSE, MAE, $R^2$, Pearson $r$, Spearman $\rho$, Macro-F1, AUROC | Implemented | Unit tested (`test_sota_v2_upgrades.py`, `test_round2_research_fixes.py`) | Detached residual weighting for $\beta$-NLL uncertainty calibration. |
+| `src/training/trainer.py` | Early Stopping (`task_loss`), 5-seed runner (`run_multi_seed_benchmark`), paired t-test & Holm-Bonferroni | Implemented | Unit tested (`test_overfit_batch.py`, `test_egm_fixes.py`) | Enforces `OFFICIAL_SEEDS = [42, 100, 2024, 777, 999]`. |
+| `src/training/reporting.py` | LaTeX / Markdown table exporters & serialized JSON result summaries | Implemented | Unit tested (`test_pipeline_and_viz.py`) | Formats multi-seed `mean ± std` with significance markers. |
+| `src/training/auto_loop.py` | Budgeted hyperparameter search loop (`T4 x 2` / automated tuning) | Implemented | Unit tested (`test_kaggle_t4x2_v2_pipeline.py`) | Guarded parameter search over validation splits. |
+| `src/utils/seed.py` | Deterministic seeding (`OFFICIAL_SEEDS`) | Implemented | Unit tested (`test_overfit_batch.py`) | Configures Python, NumPy, and PyTorch RNGs. |
+| `src/utils/text.py` | Unicode NFC & shared text normalization helpers | Implemented | Audited | Used identically across ingestion and NLP extractors. |
+| `src/utils/visualize.py` | UMAP embeddings, early-$K$ curves, cascade gate heatmaps (`paper/figures/`) | Implemented | Unit tested (`test_pipeline_and_viz.py`) | Exports `.pdf` and `.svg` vector graphics. |
 
 ---
 
-## 2. Scripts & Execution Entrypoints
+## 2. Scripts, Notebooks & Publication Tooling
 
-| Script | Purpose | Status | Audit Findings & Verification |
+| Path | Purpose | Status | Remarks |
 | :--- | :--- | :--- | :--- |
-| `scripts/kaggle_parallel_runner.py` | Dual T4 orchestration (`member1_vn`, `member2_gnn`, etc.) | **VERIFIED** | Smoke test verified: `python -m scripts.kaggle_parallel_runner --role member1_vn --smoke-test` exited with code 0. |
-| `scripts/predict_live_thread.py` | Inference CLI for live Reddit/social threads | **VERIFIED** | Audited and hardened: Added `--allow-untrained` safeguard to prevent accidental inference on real posts with random weights. Demo offline verified (`--demo-offline`). |
-| `scripts/benchmark_efficiency.py` | Model parameter counts, inference latency, RAM/VRAM | **VERIFIED** | Audited. Benchmarks all 8 models across synthetic graph batches. |
-| `scripts/demo_research_walkthrough.py` | Quick CPU walkthrough (<5s) comparing GCN vs. SBi-FAGAT | **VERIFIED** | Audited. Educational and reproducible sanity check. |
-| `scripts/run_phase2.sh` | Shell script for Frozen-Teacher NLP feature extraction | **UPDATED** | Enhanced with `PIPELINE_VERSION=v1|v2` variable. Default `v1` uses `legacy_nli` (2D). |
-| `run_all.sh` | End-to-end execution script | **UPDATED** | Enhanced with `PIPELINE_VERSION=v1|v2` variable. Default `v1` passes `--edge-dim 2`. |
-| `scripts/compute_kappa.py` | Inter-annotator agreement (SDQC, RumourEval) | **READY** | Implements Cohen's Kappa, Machine-vs-Gold, and confusion matrices. |
-| `scripts/run_experiments.py` | 5-seed benchmark runner for 8 models | **READY** | Requires processed dataset `.pt` files to execute. |
-| `scripts/run_ablation.py` | Component ablation study ($K \in \{5, 10, 20, 50\}$) | **READY** | Requires processed dataset `.pt` files to execute. |
-| `scripts/run_upfd_extension.py` | UPFD benchmark extension | **READY** | Requires UPFD dataset download to execute. |
+| `scripts/kaggle_parallel_runner.py` | Dual T4 orchestrator (`member1_vn`, `member2_gnn`, `t4x2_all`) | Verified | `--smoke-test` exits 0 offline. |
+| `scripts/predict_live_thread.py` | Live thread inference CLI (`--reddit-url`/`--url`, `--gnn-ckpt`/`--checkpoint`) | Verified | Blocks untrained live inference unless `--allow-untrained` or `--demo-offline`. |
+| `scripts/benchmark_efficiency.py` | Complexity profiler (`#Params`, `ms/cascade`, peak RAM/VRAM) + LaTeX export | Verified | Uses controlled tensor shapes strictly for speed/memory profiling (`--output-table`). |
+| `scripts/export_dataset_stats.py` | Dataset EDA (`Table 1` LaTeX) + Early-$K$ Persistence Baseline | Verified | Zero-leakage check on `y_polar(G_K)` vs. future `y_polar`. |
+| `scripts/demo_research_walkthrough.py` | Offline CPU walkthrough (`<5s`) | Verified | Educational sanity check comparing `StandardGCN` vs. `SBiFAGAT`. |
+| `scripts/run_phase2.sh`, `run_all.sh` | Profile-gated shell pipelines (`PIPELINE_VERSION=v1|v2`) | Reconciled | Default `v1` (`--edge-dim 2`, `--min-total-replies 25`); `v2` opt-in (`--edge-dim 4`). |
+| `scripts/compute_kappa.py` | Cohen's Kappa & gold human audit evaluator (`human_audit_300.csv` / `human_audit_vi_300.csv`) | Ready | Evaluates inter-annotator & teacher-vs-gold agreement. |
+| `scripts/run_experiments.py`, `run_ablation.py`, `run_upfd_extension.py` | 5-seed benchmarks, $K$-horizon ablation, and UPFD evaluation | Ready | Await real extracted `.pt` feature banks on GPU/Kaggle. |
+| `notebooks/*.ipynb` | Kaggle dual-T4 & Member 1/2 runnable notebooks | Ready | Mirrors `scripts/kaggle_parallel_runner.py` workflows. |
+| `paper/main.tex`, `paper/references.bib` | `IEEEtran` manuscript skeleton & 25 verified BibTeX references | Ready | Tables populated via `\IfFileExists{tables_*.tex}` (zero fabricated results). |
 
 ---
 
-## 3. Workspace Data & Artifact Reality
+## 3. Repository Data State on Git
 
-| Directory | Expected Content | Actual State on Disk | Impact / Assessment |
-| :--- | :--- | :--- | :--- |
-| `data/raw/` | PHEME tarballs, raw Reddit JSON dumps | Contains `.gitkeep` only | No raw data stored locally. Must be ingested via `pheme_loader.py` or `arctic_shift_vn.py`. |
-| `data/interim/` | Parsed Parquet tables, cleaned trees | Contains `.gitkeep` only | No interim tables stored locally. |
-| `data/processed/` | PyG `.pt` tensor files for Train/Val/Test | Contains `.gitkeep` only | Requires NLP feature extraction pass. |
-| `checkpoints/` | Trained model weights (`.pt`) | Directory exists (empty or gitignored) | No pre-trained checkpoints exist in the repository checkout. |
-| `outputs/` / `results/` | Final benchmark tables, figures, CSVs | Contains `.gitkeep` only | No empirical result files exist. All published tables must be generated from real training runs. |
+| Directory | Tracked on Git | Purpose |
+| :--- | :--- | :--- |
+| `data/raw/` | `.gitkeep` only | Destination for downloaded PHEME archive & raw VN Reddit dumps |
+| `data/interim/` | `.gitkeep` only | Validated `nodes.parquet` / `edges.parquet` and audit CSVs (local `vn_sample5/` gitignored) |
+| `data/processed/` | `.gitkeep` only | Pre-extracted `nlp_features.pt` and canonical `topic_splits.json` |
+| `checkpoints/` | `.gitkeep` only | Trained GNN / Student / QLoRA checkpoints (gitignored) |
+| `results/` | `.gitkeep` only | 5-seed experimental JSONs, LaTeX tables, and paired test reports (gitignored) |

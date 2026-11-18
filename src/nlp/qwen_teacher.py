@@ -28,17 +28,25 @@ import json
 import math
 import random
 import re
-import unicodedata
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from src.utils.text import normalize_nfc
+
 QWEN_TEACHER_MODEL_ID: str = "Qwen/Qwen3.8-27B"
 QWEN_KAGGLE_4BIT_MODEL_ID: str = "unsloth/Qwen3.8-27B-unsloth-bnb-4bit"
+QWEN_16GB_MODEL_ID: str = "Qwen/Qwen3-8B"
 EN_DEBERTA_MODEL_NAME: str = "microsoft/deberta-v3-base"
+
+# Continuous calibration prototypes per 5-class discourse category (G-Eval expected-score projection)
+BEHAVIOR_PROTOTYPE_S = np.array([0.85, 0.00, -0.78, -0.72, -0.92], dtype=np.float64)
+BEHAVIOR_PROTOTYPE_H = np.array([0.03, 0.03, 0.08, 0.45, 0.94], dtype=np.float64)
+BEHAVIOR_PROTOTYPE_R = np.array([0.03, 0.04, 0.06, 0.88, 0.72], dtype=np.float64)
+BEHAVIOR_PROTOTYPE_C = np.array([0.88, 0.60, 0.90, 0.08, 0.03], dtype=np.float64)
 
 DISCOURSE_BEHAVIOR_LABELS: tuple[str, ...] = (
     "support",
@@ -155,9 +163,7 @@ _SUPPORT_CUE_WORDS: tuple[str, ...] = (
 
 
 def _normalize_nfc(text: Any) -> str:
-    if not isinstance(text, str):
-        return ""
-    return unicodedata.normalize("NFC", text).replace("\x00", "").strip()
+    return normalize_nfc(text)
 
 
 def _clamp01(value: float) -> float:
@@ -271,6 +277,82 @@ def build_behavioral_prompt(
     ]
 
 
+def build_logit_rubric_prompt(
+    root_text: str,
+    parent_text: str,
+    reply_text: str,
+    lang: str = "vi",
+) -> list[dict[str, str]]:
+    """Construct single-token G-Eval digit rubric prompt (1..5) for 1-pass logit scoring."""
+    r_txt = _normalize_nfc(root_text)[:600]
+    p_txt = _normalize_nfc(parent_text)[:600]
+    c_txt = _normalize_nfc(reply_text)[:600]
+
+    if lang == "vi":
+        system_msg = (
+            "Bạn là chuyên gia phân tích tranh luận mạng xã hội. "
+            "Hãy phân loại bình luận trả lời so với bình luận trước và bài gốc thành ĐÚNG 1 chữ số duy nhất (1, 2, 3, 4 hoặc 5):\n"
+            "1 = support (tán thành, ủng hộ hợp lý, bổ sung tích cực)\n"
+            "2 = neutral (trung lập, hỏi thông tin, nhận xét khách quan)\n"
+            "3 = constructive_oppose (phản biện văn minh, không đồng tình có lý lẽ hoặc dẫn chứng)\n"
+            "4 = irrational_fallacy (vô lý, ngụy biện, nói cùn, bẻ lái, mỉa mai vô căn cứ)\n"
+            "5 = hostile_conflict (chống đối gay gắt, công kích cá nhân, chửi bới, kích động thù ghét)\n"
+            "Chỉ trả về DUY NHẤT 1 chữ số (1, 2, 3, 4 hoặc 5), không giải thích."
+        )
+        user_msg = (
+            f"[Bài gốc]: {r_txt}\n"
+            f"[Bình luận trước]: {p_txt}\n"
+            f"[Bình luận trả lời]: {c_txt}\n"
+            "Nhãn (1-5):"
+        )
+    else:
+        system_msg = (
+            "You are an expert social-media discourse analyst. "
+            "Classify the reply relative to the parent comment and root post as EXACTLY ONE digit (1, 2, 3, 4, or 5):\n"
+            "1 = support (logical agreement or constructive reinforcement)\n"
+            "2 = neutral (informational query or neutral observation)\n"
+            "3 = constructive_oppose (civil, reasoned, evidence-based disagreement)\n"
+            "4 = irrational_fallacy (illogical, strawman, whataboutism, derailment, baseless sarcasm)\n"
+            "5 = hostile_conflict (toxic personal attack, harassment, hate, inflammatory provocation)\n"
+            "Output ONLY the single digit (1, 2, 3, 4, or 5)."
+        )
+        user_msg = (
+            f"[Root Post]: {r_txt}\n"
+            f"[Parent Comment]: {p_txt}\n"
+            f"[Reply]: {c_txt}\n"
+            "Label (1-5):"
+        )
+
+    return [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ]
+
+
+def _extract_last_json_object(text: str) -> dict[str, Any] | None:
+    """Scan balanced JSON object candidates from right to left to avoid greedy brace spans."""
+    depth = 0
+    end_idx: int | None = None
+    for idx in range(len(text) - 1, -1, -1):
+        ch = text[idx]
+        if ch == "}":
+            if depth == 0:
+                end_idx = idx
+            depth += 1
+        elif ch == "{":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and end_idx is not None:
+                    snippet = text[idx : end_idx + 1]
+                    try:
+                        obj = json.loads(snippet)
+                        if isinstance(obj, dict):
+                            return obj
+                    except json.JSONDecodeError:
+                        end_idx = None
+    return None
+
+
 def behavior_probs_to_stance_probs(probs_5: Sequence[float]) -> list[float]:
     """Collapse 5-class behavior probs `[sup, neu, con_opp, irr, hos]` to 3-class `[sup, neu, opp]`."""
     arr = np.asarray(probs_5, dtype=np.float64).reshape(-1)
@@ -348,17 +430,16 @@ def parse_behavioral_teacher_json(
 ) -> dict[str, Any]:
     """Parse teacher generation into normalized 5-class probabilities and 4D `[s, h, r, c]` scores."""
     cleaned = _strip_thinking_and_fences(raw_text)
-    parsed: dict[str, Any] | None = None
-
-    json_match = _JSON_OBJECT_RE.search(cleaned)
-    if json_match:
-        candidate = json_match.group(0)
-        try:
-            obj = json.loads(candidate)
-            if isinstance(obj, dict):
-                parsed = obj
-        except json.JSONDecodeError:
-            parsed = None
+    parsed = _extract_last_json_object(cleaned)
+    if parsed is None:
+        json_match = _JSON_OBJECT_RE.search(cleaned)
+        if json_match:
+            try:
+                obj = json.loads(json_match.group(0))
+                if isinstance(obj, dict):
+                    parsed = obj
+            except json.JSONDecodeError:
+                parsed = None
 
     if parsed is None:
         return _heuristic_behavior_fallback(reply_text)
@@ -524,6 +605,67 @@ _CURATED_GOLD_SEEDS: tuple[dict[str, Any], ...] = (
         "c_uv": 0.08,
         "probs": [0.02, 0.04, 0.12, 0.70, 0.12],
     },
+    # Additional balanced Vietnamese calibration anchors (support, neutral, constructive, irrational, hostile)
+    {
+        "lang": "vi",
+        "root": "Thảo luận về việc bỏ kỳ thi tốt nghiệp THPT hoặc gộp vào xét tuyển đại học.",
+        "parent": "Giữ kỳ thi chung giúp có một mặt bằng đánh giá tối thiểu giữa các địa phương.",
+        "reply": "Đồng tình hoàn toàn, nếu bỏ hẳn kỳ thi chuẩn hóa thì học bạ ở nhiều nơi rất khó kiểm soát tính khách quan.",
+        "label": "support",
+        "s_uv": 0.86,
+        "h_uv": 0.02,
+        "r_uv": 0.03,
+        "c_uv": 0.90,
+        "probs": [0.86, 0.07, 0.04, 0.02, 0.01],
+    },
+    {
+        "lang": "vi",
+        "root": "Thảo luận về việc bỏ kỳ thi tốt nghiệp THPT hoặc gộp vào xét tuyển đại học.",
+        "parent": "Bộ đang lấy ý kiến cho phương án thi 4 môn bắt buộc và tự chọn.",
+        "reply": "Cho mình hỏi thời gian dự kiến áp dụng phương án mới là từ khóa tuyển sinh năm nào vậy?",
+        "label": "neutral",
+        "s_uv": 0.0,
+        "h_uv": 0.02,
+        "r_uv": 0.03,
+        "c_uv": 0.72,
+        "probs": [0.05, 0.87, 0.05, 0.02, 0.01],
+    },
+    {
+        "lang": "vi",
+        "root": "Tranh luận về việc áp dụng làm việc 4 ngày/tuần trong khối doanh nghiệp tư nhân.",
+        "parent": "Giảm ngày làm việc sẽ giúp nhân viên phục hồi sức khỏe và tăng năng suất.",
+        "reply": "Ý tưởng rất hay cho khối sáng tạo, nhưng ngành sản xuất dây chuyền và bán lẻ nếu giữ nguyên lương sẽ đội chi phí vận hành khoảng 20%.",
+        "label": "constructive_oppose",
+        "s_uv": -0.74,
+        "h_uv": 0.04,
+        "r_uv": 0.04,
+        "c_uv": 0.93,
+        "probs": [0.04, 0.09, 0.83, 0.03, 0.01],
+    },
+    {
+        "lang": "vi",
+        "root": "Tranh luận về việc công khai mức lương tối thiểu trong tin tuyển dụng IT.",
+        "parent": "Minh bạch lương giúp ứng viên đỡ mất thời gian phỏng vấn nhiều vòng.",
+        "reply": "Toàn bọn HR lùa gà chứ biết gì về kỹ thuật đâu, công ty nào cũng vẽ bánh hết tin người quá bạn ơi.",
+        "label": "irrational_fallacy",
+        "s_uv": -0.70,
+        "h_uv": 0.45,
+        "r_uv": 0.85,
+        "c_uv": 0.08,
+        "probs": [0.02, 0.05, 0.11, 0.70, 0.12],
+    },
+    {
+        "lang": "vi",
+        "root": "Thảo luận về đề xuất phạt nguội người đi bộ sang đường sai quy định.",
+        "parent": "Cần lắp thêm cầu vượt và vạch kẻ rõ ràng trước khi xử phạt đồng loạt.",
+        "reply": "Óc chó mới nghĩ ra trò phạt người đi bộ, tụi bây ăn hết tiền thuế dân rồi còn bày đặt luật lệ!",
+        "label": "hostile_conflict",
+        "s_uv": -0.95,
+        "h_uv": 0.96,
+        "r_uv": 0.75,
+        "c_uv": 0.02,
+        "probs": [0.01, 0.01, 0.02, 0.09, 0.87],
+    },
     # English social debate calibration examples
     {
         "lang": "en",
@@ -585,6 +727,90 @@ _CURATED_GOLD_SEEDS: tuple[dict[str, Any], ...] = (
         "c_uv": 0.02,
         "probs": [0.01, 0.01, 0.02, 0.09, 0.87],
     },
+    {
+        "lang": "en",
+        "root": "Health ministry reviews mandatory calorie labeling for restaurant chains.",
+        "parent": "Evidence from NYC shows modest reformulation toward lower-sodium menu items.",
+        "reply": "Good point, transparent nutritional data also helps people managing diabetes compare meals quickly.",
+        "label": "support",
+        "s_uv": 0.84,
+        "h_uv": 0.02,
+        "r_uv": 0.03,
+        "c_uv": 0.88,
+        "probs": [0.84, 0.09, 0.04, 0.02, 0.01],
+    },
+    {
+        "lang": "en",
+        "root": "Health ministry reviews mandatory calorie labeling for restaurant chains.",
+        "parent": "Independent cafes under 20 locations would be excluded from the rule.",
+        "reply": "According to the draft bill attached in the press release, compliance begins 18 months after enactment.",
+        "label": "neutral",
+        "s_uv": 0.0,
+        "h_uv": 0.02,
+        "r_uv": 0.03,
+        "c_uv": 0.75,
+        "probs": [0.05, 0.86, 0.06, 0.02, 0.01],
+    },
+    {
+        "lang": "en",
+        "root": "Health ministry reviews mandatory calorie labeling for restaurant chains.",
+        "parent": "Displaying calories uniformly eliminates unhealthy ordering habits.",
+        "reply": "Randomized cafe trials show calorie counts alone rarely change ordering behavior without pricing or portion-size nudges, and can trigger disordered eating.",
+        "label": "constructive_oppose",
+        "s_uv": -0.78,
+        "h_uv": 0.05,
+        "r_uv": 0.04,
+        "c_uv": 0.92,
+        "probs": [0.03, 0.08, 0.84, 0.04, 0.01],
+    },
+    {
+        "lang": "en",
+        "root": "Police confirmed a suspect was arrested near the downtown transit hub.",
+        "parent": "Witnesses report officers cordoned off two blocks during the search.",
+        "reply": "False flag staged by crisis actors again, nobody believes mainstream police reports anymore lol.",
+        "label": "irrational_fallacy",
+        "s_uv": -0.80,
+        "h_uv": 0.38,
+        "r_uv": 0.91,
+        "c_uv": 0.05,
+        "probs": [0.01, 0.03, 0.07, 0.79, 0.10],
+    },
+    {
+        "lang": "en",
+        "root": "Police confirmed a suspect was arrested near the downtown transit hub.",
+        "parent": "Officials urged residents to wait for forensic verification before sharing rumors.",
+        "reply": "You bootlicking idiot, keep defending corrupt liar officials you pathetic clown!",
+        "label": "hostile_conflict",
+        "s_uv": -0.94,
+        "h_uv": 0.96,
+        "r_uv": 0.74,
+        "c_uv": 0.02,
+        "probs": [0.01, 0.01, 0.02, 0.10, 0.86],
+    },
+    {
+        "lang": "en",
+        "root": "University senate votes on adopting open-weight AI grading assistants for introductory labs.",
+        "parent": "Automated unit-test feedback cuts TA turnaround time from 5 days to under an hour.",
+        "reply": "Backing automated style and test hints makes sense as long as appeal reviews remain human-led.",
+        "label": "support",
+        "s_uv": 0.80,
+        "h_uv": 0.03,
+        "r_uv": 0.04,
+        "c_uv": 0.89,
+        "probs": [0.80, 0.10, 0.06, 0.03, 0.01],
+    },
+    {
+        "lang": "en",
+        "root": "University senate votes on adopting open-weight AI grading assistants for introductory labs.",
+        "parent": "Automated grading models could misinterpret creative student solutions.",
+        "reply": "Exactly, rubric edge cases in recursive assignments had a 14% false-negative rate in last semester's audit, so human oversight is still needed for partial credit.",
+        "label": "constructive_oppose",
+        "s_uv": -0.72,
+        "h_uv": 0.04,
+        "r_uv": 0.05,
+        "c_uv": 0.91,
+        "probs": [0.04, 0.09, 0.82, 0.04, 0.01],
+    },
 )
 
 
@@ -600,19 +826,25 @@ def _format_example_record(
     r_uv: float,
     c_uv: float,
     probs: list[float],
+    scoring_mode: Literal["logit", "generate"] = "logit",
 ) -> dict[str, Any]:
-    target_json = json.dumps(
-        {
-            "label": label,
-            "s_uv": round(float(s_uv), 4),
-            "h_uv": round(float(h_uv), 4),
-            "r_uv": round(float(r_uv), 4),
-            "c_uv": round(float(c_uv), 4),
-            "probs": [round(float(p), 4) for p in probs],
-        },
-        ensure_ascii=False,
-    )
-    messages = build_behavioral_prompt(root_text, parent_text, reply_text, lang=lang)
+    if scoring_mode == "logit":
+        digit = str(BEHAVIOR_LABEL_TO_IDX.get(label, 1) + 1)
+        messages = build_logit_rubric_prompt(root_text, parent_text, reply_text, lang=lang)
+        assistant_content = digit
+    else:
+        assistant_content = json.dumps(
+            {
+                "label": label,
+                "s_uv": round(float(s_uv), 4),
+                "h_uv": round(float(h_uv), 4),
+                "r_uv": round(float(r_uv), 4),
+                "c_uv": round(float(c_uv), 4),
+                "probs": [round(float(p), 4) for p in probs],
+            },
+            ensure_ascii=False,
+        )
+        messages = build_behavioral_prompt(root_text, parent_text, reply_text, lang=lang)
     return {
         "lang": lang,
         "root_text": root_text,
@@ -624,7 +856,7 @@ def _format_example_record(
         "r_uv": float(r_uv),
         "c_uv": float(c_uv),
         "probs": probs,
-        "messages": messages + [{"role": "assistant", "content": target_json}],
+        "messages": messages + [{"role": "assistant", "content": assistant_content}],
     }
 
 
@@ -633,26 +865,29 @@ def build_qlora_gold_examples(
     lang: str = "vi",
     vihsd_samples: Sequence[Mapping[str, Any]] | None = None,
     rumoureval_samples: Sequence[Mapping[str, Any]] | None = None,
+    tweet_eval_samples: Sequence[Mapping[str, Any]] | None = None,
     pilot_gold_csv: Path | None = None,
+    scoring_mode: Literal["logit", "generate"] = "logit",
     max_samples: int = 1200,
     seed: int = 42,
 ) -> list[dict[str, Any]]:
     """Build strictly leakage-free QLoRA calibration examples from gold external sources.
 
-    Combines curated 5-class rubric anchors with optional external datasets (`UIT-ViHSD`
-    hate/hostility samples, `RumourEval` SDQC stance pairs, and an explicit human-adjudicated
-    pilot CSV). Never reads held-out target `val`/`test` cascade splits.
+    Combines curated 5-class rubric anchors with balanced external datasets (`UIT-ViHSD`
+    hate/hostility samples, `RumourEval` SDQC stance pairs, optional `TweetEval` offensive/hate
+    anchors, and explicit human-adjudicated pilot rows). Never reads held-out target
+    `val`/`test` cascade splits.
     """
     if lang not in {"vi", "en"}:
         raise ValueError(f"Unsupported lang {lang!r}; expected 'vi' or 'en'")
 
     rng = random.Random(seed)
-    examples: list[dict[str, Any]] = []
+    core_examples: list[dict[str, Any]] = []
+    external_buckets: dict[str, list[dict[str, Any]]] = {lbl: [] for lbl in DISCOURSE_BEHAVIOR_LABELS}
 
     for item in _CURATED_GOLD_SEEDS:
-        # Include both languages with slight priority to active language
         if item["lang"] == lang or lang == "vi":
-            examples.append(
+            core_examples.append(
                 _format_example_record(
                     root_text=item["root"],
                     parent_text=item["parent"],
@@ -664,6 +899,7 @@ def build_qlora_gold_examples(
                     r_uv=item["r_uv"],
                     c_uv=item["c_uv"],
                     probs=list(item["probs"]),
+                    scoring_mode=scoring_mode,
                 )
             )
 
@@ -679,7 +915,7 @@ def build_qlora_gold_examples(
                 lbl, s_v, h_v, r_v, c_v = "irrational_fallacy", -0.55, 0.62, 0.68, 0.12
             else:
                 lbl, s_v, h_v, r_v, c_v = "neutral", 0.0, 0.05, 0.08, 0.55
-            examples.append(
+            external_buckets[lbl].append(
                 _format_example_record(
                     root_text="Chủ đề thảo luận cộng đồng mạng xã hội Việt Nam.",
                     parent_text="Ý kiến trao đổi trong chủ đề.",
@@ -691,6 +927,36 @@ def build_qlora_gold_examples(
                     r_uv=r_v,
                     c_uv=c_v,
                     probs=_default_probs_from_label(lbl),
+                    scoring_mode=scoring_mode,
+                )
+            )
+
+    if tweet_eval_samples:
+        for row in tweet_eval_samples:
+            text = _normalize_nfc(str(row.get("text") or ""))
+            if not text:
+                continue
+            raw_lbl = int(row.get("label", 0))
+            subset = str(row.get("subset") or "offensive").lower()
+            if subset == "hate" and raw_lbl == 1:
+                lbl, s_v, h_v, r_v, c_v = "hostile_conflict", -0.85, 0.90, 0.65, 0.05
+            elif raw_lbl == 1:
+                lbl, s_v, h_v, r_v, c_v = "irrational_fallacy", -0.55, 0.60, 0.70, 0.10
+            else:
+                lbl, s_v, h_v, r_v, c_v = "neutral", 0.0, 0.05, 0.08, 0.55
+            external_buckets[lbl].append(
+                _format_example_record(
+                    root_text="English social media thread discussion.",
+                    parent_text="Earlier comment in thread.",
+                    reply_text=text,
+                    lang="en",
+                    label=lbl,
+                    s_uv=s_v,
+                    h_uv=h_v,
+                    r_uv=r_v,
+                    c_uv=c_v,
+                    probs=_default_probs_from_label(lbl),
+                    scoring_mode=scoring_mode,
                 )
             )
 
@@ -714,7 +980,7 @@ def build_qlora_gold_examples(
             lbl, s_v, h_v, r_v, c_v = sdqc_map.get(
                 gold_raw, ("neutral", 0.0, 0.08, 0.10, 0.45)
             )
-            examples.append(
+            external_buckets[lbl].append(
                 _format_example_record(
                     root_text=_normalize_nfc(str(row.get("root_text") or parent_txt)),
                     parent_text=parent_txt,
@@ -726,6 +992,7 @@ def build_qlora_gold_examples(
                     r_uv=r_v,
                     c_uv=c_v,
                     probs=_default_probs_from_label(lbl),
+                    scoring_mode=scoring_mode,
                 )
             )
 
@@ -764,7 +1031,7 @@ def build_qlora_gold_examples(
                     "irrational_fallacy": -0.70,
                     "hostile_conflict": -0.90,
                 }
-                examples.append(
+                core_examples.append(
                     _format_example_record(
                         root_text=_normalize_nfc(row.get("root_text") or p_txt),
                         parent_text=p_txt,
@@ -776,12 +1043,40 @@ def build_qlora_gold_examples(
                         r_uv=0.80 if lbl == "irrational_fallacy" else (0.60 if lbl == "hostile_conflict" else 0.08),
                         c_uv=0.85 if lbl in {"support", "constructive_oppose"} else (0.50 if lbl == "neutral" else 0.05),
                         probs=_default_probs_from_label(lbl),
+                        scoring_mode=scoring_mode,
                     )
                 )
 
+    examples = list(core_examples)
+    remaining_budget = (
+        max(0, int(max_samples) - len(core_examples)) if max_samples > 0 else sum(len(v) for v in external_buckets.values())
+    )
+    if remaining_budget > 0:
+        non_empty = [lbl for lbl, rows in external_buckets.items() if rows]
+        if non_empty:
+            per_class_cap = max(1, remaining_budget // len(non_empty))
+            leftover_rows: list[dict[str, Any]] = []
+            for lbl in non_empty:
+                bucket = list(external_buckets[lbl])
+                rng.shuffle(bucket)
+                examples.extend(bucket[:per_class_cap])
+                leftover_rows.extend(bucket[per_class_cap:])
+            if len(examples) < len(core_examples) + remaining_budget and leftover_rows:
+                rng.shuffle(leftover_rows)
+                needed = len(core_examples) + remaining_budget - len(examples)
+                examples.extend(leftover_rows[:needed])
+
     rng.shuffle(examples)
     if max_samples > 0 and len(examples) > max_samples:
-        examples = examples[:max_samples]
+        # Guarantee curated rubric anchors + adjudicated pilot rows always fit
+        if len(core_examples) <= max_samples:
+            keep = list(core_examples)
+            extras = [ex for ex in examples if ex not in core_examples]
+            rng.shuffle(extras)
+            examples = keep + extras[: max_samples - len(keep)]
+            rng.shuffle(examples)
+        else:
+            examples = examples[:max_samples]
     return examples
 
 
@@ -917,6 +1212,42 @@ def _load_external_vihsd_subset(limit: int = 800, seed: int = 42) -> list[dict[s
         return []
 
 
+def _get_input_device(model: torch.nn.Module) -> torch.device:
+    """Resolve device of the input embedding table cleanly under multi-GPU device_map='auto'."""
+    try:
+        emb = model.get_input_embeddings()
+        if emb is not None and hasattr(emb, "weight") and emb.weight.device.type != "meta":
+            return emb.weight.device
+    except Exception:
+        pass
+    for param in model.parameters():
+        if param.device.type == "cuda":
+            return param.device
+    first_param = next(model.parameters(), None)
+    if first_param is not None and first_param.device.type != "meta":
+        return first_param.device
+    return torch.device("cpu")
+
+
+def _collate_sft_batch(rows: Sequence[dict[str, torch.Tensor]], pad_id: int) -> dict[str, torch.Tensor]:
+    """Dynamically padCausal-LM SFT mini-batches to the longest sample in batch."""
+    max_len = max(int(r["input_ids"].numel()) for r in rows)
+    bsz = len(rows)
+    input_ids = torch.full((bsz, max_len), int(pad_id), dtype=torch.long)
+    attention_mask = torch.zeros((bsz, max_len), dtype=torch.long)
+    labels = torch.full((bsz, max_len), -100, dtype=torch.long)
+    for idx, row in enumerate(rows):
+        seq_len = int(row["input_ids"].numel())
+        input_ids[idx, :seq_len] = row["input_ids"].long()
+        attention_mask[idx, :seq_len] = row["attention_mask"].long()
+        labels[idx, :seq_len] = row["labels"].long()
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
+
+
 def finetune_qwen_qlora(
     *,
     output_dir: Path = Path("checkpoints/qwen38_27b_qlora"),
@@ -926,6 +1257,7 @@ def finetune_qwen_qlora(
     pilot_gold_csv: Path | None = None,
     include_vihsd: bool = True,
     max_vihsd_samples: int = 600,
+    scoring_mode: Literal["logit", "generate"] = "logit",
     epochs: int = 1,
     batch_size: int = 2,
     grad_accum_steps: int = 4,
@@ -937,10 +1269,11 @@ def finetune_qwen_qlora(
     model: Any | None = None,
     tokenizer: Any | None = None,
 ) -> Path:
-    """Adapt Qwen3.8-27B via text-only 4-bit QLoRA on external gold behavioral examples.
+    """Adapt Qwen teacher via text-only 4-bit QLoRA on balanced gold behavioral examples.
 
-    Keeps 99.5%+ of base weights frozen in NF4 across Kaggle `T4 x 2` and adapts only
-    thin LoRA projections on gold examples (never target `val` or `test` cascades).
+    Keeps 99.5%+ of base weights frozen in NF4 across Kaggle `T4 x 2`, masks prompt tokens
+    (`labels[:prompt_len] = -100`) so SFT loss optimizes only calibrated assistant tokens, and
+    never reads held-out target `val` or `test` cascades.
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -955,6 +1288,7 @@ def finetune_qwen_qlora(
             lang=lang,
             vihsd_samples=vihsd_rows,
             pilot_gold_csv=pilot_gold_csv,
+            scoring_mode=scoring_mode,
             seed=seed,
         )
     else:
@@ -1013,8 +1347,11 @@ def finetune_qwen_qlora(
                 active_model = get_peft_model(active_model, lora_cfg)
             _freeze_vision_modules_for_text_qlora(active_model)
             used_peft = True
-        except Exception:
-            used_peft = False
+        except Exception as exc:
+            raise RuntimeError(
+                f"QLoRA PEFT initialization failed for {model_name_or_path}; "
+                "refusing silent full-model NF4 fallback."
+            ) from exc
 
     tokenized_rows: list[dict[str, torch.Tensor]] = []
     pad_id = getattr(tok, "pad_token_id", None)
@@ -1024,38 +1361,62 @@ def finetune_qwen_qlora(
     for rec in gold_records:
         messages = rec.get("messages")
         if not messages:
-            messages = build_behavioral_prompt(
-                rec.get("root_text", ""),
-                rec.get("parent_text", ""),
-                rec.get("reply_text", ""),
-                lang=str(rec.get("lang", lang)),
-            ) + [
-                {
-                    "role": "assistant",
-                    "content": json.dumps(
-                        {
-                            "label": rec.get("label", "neutral"),
-                            "s_uv": float(rec.get("s_uv", 0.0)),
-                            "h_uv": float(rec.get("h_uv", 0.0)),
-                            "r_uv": float(rec.get("r_uv", 0.0)),
-                            "c_uv": float(rec.get("c_uv", 0.5)),
-                            "probs": rec.get("probs", [0.1, 0.6, 0.1, 0.1, 0.1]),
-                        },
-                        ensure_ascii=False,
-                    ),
-                }
-            ]
+            if scoring_mode == "logit":
+                lbl_str = str(rec.get("label", "neutral"))
+                digit = str(BEHAVIOR_LABEL_TO_IDX.get(lbl_str, 1) + 1)
+                messages = build_logit_rubric_prompt(
+                    rec.get("root_text", ""),
+                    rec.get("parent_text", ""),
+                    rec.get("reply_text", ""),
+                    lang=str(rec.get("lang", lang)),
+                ) + [{"role": "assistant", "content": digit}]
+            else:
+                messages = build_behavioral_prompt(
+                    rec.get("root_text", ""),
+                    rec.get("parent_text", ""),
+                    rec.get("reply_text", ""),
+                    lang=str(rec.get("lang", lang)),
+                ) + [
+                    {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {
+                                "label": rec.get("label", "neutral"),
+                                "s_uv": float(rec.get("s_uv", 0.0)),
+                                "h_uv": float(rec.get("h_uv", 0.0)),
+                                "r_uv": float(rec.get("r_uv", 0.0)),
+                                "c_uv": float(rec.get("c_uv", 0.5)),
+                                "probs": rec.get("probs", [0.1, 0.6, 0.1, 0.1, 0.1]),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ]
+        prompt_text = _render_chat_text(tok, messages[:-1], add_generation_prompt=True)
         full_text = _render_chat_text(tok, messages, add_generation_prompt=False)
-        enc = tok(
+        enc_full = tok(
             full_text,
             truncation=True,
             max_length=max_length,
-            padding="max_length",
             return_tensors="pt",
         )
-        input_ids = enc["input_ids"].squeeze(0).long()
-        attention_mask = enc["attention_mask"].squeeze(0).long()
+        enc_prompt = tok(
+            prompt_text,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        input_ids = enc_full["input_ids"].squeeze(0).long()
+        attention_mask = enc_full["attention_mask"].squeeze(0).long()
+        prompt_mask = enc_prompt.get("attention_mask")
+        if prompt_mask is not None:
+            prompt_len = int(prompt_mask.sum().item())
+        else:
+            prompt_len = int(enc_prompt["input_ids"].shape[-1])
+        if prompt_len >= input_ids.numel():
+            prompt_len = max(0, input_ids.numel() - 1)
         labels = input_ids.clone()
+        labels[:prompt_len] = -100
         labels[attention_mask == 0] = -100
         tokenized_rows.append(
             {
@@ -1065,15 +1426,24 @@ def finetune_qwen_qlora(
             }
         )
 
-    loader = DataLoader(_CausalSFTDataset(tokenized_rows), batch_size=max(1, batch_size), shuffle=True)
+    loader = DataLoader(
+        _CausalSFTDataset(tokenized_rows),
+        batch_size=max(1, batch_size),
+        shuffle=True,
+        collate_fn=lambda rows: _collate_sft_batch(rows, pad_id=int(pad_id)),
+    )
     trainable_params = [p for p in active_model.parameters() if p.requires_grad]
     if not trainable_params:
         raise RuntimeError("No trainable parameters found for Qwen QLoRA adaptation")
 
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
-    first_param = trainable_params[0]
-    param_device = first_param.device
-    use_amp = param_device.type == "cuda"
+    input_device = _get_input_device(active_model)
+    use_amp = input_device.type == "cuda"
+    scaler = (
+        torch.amp.GradScaler("cuda", enabled=use_amp)
+        if hasattr(torch.amp, "GradScaler")
+        else torch.cuda.amp.GradScaler(enabled=use_amp)
+    )
 
     active_model.train()
     losses: list[float] = []
@@ -1084,16 +1454,25 @@ def finetune_qwen_qlora(
         epoch_loss = 0.0
         steps = 0
         for step_idx, batch in enumerate(loader):
-            batch_dev = {k: v.to(param_device) for k, v in batch.items()}
+            batch_dev = {k: v.to(input_device) for k, v in batch.items()}
             with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                 out = active_model(**batch_dev)
                 loss = out.loss / float(accum)
-            loss.backward()
+            if use_amp:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             epoch_loss += float(loss.detach().cpu().item()) * float(accum)
             steps += 1
             if (step_idx + 1) % accum == 0 or (step_idx + 1) == len(loader):
+                if use_amp:
+                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-                optimizer.step()
+                if use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
         losses.append(epoch_loss / max(1, steps))
 
@@ -1105,11 +1484,13 @@ def finetune_qwen_qlora(
     report = {
         "model_name_or_path": model_name_or_path,
         "lang": lang,
+        "scoring_mode": scoring_mode,
         "num_examples": len(gold_records),
         "used_peft_qlora": used_peft,
         "frozen_vision_tensors": len(frozen_vision),
         "epochs": epochs,
         "epoch_losses": losses,
+        "prompt_masked": True,
         "zero_target_leakage": True,
     }
     (out_path / "qlora_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -1119,8 +1500,11 @@ def finetune_qwen_qlora(
 class QwenBehavioralTeacherScorer:
     """System-2 teacher scoring `(root, parent, reply)` into 5 classes and 4D `[s, h, r, c]`.
 
-    Uses `Qwen/Qwen3.8-27B` (optionally with QLoRA adapter) across Kaggle `T4 x 2`,
-    disabling verbose `<think>` tokens and falling back deterministically on malformed JSON.
+    Supports two modes:
+      - `"logit"` (default, G-Eval Liu et al. EMNLP 2023): single forward pass extracting
+        softmax probabilities over digit tokens `'1'..'5'` + prototype expected values.
+        Eliminates JSON parse errors and delivers ~10-20x higher throughput on T4 x 2.
+      - `"generate"`: greedy JSON generation (legacy/diagnostic or custom_generate_fn).
     """
 
     def __init__(
@@ -1129,20 +1513,29 @@ class QwenBehavioralTeacherScorer:
         model_name_or_path: str = QWEN_TEACHER_MODEL_ID,
         adapter_dir: Path | str | None = None,
         lang: str = "vi",
+        scoring_mode: Literal["logit", "generate"] = "logit",
+        logit_temperature: float = 1.0,
+        max_fallback_rate: float = 1.0,
         model: Any | None = None,
         tokenizer: Any | None = None,
         custom_generate_fn: Callable[[Sequence[str]], Sequence[str]] | None = None,
         max_new_tokens: int = 96,
         batch_size: int = 8,
     ) -> None:
+        if scoring_mode not in {"logit", "generate"}:
+            raise ValueError(f"Unsupported scoring_mode={scoring_mode!r}; expected 'logit' or 'generate'")
         self.model_name_or_path = str(model_name_or_path)
         self.adapter_dir = Path(adapter_dir) if adapter_dir is not None else None
         self.lang = lang
+        self.scoring_mode = scoring_mode
+        self.logit_temperature = max(1e-3, float(logit_temperature))
+        self.max_fallback_rate = float(max_fallback_rate)
         self.max_new_tokens = int(max_new_tokens)
         self.batch_size = max(1, int(batch_size))
         self.custom_generate_fn = custom_generate_fn
         self.model = model
         self.tokenizer = tokenizer
+        self._digit_token_ids: list[int] | None = None
 
         if self.custom_generate_fn is None and self.model is None:
             from transformers import AutoTokenizer
@@ -1166,14 +1559,87 @@ class QwenBehavioralTeacherScorer:
                     from peft import PeftModel
 
                     base_model = PeftModel.from_pretrained(base_model, str(self.adapter_dir))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed to load PEFT QLoRA adapter from {self.adapter_dir}: {exc}"
+                    ) from exc
             base_model.eval()
             for p in base_model.parameters():
                 p.requires_grad_(False)
             self.model = base_model
         elif self.model is not None and hasattr(self.model, "eval"):
             self.model.eval()
+
+    def _resolve_digit_token_ids(self) -> list[int]:
+        if self._digit_token_ids is not None:
+            return self._digit_token_ids
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer is required for G-Eval single-pass logit scoring")
+        digit_ids: list[int] = []
+        for d in ("1", "2", "3", "4", "5"):
+            enc = self.tokenizer.encode(d, add_special_tokens=False)
+            if not enc:
+                raise RuntimeError(f"Tokenizer returned empty token ids for rubric digit {d!r}")
+            digit_ids.append(int(enc[-1]))
+        self._digit_token_ids = digit_ids
+        return digit_ids
+
+    def _score_batch_logits(self, prompts: Sequence[str]) -> list[dict[str, Any]]:
+        assert self.model is not None and self.tokenizer is not None
+        if getattr(self.tokenizer, "pad_token_id", None) is None and getattr(self.tokenizer, "eos_token_id", None) is not None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.tokenizer.padding_side = "left"
+        digit_ids = self._resolve_digit_token_ids()
+
+        enc = self.tokenizer(
+            list(prompts),
+            padding=True,
+            truncation=True,
+            max_length=1536,
+            return_tensors="pt",
+        )
+        target_dev = _get_input_device(self.model)
+        enc_dev = {k: v.to(target_dev) for k, v in enc.items()}
+
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=(target_dev.type == "cuda")):
+                outputs = self.model(**enc_dev)
+
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+        bsz, seq_len, _ = logits.shape
+        attn_mask = enc_dev.get("attention_mask")
+        if getattr(self.tokenizer, "padding_side", "left") == "left" or attn_mask is None:
+            pos = torch.full((bsz,), seq_len - 1, dtype=torch.long, device=logits.device)
+        else:
+            pos = (attn_mask.to(logits.device).sum(dim=1) - 1).clamp(min=0)
+
+        next_logits = logits[torch.arange(bsz, device=logits.device), pos, :]
+        digit_logits = next_logits[:, digit_ids].float() / self.logit_temperature
+        probs_np = torch.softmax(digit_logits, dim=-1).detach().cpu().numpy()
+
+        parsed_rows: list[dict[str, Any]] = []
+        for row_idx in range(bsz):
+            probs = probs_np[row_idx].astype(np.float64)
+            probs = probs / max(1e-12, float(probs.sum()))
+            probs_list = [float(v) for v in probs]
+            s_val = float(np.clip(np.dot(probs, BEHAVIOR_PROTOTYPE_S), -1.0, 1.0))
+            h_val = float(np.clip(np.dot(probs, BEHAVIOR_PROTOTYPE_H), 0.0, 1.0))
+            r_val = float(np.clip(np.dot(probs, BEHAVIOR_PROTOTYPE_R), 0.0, 1.0))
+            c_val = float(np.clip(np.dot(probs, BEHAVIOR_PROTOTYPE_C), 0.0, 1.0))
+            lbl = DISCOURSE_BEHAVIOR_LABELS[int(np.argmax(probs))]
+            parsed_rows.append(
+                {
+                    "label": lbl,
+                    "s_uv": s_val,
+                    "h_uv": h_val,
+                    "r_uv": r_val,
+                    "c_uv": c_val,
+                    "probs": probs_list,
+                    "stance_probs": behavior_probs_to_stance_probs(probs_list),
+                    "fallback_used": False,
+                }
+            )
+        return parsed_rows
 
     def _generate_batch(self, prompts: Sequence[str]) -> list[str]:
         if self.custom_generate_fn is not None:
@@ -1191,8 +1657,7 @@ class QwenBehavioralTeacherScorer:
             max_length=1536,
             return_tensors="pt",
         )
-        first_param = next(self.model.parameters(), None)
-        target_dev = first_param.device if first_param is not None else torch.device("cpu")
+        target_dev = _get_input_device(self.model)
         enc_dev = {k: v.to(target_dev) for k, v in enc.items()}
         input_len = int(enc_dev["input_ids"].shape[1])
 
@@ -1222,6 +1687,7 @@ class QwenBehavioralTeacherScorer:
         *,
         batch_size: int | None = None,
         lang: str | None = None,
+        scoring_mode: Literal["logit", "generate"] | None = None,
     ) -> dict[str, Any]:
         if not (len(root_texts) == len(parent_texts) == len(reply_texts)):
             raise ValueError("root_texts, parent_texts, and reply_texts must have equal length")
@@ -1237,9 +1703,13 @@ class QwenBehavioralTeacherScorer:
                 "behavior_label": [],
                 "stance_probs": np.zeros((0, 3), dtype=np.float32),
                 "pred_label": [],
+                "fallback_count": 0,
+                "fallback_rate": 0.0,
             }
 
         active_lang = lang or self.lang
+        # Keep custom_generate_fn working seamlessly with JSON mock generators
+        active_mode = "generate" if self.custom_generate_fn is not None else (scoring_mode or self.scoring_mode)
         bs = max(1, int(batch_size or self.batch_size))
 
         s_list: list[float] = []
@@ -1250,23 +1720,41 @@ class QwenBehavioralTeacherScorer:
         b_labels: list[str] = []
         st_probs_list: list[list[float]] = []
         st_labels: list[str] = []
+        fallback_count = 0
         stance_3_names = ("support", "neutral", "oppose")
 
         for start in range(0, n, bs):
             prompts: list[str] = []
             slice_replies = reply_texts[start : start + bs]
             for idx in range(start, min(n, start + bs)):
-                msgs = build_behavioral_prompt(
-                    root_texts[idx],
-                    parent_texts[idx],
-                    reply_texts[idx],
-                    lang=active_lang,
-                )
+                if active_mode == "logit":
+                    msgs = build_logit_rubric_prompt(
+                        root_texts[idx],
+                        parent_texts[idx],
+                        reply_texts[idx],
+                        lang=active_lang,
+                    )
+                else:
+                    msgs = build_behavioral_prompt(
+                        root_texts[idx],
+                        parent_texts[idx],
+                        reply_texts[idx],
+                        lang=active_lang,
+                    )
                 prompts.append(_render_chat_text(self.tokenizer, msgs, add_generation_prompt=True))
 
-            raw_outputs = self._generate_batch(prompts)
-            for raw_out, rep_txt in zip(raw_outputs, slice_replies):
-                parsed = parse_behavioral_teacher_json(raw_out, reply_text=str(rep_txt))
+            if active_mode == "logit":
+                parsed_rows = self._score_batch_logits(prompts)
+            else:
+                raw_outputs = self._generate_batch(prompts)
+                parsed_rows = [
+                    parse_behavioral_teacher_json(raw_out, reply_text=str(rep_txt))
+                    for raw_out, rep_txt in zip(raw_outputs, slice_replies)
+                ]
+
+            for parsed in parsed_rows:
+                if bool(parsed.get("fallback_used", False)):
+                    fallback_count += 1
                 s_list.append(float(parsed["s_uv"]))
                 h_list.append(float(parsed["h_uv"]))
                 r_list.append(float(parsed["r_uv"]))
@@ -1277,6 +1765,12 @@ class QwenBehavioralTeacherScorer:
                 st_probs_list.append(st_p)
                 st_labels.append(stance_3_names[int(np.argmax(st_p))])
 
+        fallback_rate = float(fallback_count / max(1, n))
+        if fallback_rate > self.max_fallback_rate:
+            raise RuntimeError(
+                f"Teacher fallback_rate={fallback_rate:.3f} exceeds max_fallback_rate={self.max_fallback_rate:.3f}"
+            )
+
         return {
             "s_uv": np.asarray(s_list, dtype=np.float32),
             "h_uv": np.asarray(h_list, dtype=np.float32),
@@ -1286,4 +1780,6 @@ class QwenBehavioralTeacherScorer:
             "behavior_label": b_labels,
             "stance_probs": np.asarray(st_probs_list, dtype=np.float32),
             "pred_label": st_labels,
+            "fallback_count": fallback_count,
+            "fallback_rate": fallback_rate,
         }

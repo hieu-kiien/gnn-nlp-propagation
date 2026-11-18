@@ -1,95 +1,52 @@
 # SBi-FAGAT: Architecture Decision Records (ADRs)
 
-This document formalizes key architectural, methodological, and security decisions made in the SBi-FAGAT project.
-
----
-
 ## ADR-01: Pseudonymization vs. Anonymization and Salt Management
-
-### Context
-Social media research involving Reddit usernames requires compliance with ethical guidelines and privacy regulations (GDPR, IRB). The codebase originally referred to truncated SHA-256 hashes of author usernames as "anonymization".
-
-### Decision
-1. **Terminology Correction:** Replaced all claims of "anonymization" with **"pseudonymization"**. Under international data protection frameworks, static deterministic hashing of public identifiers without a secret salt is pseudonymized, not anonymized, because it is vulnerable to rainbow-table precomputation and dictionary attacks.
-2. **Salt Implementation:** Updated `src/data/arctic_shift_vn.py` to support a cryptographic salt via the `SBIF_HASH_SALT` environment variable or `data/interim/.author_hash_salt.secret`.
-3. **Safe Fallback:** If no salt is configured, the system logs a `UserWarning` explicitly stating that unsalted SHA-256 hashes are vulnerable to re-identification.
-
-### Status
-**ACCEPTED & IMPLEMENTED**
+- **Context:** Reddit author usernames cannot be deterministically hashed without secret salt and labeled "anonymous", as static SHA-256 hashes remain susceptible to dictionary precomputation.
+- **Decision:** Use the accurate term **pseudonymization** in `src/data/arctic_shift_vn.py`, resolve salt from `SBIF_HASH_SALT` or `data/interim/.author_hash_salt.secret`, and emit a `UserWarning` when unsalted hashing is triggered.
+- **Status:** Accepted & Implemented.
 
 ---
 
-## ADR-02: Nature of $y_{\text{polar}}$ as a Silver-Standard Model-Derived Label
-
-### Context
-The target metric $y_{\text{polar}} \in [0, 1]$ represents the community opinion polarization across the full future cascade. Unlike $y_{\text{size}}$ (which is directly observed from counts) or $y_{\text{rumor}}$ (which is human-annotated in PHEME), $y_{\text{polar}}$ is computed from stance distributions produced by a teacher NLP model across future comments.
-
-### Decision
-1. **Scientific Clarification:** Formally designate $y_{\text{polar}}$ as a **silver-standard label** (pseudo-ground truth) rather than human gold ground truth.
-2. **Mathematical Definition:** Ensure $y_{\text{polar}}$ is defined as the normalized Popoviciu variance combined with Sarle's Bimodality Coefficient:
-   $$y_{\text{polar}} = \text{clamp}\left(4 \cdot \text{Var}(s) \cdot \text{BC}(s), 0, 1\right)$$
-3. **Reporting Integrity:** Paper drafts and reports must clearly disclose that polarization evaluation reflects agreement with the teacher's synthesized distribution over future interactions.
-
-### Status
-**ACCEPTED & IMPLEMENTED**
+## ADR-02: Silver-Standard Nature and Mathematical Form of $y_{\text{polar}}$
+- **Context:** Unlike observed final reply counts ($y_{\text{size}}$) or human-annotated PHEME veracity labels ($y_{\text{rumor}}$), future-tree polarization ($y_{\text{polar}}$) is computed from NLP stance scores on replies after $t_K$ (`polar_target_mode="future_only"`).
+- **Decision:**
+  1. Disclose $y_{\text{polar}}$ explicitly as a **silver-standard model-derived label**.
+  2. Define $y_{\text{polar}}$ in `src/data/pyg_dataset.py` (`_compute_full_tree_polarization`, $\lambda_p = 0.5$) from root-aligned future stances $\tilde{s}_v \in [-1, 1]$ with neutral threshold $\tau = 0.1$:
+     $$y_{\text{polar}} = \operatorname{clip}\!\left(\lambda_p \, \sigma_{\tilde{s}}^2 + (1 - \lambda_p)(4 p_+ p_-),\, 0,\, 1\right)$$
+  3. Validate reliability via blind 300-pair audit (`scripts/compute_kappa.py`), 50-thread VN manual audit, Sarle's Bimodality Coefficient (`compute_bimodality_coefficient`), Signed Assortativity (`compute_signed_assortativity`), and comparison against the Early-$K$ Persistence Baseline (`scripts/export_dataset_stats.py`).
+- **Status:** Accepted & Implemented.
 
 ---
 
-## ADR-03: Backward Compatible Pipeline Default (v1) with Opt-in v2
-
-### Context
-The repository includes both a lightweight, reproducible v1 pipeline (frozen RoBERTa/mDeBERTa NLI teacher, 2D edge scores) and an advanced v2 pipeline (fine-tuned Qwen 27B QLoRA, 4D edge scores, 8D burst features, Monte Carlo Dropout). Running v2 requires multi-GPU infrastructure (Kaggle dual T4 or 32GB+ VRAM), while v1 can run on standard 16GB GPUs or CPU smoke tests.
-
-### Decision
-1. **Default Stability:** Maintain **Profile v1** as the default configuration across `run_all.sh`, `scripts/run_phase2.sh`, and unit tests.
-2. **Explicit Opt-In:** Require explicit opt-in for **Profile v2** via `export PIPELINE_VERSION=v2` or `--v2` CLI arguments.
-3. **No Automatic Downgrade/Upgrade:** Ensure that datasets extracted with 2D edges fail gracefully with clear error messages if fed to 4D models, rather than silently slicing or padding tensors.
-
-### Status
-**ACCEPTED & IMPLEMENTED**
+## ADR-03: Stable Profile `v1` Default with Opt-In Profile `v2`
+- **Context:** Running `Qwen/Qwen3.8-27B` QLoRA requires `T4 x 2` (32 GB VRAM) and `transformers >= 5.8.0`, whereas `v1` runs cleanly on single 8–16 GB GPUs or CPU CI.
+- **Decision:** Keep `PIPELINE_VERSION=v1` (`--teacher-backend legacy_nli --edge-dim 2`, deterministic point heads) as default across `run_all.sh` and `scripts/run_phase2.sh`, and gate `v2` (`--teacher-backend qwen_qlora --edge-dim 4 --v2` with 8D `cascade_stats` and $\beta$-NLL uncertainty) behind explicit opt-in (`SBIF-27`, `SBIF-28` resolved).
+- **Status:** Accepted & Implemented.
 
 ---
 
-## ADR-04: Rejection of RWC and Modularity for Sparse Cascades ($K=20$)
-
-### Context
-Early literature review suggested graph-based polarization metrics such as Random Walk Controversy (RWC) or Newman's Modularity ($Q$).
-
-### Decision
-1. **Empirical Analysis & Rejection:** On early-stage cascades with only $K = 20$ nodes, the graph topology is predominantly a shallow tree with $E \approx 20$. Random walks on such sparse trees fail to achieve stationary mixing, and community detection algorithms degenerate or yield singletons.
-2. **Adoption of Node-Centric Stance Statistics:** Adopted Sarle's Bimodality Coefficient (BC) and Signed Newman Assortativity on stance attributes instead of RWC/Modularity.
-3. **Documentation:** Reconciled `docs/math_spec.md` to state that RWC and Modularity were analyzed and rejected for $K=20$ early prediction.
-
-### Status
-**ACCEPTED & IMPLEMENTED**
+## ADR-04: Rejection of RWC and Modularity for Sparse Early Trees ($K=20$)
+- **Context:** Random Walk Controversy (RWC) and Modularity ($Q$) require denser community graphs than a $K=20$ shallow propagation tree, where random walks fail to mix and modularity degenerates.
+- **Decision:** Reject RWC/$Q$ in favor of node/edge stance dispersion, Sarle's Bimodality Coefficient, and Signed Assortativity (`docs/math_spec.md`).
+- **Status:** Accepted & Documented.
 
 ---
 
-## ADR-05: Untrained Model Guard on Live Predictor CLI
-
-### Context
-`scripts/predict_live_thread.py` is intended to allow researchers to test the model on live Reddit threads. Previously, if `--checkpoint` was omitted, the script initialized a random SBi-FAGAT model and outputted predictions without warning, creating a high risk of misinterpretation.
-
-### Decision
-1. **Mandatory Checkpoint for Live Data:** Block live thread inference when no checkpoint is supplied, raising a `RuntimeError`.
-2. **Explicit Bypass Flag:** Add `--allow-untrained` for researchers who explicitly wish to perform structural/dry-run checks with randomly initialized weights.
-3. **Prominent CLI Output Tagging:** When `--allow-untrained` or `--demo-offline` is active, prominently print warning banners in the terminal output stating that predictions are generated by an untuned model.
-4. **Checkpoint Integrity Check:** Add validation to verify that checkpoint files are readable and contain a valid `model_state_dict`.
-
-### Status
-**ACCEPTED & IMPLEMENTED**
+## ADR-05: Live Predictor Untrained Guard & CLI Compatibility
+- **Context:** `scripts/predict_live_thread.py` must prevent scientific misuse of random weights on real URLs.
+- **Decision:** Raise `ValueError`/`RuntimeError` when `--gnn-ckpt` (alias `--checkpoint`) is omitted for a live URL unless `--allow-untrained` or `--demo-offline` is passed; validate checkpoint readability and `model_state_dict`; keep backward-compatible CLI aliases (`--reddit-url`/`--url` and `--gnn-ckpt`/`--checkpoint`).
+- **Status:** Accepted & Implemented.
 
 ---
 
-## ADR-06: Heuristic Temporal-Keyword Grouped Inductive Split for Vietnamese Data
+## ADR-06: Heuristic Temporal-Keyword / TF-IDF Split for Vietnamese Reddit Data
+- **Context:** Vietnamese Reddit posts lack canonical news-event IDs like PHEME.
+- **Decision:** Partition VN cascades via `cluster_vn_cascade_topics` (14-day temporal window + TF-IDF cosine clustering + title keywords) and accurately report this as a **Heuristic Temporal-Keyword Grouped Inductive Split**.
+- **Status:** Accepted & Implemented.
 
-### Context
-In the PHEME benchmark, threads are grouped naturally into 9 distinct breaking events (Ferguson, Sydney Siege, etc.), enabling true inductive event splitting. In the Reddit Vietnam dataset, posts do not carry explicit event IDs.
+---
 
-### Decision
-1. **Grouping Mechanism:** Group threads by ISO calendar week (`YYYY-WW`) and top title keywords (e.g., `kinh_te`, `chinh_tri`, `xa_hoi`).
-2. **Naming Precision:** Designate this split as a **Heuristic Temporal-Keyword Grouped Inductive Split**.
-3. **Disclosure:** Disclose in research documentation that while this grouping strongly prevents cross-split thread leakage, it does not guarantee complete semantic independence to the same degree as real-world crisis event splits.
-
-### Status
-**ACCEPTED & IMPLEMENTED**
+## ADR-07: Canonical Forecasting Minimum Reply Floor (`min_total_replies = 25`)
+- **Context:** Computing meaningful `future_only` polarization targets beyond the $K=20$ observation prefix requires at least 5 future replies beyond $K=20$.
+- **Decision:** Standardize `DEFAULT_FORECAST_MIN_REPLIES = 25` across `pyg_dataset.py`, `dual_edge_scorer.py`, `run_experiments.py`, `run_ablation.py`, `run_all.sh`, and `scripts/run_phase2.sh`.
+- **Status:** Accepted & Implemented.

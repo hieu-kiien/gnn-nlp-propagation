@@ -32,6 +32,7 @@ from src.data.schema import (
     build_nodes_table,
     save_cascade_parquet,
 )
+from src.utils.text import normalize_nfc
 
 ARCTIC_SHIFT_API_BASE = "https://arctic-shift.photon-reddit.com/api"
 TARGET_SUBREDDITS: tuple[str, ...] = ("vozforums", "VietNam")
@@ -98,9 +99,7 @@ def hash_author_sha256(author: str | None, salt: str | None = None) -> str | Non
 
 def normalize_social_text_nfc(text: str) -> str:
     """Normalize text to Unicode NFC while preserving emojis and social slang."""
-    if not isinstance(text, str):
-        return ""
-    return unicodedata.normalize("NFC", text).replace("\x00", "").strip()
+    return normalize_nfc(text)
 
 
 def is_invalid_or_spam_text(text: str, author_raw: str | None = None) -> bool:
@@ -284,6 +283,95 @@ def _compute_topic_id(post: Mapping[str, Any], norm_title: str) -> str:
             key = f"{week_tag}|{cleaned}"
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
     return f"vn_topic_{digest}"
+
+
+def cluster_vn_cascade_topics(
+    node_rows: list[dict[str, Any]],
+    *,
+    time_window_days: float = 14.0,
+    sim_threshold: float = 0.55,
+) -> list[dict[str, Any]]:
+    """Merge semantically related Vietnamese cascades within a sliding time window into shared topics.
+
+    Uses TF-IDF (1-2 gram) cosine similarity across root posts combined with a temporal
+    window (`time_window_days`) to assign a single connected-component `topic_id` across
+    near-duplicate news events, preventing cross-split leakage from minor title rewrites.
+    """
+    roots = [r for r in node_rows if bool(r.get("is_root"))]
+    if len(roots) < 2:
+        return node_rows
+
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    texts = [normalize_nfc(str(r.get("text") or "")).lower() for r in roots]
+    if not any(texts):
+        return node_rows
+
+    try:
+        vec = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, min_df=1)
+        mat = vec.fit_transform(texts)
+    except ValueError:
+        return node_rows
+
+    sim_mat = cosine_similarity(mat)
+    timestamps: list[float] = []
+    for r in roots:
+        ts_val = r.get("created_at_utc")
+        if isinstance(ts_val, datetime):
+            timestamps.append(ts_val.timestamp())
+        else:
+            timestamps.append(0.0)
+
+    max_dt_sec = float(time_window_days) * 86400.0
+    n = len(roots)
+    parent = list(range(n))
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a: int, b: int) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            if ra < rb:
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+    # Group first by identical existing topic_id, then merge high-similarity pairs in window
+    existing_groups: dict[str, int] = {}
+    for idx, r in enumerate(roots):
+        tid = str(r.get("topic_id") or "")
+        if tid in existing_groups:
+            _union(existing_groups[tid], idx)
+        else:
+            existing_groups[tid] = idx
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if abs(timestamps[i] - timestamps[j]) <= max_dt_sec and sim_mat[i, j] >= sim_threshold:
+                _union(i, j)
+
+    comp_topics: dict[int, str] = {}
+    for idx, r in enumerate(roots):
+        rep = _find(idx)
+        if rep not in comp_topics:
+            comp_topics[rep] = str(r.get("topic_id") or f"vn_topic_{rep:06d}")
+
+    cascade_to_topic: dict[str, str] = {}
+    for idx, r in enumerate(roots):
+        cid = str(r["cascade_id"])
+        cascade_to_topic[cid] = comp_topics[_find(idx)]
+
+    for row in node_rows:
+        cid = str(row["cascade_id"])
+        if cid in cascade_to_topic:
+            row["topic_id"] = cascade_to_topic[cid]
+
+    return node_rows
 
 
 def build_vn_cascade_from_thread(
@@ -679,6 +767,7 @@ def crawl_arctic_shift_discussions(
                 f"across {list(subreddits)}."
             )
 
+    all_nodes = cluster_vn_cascade_topics(all_nodes)
     nodes_table = build_nodes_table(all_nodes)
     edges_table = build_edges_table(all_edges)
     return save_cascade_parquet(nodes_table, edges_table, output_dir=output_dir, validate=True)

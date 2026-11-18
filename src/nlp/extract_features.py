@@ -410,13 +410,40 @@ def extract_and_save_features(
     behavior_labels: list[str] | None = None
     effective_edge_dim = int(edge_dim) if edge_dim is not None else 2
 
+    cache_by_eid: dict[str, dict[str, Any]] = {}
+    if scored_cache_json is not None and Path(scored_cache_json).exists():
+        raw_cache = json.loads(Path(scored_cache_json).read_text(encoding="utf-8"))
+        if not isinstance(raw_cache, list):
+            raise ValueError(f"Expected JSON list in {scored_cache_json}")
+        cache_by_eid = {
+            str(item["edge_id"]): item
+            for item in raw_cache
+            if isinstance(item, dict) and item.get("edge_id") is not None
+        }
+    full_teacher_coverage = bool(
+        edge_ids
+        and cache_by_eid
+        and all(
+            eid in cache_by_eid and "s_uv" in cache_by_eid[eid] and "h_uv" in cache_by_eid[eid]
+            for eid in edge_ids
+        )
+    )
+
     if loaded_ckpt_model is not None:
-        # System-1 Student Cross-Encoder scores ALL edges cleanly (even when test edges were omitted from Teacher budget)
+        # System-1 Student Cross-Encoder scores ALL edges consistently across Train/Val/Test
+        ckpt_edge_dim = int(getattr(loaded_ckpt_model, "edge_dim", 2))
         if edge_dim is None:
-            effective_edge_dim = int(getattr(loaded_ckpt_model, "edge_dim", 2))
+            effective_edge_dim = ckpt_edge_dim
+        elif int(edge_dim) == 4 and ckpt_edge_dim != 4:
+            raise ValueError(
+                f"Requested edge_dim=4, but Cross-Encoder checkpoint has edge_dim={ckpt_edge_dim}."
+            )
+        effective_root_ctx = bool(
+            include_root_context or getattr(loaded_ckpt_model, "include_root_context", False)
+        )
         edge_tok = loaded_ckpt_tok if loaded_ckpt_tok is not None else active_tok
         pair_parents = [
-            f"{r[:220]} | {p}" if (include_root_context and r and r != p) else p
+            f"{r[:220]} | {p}" if (effective_root_ctx and r and r != p) else p
             for r, p in zip(edge_root_texts, parent_texts)
         ]
         edge_pred = encode_edges_with_cross_encoder(
@@ -454,32 +481,17 @@ def extract_and_save_features(
                 node_root_stance[edge_target_ids[i]] = max(
                     -1.0, min(1.0, float(deep_pred["s_uv"][pos]))
                 )
-        if scored_cache_json is not None and Path(scored_cache_json).exists():
-            raw_cache = json.loads(Path(scored_cache_json).read_text(encoding="utf-8"))
-            if isinstance(raw_cache, list):
-                cache_by_eid = {
-                    str(item["edge_id"]): item
-                    for item in raw_cache
-                    if isinstance(item, dict) and item.get("edge_id") is not None
-                }
-                for idx, eid in enumerate(edge_ids):
-                    entry = cache_by_eid.get(eid)
-                    if entry is not None and "root_s_uv" in entry:
-                        node_root_stance[edge_target_ids[idx]] = max(
-                            -1.0, min(1.0, float(entry["root_s_uv"]))
-                        )
+        # Only use Teacher root_s_uv when Teacher cache covers 100% of edges;
+        # partial caches keep uniform Student root_s_uv across Train/Val/Test to avoid target drift.
+        if full_teacher_coverage and all("root_s_uv" in cache_by_eid[eid] for eid in edge_ids):
+            for idx, eid in enumerate(edge_ids):
+                node_root_stance[edge_target_ids[idx]] = max(
+                    -1.0, min(1.0, float(cache_by_eid[eid]["root_s_uv"]))
+                )
     elif scored_cache_json is not None:
         cache_file = Path(scored_cache_json)
         if not cache_file.exists():
             raise FileNotFoundError(f"Scored cache JSON not found: {cache_file}")
-        raw_cache = json.loads(cache_file.read_text(encoding="utf-8"))
-        if not isinstance(raw_cache, list):
-            raise ValueError(f"Expected JSON list in {cache_file}")
-        cache_by_eid = {
-            str(item["edge_id"]): item
-            for item in raw_cache
-            if isinstance(item, dict) and item.get("edge_id") is not None
-        }
         missing_eids = [eid for eid in edge_ids if eid not in cache_by_eid]
         if missing_eids:
             raise ValueError(
@@ -492,6 +504,11 @@ def extract_and_save_features(
         )
         if edge_dim is None and has_4d_in_cache:
             effective_edge_dim = 4
+        elif len(edge_ids) > 0 and effective_edge_dim == 4 and not has_4d_in_cache:
+            raise ValueError(
+                f"Requested edge_dim=4, but scored_cache_json {cache_file} lacks 4D r_uv/c_uv scores "
+                "and no 4D Cross-Encoder checkpoint was provided."
+            )
 
         s_list: list[float] = []
         h_list: list[float] = []
@@ -667,6 +684,45 @@ def extract_and_save_features(
         payload["edge_constructive"] = edge_constructive_map
         if edge_behavior_label:
             payload["edge_behavior_label"] = edge_behavior_label
+    if full_teacher_coverage:
+        # Preserve isolated zero-shot Teacher edge scores only under 100% coverage
+        # (partial caches with --max-teacher-pairs must never emit partial maps that default missing Test edges to 0.0).
+        t_stance: dict[str, float] = {}
+        t_hostility: dict[str, float] = {}
+        t_irrat: dict[str, float] = {}
+        t_constr: dict[str, float] = {}
+        t_oppose: dict[str, bool] = {}
+        t_pred_lbl: dict[str, str] = {}
+        t_beh_lbl: dict[str, str] = {}
+        t_node_root_stance: dict[str, float] = {}
+        for idx, eid in enumerate(edge_ids):
+            entry = cache_by_eid[eid]
+            sv = float(entry["s_uv"])
+            hv = float(entry["h_uv"])
+            t_stance[eid] = sv
+            t_hostility[eid] = hv
+            plbl = str(entry.get("pred_label") or ("support" if sv >= 0.1 else ("oppose" if sv <= -0.1 else "neutral")))
+            t_pred_lbl[eid] = plbl
+            t_oppose[eid] = plbl == "oppose"
+            t_node_root_stance[edge_target_ids[idx]] = max(
+                -1.0, min(1.0, float(entry.get("root_s_uv", sv)))
+            )
+            if "r_uv" in entry and "c_uv" in entry:
+                t_irrat[eid] = float(entry["r_uv"])
+                t_constr[eid] = float(entry["c_uv"])
+                if entry.get("behavior_label") in DISCOURSE_BEHAVIOR_LABELS:
+                    t_beh_lbl[eid] = str(entry["behavior_label"])
+        if t_stance:
+            payload["teacher_edge_stance"] = t_stance
+            payload["teacher_edge_hostility"] = t_hostility
+            payload["teacher_edge_oppose_flag"] = t_oppose
+            payload["teacher_edge_pred_label"] = t_pred_lbl
+            payload["teacher_node_root_stance"] = t_node_root_stance
+            if len(t_irrat) == len(edge_ids) and len(t_constr) == len(edge_ids):
+                payload["teacher_edge_irrationality"] = t_irrat
+                payload["teacher_edge_constructive"] = t_constr
+                if t_beh_lbl:
+                    payload["teacher_edge_behavior_label"] = t_beh_lbl
     if node_features_770 is not None:
         payload["node_features_770"] = node_features_770
 
@@ -674,6 +730,9 @@ def extract_and_save_features(
 
     out_dir = Path(output_dir)
     save_cascade_parquet(nodes_tbl, edges_tbl, output_dir=out_dir, validate=True)
+    src_splits = Path(interim_dir) / "topic_splits.json"
+    if src_splits.exists():
+        (out_dir / "topic_splits.json").write_text(src_splits.read_text(encoding="utf-8"), encoding="utf-8")
     pt_path = out_dir / "nlp_features.pt"
     torch.save(payload, pt_path)
     return pt_path

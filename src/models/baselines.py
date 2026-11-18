@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch_geometric.nn import FAConv, GATv2Conv, GCNConv, global_mean_pool
-from torch_geometric.utils import dropout_edge, to_undirected
+from torch_geometric.utils import dropout_edge, scatter, to_undirected
 
 
 def resolve_root_indices(data: Any, num_nodes: int) -> tuple[Tensor, Tensor]:
@@ -137,10 +137,11 @@ class MultiTaskHead(nn.Module):
             "node_emb": node_emb,
         }
         if self.uncertainty_head is not None:
-            raw_logvars = self.uncertainty_head(reg_emb).clamp(-6.0, 3.0)
+            raw_logvars = -6.0 + 9.0 * torch.sigmoid(self.uncertainty_head(reg_emb))
             size_logvar = raw_logvars[:, 0]
             polar_logvar = raw_logvars[:, 1]
-            confidence = torch.exp(-0.5 * polar_logvar.clamp(min=0.0)).clamp(0.0, 1.0)
+            polar_sigma = torch.exp(0.5 * polar_logvar)
+            confidence = torch.exp(-polar_sigma / 0.25).clamp(0.0, 1.0)
             result["size_logvar"] = size_logvar
             result["polar_logvar"] = polar_logvar
             result["confidence_score"] = confidence
@@ -156,8 +157,12 @@ class TextMLP(nn.Module):
         hidden_dim: int = 128,
         num_rumor_classes: int = 4,
         dropout: float = 0.1,
+        use_cascade_stats: bool = False,
+        cascade_feat_dim: int = 8,
     ) -> None:
         super().__init__()
+        self.use_cascade_stats = bool(use_cascade_stats)
+        self.cascade_feat_dim = int(cascade_feat_dim)
         self.encoder = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -167,23 +172,25 @@ class TextMLP(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
         )
-        self.head = MultiTaskHead(hidden_dim, hidden_dim, num_rumor_classes, dropout)
+        self.head = MultiTaskHead(
+            hidden_dim,
+            hidden_dim,
+            num_rumor_classes,
+            dropout,
+            cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+        )
 
     def forward(self, data: Any) -> dict[str, Tensor]:
         x = data.x.float()
         _, batch_vec = resolve_root_indices(data, x.size(0))
         node_emb = self.encoder(x)
         graph_emb = global_mean_pool(node_emb, batch_vec)
-        return self.head(graph_emb, node_emb)
+        c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
+        return self.head(graph_emb, node_emb, cascade_stats=c_stats)
 
 
 class TemporalStanceMLP(nn.Module):
-    """Non-graph ablation baseline fusing node temporal features and pooled 2D edge statistics.
-
-    Uses identical inputs to `SBiFAGAT` (770-d node embeddings + root representation +
-    aggregate `[s_uv, h_uv]` mean/std/min/max statistics) without message passing,
-    isolating how much performance comes from graph propagation vs. scalar NLP features.
-    """
+    """Non-graph ablation baseline fusing node temporal features and pooled 2D/4D edge statistics."""
 
     def __init__(
         self,
@@ -192,9 +199,13 @@ class TemporalStanceMLP(nn.Module):
         edge_dim: int = 2,
         num_rumor_classes: int = 4,
         dropout: float = 0.1,
+        use_cascade_stats: bool = False,
+        cascade_feat_dim: int = 8,
     ) -> None:
         super().__init__()
         self.edge_dim = edge_dim
+        self.use_cascade_stats = bool(use_cascade_stats)
+        self.cascade_feat_dim = int(cascade_feat_dim)
         self.node_encoder = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -210,7 +221,13 @@ class TemporalStanceMLP(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
-        self.head = MultiTaskHead(hidden_dim, hidden_dim, num_rumor_classes, dropout)
+        self.head = MultiTaskHead(
+            hidden_dim,
+            hidden_dim,
+            num_rumor_classes,
+            dropout,
+            cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+        )
 
     def forward(self, data: Any) -> dict[str, Tensor]:
         x = data.x.float()
@@ -234,7 +251,7 @@ class TemporalStanceMLP(nn.Module):
             and edge_attr.numel() > 0
             and raw_edge_index.numel() > 0
         ):
-            attr = edge_attr.float()
+            attr = edge_attr.to(device=x.device, dtype=node_emb.dtype)
             if attr.dim() == 1:
                 attr = attr.unsqueeze(-1)
             if attr.size(1) < self.edge_dim:
@@ -242,18 +259,26 @@ class TemporalStanceMLP(nn.Module):
             elif attr.size(1) > self.edge_dim:
                 attr = attr[:, : self.edge_dim]
             edge_batch = batch_vec[raw_edge_index[0]]
-            for g in range(num_graphs):
-                mask = edge_batch == g
-                if mask.any():
-                    eg = attr[mask]
-                    e_mean[g] = eg.mean(dim=0)
-                    e_std[g] = eg.std(dim=0, unbiased=False) if eg.size(0) >= 2 else 0.0
-                    e_min[g] = eg.min(dim=0).values
-                    e_max[g] = eg.max(dim=0).values
+            ones = torch.ones((attr.size(0), 1), device=x.device, dtype=node_emb.dtype)
+            edge_counts = scatter(ones, edge_batch, dim=0, dim_size=num_graphs, reduce="sum").squeeze(-1)
+            has_edges = (edge_counts > 0).unsqueeze(-1)
+            has_multi_edges = (edge_counts >= 2).unsqueeze(-1)
+
+            e_mean_raw = scatter(attr, edge_batch, dim=0, dim_size=num_graphs, reduce="mean")
+            e_sq_raw = scatter(attr.pow(2), edge_batch, dim=0, dim_size=num_graphs, reduce="mean")
+            e_min_raw = scatter(attr, edge_batch, dim=0, dim_size=num_graphs, reduce="min")
+            e_max_raw = scatter(attr, edge_batch, dim=0, dim_size=num_graphs, reduce="max")
+
+            e_mean = torch.where(has_edges, e_mean_raw, e_mean)
+            e_min = torch.where(has_edges, e_min_raw, e_min)
+            e_max = torch.where(has_edges, e_max_raw, e_max)
+            e_std_raw = (e_sq_raw - e_mean_raw.pow(2)).clamp(min=0.0).sqrt()
+            e_std = torch.where(has_multi_edges, e_std_raw, e_std)
 
         fused_in = torch.cat([h_root, h_pool, e_mean, e_std, e_min, e_max], dim=-1)
         graph_emb = self.fusion(fused_in)
-        return self.head(graph_emb, node_emb)
+        c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
+        return self.head(graph_emb, node_emb, cascade_stats=c_stats)
 
 
 class StandardGCN(nn.Module):
@@ -266,8 +291,12 @@ class StandardGCN(nn.Module):
         num_layers: int = 2,
         num_rumor_classes: int = 4,
         dropout: float = 0.1,
+        use_cascade_stats: bool = False,
+        cascade_feat_dim: int = 8,
     ) -> None:
         super().__init__()
+        self.use_cascade_stats = bool(use_cascade_stats)
+        self.cascade_feat_dim = int(cascade_feat_dim)
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
@@ -280,7 +309,13 @@ class StandardGCN(nn.Module):
             [nn.LayerNorm(hidden_dim) for _ in range(num_layers)]
         )
         self.dropout = nn.Dropout(dropout)
-        self.head = MultiTaskHead(2 * hidden_dim, hidden_dim, num_rumor_classes, dropout)
+        self.head = MultiTaskHead(
+            2 * hidden_dim,
+            hidden_dim,
+            num_rumor_classes,
+            dropout,
+            cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+        )
 
     def forward(self, data: Any) -> dict[str, Tensor]:
         x = data.x.float()
@@ -298,7 +333,8 @@ class StandardGCN(nn.Module):
             h = self.dropout(h)
 
         graph_emb = torch.cat([h[root_idx], global_mean_pool(h, batch_vec)], dim=-1)
-        return self.head(graph_emb, h)
+        c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
+        return self.head(graph_emb, h, cascade_stats=c_stats)
 
 
 class StandardGATv2(nn.Module):
@@ -312,12 +348,16 @@ class StandardGATv2(nn.Module):
         heads: int = 4,
         num_rumor_classes: int = 4,
         dropout: float = 0.1,
+        use_cascade_stats: bool = False,
+        cascade_feat_dim: int = 8,
     ) -> None:
         super().__init__()
         if hidden_dim % heads != 0:
             raise ValueError(
                 f"hidden_dim ({hidden_dim}) must be divisible by heads ({heads})"
             )
+        self.use_cascade_stats = bool(use_cascade_stats)
+        self.cascade_feat_dim = int(cascade_feat_dim)
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
@@ -341,7 +381,13 @@ class StandardGATv2(nn.Module):
             [nn.LayerNorm(hidden_dim) for _ in range(num_layers)]
         )
         self.dropout = nn.Dropout(dropout)
-        self.head = MultiTaskHead(2 * hidden_dim, hidden_dim, num_rumor_classes, dropout)
+        self.head = MultiTaskHead(
+            2 * hidden_dim,
+            hidden_dim,
+            num_rumor_classes,
+            dropout,
+            cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+        )
 
     def forward(self, data: Any) -> dict[str, Tensor]:
         x = data.x.float()
@@ -359,7 +405,8 @@ class StandardGATv2(nn.Module):
             h = self.dropout(h)
 
         graph_emb = torch.cat([h[root_idx], global_mean_pool(h, batch_vec)], dim=-1)
-        return self.head(graph_emb, h)
+        c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
+        return self.head(graph_emb, h, cascade_stats=c_stats)
 
 
 class _BiGCNBranch(nn.Module):
@@ -406,8 +453,12 @@ class BiGCN(nn.Module):
         num_rumor_classes: int = 4,
         drop_edge_p: float = 0.1,
         dropout: float = 0.1,
+        use_cascade_stats: bool = False,
+        cascade_feat_dim: int = 8,
     ) -> None:
         super().__init__()
+        self.use_cascade_stats = bool(use_cascade_stats)
+        self.cascade_feat_dim = int(cascade_feat_dim)
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
@@ -415,7 +466,13 @@ class BiGCN(nn.Module):
         )
         self.td_branch = _BiGCNBranch(hidden_dim, num_layers, drop_edge_p, dropout)
         self.bu_branch = _BiGCNBranch(hidden_dim, num_layers, drop_edge_p, dropout)
-        self.head = MultiTaskHead(2 * hidden_dim, hidden_dim, num_rumor_classes, dropout)
+        self.head = MultiTaskHead(
+            2 * hidden_dim,
+            hidden_dim,
+            num_rumor_classes,
+            dropout,
+            cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+        )
 
     def forward(self, data: Any) -> dict[str, Tensor]:
         x = data.x.float()
@@ -436,11 +493,12 @@ class BiGCN(nn.Module):
             [global_mean_pool(h_td, batch_vec), global_mean_pool(h_bu, batch_vec)],
             dim=-1,
         )
-        return self.head(graph_emb, node_emb)
+        c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
+        return self.head(graph_emb, node_emb, cascade_stats=c_stats)
 
 
-class _BaselineLatentEdgeMLP(nn.Module):
-    """Shared 2-layer latent edge inferrer matching SBiFAGAT's UPFD capacity."""
+class LatentConflictMLP(nn.Module):
+    """Shared 2-layer latent edge inferrer (`[s_hat, h_hat]` or 4D) for text-free graphs (e.g. UPFD)."""
 
     def __init__(
         self,
@@ -470,6 +528,9 @@ class _BaselineLatentEdgeMLP(nn.Module):
         return torch.cat([torch.tanh(raw[:, 0:1]), torch.sigmoid(raw[:, 1:])], dim=-1)
 
 
+_BaselineLatentEdgeMLP = LatentConflictMLP
+
+
 class EdgeGATv2(nn.Module):
     """Edge-aware GATv2 baseline receiving `[s_uv, h_uv]` or 4D edge features."""
 
@@ -483,6 +544,8 @@ class EdgeGATv2(nn.Module):
         num_rumor_classes: int = 4,
         dropout: float = 0.1,
         use_latent_edge_mlp: bool = False,
+        use_cascade_stats: bool = False,
+        cascade_feat_dim: int = 8,
     ) -> None:
         super().__init__()
         if hidden_dim % heads != 0:
@@ -491,13 +554,15 @@ class EdgeGATv2(nn.Module):
             )
         self.edge_dim = edge_dim
         self.use_latent_edge_mlp = use_latent_edge_mlp
+        self.use_cascade_stats = bool(use_cascade_stats)
+        self.cascade_feat_dim = int(cascade_feat_dim)
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
         )
         self.latent_edge_mlp = (
-            _BaselineLatentEdgeMLP(
+            LatentConflictMLP(
                 in_dim=in_dim, hidden_dim=hidden_dim, edge_dim=edge_dim, dropout=dropout
             )
             if use_latent_edge_mlp
@@ -521,7 +586,13 @@ class EdgeGATv2(nn.Module):
         )
         self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
         self.dropout = nn.Dropout(dropout)
-        self.head = MultiTaskHead(2 * hidden_dim, hidden_dim, num_rumor_classes, dropout)
+        self.head = MultiTaskHead(
+            2 * hidden_dim,
+            hidden_dim,
+            num_rumor_classes,
+            dropout,
+            cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+        )
 
     def _prepare_edge_attr(self, x: Tensor, edge_index: Tensor, data: Any) -> Tensor:
         if self.latent_edge_mlp is not None:
@@ -562,7 +633,8 @@ class EdgeGATv2(nn.Module):
             h = self.dropout(h)
 
         graph_emb = torch.cat([h[root_idx], global_mean_pool(h, batch_vec)], dim=-1)
-        return self.head(graph_emb, h)
+        c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
+        return self.head(graph_emb, h, cascade_stats=c_stats)
 
 
 class FAGCNBaseline(nn.Module):
@@ -576,8 +648,12 @@ class FAGCNBaseline(nn.Module):
         num_rumor_classes: int = 4,
         eps: float = 0.5,
         dropout: float = 0.1,
+        use_cascade_stats: bool = False,
+        cascade_feat_dim: int = 8,
     ) -> None:
         super().__init__()
+        self.use_cascade_stats = bool(use_cascade_stats)
+        self.cascade_feat_dim = int(cascade_feat_dim)
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
@@ -596,7 +672,13 @@ class FAGCNBaseline(nn.Module):
         )
         self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
         self.dropout = nn.Dropout(dropout)
-        self.head = MultiTaskHead(2 * hidden_dim, hidden_dim, num_rumor_classes, dropout)
+        self.head = MultiTaskHead(
+            2 * hidden_dim,
+            hidden_dim,
+            num_rumor_classes,
+            dropout,
+            cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+        )
 
     def forward(self, data: Any) -> dict[str, Tensor]:
         x = data.x.float()
@@ -615,4 +697,5 @@ class FAGCNBaseline(nn.Module):
             h = self.dropout(h)
 
         graph_emb = torch.cat([h[root_idx], global_mean_pool(h, batch_vec)], dim=-1)
-        return self.head(graph_emb, h)
+        c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
+        return self.head(graph_emb, h, cascade_stats=c_stats)

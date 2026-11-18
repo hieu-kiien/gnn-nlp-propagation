@@ -17,6 +17,7 @@ venv/
 env/
 .env
 .env.*
+*.secret
 .vscode/
 .idea/
 Thumbs.db
@@ -39,3 +40,21 @@ logs/
 *.bin
 *.safetensors
 *.parquet
+
+# Archive bundles, runtime logs & double-blind audit answer keys (keep public repo clean)
+*.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+*.7z
+runner_summary_*.json
+*_machine_key.csv
+*.tmp.json
+*.jsonl
+.ipynb_checkpoints/
+wandb/
+
+# Temporary / smoke paper outputs (commit only final 5-seed verified tables/JSON)
+paper/*smoke*
+paper/*draft*
+paper/*debug*

@@ -1,52 +1,21 @@
-# SBi-FAGAT: Project Changelog & Audit Modification Record
+# SBi-FAGAT: Changelog & Audit Modification Record
 
-All notable modifications, hardening measures, and test additions are documented in this file.
+## [v2.0-rc1] - PR #1 Reconciliation, EGM Hardening & Paper Tooling
 
----
-
-## [Uncommitted Audit Release] - Technical Lead & Methodology Verification Cycle
+### Reconciled & Merged (`5820e71` + v2 + EGM `F1–F6`)
+- **`src/data/arctic_shift_vn.py`**: Preserved `PR #1` salted SHA-256 pseudonymization (`SBIF_HASH_SALT` / `.author_hash_salt.secret` + `UserWarning`) alongside `v2` `cluster_vn_cascade_topics` and `--before-epoch`.
+- **`scripts/predict_live_thread.py`**: Preserved `PR #1` untrained live guard, `--allow-untrained`, and corrupt checkpoint error handling alongside `v2` 5-class discourse inference, 8D `cascade_stats`, and `node_backbone` selection; supported both `--reddit-url`/`--url` and `--gnn-ckpt`/`--checkpoint` CLI aliases.
+- **`run_all.sh` & `scripts/run_phase2.sh`**: Unified `PIPELINE_VERSION=v1|v2` gating with consistent `MIN_TOTAL_REPLIES=25`, `VN_BEFORE_EPOCH=1763164800`, and `human_audit_vi_300.csv`.
+- **6 EGM Hardening Fixes (`F1–F6`)**:
+  - Restored `DualHeadCrossEncoder` / `extract_features.py` `node_backbone` consistency.
+  - Restored LOO teacher isolation (`edge_source="teacher"`).
+  - Enforced `DEFAULT_FORECAST_MIN_REPLIES=25` uniformly across ingestion, splits, and trainers.
+  - Hardened finite-tensor assertions and checkpoint state validation.
+- **`docs/`**: Removed broken absolute links, documented empirical rejection of RWC/Modularity on $K=20$ cascades, and reconciled all 7 files in `docs/project-management/` to match actual codebase symbols and dependency bounds.
 
 ### Added
-- **`tests/test_live_predictor_audit.py`**:
-  - Implemented 5 dedicated unit tests verifying the newly introduced safety guards on `scripts/predict_live_thread.py`.
-  - Tests verify: blocking of uncheckpointed live inference, explicit `--allow-untrained` bypass, corrupt checkpoint handling, `--demo-offline` functionality, and empty thread error reporting.
-- **`docs/project-management/`**:
-  - `PROJECT_CONTEXT.md`: Problem statement, architecture, data contract, v1 vs. v2 profiles.
-  - `DEVELOPMENT_HISTORY.md`: Commit log analysis, historical progression from v1 to v2.
-  - `PROJECT_STATUS.md`: Module implementation and verification matrix.
-  - `TODO_ROADMAP.md`: Prioritized P0–P4 action items with root cause analysis and acceptance criteria.
-  - `TECHNICAL_DECISIONS.md`: Architecture Decision Records (ADR-01 through ADR-06).
-  - `TEST_REPORT.md`: Comprehensive test report documenting 79/79 passing unit tests and smoke tests.
-  - `CHANGELOG.md`: Detailed log of all code and documentation modifications.
-- **Environment & Dependencies**:
-  - Added `tzdata>=2024.1; sys_platform == 'win32'` to `requirements.txt` to eliminate Windows PyArrow UTC parsing exceptions.
-  - Set up isolated virtual environment `.venv` with Python 3.14, PyTorch 2.15, and PyG 2.8.1.
-
-### Changed & Hardened
-- **`scripts/predict_live_thread.py`**:
-  - Added safety guard blocking live thread prediction when no trained `--checkpoint` is provided (raises `RuntimeError`).
-  - Added `--allow-untrained` flag to allow intentional structural or dry-run checks with random weights.
-  - Added checkpoint file inspection and corruption handling (`try/except` on `torch.load` and validation of `model_state_dict`).
-  - Enhanced terminal reporting banner to prominently state when untuned structural check weights are being used.
-- **`src/data/arctic_shift_vn.py`**:
-  - Changed author identity handling from "anonymization" to "pseudonymization" across docstrings and code comments.
-  - Added support for cryptographic salt via `os.environ.get("SBIF_HASH_SALT")` or `data/interim/.author_hash_salt.secret`.
-  - Added `warnings.warn` fallback notifying the user when unsalted hashing is active.
-- **`docs/math_spec.md`**:
-  - Fixed broken local filesystem link (`file:///d:/1.%20LapTrinh/...` replaced with relative link to `literature_review.md`).
-  - Documented empirical rejection of Random Walk Controversy (RWC) and Modularity ($Q$) on sparse early cascades ($K=20$) in favor of Sarle's Bimodality Coefficient and Signed Newman Assortativity.
-  - Formally specified $y_{\text{polar}}$ as a silver-standard model-derived label rather than human ground truth.
-  - Defined the Reddit Vietnam split as a *Heuristic Temporal-Keyword Grouped Inductive Split*.
-- **`scripts/run_phase2.sh`**:
-  - Added environment variable `PIPELINE_VERSION="${PIPELINE_VERSION:-v1}"`.
-  - Default `v1` passes `--teacher-backend legacy_nli --edge-dim 2`.
-  - Profile `v2` passes `--teacher-backend qwen_qlora --edge-dim 4`.
-- **`run_all.sh`**:
-  - Added environment variable `PIPELINE_VERSION="${PIPELINE_VERSION:-v1}"`.
-  - Profile `v1` runs standard pipeline with `--edge-dim 2`.
-  - Profile `v2` adds `--v2 --edge-dim 4`.
-
-### Security & Scientific Integrity Notes
-- Verified that all unit tests run without accessing external network or modifying public datasets.
-- Confirmed that no synthetic data is used to generate publication benchmark figures.
-- Preserved existing git working tree without commits or destructive resets.
+- **`.github/workflows/ci.yml` & `.github/pull_request_template.md`**: Automated CPU `pytest` + Forbidden Binary/Data File Gate + offline smoke checks on push/PR to `main`.
+- **`scripts/export_dataset_stats.py`**: Leakage-free Table 1 dataset EDA exporter and Early-$K$ Persistence Baseline evaluator (`paper/tables_dataset_eda.tex`, `paper/results_dataset_eda.json`).
+- **`scripts/benchmark_efficiency.py`**: Added `format_efficiency_latex` and `--output-table` to emit `paper/tables_efficiency.tex`.
+- **`paper/main.tex`**: Zero-fabrication `IEEEtran` conference manuscript skeleton wired to `paper/references.bib` and dynamic `\IfFileExists` LaTeX tables.
+- **`tests/test_sota_v2_upgrades.py`**: Added regression tests covering Persistence baseline, dataset EDA LaTeX formatting, efficiency LaTeX formatting, and `--url`/`--checkpoint` CLI aliases.

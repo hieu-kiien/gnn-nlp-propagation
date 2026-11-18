@@ -32,7 +32,12 @@ from typing import Any, Sequence
 import torch
 from torch_geometric.loader import DataLoader
 
-from src.data.pyg_dataset import EarlyCascadeDataset, TOTAL_NODE_FEATURE_DIM
+from src.data.pyg_dataset import (
+    DEFAULT_FORECAST_MIN_REPLIES,
+    EarlyCascadeDataset,
+    TOTAL_NODE_FEATURE_DIM,
+    compute_canonical_topic_splits,
+)
 from src.data.schema import build_edges_table, build_nodes_table, save_cascade_parquet
 from src.models.baselines import BiGCN, TemporalStanceMLP, TextMLP
 from src.models.sbi_fagat import SBiFAGAT
@@ -65,18 +70,44 @@ def _bundle_outputs(
     *,
     source_paths: Sequence[Path],
     base_dir: Path,
+    include_heavy_weights: bool = False,
 ) -> Path:
+    """Package results into a compact archive, skipping multi-GB base/adapter weights unless requested."""
+    heavy_suffixes = {".safetensors", ".bin"}
+    heavy_dir_tags = ("qwen", "dual_ce", "visobert", "deberta")
+
+    def _should_skip(file_path: Path) -> bool:
+        if include_heavy_weights:
+            return False
+        low_name = file_path.name.lower()
+        if file_path.suffix.lower() in heavy_suffixes:
+            return True
+        if file_path.suffix.lower() == ".pt" and "sbifagat" not in low_name and "nlp_features" not in low_name:
+            try:
+                if file_path.stat().st_size > 20 * 1024 * 1024:
+                    return True
+            except OSError:
+                pass
+        try:
+            rel_parts = [p.lower() for p in file_path.relative_to(base_dir).parts]
+        except ValueError:
+            rel_parts = [p.lower() for p in file_path.parts]
+        if any(any(tag in part for tag in heavy_dir_tags) for part in rel_parts):
+            if file_path.suffix.lower() not in {".json", ".csv", ".txt", ".yaml", ".yml"}:
+                return True
+        return False
+
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for path in source_paths:
             if not path.exists():
                 continue
-            if path.is_file():
+            if path.is_file() and not _should_skip(path):
                 arc = path.relative_to(base_dir) if path.is_relative_to(base_dir) else Path(path.name)
                 zf.write(path, arcname=str(arc))
             elif path.is_dir():
                 for child in path.rglob("*"):
-                    if child.is_file():
+                    if child.is_file() and not _should_skip(child):
                         arc = child.relative_to(base_dir) if child.is_relative_to(base_dir) else child.name
                         zf.write(child, arcname=str(arc))
     return bundle_path
@@ -162,7 +193,7 @@ def _build_smoke_parquet_dataset(interim_dir: Path, *, lang: str) -> None:
                 "rumor_label": r_lbl if lang == "en" else None,
             }
         )
-        n_replies = 23 + (c_idx % 3) * 2
+        n_replies = 25 + (c_idx % 3) * 2
         for r_idx in range(1, n_replies + 1):
             nid = f"{cid}_n{r_idx}"
             pid = root_id if r_idx <= 8 else f"{cid}_n{(r_idx - 1) // 2 + 1}"
@@ -338,13 +369,25 @@ def _run_smoke_pipeline(role: str, lang: str, work_dir: Path) -> dict[str, Any]:
 
     if role != "model_nlp_only":
         train_ds = EarlyCascadeDataset(
-            root_dir=processed_dir, k_horizon=20, split="train", min_total_replies=21, polar_target_mode="future_only"
+            root_dir=processed_dir,
+            k_horizon=20,
+            split="train",
+            min_total_replies=DEFAULT_FORECAST_MIN_REPLIES,
+            polar_target_mode="future_only",
         )
         val_ds = EarlyCascadeDataset(
-            root_dir=processed_dir, k_horizon=20, split="val", min_total_replies=21, polar_target_mode="future_only"
+            root_dir=processed_dir,
+            k_horizon=20,
+            split="val",
+            min_total_replies=DEFAULT_FORECAST_MIN_REPLIES,
+            polar_target_mode="future_only",
         )
         test_ds = EarlyCascadeDataset(
-            root_dir=processed_dir, k_horizon=20, split="test", min_total_replies=21, polar_target_mode="future_only"
+            root_dir=processed_dir,
+            k_horizon=20,
+            split="test",
+            min_total_replies=DEFAULT_FORECAST_MIN_REPLIES,
+            polar_target_mode="future_only",
         )
         tr_l = DataLoader(train_ds, batch_size=2, shuffle=True)
         va_l = DataLoader(val_ds, batch_size=2, shuffle=False)
@@ -372,11 +415,25 @@ def _run_smoke_pipeline(role: str, lang: str, work_dir: Path) -> dict[str, Any]:
         h_dim = int(best_cfg["hidden_dim"])
         bench_res = run_multi_seed_benchmark(
             {
-                "TextMLP": lambda: TextMLP(in_dim=TOTAL_NODE_FEATURE_DIM, hidden_dim=h_dim, num_rumor_classes=num_cls),
-                "TemporalStanceMLP": lambda: TemporalStanceMLP(
-                    in_dim=TOTAL_NODE_FEATURE_DIM, hidden_dim=h_dim, edge_dim=4, num_rumor_classes=num_cls
+                "TextMLP": lambda: TextMLP(
+                    in_dim=TOTAL_NODE_FEATURE_DIM,
+                    hidden_dim=h_dim,
+                    num_rumor_classes=num_cls,
+                    use_cascade_stats=True,
                 ),
-                "BiGCN": lambda: BiGCN(in_dim=TOTAL_NODE_FEATURE_DIM, hidden_dim=h_dim, num_rumor_classes=num_cls),
+                "TemporalStanceMLP": lambda: TemporalStanceMLP(
+                    in_dim=TOTAL_NODE_FEATURE_DIM,
+                    hidden_dim=h_dim,
+                    edge_dim=4,
+                    num_rumor_classes=num_cls,
+                    use_cascade_stats=True,
+                ),
+                "BiGCN": lambda: BiGCN(
+                    in_dim=TOTAL_NODE_FEATURE_DIM,
+                    hidden_dim=h_dim,
+                    num_rumor_classes=num_cls,
+                    use_cascade_stats=True,
+                ),
                 "SBiFAGAT": lambda: SBiFAGAT(
                     in_dim=TOTAL_NODE_FEATURE_DIM,
                     hidden_dim=h_dim,
@@ -495,6 +552,12 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             "legacy_nli" if use_legacy_bootstrap else "qwen_qlora",
             "--teacher-model",
             args.teacher_model,
+            "--scoring-mode",
+            args.scoring_mode,
+            "--qlora-epochs",
+            str(args.epochs_qlora),
+            "--min-total-replies",
+            str(args.min_total_replies),
             "--qlora-adapter-dir",
             str(qlora_dir),
             "--edge-dim",
@@ -559,14 +622,14 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             root_dir=processed_dir,
             k_horizon=args.k_horizon,
             split="train",
-            min_total_replies=args.k_horizon + 1,
+            min_total_replies=args.min_total_replies,
             polar_target_mode="future_only",
         )
         val_ds = EarlyCascadeDataset(
             root_dir=processed_dir,
             k_horizon=args.k_horizon,
             split="val",
-            min_total_replies=args.k_horizon + 1,
+            min_total_replies=args.min_total_replies,
             polar_target_mode="future_only",
         )
         inferred_edge_dim = (
@@ -598,6 +661,8 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             str(processed_dir),
             "--k-horizon",
             str(args.k_horizon),
+            "--min-total-replies",
+            str(args.min_total_replies),
             "--hidden-dim",
             str(best_cfg["hidden_dim"]),
             "--edge-dim",
@@ -608,6 +673,8 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             str(best_cfg["dropout"]),
             "--lr",
             str(best_cfg["lr"]),
+            "--lambda-uncertainty",
+            str(best_cfg["lambda_uncertainty"]),
             "--epochs",
             str(args.epochs_gnn),
             "--batch-size",
@@ -617,7 +684,19 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
         _run_cmd(exp_cmd, cwd=work_dir)
 
         if lang == "en":
-            _run_cmd(exp_cmd + ["--eval-protocol", "loo", "--output-table", f"paper/tables_loo_{ds_name}.tex", "--output-json", f"paper/results_loo_{ds_name}.json", "--skip-figures"], cwd=work_dir)
+            _run_cmd(
+                exp_cmd
+                + [
+                    "--eval-protocol",
+                    "loo",
+                    "--output-table",
+                    f"paper/tables_loo_{ds_name}.tex",
+                    "--output-json",
+                    f"paper/results_loo_{ds_name}.json",
+                    "--skip-figures",
+                ],
+                cwd=work_dir,
+            )
 
         # Full component & K-horizon ablations
         abl_cmd = [
@@ -628,10 +707,20 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             str(processed_dir),
             "--k-horizon",
             str(args.k_horizon),
+            "--min-total-replies",
+            str(args.min_total_replies),
             "--hidden-dim",
             str(best_cfg["hidden_dim"]),
             "--edge-dim",
             str(inferred_edge_dim),
+            "--eps",
+            str(best_cfg["eps"]),
+            "--dropout",
+            str(best_cfg["dropout"]),
+            "--lr",
+            str(best_cfg["lr"]),
+            "--lambda-uncertainty",
+            str(best_cfg["lambda_uncertainty"]),
             "--epochs",
             str(args.epochs_gnn),
             "--batch-size",
@@ -640,11 +729,26 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
         ]
         _run_cmd(abl_cmd, cwd=work_dir)
 
+        if args.run_upfd and lang == "en":
+            _run_cmd(
+                [
+                    py,
+                    "-m",
+                    "scripts.run_upfd_extension",
+                    "--hidden-dim",
+                    str(args.hidden_dim),
+                    "--epochs",
+                    str(args.epochs_gnn),
+                ],
+                cwd=work_dir,
+            )
+
     bundle_sources = [
         processed_dir,
         work_dir / "paper",
         work_dir / "outputs",
         work_dir / "data" / "interim",
+        work_dir / "checkpoints",
         ce_ckpt,
         qlora_dir,
     ]
@@ -652,6 +756,7 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
         work_dir / f"sbifagat_{args.role}_bundle.zip",
         source_paths=bundle_sources,
         base_dir=work_dir,
+        include_heavy_weights=bool(args.bundle_weights),
     )
     return {
         "mode": "kaggle_t4x2",
@@ -677,15 +782,19 @@ def main() -> None:
     parser.add_argument("--max-teacher-pairs", type=int, default=6000)
     parser.add_argument("--before-epoch", type=int, default=None)
     parser.add_argument("--teacher-model", type=str, default=QWEN_KAGGLE_4BIT_MODEL_ID)
+    parser.add_argument("--scoring-mode", choices=["logit", "generate"], default="logit")
     parser.add_argument("--k-horizon", type=int, default=20)
+    parser.add_argument("--min-total-replies", type=int, default=DEFAULT_FORECAST_MIN_REPLIES)
     parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--epochs-qlora", type=int, default=1)
+    parser.add_argument("--epochs-qlora", type=int, default=2)
     parser.add_argument("--epochs-nlp", type=int, default=3)
     parser.add_argument("--epochs-gnn", type=int, default=100)
     parser.add_argument("--batch-size-nlp", type=int, default=16)
     parser.add_argument("--batch-size-gnn", type=int, default=32)
     parser.add_argument("--skip-qlora", action="store_true")
     parser.add_argument("--bootstrap-if-missing", action="store_true")
+    parser.add_argument("--run-upfd", action="store_true")
+    parser.add_argument("--bundle-weights", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     args = parser.parse_args()
 

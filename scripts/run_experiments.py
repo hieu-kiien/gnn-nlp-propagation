@@ -11,6 +11,7 @@ import torch
 from torch_geometric.loader import DataLoader
 
 from src.data.pyg_dataset import (
+    DEFAULT_FORECAST_MIN_REPLIES,
     EarlyCascadeDataset,
     TOTAL_NODE_FEATURE_DIM,
     leave_one_event_out_splits,
@@ -67,6 +68,7 @@ def _build_loaders(
     polar_target_mode: str = "full",
     label_scheme: str = "veracity4",
     custom_topic_splits: dict[str, set[str]] | None = None,
+    edge_source: str = "auto",
     nodes_table: Any = None,
     edges_table: Any = None,
     nlp_features: Any = None,
@@ -87,6 +89,7 @@ def _build_loaders(
         "polar_target_mode": polar_target_mode,
         "label_scheme": label_scheme,
         "custom_topic_splits": custom_topic_splits,
+        "edge_source": edge_source,
         "nodes_table": nodes_table,
         "edges_table": edges_table,
         "nlp_features": nlp_features,
@@ -183,7 +186,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--min-total-replies", type=int, default=21)
+    parser.add_argument("--min-total-replies", type=int, default=DEFAULT_FORECAST_MIN_REPLIES)
     parser.add_argument(
         "--polar-target-mode", choices=["full", "future_only"], default="future_only"
     )
@@ -197,6 +200,7 @@ def main() -> None:
     parser.add_argument("--output-table", type=Path, default=None)
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--figures-dir", type=Path, default=None)
+    parser.add_argument("--ckpt-out", type=Path, default=None)
     parser.add_argument("--skip-figures", action="store_true")
     args = parser.parse_args()
 
@@ -217,15 +221,58 @@ def main() -> None:
     )
     num_cls = 2 if args.label_scheme == "binary" else 4
     model_factories = {
-        "TextMLP": lambda: TextMLP(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls, dropout=args.dropout),
-        "TemporalStanceMLP": lambda: TemporalStanceMLP(
-            in_dim=in_dim, hidden_dim=h_dim, edge_dim=edge_dim, num_rumor_classes=num_cls, dropout=args.dropout
+        "TextMLP": lambda: TextMLP(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            num_rumor_classes=num_cls,
+            dropout=args.dropout,
+            use_cascade_stats=use_stats,
         ),
-        "StandardGCN": lambda: StandardGCN(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls, dropout=args.dropout),
-        "StandardGATv2": lambda: StandardGATv2(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls, dropout=args.dropout),
-        "EdgeGATv2": lambda: EdgeGATv2(in_dim=in_dim, hidden_dim=h_dim, edge_dim=edge_dim, num_rumor_classes=num_cls, dropout=args.dropout),
-        "FAGCN": lambda: FAGCNBaseline(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls, eps=args.eps, dropout=args.dropout),
-        "BiGCN": lambda: BiGCN(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=num_cls, dropout=args.dropout),
+        "TemporalStanceMLP": lambda: TemporalStanceMLP(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            dropout=args.dropout,
+            use_cascade_stats=use_stats,
+        ),
+        "StandardGCN": lambda: StandardGCN(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            num_rumor_classes=num_cls,
+            dropout=args.dropout,
+            use_cascade_stats=use_stats,
+        ),
+        "StandardGATv2": lambda: StandardGATv2(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            num_rumor_classes=num_cls,
+            dropout=args.dropout,
+            use_cascade_stats=use_stats,
+        ),
+        "EdgeGATv2": lambda: EdgeGATv2(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            dropout=args.dropout,
+            use_cascade_stats=use_stats,
+        ),
+        "FAGCN": lambda: FAGCNBaseline(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
+            use_cascade_stats=use_stats,
+        ),
+        "BiGCN": lambda: BiGCN(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            num_rumor_classes=num_cls,
+            dropout=args.dropout,
+            use_cascade_stats=use_stats,
+        ),
         "SBiFAGAT": lambda: SBiFAGAT(
             in_dim=in_dim,
             hidden_dim=h_dim,
@@ -249,6 +296,7 @@ def main() -> None:
         )
         has_rumor_labels = any(int(d.y_rumor.item()) >= 0 for d in test_ds)
         active_metrics = MAIN_METRICS if has_rumor_labels else VN_MAIN_METRICS
+        active_keys = tuple(k for k, _, _ in active_metrics)
         result = run_multi_seed_benchmark(
             model_factories,
             train_loader,
@@ -261,6 +309,7 @@ def main() -> None:
             lambda_uncertainty=lam_unc,
             reference_model="SBiFAGAT",
             comparator_model=args.comparator_model,
+            primary_hypothesis_keys=active_keys,
             device=device,
         )
     else:
@@ -278,10 +327,14 @@ def main() -> None:
             min_total_replies=args.min_total_replies,
             polar_target_mode=args.polar_target_mode,
             label_scheme=args.label_scheme,
+            edge_source="teacher",
         )
-        folds = leave_one_event_out_splits(base_all._all_cascades)
+        folds = leave_one_event_out_splits(
+            base_all._all_cascades, min_cascades_per_fold=15
+        )
         has_rumor_labels = any(int(d.y_rumor.item()) >= 0 for d in base_all._all_cascades)
         active_metrics = MAIN_METRICS if has_rumor_labels else VN_MAIN_METRICS
+        active_keys = [k for k, _, _ in active_metrics]
         fold_raw: dict[str, list[dict[str, float]]] = {m: [] for m in model_factories}
         last_bundle: dict[str, Any] = {}
         for fold in folds:
@@ -293,6 +346,7 @@ def main() -> None:
                 polar_target_mode=args.polar_target_mode,
                 label_scheme=args.label_scheme,
                 custom_topic_splits=fold,
+                edge_source="teacher",
                 nodes_table=nodes_tbl,
                 edges_table=edges_tbl,
                 nlp_features=nlp_feats,
@@ -309,6 +363,8 @@ def main() -> None:
                 lambda_uncertainty=lam_unc,
                 reference_model="SBiFAGAT",
                 comparator_model=args.comparator_model,
+                compute_bootstrap=False,
+                primary_hypothesis_keys=active_keys,
                 device=device,
             )
             for m_name, m_stats in fold_res["summary_stats"].items():
@@ -347,14 +403,20 @@ def main() -> None:
             )
             for k in metric_keys
         }
+        adj_p_scoped = holm_bonferroni_adjust({k: p_vals[k] for k in active_keys if k in p_vals})
+        adj_boot_scoped = holm_bonferroni_adjust(
+            {k: boot_p_vals[k] for k in active_keys if k in boot_p_vals}
+        )
         result = {
             "seeds": list(OFFICIAL_SEEDS),
             "raw_results": fold_raw,
             "summary_stats": summary_stats,
             "p_values": p_vals,
-            "adjusted_p_values": holm_bonferroni_adjust(p_vals),
+            "adjusted_p_values": {k: adj_p_scoped.get(k, float("nan")) for k in metric_keys},
             "bootstrap_p_values": boot_p_vals,
-            "adjusted_bootstrap_p_values": holm_bonferroni_adjust(boot_p_vals),
+            "adjusted_bootstrap_p_values": {
+                k: adj_boot_scoped.get(k, float("nan")) for k in metric_keys
+            },
             "reference_model": "SBiFAGAT",
             "comparator_model": cmp_name,
             "models": last_bundle["models"],
@@ -384,8 +446,34 @@ def main() -> None:
             "polar_target_mode": args.polar_target_mode,
             "min_total_replies": args.min_total_replies,
             "label_scheme": args.label_scheme,
+            "use_cascade_stats": use_stats,
         },
     )
+
+    if "SBiFAGAT" in result.get("models", {}):
+        ds_tag = args.data_dir.name.lower() if args.data_dir.name.lower() in {"pheme", "vn"} else "main"
+        ckpt_path = args.ckpt_out or (
+            out_json.with_name(f"best_sbifagat_{ds_tag}.pt")
+            if args.output_json is not None
+            else Path(f"checkpoints/best_sbifagat_{ds_tag}.pt")
+        )
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "config": {
+                    "hidden_dim": h_dim,
+                    "edge_dim": edge_dim,
+                    "eps": args.eps,
+                    "dropout": args.dropout,
+                    "use_cascade_stats": use_stats,
+                    "predict_uncertainty": use_unc,
+                },
+                "model_state_dict": result["models"]["SBiFAGAT"].state_dict(),
+                "in_dim": in_dim,
+                "num_rumor_classes": num_cls,
+            },
+            ckpt_path,
+        )
 
     if not args.skip_figures:
         _export_diagnostic_figures(

@@ -19,6 +19,8 @@ import numpy as np
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix, f1_score
 
+from src.nlp.qwen_teacher import DISCOURSE_BEHAVIOR_LABELS, _LABEL_SYNONYMS
+
 _STANCE_SYNONYMS: dict[str, str] = {
     "support": "support",
     "entailment": "support",
@@ -170,6 +172,10 @@ def evaluate_machine_vs_human(
     host_gold_num: list[float] = []
     host_pred_h: list[float] = []
 
+    behavior_gold: list[str] = []
+    behavior_pred: list[str] = []
+    behavior_order = list(DISCOURSE_BEHAVIOR_LABELS)
+
     with audit_path.open("r", encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
             eid = str(row.get("edge_id") or "").strip()
@@ -219,6 +225,22 @@ def evaluate_machine_vs_human(
                 host_gold_num.append(_HOSTILITY_TO_NUM[gh_lbl])
                 host_pred_h.append(h_uv)
 
+            # 5-class behavior gold vs machine behavior label
+            raw_gb = str(row.get("gold_adjudicated_behavior") or "").strip().lower()
+            if not raw_gb:
+                b1 = str(row.get("annotator_1_behavior") or "").strip().lower()
+                b2 = str(row.get("annotator_2_behavior") or "").strip().lower()
+                nb1 = _LABEL_SYNONYMS.get(b1)
+                nb2 = _LABEL_SYNONYMS.get(b2)
+                if nb1 is not None and nb1 == nb2:
+                    raw_gb = nb1
+            gb_norm = _LABEL_SYNONYMS.get(raw_gb)
+            pb_raw = str(key_row.get("machine_behavior_label") or "").strip().lower()
+            pb_norm = _LABEL_SYNONYMS.get(pb_raw)
+            if gb_norm is not None and pb_norm is not None:
+                behavior_gold.append(gb_norm)
+                behavior_pred.append(pb_norm)
+
     result: dict[str, Any] = {}
     if stance_gold:
         kappa = float(cohen_kappa_score(stance_gold, stance_pred, labels=list(STANCE_ORDER)))
@@ -252,6 +274,22 @@ def evaluate_machine_vs_human(
             "cohen_kappa_unweighted": h_kappa,
             "pearson_r": pr_h,
             "spearman_r": sr_h,
+        }
+    if behavior_gold:
+        b_kappa = float(cohen_kappa_score(behavior_gold, behavior_pred, labels=behavior_order))
+        if math.isnan(b_kappa):
+            b_kappa = 1.0 if behavior_gold == behavior_pred else 0.0
+        result["behavior_5class"] = {
+            "num_samples": len(behavior_gold),
+            "labels": behavior_order,
+            "macro_f1": float(
+                f1_score(behavior_gold, behavior_pred, labels=behavior_order, average="macro", zero_division=0)
+            ),
+            "accuracy": float(accuracy_score(behavior_gold, behavior_pred)),
+            "cohen_kappa_unweighted": b_kappa,
+            "confusion_matrix": confusion_matrix(
+                behavior_gold, behavior_pred, labels=behavior_order
+            ).tolist(),
         }
     return result
 
@@ -345,6 +383,9 @@ def evaluate_audit_csv(
     stance_2: list[str] = []
     hostility_1: list[str] = []
     hostility_2: list[str] = []
+    behavior_1: list[str] = []
+    behavior_2: list[str] = []
+    behavior_order = list(DISCOURSE_BEHAVIOR_LABELS)
 
     with path.open("r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
@@ -361,13 +402,21 @@ def evaluate_audit_csv(
                 hostility_1.append(_normalize_label(h1, _HOSTILITY_SYNONYMS, "hostility"))
                 hostility_2.append(_normalize_label(h2, _HOSTILITY_SYNONYMS, "hostility"))
 
+            b1 = _LABEL_SYNONYMS.get(str(row.get("annotator_1_behavior") or "").strip().lower())
+            b2 = _LABEL_SYNONYMS.get(str(row.get("annotator_2_behavior") or "").strip().lower())
+            if b1 is not None and b2 is not None:
+                behavior_1.append(b1)
+                behavior_2.append(b2)
+
     report: dict[str, Any] = {"input_csv": str(path)}
     if stance_1:
         report["stance"] = _compute_pair_agreement(stance_1, stance_2, STANCE_ORDER)
     if hostility_1:
         report["hostility"] = _compute_pair_agreement(hostility_1, hostility_2, HOSTILITY_ORDER)
+    if behavior_1:
+        report["behavior_5class"] = _compute_pair_agreement(behavior_1, behavior_2, behavior_order)
 
-    if "stance" not in report and "hostility" not in report:
+    if "stance" not in report and "hostility" not in report and "behavior_5class" not in report:
         raise ValueError(
             f"No completed dual annotations found in '{path}'. "
             "Fill annotator_1_* and annotator_2_* columns before running compute_kappa.py."
@@ -379,17 +428,36 @@ def evaluate_audit_csv(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compute Cohen's Kappa & Machine-vs-Gold metrics.")
-    parser.add_argument("--input", type=Path, default=Path("data/interim/human_audit_300.csv"))
+    parser.add_argument("--input", type=Path, default=None)
     parser.add_argument("--machine-key", type=Path, default=None)
     parser.add_argument("--rumoureval-json", type=Path, default=None)
     parser.add_argument("--output-json", type=Path, default=None)
     args = parser.parse_args()
 
+    resolved_input = args.input
+    if resolved_input is None:
+        for candidate in (
+            Path("data/interim/human_audit_vi_300.csv"),
+            Path("data/interim/human_audit_en_300.csv"),
+            Path("data/interim/human_audit_300.csv"),
+        ):
+            if candidate.is_file():
+                resolved_input = candidate
+                break
+        if resolved_input is None:
+            resolved_input = Path("data/interim/human_audit_300.csv")
+
+    resolved_key = args.machine_key
+    if resolved_key is None:
+        default_key = resolved_input.with_name(f"{resolved_input.stem}_machine_key.csv")
+        if default_key.is_file():
+            resolved_key = default_key
+
     report: dict[str, Any] = {}
-    if args.rumoureval_json is not None and not args.input.is_file():
+    if args.rumoureval_json is not None and not resolved_input.is_file():
         report["rumoureval_sdqc"] = evaluate_rumoureval_sdqc(args.rumoureval_json)
     else:
-        report.update(evaluate_audit_csv(args.input, machine_key_csv=args.machine_key))
+        report.update(evaluate_audit_csv(resolved_input, machine_key_csv=resolved_key))
         if args.rumoureval_json is not None:
             report["rumoureval_sdqc"] = evaluate_rumoureval_sdqc(args.rumoureval_json)
     print(json.dumps(report, indent=2, ensure_ascii=False))

@@ -9,22 +9,22 @@ Tài liệu này hướng dẫn trực tiếp cho **2 thành viên trong nhóm**
 Hệ thống AI của nhóm hoạt động theo **dây chuyền 3 mô hình nối tiếp nhau**:
 
 1. **Mô hình 1 — Thầy Thông minh (`Qwen/Qwen3.8-27B` gắn mảnh ghép thích nghi `QLoRA`):**
-   - Nạp chế độ nén **4-bit NF4 + `float16`** trải đều trên cả **2 card T4 (32 GB VRAM)**, đóng băng phần xử lý ảnh để tiết kiệm bộ nhớ.
+   - Nạp chế độ nén **4-bit NF4 + `float16`** trải đều trên cả **2 card T4 (32 GB VRAM)**, đóng băng phần xử lý ảnh để tiết kiệm bộ nhớ; sử dụng **G-Eval single-pass logit scoring** (`--scoring-mode logit`, đọc trực tiếp phân phối chữ số `1..5` trong 1 lượt forward thay vì sinh JSON 96 token) để đạt **0% lỗi JSON** và tăng tốc 10–20×.
    - Đọc đầy đủ *(Bài gốc + Bình luận trước + Bình luận trả lời)* để phân loại **5 nhóm hành vi thực tế** (không gộp thô thành ủng hộ/phản đối nữa):
      1. `support`: Tán thành / ủng hộ hợp lý
      2. `neutral`: Trung lập / hỏi thông tin
      3. `constructive_oppose`: Phản biện văn minh có lý lẽ
      4. `irrational_fallacy`: Bình luận vô lý, ngụy biện, nói cùn, bẻ lái phá đám
      5. `hostile_conflict`: Chống đối gay gắt, công kích, kích động xung đột
-   - Xuất 4 chỉ số liên tục `[s_uv, h_uv, r_uv, c_uv]` làm nhãn dạy cho Mô hình 2 (tuyệt đối không chạm vào tập Kiểm tra `Test`).
+   - Xuất 4 chỉ số liên tục `[s_uv, h_uv, r_uv, c_uv]` làm nhãn dạy cho Mô hình 2 dựa trên phân hoạch chuẩn hóa `topic_splits.json` (`--min-total-replies 25`, tuyệt đối không chạm vào tập Kiểm tra `Test`; nhánh PHEME LOO dùng cô lập `edge_source="teacher"`).
 
 2. **Mô hình 2 — Bộ Đọc Nhanh Trực Chiến NLP (`ViSoBERT` cho Tiếng Việt / `DeBERTa-v3-base` cho Tiếng Anh):**
-   - Chưng cất từ Mô hình 1 **chỉ trên tập Học (`70%` chủ đề)** bằng cả 2 card T4 song song (`DataParallel`).
+   - Chưng cất từ Mô hình 1 **chỉ trên tập Học (`70%` chủ đề chuẩn hóa)** bằng cả 2 card T4 song song (`DataParallel`).
    - Nhỏ gọn, suy luận cực nhanh trong thực tế để gắn nhãn 5 hành vi và 4 chỉ số trên từng mũi tên bình luận.
 
 3. **Mô hình 3 — Mạng Nơ-ron Đồ thị `SBi-FAGAT v2` (Trọng tâm bài báo):**
-   - Nhận dữ liệu từ Mô hình 2 + **Đồng hồ tốc độ & hình dáng 8 chiều của 20 câu đầu** (tốc độ dồn dập, gia tốc tăng/giảm, số nhánh trực tiếp, tỷ lệ câu có nội dung thật, chỉ số kích động 1 chiều) + **Đầu đo Độ tự tin dự báo** (tự cảnh báo khi 20 câu đầu quá nhạt cần chờ thêm).
-   - Chạy vòng lặp tự tối ưu trên tập Validation (`run_self_auditing_validation_loop`), xuất báo cáo các ca đoán lệch nhiều nhất (`worst_val_cases_for_review.json`), rồi chạy thi đấu 8 mô hình × 5 hạt giống ngẫu nhiên và xuất biểu đồ vector.
+   - Nhận dữ liệu từ Mô hình 2 + **Đồng hồ tốc độ & hình dáng 8 chiều của 20 câu đầu** (được truyền công bằng cho **cả 8 mô hình** khi bật `--v2`) + **Đầu đo Độ tự tin dự báo β-NLL (`beta=0.5`, $\exp(-\hat{\sigma}_{\text{polar}}/0.25)$)**.
+   - Chạy vòng lặp tự tối ưu trên tập Validation (`run_self_auditing_validation_loop` xếp hạng theo `task_loss`), xuất báo cáo các ca đoán lệch nhiều nhất (`worst_val_cases_for_review.json`), rồi chạy thi đấu 8 mô hình × 5 hạt giống ngẫu nhiên và xuất tệp nén `.zip` gọn nhẹ (mặc định bỏ qua trọng số nặng nhiều GB trừ khi truyền `--bundle-weights`, có thể bật `--run-upfd` trên track `en`).
 
 ---
 

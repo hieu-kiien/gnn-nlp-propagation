@@ -37,6 +37,7 @@ def build_profiling_batch(
     num_cascades: int = 32,
     k_horizon: int = 20,
     in_dim: int = TOTAL_NODE_FEATURE_DIM,
+    edge_dim: int = 2,
     num_classes: int = 4,
     seed: int = 42,
 ) -> Batch:
@@ -52,7 +53,12 @@ def build_profiling_batch(
         edge_index_bu = torch.tensor([dst, src], dtype=torch.long)
         s_uv = torch.linspace(-0.9, 0.9, steps=len(dst))
         h_uv = torch.linspace(0.1, 0.85, steps=len(dst))
-        edge_attr = torch.stack([s_uv, h_uv], dim=-1)
+        if edge_dim == 4:
+            r_uv = torch.linspace(0.05, 0.75, steps=len(dst))
+            c_uv = torch.linspace(0.85, 0.15, steps=len(dst))
+            edge_attr = torch.stack([s_uv, h_uv, r_uv, c_uv], dim=-1)
+        else:
+            edge_attr = torch.stack([s_uv, h_uv], dim=-1)
         graphs.append(
             CascadeData(
                 x=x,
@@ -61,6 +67,7 @@ def build_profiling_batch(
                 edge_index_bu=edge_index_bu,
                 edge_attr=edge_attr,
                 edge_stance=s_uv.unsqueeze(-1),
+                cascade_stats=torch.rand((1, 8), dtype=torch.float32),
                 root_index=torch.tensor([0], dtype=torch.long),
                 y_size=torch.tensor([3.2], dtype=torch.float32),
                 y_polar=torch.tensor([0.55], dtype=torch.float32),
@@ -169,6 +176,9 @@ def run_efficiency_benchmark(
     num_cascades: int = 32,
     k_horizon: int = 20,
     hidden_dim: int = 128,
+    edge_dim: int = 2,
+    use_cascade_stats: bool = False,
+    predict_uncertainty: bool = False,
     num_classes: int = 4,
     warmup: int = 3,
     repeats: int = 10,
@@ -180,24 +190,61 @@ def run_efficiency_benchmark(
         num_cascades=num_cascades,
         k_horizon=k_horizon,
         in_dim=in_dim,
+        edge_dim=edge_dim,
         num_classes=num_classes,
     )
     factories: dict[str, Callable[[], nn.Module]] = {
-        "TextMLP": lambda: TextMLP(in_dim=in_dim, hidden_dim=hidden_dim, num_rumor_classes=num_classes),
-        "TemporalStanceMLP": lambda: TemporalStanceMLP(
-            in_dim=in_dim, hidden_dim=hidden_dim, edge_dim=2, num_rumor_classes=num_classes
+        "TextMLP": lambda: TextMLP(
+            in_dim=in_dim,
+            hidden_dim=hidden_dim,
+            num_rumor_classes=num_classes,
+            use_cascade_stats=use_cascade_stats,
         ),
-        "StandardGCN": lambda: StandardGCN(in_dim=in_dim, hidden_dim=hidden_dim, num_rumor_classes=num_classes),
+        "TemporalStanceMLP": lambda: TemporalStanceMLP(
+            in_dim=in_dim,
+            hidden_dim=hidden_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_classes,
+            use_cascade_stats=use_cascade_stats,
+        ),
+        "StandardGCN": lambda: StandardGCN(
+            in_dim=in_dim,
+            hidden_dim=hidden_dim,
+            num_rumor_classes=num_classes,
+            use_cascade_stats=use_cascade_stats,
+        ),
         "StandardGATv2": lambda: StandardGATv2(
-            in_dim=in_dim, hidden_dim=hidden_dim, num_rumor_classes=num_classes
+            in_dim=in_dim,
+            hidden_dim=hidden_dim,
+            num_rumor_classes=num_classes,
+            use_cascade_stats=use_cascade_stats,
         ),
         "EdgeGATv2": lambda: EdgeGATv2(
-            in_dim=in_dim, hidden_dim=hidden_dim, edge_dim=2, num_rumor_classes=num_classes
+            in_dim=in_dim,
+            hidden_dim=hidden_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_classes,
+            use_cascade_stats=use_cascade_stats,
         ),
-        "FAGCN": lambda: FAGCNBaseline(in_dim=in_dim, hidden_dim=hidden_dim, num_rumor_classes=num_classes),
-        "BiGCN": lambda: BiGCN(in_dim=in_dim, hidden_dim=hidden_dim, num_rumor_classes=num_classes),
+        "FAGCN": lambda: FAGCNBaseline(
+            in_dim=in_dim,
+            hidden_dim=hidden_dim,
+            num_rumor_classes=num_classes,
+            use_cascade_stats=use_cascade_stats,
+        ),
+        "BiGCN": lambda: BiGCN(
+            in_dim=in_dim,
+            hidden_dim=hidden_dim,
+            num_rumor_classes=num_classes,
+            use_cascade_stats=use_cascade_stats,
+        ),
         "SBiFAGAT": lambda: SBiFAGAT(
-            in_dim=in_dim, hidden_dim=hidden_dim, edge_dim=2, num_rumor_classes=num_classes
+            in_dim=in_dim,
+            hidden_dim=hidden_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_classes,
+            use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
     }
 
@@ -230,6 +277,40 @@ def format_efficiency_markdown(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def format_efficiency_latex(
+    rows: list[dict[str, Any]],
+    *,
+    caption: str = "Computational efficiency benchmark (parameters, per-cascade latency, and peak memory).",
+    label: str = "tab:efficiency",
+) -> str:
+    """Format computational efficiency rows into an IEEEtran `booktabs` LaTeX table."""
+    mem_col = rows[0]["mem_label"] if rows else "Peak Mem (MB)"
+    body_lines: list[str] = []
+    for r in rows:
+        escaped_model = str(r["model"]).replace("_", "\\_")
+        body_lines.append(
+            f"{escaped_model} & {int(r['params']):,} & {float(r['infer_ms_per_cascade']):.4f} & "
+            f"{float(r['train_ms_per_batch']):.2f} & {float(r['peak_mem_mb']):.2f} \\\\"
+        )
+    return "\n".join(
+        [
+            "\\begin{table}[t]",
+            "\\centering",
+            f"\\caption{{{caption}}}",
+            f"\\label{{{label}}}",
+            "\\begin{tabular}{lcccc}",
+            "\\toprule",
+            f"Model & \\#Params & Infer (ms/cascade)$\\downarrow$ & Train Step (ms/batch)$\\downarrow$ & {mem_col}$\\downarrow$ \\\\",
+            "\\midrule",
+            *body_lines,
+            "\\bottomrule",
+            "\\end{tabular}",
+            "\\end{table}",
+            "",
+        ]
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark parameter count, inference/train latency, and memory across all 8 models."
@@ -237,11 +318,18 @@ def main() -> None:
     parser.add_argument("--num-cascades", type=int, default=32)
     parser.add_argument("--k-horizon", type=int, default=20)
     parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--edge-dim", type=int, choices=[2, 4], default=2)
+    parser.add_argument("--v2", action="store_true")
+    parser.add_argument("--use-cascade-stats", action="store_true")
+    parser.add_argument("--predict-uncertainty", action="store_true")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--output-json", type=Path, default=None)
+    parser.add_argument("--output-table", type=Path, default=None)
     args = parser.parse_args()
 
+    use_stats = bool(args.use_cascade_stats or args.v2)
+    use_unc = bool(args.predict_uncertainty or args.v2)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[EFFICIENCY & COMPLEXITY PROFILING ONLY - SYNTHETIC SHAPES, NOT REAL ACCURACY DATA]")
     print(f"Device: {device} | Cascades/batch={args.num_cascades} | K={args.k_horizon} | hidden_dim={args.hidden_dim}\n")
@@ -250,6 +338,9 @@ def main() -> None:
         num_cascades=args.num_cascades,
         k_horizon=args.k_horizon,
         hidden_dim=args.hidden_dim,
+        edge_dim=args.edge_dim,
+        use_cascade_stats=use_stats,
+        predict_uncertainty=use_unc,
         warmup=args.warmup,
         repeats=args.repeats,
         device=device,
@@ -260,6 +351,11 @@ def main() -> None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(json.dumps(rows, indent=2), encoding="utf-8")
         print(f"\nSaved efficiency profile JSON to: {args.output_json}")
+
+    if args.output_table is not None:
+        args.output_table.parent.mkdir(parents=True, exist_ok=True)
+        args.output_table.write_text(format_efficiency_latex(rows), encoding="utf-8")
+        print(f"Saved efficiency LaTeX table to: {args.output_table}")
 
 
 if __name__ == "__main__":

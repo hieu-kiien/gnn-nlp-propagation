@@ -3,40 +3,39 @@
 ## 1. Problem Statement & Research Objectives
 This project addresses early-stage modeling of community opinion polarization and information propagation scale on social media.
 The research title is:
-**"Graph Neural Networks and Natural Language Processing in Modeling Opinion Polarization and Information Propagation on Social Media"** (*Mạng nơ-ron đồ thị và xử lý ngôn ngữ tự nhiên trong mô hình hóa sự phân cực quan điểm và lan truyền thông tin trên mạng xã hội*).
+**"Mạng nơ-ron đồ thị và xử lý ngôn ngữ tự nhiên trong mô hình hóa sự phân cực quan điểm và lan truyền thông tin trên mạng xã hội"** (*Graph Neural Networks and Natural Language Processing for Modeling Opinion Polarization and Information Propagation on Social Media*).
 
 ### Core Challenge
 Early-stage prediction of viral cascades and polarization is intrinsically challenging because:
-1. **Sparsity & Cold-Start:** Only the source post and the first $K = 20$ interactions ($t \le t_{20}$) are available at inference time.
-2. **Structural & Semantic Coupling:** Cascade propagation is driven both by structural topology (tree depth, branching factor, speed) and semantic interaction (agreement, disagreement, toxic escalation, support).
-3. **Multi-task Objectives:** The model must predict:
-   - $y_{\text{size}} = \log(1 + N_{\text{total}})$: Log-scale final cascade size (Regression).
-   - $y_{\text{polar}} \in [0, 1]$: Community polarization intensity across the complete future cascade (Regression, silver-standard label).
-   - $y_{\text{rumor}} \in \{0, 1\}$: Rumor verification classification (Binary, on PHEME dataset).
+1. **Sparsity & Cold-Start:** Only the source post and the earliest $K = 20$ chronological interactions ($t_i \le t_K$) are visible at inference time (`min_total_replies = 25` enforced on forecasting splits so non-trivial future growth exists past $t_K$).
+2. **Structural & Semantic Coupling:** Cascade propagation is driven both by tree topology (depth, branching, temporal delay) and pairwise discourse dynamics (stance agreement, constructive opposition, fallacy, hostility).
+3. **Multi-Task Objectives (`MultiTaskHead`):**
+   - $y_{\text{size}} = \log(1 + N_{\text{total}})$: Log-scale final cascade size regression (`F.softplus` output, Huber loss).
+   - $y_{\text{polar}} \in [0, 1]$: Silver-standard community polarization intensity over future interactions (`torch.sigmoid` output, Huber loss).
+   - $y_{\text{rumor}}$: Rumor veracity classification on PHEME (`veracity4` 4-class or `binary`, Cross-Entropy loss; masked out via `-1` when predicting Vietnamese Reddit threads without rumor labels).
 
 ---
 
 ## 2. Proposed Architecture: SBi-FAGAT
-**SBi-FAGAT** stands for **Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network**.
+**SBi-FAGAT** stands for **Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network** (`src/models/sbi_fagat.py`), compared fairly against 7 baselines sharing `hidden_dim = 128` (`src/models/baselines.py`):
+`TextMLP`, `TemporalStanceMLP`, `StandardGCN`, `StandardGATv2`, `EdgeGATv2`, `FAGCNBaseline` (`FAGCN`), and `BiGCN`.
 
 ### Key Architectural Components
-1. **Node Feature Representation ($X \in \mathbb{R}^{|V| \times d_{\text{in}}}$):**
-   - 768-dimensional contextual text embeddings extracted from frozen language models (e.g., `vinai/phobert-base-v2` for Vietnamese, `sentence-transformers/all-mpnet-base-v2` or `roberta-base` for English).
-   - Augmented by root-relative temporal and topological node attributes.
+1. **Node Feature Representation ($X \in \mathbb{R}^{|V_K| \times 770}$):**
+   - `768`-dimensional contextual text embeddings extracted offline via masked mean pooling from frozen backbones (`uitnlp/visobert` for Vietnamese, `roberta-base` for English PHEME).
+   - Concatenated with `2` causal intra-$K$ structural/temporal features (`t_norm` using fixed 7-day logarithmic reference `TEMPORAL_REF_SECONDS`, and `depth_norm`), forming `TOTAL_NODE_FEATURE_DIM = 770`.
 2. **Stance-Guided Edge Modulation ($e_{uv} \in \mathbb{R}^{d_{\text{edge}}}$):**
-   - Encodes stance interaction between parent node $u$ and child reply $v$.
-   - **Profile v1 ($d_{\text{edge}} = 2$):** Signed agreement/disagreement score $s_{uv} \in [-1, +1]$ and confidence $c_{uv} \in [0, 1]$ computed via legacy NLI teacher (`FacebookAI/roberta-large-mnli` / `MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7`).
-   - **Profile v2 ($d_{\text{edge}} = 4$):** 5-class stance probabilities projected via Qwen QLoRA (`support, refute, query, comment, toxic`) yielding signed polarity, confidence, structural decay, and stance entropy.
-3. **Bidirectional Message Passing:**
-   - Downward edge propagation ($\mathcal{E}_{\text{down}}$: post $\to$ response) captures cascade dispersion.
-   - Upward edge propagation ($\mathcal{E}_{\text{up}}$: response $\to$ parent) captures aggregation and collective consensus/conflict.
-4. **Frequency-Adaptive Attention (FAGAT Filtering):**
-   - Learns low-pass coefficients ($\beta_l > 0$) for homophilic opinion clusters (reinforcing stance agreement).
-   - Learns high-pass coefficients ($\beta_l < 0$) for heterophilic cross-ideological friction (disagreement, controversy).
-5. **Readout & Multi-Task Predictor:**
-   - Mean/Max/Sum graph-level pooling.
-   - Optional burst statistics (8-dimensional temporal velocity features) in v2.
-   - Multi-layer perceptron heads with optional Monte Carlo Dropout for epistemic uncertainty estimation.
+   - Encodes directed parent-reply interaction $(u, v)$.
+   - **Profile `v1` (Default MVP, $d_{\text{edge}} = 2$):** `e_uv = [s_uv, h_uv]` where `s_uv in [-1, 1]` is stance polarity from `MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7` and `h_uv in [0, 1]` is hostility intensity from `uitnlp/visobert` (`ura-hcmut/UIT-ViHSD`) for VI or `cardiffnlp/twitter-roberta-base-offensive` for EN, distilled into 2-head `DualHeadCrossEncoder`.
+   - **Profile `v2` (Opt-In Scaling, $d_{\text{edge}} = 4$):** `e_uv = [s_uv, h_uv, r_uv, c_uv]` (stance polarity, hostility intensity, irrationality/fallacy intensity, constructive reasoning quality) projected from 5-class discourse probabilities (`support`, `neutral`, `constructive_oppose`, `irrational_fallacy`, `hostile_conflict`) via `Qwen/Qwen3.8-27B` QLoRA 1-pass G-Eval logit scoring (`src/nlp/qwen_teacher.py`) and distilled into 4D `DualHeadCrossEncoder` (`uitnlp/visobert` / `microsoft/deberta-v3-base`).
+   - Also provides `LatentConflictMLP(x_u, x_v, x_u - x_v)` for edge-text-free datasets such as PyG `UPFD` (`scripts/run_upfd_extension.py`).
+3. **Bidirectional Frequency-Adaptive Attention (`StanceGuidedFAConv`):**
+   - Computes bounded signed edge gates $\gamma_{uv} = \tanh(\mathbf{a}^\top [z_u^{\text{norm}} \Vert z_v^{\text{norm}} \Vert e_{uv}]) \in (-1, +1)$ (with `sigmoid` ablation option) and symmetric degree normalization $((d_{\text{out}}(u)+1)(d_{\text{in}}(v)+1))^{-1/2}$.
+   - Runs independent Top-Down (`edge_index_td`) and Bottom-Up (`edge_index_bu`) message passing stacks with initial residual (`eps * h_0`), root anchoring (`lin_root(h_root_broadcast)`), and nonlinear stabilization (`raw + 0.2 * tanh(raw)`).
+4. **Readout, Cascade Summary, & Uncertainty (`MultiTaskHead`):**
+   - Concatenates 4 graph vectors `[z_root_td, z_att_td, z_root_bu, z_att_bu]` (`4 * hidden_dim = 512`) using `GlobalAttentionReadout` (or mean pool ablation).
+   - Optional 8-dimensional early structural/temporal `cascade_stats` projection (`use_cascade_stats=True` in `v2`).
+   - Optional heteroscedastic $\beta$-NLL uncertainty head (`predict_uncertainty=True` in `v2`) outputting bounded `size_logvar` and `polar_logvar` (`[-6, 3]`) trained with detached residuals (`beta_nll = 0.5`, Seitzer et al., ICLR 2022).
 
 ---
 
@@ -44,30 +43,31 @@ Early-stage prediction of viral cascades and polarization is intrinsically chall
 
 ### Datasets
 1. **PHEME Dataset (English Benchmark):**
-   - Contains rumor and non-rumor cascades across 9 breaking events (e.g., Ferguson, Sydney Siege, Charlie Hebdo).
-   - Ingested via `src/data/pheme_loader.py`.
-   - Truly inductive splits: Train/Val/Test split grouped strictly by distinct real-world events.
+   - Rumor and non-rumor cascades ingested from Figshare article `6392078` via `src/data/pheme_loader.py` into validated `nodes.parquet` / `edges.parquet`.
+   - Truly inductive topic split grouped strictly by real-world breaking news event (`topic_id`).
 2. **Vietnamese Social Media Dataset (Arctic Shift / Reddit VN):**
-   - Crawled from Reddit Vietnam subreddits (e.g., `r/VietNam`, `r/TroChuyenLinhTinh`) via `src/data/arctic_shift_vn.py`.
-   - Heuristic Temporal-Keyword Grouped Inductive Split: Threads partitioned by ISO week and title keywords to prevent overlap.
+   - Ingested from Reddit Vietnam subreddits (e.g., `r/VietNam`, `r/TroChuyenLinhTinh`) via `src/data/arctic_shift_vn.py` with temporal cutoff `--before-epoch` support.
+   - Uses a **Heuristic Temporal-Keyword / 14-day TF-IDF Grouped Inductive Split** (`cluster_vn_cascade_topics`) to avoid thread overlap across Train/Val/Test while disclosing that it is heuristic rather than event-level ground truth.
 3. **UPFD Benchmark (GossipCop / PolitiFact):**
-   - Optional transfer learning benchmark ingested via PyG UPFD datasets.
+   - External benchmark ingested via `scripts/run_upfd_extension.py` using `LatentConflictMLP`.
 
-### Strict Data Ingestion Guardrails (5 Iron Laws)
-- **Zero Data Leakage:** Node inputs strictly limited to root post and earliest $K=20$ interactions ($t_i \le t_K$).
-- **Label Independence:** Target metrics $y_{\text{size}}$ and $y_{\text{polar}}$ are derived from full-cascade metadata but never included in node or edge feature matrices.
-- **Pseudonymization:** User identifiers are pseudonymized with SHA-256 and optional secret salt (`SBIF_HASH_SALT`); plain unsalted hashes are tagged with clear methodological warnings.
+### Five Iron Laws (`GEMINI.md`)
+- **Zero Synthetic Results:** Never report synthetic/mock numbers in experimental paper tables; synthetic tensors are strictly restricted to unit tests (`tests/`) and computational complexity profiling (`scripts/benchmark_efficiency.py`).
+- **Zero Data Leakage:** Strictly limit graph inputs to root + earliest $K = 20$ replies, isolate post-hoc labels (`FORBIDDEN_LEAKAGE_COLUMNS` in `src/data/schema.py`), share canonical `topic_splits.json`, and isolate LOO teacher edges (`edge_source="teacher"`).
+- **Verified References Only:** All citations in `paper/references.bib` must carry verified authors, venues, and DOIs/arXiv IDs.
+- **GPU Optimization & Reproducibility:** Offline NLP extraction (`.pt` feature banks), mixed precision (`torch.amp`), and mandatory 5-seed evaluation (`[42, 100, 2024, 777, 999]`) with Early Stopping on `task_loss`.
+- **Test-Gated Delivery:** Every change must pass `pytest` before reporting completion.
 
 ---
 
-## 4. Pipeline Execution Profiles (v1 vs. v2)
+## 4. Pipeline Execution Profiles (`v1` vs. `v2`)
 
-| Dimension | Profile v1 (Default & Stable) | Profile v2 (Advanced & Opt-In) |
+| Dimension | Profile `v1` (Default MVP) | Profile `v2` (Opt-In Scaling) |
 | :--- | :--- | :--- |
-| **Philosophy** | Reproducible baseline, low compute overhead, strict paper compatibility | Experimental scaling, LLM-based stance distillation, uncertainty quantification |
-| **NLP Edge Teacher** | Frozen NLI teacher (`legacy_nli`) | Qwen 2.5 / 3.8 / 27B QLoRA teacher (`qwen_qlora`) |
-| **Edge Dimension ($d_{\text{edge}}$)** | 2 ($s_{uv}, c_{uv}$) | 4 (polarity, confidence, decay, entropy) |
-| **Burst Statistics** | Disabled (standard graph readout) | Enabled (8-dimensional cascade velocity features) |
-| **Uncertainty Estimation** | Standard point predictions | Monte Carlo Dropout (variance across $M=20$ passes) |
-| **Hardware Requirement** | CPU or 1x 8-16GB GPU | Dual GPU (Kaggle T4 x 2, 32GB VRAM total) |
-| **Activation Flag** | Default (`PIPELINE_VERSION=v1`) | `PIPELINE_VERSION=v2` or `--v2` |
+| **Activation** | Default (`PIPELINE_VERSION=v1`) | `export PIPELINE_VERSION=v2` or `--v2` |
+| **NLP Edge Teacher** | Frozen NLI (`legacy_nli`: `mDeBERTa-v3` + `ViHSD`/`twitter-roberta`) | `Qwen/Qwen3.8-27B` QLoRA 1-pass G-Eval (`qwen_qlora`) |
+| **Edge Dimension ($d_{\text{edge}}$)** | `2`: `[s_uv, h_uv]` | `4`: `[s_uv, h_uv, r_uv, c_uv]` |
+| **Student Edge Encoder** | 2D `DualHeadCrossEncoder` | 4D `DualHeadCrossEncoder` (`visobert` / `deberta-v3-base`) |
+| **Cascade Burst Stats** | Off (`use_cascade_stats=False`) | On (8-dimensional `cascade_stats`) |
+| **Uncertainty Estimation** | Deterministic point prediction | Heteroscedastic $\beta$-NLL (`beta_nll=0.5`, detached residuals) |
+| **Target Compute** | CPU or 1x 8–16 GB GPU | Dual GPU (`Kaggle T4 x 2`, 32 GB total VRAM) |

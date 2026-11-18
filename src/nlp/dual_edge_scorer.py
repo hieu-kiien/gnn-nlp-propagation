@@ -22,10 +22,10 @@ import argparse
 import copy
 import csv
 import gc
+import inspect
 import json
 import math
 import random
-import unicodedata
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -50,7 +50,12 @@ except ImportError:  # pragma: no cover
     def tqdm(iterable: Any, **_kwargs: Any) -> Any:
         return iterable
 
-from src.data.pyg_dataset import inductive_topic_split
+from src.data.pyg_dataset import (
+    DEFAULT_FORECAST_MIN_REPLIES,
+    compute_canonical_topic_splits,
+    inductive_topic_split,
+    save_topic_splits_json,
+)
 from src.data.schema import load_cascade_parquet
 from src.nlp.qwen_teacher import (
     DISCOURSE_BEHAVIOR_LABELS,
@@ -61,6 +66,7 @@ from src.nlp.qwen_teacher import (
     finetune_qwen_qlora,
 )
 from src.utils.seed import seed_everything
+from src.utils.text import normalize_nfc
 
 VISOBERT_MODEL_NAME = "uitnlp/visobert"
 UIT_VIHSD_DATASET_NAME = "ura-hcmut/UIT-ViHSD"
@@ -86,9 +92,7 @@ def _cuda_autocast(enabled: bool) -> Any:
 
 
 def _normalize_nfc(text: Any) -> str:
-    if not isinstance(text, str):
-        return ""
-    return unicodedata.normalize("NFC", text).replace("\x00", "").strip()
+    return normalize_nfc(text)
 
 
 def load_tokenizer_safe(model_name_or_path: str | Path) -> Any:
@@ -560,6 +564,7 @@ def export_stratified_human_audit_csv(
         "sample_id",
         "cascade_id",
         "edge_id",
+        "root_text",
         "parent_text",
         "reply_text",
         "annotator_1_stance",
@@ -585,6 +590,7 @@ def export_stratified_human_audit_csv(
                     "sample_id": f"{prefix}_{idx + 1:03d}",
                     "cascade_id": str(row.get("cascade_id") or ""),
                     "edge_id": str(row.get("edge_id") or ""),
+                    "root_text": str(row.get("root_text") or row.get("parent_text") or ""),
                     "parent_text": str(row.get("parent_text") or ""),
                     "reply_text": str(row.get("reply_text") or ""),
                     "annotator_1_stance": "",
@@ -666,6 +672,7 @@ class DualHeadCrossEncoder(nn.Module):
         encoder: Any | None = None,
         edge_dim: int = 2,
         dropout: float = 0.1,
+        include_root_context: bool = False,
     ) -> None:
         super().__init__()
         if lang not in {"vi", "en"}:
@@ -676,6 +683,7 @@ class DualHeadCrossEncoder(nn.Module):
         self.edge_dim = int(edge_dim)
         self.model_name = model_name or (VISOBERT_MODEL_NAME if lang == "vi" else ROBERTA_BASE_MODEL_NAME)
         self.dropout_p = float(dropout)
+        self.include_root_context = bool(include_root_context)
         self.encoder = encoder if encoder is not None else AutoModel.from_pretrained(self.model_name)
         hidden_size = int(self.encoder.config.hidden_size)
 
@@ -698,8 +706,16 @@ class DualHeadCrossEncoder(nn.Module):
         token_type_ids: Tensor | None = None,
     ) -> dict[str, Tensor]:
         kwargs: dict[str, Any] = {"input_ids": input_ids, "attention_mask": attention_mask}
-        if token_type_ids is not None and "token_type_ids" in self.encoder.forward.__code__.co_varnames:
-            kwargs["token_type_ids"] = token_type_ids
+        if token_type_ids is not None:
+            try:
+                sig_params = inspect.signature(self.encoder.forward).parameters
+                accepts_type_ids = "token_type_ids" in sig_params or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
+                )
+            except (TypeError, ValueError):
+                accepts_type_ids = "token_type_ids" in self.encoder.forward.__code__.co_varnames
+            if accepts_type_ids:
+                kwargs["token_type_ids"] = token_type_ids
         outputs = self.encoder(**kwargs)
         cls_repr = self.dropout(outputs.last_hidden_state[:, 0, :])
 
@@ -751,6 +767,7 @@ class DualHeadCrossEncoder(nn.Module):
             "model_name": self.model_name,
             "edge_dim": self.edge_dim,
             "dropout": self.dropout_p,
+            "include_root_context": bool(getattr(self, "include_root_context", False)),
             "has_pooler": getattr(self.encoder, "pooler", None) is not None,
         }
         (out_path / "dual_head_meta.json").write_text(
@@ -780,6 +797,7 @@ class DualHeadCrossEncoder(nn.Module):
             encoder=encoder,
             edge_dim=int(meta.get("edge_dim", 2)),
             dropout=float(meta.get("dropout", 0.1)),
+            include_root_context=bool(meta.get("include_root_context", False)),
         )
         state = torch.load(ckpt_path / "dual_head_weights.pt", map_location=map_location, weights_only=True)
         instance.load_state_dict(state)
@@ -917,8 +935,14 @@ def distill_dual_cross_encoder(
     student = (
         model
         if model is not None
-        else DualHeadCrossEncoder(lang=lang, model_name=model_name, edge_dim=effective_edge_dim)
+        else DualHeadCrossEncoder(
+            lang=lang,
+            model_name=model_name,
+            edge_dim=effective_edge_dim,
+            include_root_context=include_root_context,
+        )
     )
+    student.include_root_context = bool(include_root_context)
     student = student.to(target_device)
     tok = tokenizer if tokenizer is not None else load_tokenizer_safe(student.model_name)
 
@@ -1119,10 +1143,25 @@ def distill_dual_cross_encoder(
     return report
 
 
-def extract_parent_reply_pairs_from_parquet(interim_dir: Path) -> list[dict[str, Any]]:
+def extract_parent_reply_pairs_from_parquet(
+    interim_dir: Path,
+    *,
+    min_total_replies: int = 0,
+) -> list[dict[str, Any]]:
     """Read validated `nodes.parquet` and `edges.parquet` into `(u, v)` text pair records."""
     nodes_tbl, edges_tbl = load_cascade_parquet(interim_dir, validate=True)
     node_rows = nodes_tbl.to_pylist()
+    allowed_cascades: set[str] | None = None
+    if int(min_total_replies) > 0:
+        reply_counts: dict[str, int] = {}
+        for row in node_rows:
+            cid = str(row["cascade_id"])
+            if not bool(row.get("is_root")):
+                reply_counts[cid] = reply_counts.get(cid, 0) + 1
+        allowed_cascades = {
+            cid for cid, cnt in reply_counts.items() if cnt >= int(min_total_replies)
+        }
+
     node_text_by_id = {str(row["node_id"]): str(row["text"]) for row in node_rows}
     node_topic_by_id = {str(row["node_id"]): str(row["topic_id"]) for row in node_rows}
     cascade_root_id: dict[str, str] = {}
@@ -1133,6 +1172,8 @@ def extract_parent_reply_pairs_from_parquet(interim_dir: Path) -> list[dict[str,
     pairs: list[dict[str, Any]] = []
     for edge in edges_tbl.to_pylist():
         cid = str(edge["cascade_id"])
+        if allowed_cascades is not None and cid not in allowed_cascades:
+            continue
         src = str(edge["source_id"])
         tgt = str(edge["target_id"])
         root_id = cascade_root_id.get(cid, src)
@@ -1159,6 +1200,7 @@ def split_pairs_by_inductive_topics(
     train_ratio: float = 0.70,
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
+    canonical_topic_splits: Mapping[str, set[str] | Sequence[str]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Partition `(u, v)` edge pairs strictly by `topic_id` so test topics never leak into distillation."""
     if not pairs:
@@ -1167,16 +1209,32 @@ def split_pairs_by_inductive_topics(
         {**dict(p), "topic_id": str(p.get("topic_id") or p.get("cascade_id") or "default")}
         for p in pairs
     ]
-    split_indices = inductive_topic_split(
-        normalized,
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
-        test_ratio=test_ratio,
-        seed=split_seed,
-    )
-    train_pairs = [normalized[i] for i in split_indices["train"]]
-    val_pairs = [normalized[i] for i in split_indices["val"]]
-    test_pairs = [normalized[i] for i in split_indices["test"]]
+    if canonical_topic_splits is not None:
+        tr_topics_cfg = {str(t) for t in canonical_topic_splits.get("train", ())}
+        va_topics_cfg = {str(t) for t in canonical_topic_splits.get("val", ())}
+        te_topics_cfg = {str(t) for t in canonical_topic_splits.get("test", ())}
+        train_pairs: list[dict[str, Any]] = []
+        val_pairs: list[dict[str, Any]] = []
+        test_pairs: list[dict[str, Any]] = []
+        for p in normalized:
+            top = str(p["topic_id"])
+            if top in tr_topics_cfg:
+                train_pairs.append(p)
+            elif top in va_topics_cfg:
+                val_pairs.append(p)
+            elif top in te_topics_cfg:
+                test_pairs.append(p)
+    else:
+        split_indices = inductive_topic_split(
+            normalized,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            seed=split_seed,
+        )
+        train_pairs = [normalized[i] for i in split_indices["train"]]
+        val_pairs = [normalized[i] for i in split_indices["val"]]
+        test_pairs = [normalized[i] for i in split_indices["test"]]
 
     tr_topics = {str(p["topic_id"]) for p in train_pairs}
     va_topics = {str(p["topic_id"]) for p in val_pairs}
@@ -1207,6 +1265,9 @@ def _score_pairs_with_teachers(
     teacher_model: str = QWEN_TEACHER_MODEL_ID,
     qlora_adapter_dir: Path | None = None,
     qwen_scorer: QwenBehavioralTeacherScorer | None = None,
+    scoring_mode: str = "logit",
+    max_fallback_rate: float = 1.0,
+    telemetry: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Run teacher scorers (`legacy_nli` or `qwen_qlora`) with atomic shard checkpointing."""
     if not pairs:
@@ -1250,16 +1311,20 @@ def _score_pairs_with_teachers(
             for i, p in enumerate(pairs)
             if any(k not in p for k in ("s_uv", "h_uv", "r_uv", "c_uv", "behavior_label", "root_s_uv"))
         ]
+        total_fb_count = 0
+        total_scored_calls = 0
         if need_idx:
             owns_scorer = qwen_scorer is None
             scorer = qwen_scorer or QwenBehavioralTeacherScorer(
                 model_name_or_path=teacher_model,
                 adapter_dir=qlora_adapter_dir,
                 lang=lang,
+                scoring_mode=scoring_mode,  # type: ignore[arg-type]
+                max_fallback_rate=max_fallback_rate,
                 batch_size=max(1, min(int(batch_size), 8)),
             )
             chunk_starts = range(0, len(need_idx), chunk_size)
-            for start in tqdm(chunk_starts, desc=f"Qwen3.8-27B QLoRA teacher ({lang})"):
+            for start in tqdm(chunk_starts, desc=f"Qwen Teacher ({scoring_mode}, {lang})"):
                 idx_slice = need_idx[start : start + chunk_size]
                 need_edge = [
                     i
@@ -1273,6 +1338,8 @@ def _score_pairs_with_teachers(
                         [str(pairs[i]["reply_text"]) for i in need_edge],
                         lang=lang,
                     )
+                    total_fb_count += int(out.get("fallback_count", 0))
+                    total_scored_calls += len(need_edge)
                     for pos, i in enumerate(need_edge):
                         pairs[i]["s_uv"] = float(out["s_uv"][pos])
                         pairs[i]["h_uv"] = float(out["h_uv"][pos])
@@ -1306,6 +1373,8 @@ def _score_pairs_with_teachers(
                         [str(pairs[i]["reply_text"]) for i in deep_indices],
                         lang=lang,
                     )
+                    total_fb_count += int(root_out.get("fallback_count", 0))
+                    total_scored_calls += len(deep_indices)
                     for pos, i in enumerate(deep_indices):
                         pairs[i]["root_s_uv"] = float(root_out["s_uv"][pos])
 
@@ -1317,6 +1386,11 @@ def _score_pairs_with_teachers(
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+        if telemetry is not None:
+            telemetry["teacher_backend"] = teacher_backend
+            telemetry["scoring_mode"] = scoring_mode
+            telemetry["fallback_count"] = int(total_fb_count)
+            telemetry["fallback_rate"] = float(total_fb_count / max(1, total_scored_calls))
         return pairs
 
     # Legacy dual teacher path (Hostility RoBERTa/ViSoBERT + mDeBERTa NLI)
@@ -1410,6 +1484,7 @@ def main() -> None:
     parser.add_argument("--pilot-csv", type=Path, default=None)
     parser.add_argument("--machine-key-csv", type=Path, default=None)
     parser.add_argument("--scored-cache-json", type=Path, default=None)
+    parser.add_argument("--topic-splits-json", type=Path, default=None)
     parser.add_argument("--train-vihsd", action="store_true")
     parser.add_argument("--train-qwen-qlora", action="store_true")
     parser.add_argument(
@@ -1418,6 +1493,14 @@ def main() -> None:
         default="legacy_nli",
     )
     parser.add_argument("--teacher-model", type=str, default=QWEN_TEACHER_MODEL_ID)
+    parser.add_argument(
+        "--scoring-mode",
+        choices=["logit", "generate"],
+        default="logit",
+        help="G-Eval single-pass digit logit scoring (default, fastest) vs generative JSON.",
+    )
+    parser.add_argument("--max-fallback-rate", type=float, default=1.0)
+    parser.add_argument("--qlora-epochs", type=int, default=2)
     parser.add_argument(
         "--qlora-adapter-dir",
         type=Path,
@@ -1432,6 +1515,12 @@ def main() -> None:
     parser.add_argument("--sanity-check-shuffle", action="store_true")
     parser.add_argument("--allow-untrained-vihsd", action="store_true")
     parser.add_argument("--split-seed", type=int, default=42)
+    parser.add_argument(
+        "--min-total-replies",
+        type=int,
+        default=DEFAULT_FORECAST_MIN_REPLIES,
+        help="Canonical minimum replies threshold aligned with EarlyCascadeDataset (default: 25).",
+    )
     parser.add_argument("--max-pairs", type=int, default=None)
     parser.add_argument("--max-teacher-pairs", type=int, default=None)
     parser.add_argument("--checkpoint-every", type=int, default=250)
@@ -1446,6 +1535,7 @@ def main() -> None:
     machine_key_csv = args.machine_key_csv or audit_csv.with_name(
         f"{audit_csv.stem}_machine_key.csv"
     )
+    splits_path = args.topic_splits_json or (args.interim_dir / "topic_splits.json")
 
     if args.train_vihsd:
         finetune_visobert_vihsd(
@@ -1460,12 +1550,32 @@ def main() -> None:
             model_name_or_path=args.teacher_model,
             lang=args.lang,
             pilot_gold_csv=args.pilot_csv if (args.pilot_csv is not None and args.pilot_csv.exists()) else None,
-            epochs=1,
+            scoring_mode=args.scoring_mode,
+            epochs=args.qlora_epochs,
             batch_size=2,
         )
 
     if args.score_only or args.export_audit or args.distill:
-        pairs = extract_parent_reply_pairs_from_parquet(args.interim_dir)
+        nodes_tbl, _ = load_cascade_parquet(args.interim_dir, validate=True)
+        canonical_splits = compute_canonical_topic_splits(
+            nodes_tbl,
+            min_total_replies=args.min_total_replies,
+            seed=args.split_seed,
+        )
+        save_topic_splits_json(
+            canonical_splits,
+            splits_path,
+            meta={
+                "lang": args.lang,
+                "min_total_replies": int(args.min_total_replies),
+                "split_seed": int(args.split_seed),
+            },
+        )
+
+        pairs = extract_parent_reply_pairs_from_parquet(
+            args.interim_dir,
+            min_total_replies=args.min_total_replies,
+        )
         if args.max_pairs is not None:
             pairs = pairs[: args.max_pairs]
 
@@ -1475,18 +1585,23 @@ def main() -> None:
             and args.max_teacher_pairs is not None
             and len(pairs) > args.max_teacher_pairs
         ):
-            # Budget Teacher scoring strictly inside train + val topics (ZERO test-topic leakage)
-            topic_splits = split_pairs_by_inductive_topics(pairs, split_seed=args.split_seed)
+            # Budget Teacher scoring strictly inside canonical train + val topics (ZERO test-topic leakage)
+            topic_splits = split_pairs_by_inductive_topics(
+                pairs,
+                split_seed=args.split_seed,
+                canonical_topic_splits=canonical_splits,
+            )
             rng_budget = random.Random(args.split_seed)
             tr_pool = list(topic_splits["train"])
             va_pool = list(topic_splits["val"])
             rng_budget.shuffle(tr_pool)
             rng_budget.shuffle(va_pool)
-            tr_quota = min(len(tr_pool), max(1, int(round(0.82 * args.max_teacher_pairs))))
-            va_quota = min(len(va_pool), max(1, int(args.max_teacher_pairs) - tr_quota))
+            tr_quota = min(len(tr_pool), max(1, int(round(0.82 * args.max_teacher_pairs)))) if tr_pool else 0
+            va_quota = min(len(va_pool), max(1, int(args.max_teacher_pairs) - tr_quota)) if va_pool else 0
             pairs = tr_pool[:tr_quota] + va_pool[:va_quota]
             presplit_train_count = tr_quota
 
+        telemetry: dict[str, Any] = {}
         scored = _score_pairs_with_teachers(
             pairs,
             lang=args.lang,
@@ -1498,9 +1613,17 @@ def main() -> None:
             teacher_backend=args.teacher_backend,
             teacher_model=args.teacher_model,
             qlora_adapter_dir=args.qlora_adapter_dir,
+            scoring_mode=args.scoring_mode,
+            max_fallback_rate=args.max_fallback_rate,
+            telemetry=telemetry,
         )
         if args.scored_cache_json is not None:
             _atomic_write_json(args.scored_cache_json, scored)
+            if telemetry:
+                _atomic_write_json(
+                    args.scored_cache_json.with_name("teacher_scoring_report.json"),
+                    telemetry,
+                )
 
         if args.export_audit:
             csv_path = export_stratified_human_audit_csv(
@@ -1517,7 +1640,9 @@ def main() -> None:
                 val_distill = scored[presplit_train_count:]
             else:
                 topic_splits = split_pairs_by_inductive_topics(
-                    scored, split_seed=args.split_seed
+                    scored,
+                    split_seed=args.split_seed,
+                    canonical_topic_splits=canonical_splits,
                 )
                 train_distill = topic_splits["train"]
                 val_distill = topic_splits["val"]
@@ -1536,6 +1661,13 @@ def main() -> None:
                 batch_size=args.batch_size,
                 sanity_check_shuffle=args.sanity_check_shuffle,
             )
+            report["canonical_splits_path"] = str(splits_path)
+            if telemetry:
+                report["teacher_telemetry"] = telemetry
+                (out_dir / "distill_report.json").write_text(
+                    json.dumps(report, indent=2),
+                    encoding="utf-8",
+                )
             print("Distillation summary:", json.dumps(report, indent=2))
 
 

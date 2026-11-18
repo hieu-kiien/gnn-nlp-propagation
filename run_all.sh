@@ -6,16 +6,17 @@ cd "${SCRIPT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 UPFD_ROOT="${UPFD_ROOT:-data/raw/upfd}"
-MIN_TOTAL_REPLIES="${MIN_TOTAL_REPLIES:-21}"
+MIN_TOTAL_REPLIES="${MIN_TOTAL_REPLIES:-25}"
 POLAR_MODE="${POLAR_MODE:-future_only}"
 PIPELINE_VERSION="${PIPELINE_VERSION:-v1}"
 
 EXTRA_FLAGS=()
 if [[ "${PIPELINE_VERSION}" == "v2" ]]; then
     EXTRA_FLAGS+=("--v2" "--edge-dim" "4")
-    echo ">>> PIPELINE_VERSION=v2 selected: Enabling 4D edge attributes, 8D burst stats, and uncertainty head."
+    echo ">>> PIPELINE_VERSION=v2 selected: Enabling 4D edge attributes, 8D burst stats, and beta-NLL uncertainty."
 else
-    echo ">>> PIPELINE_VERSION=v1 selected (default): Running 2D edge attributes foundation."
+    EXTRA_FLAGS+=("--edge-dim" "2")
+    echo ">>> PIPELINE_VERSION=v1 selected (default MVP): Running 2D edge attributes foundation."
 fi
 
 echo "[1/4] Running full pytest verification suite..."

@@ -88,6 +88,17 @@ def _best_model_per_metric(
     return best
 
 
+def _resolve_marker_pvalue(benchmark_result: Mapping[str, Any], key: str) -> float | None:
+    """Prefer Holm-Bonferroni adjusted sample-level bootstrap p-value, falling back to paired t-test."""
+    for map_key in ("adjusted_bootstrap_p_values", "adjusted_p_values", "p_values"):
+        pmap = benchmark_result.get(map_key, {})
+        if key in pmap:
+            pv = pmap[key]
+            if pv is not None and not math.isnan(float(pv)):
+                return float(pv)
+    return None
+
+
 def build_markdown_table(
     benchmark_result: Mapping[str, Any],
     metrics: Sequence[tuple[str, str, bool]] = MAIN_METRICS,
@@ -116,7 +127,7 @@ def build_markdown_table(
         for key, _, _ in metrics:
             mean_v, std_v = stats.get(key, (float("nan"), float("nan")))
             marker = (
-                significance_marker(p_values.get(key), latex=False)
+                significance_marker(_resolve_marker_pvalue(benchmark_result, key), latex=False)
                 if model_name == ref_model
                 else ""
             )
@@ -196,7 +207,7 @@ def export_latex_table(
         for key, _, _ in metrics:
             mean_v, std_v = stats.get(key, (float("nan"), float("nan")))
             marker = (
-                significance_marker(p_values.get(key), latex=True)
+                significance_marker(_resolve_marker_pvalue(benchmark_result, key), latex=True)
                 if model_name == ref_model
                 else ""
             )

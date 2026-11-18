@@ -10,11 +10,12 @@ inductive 70/15/15 topic-disjoint splitting.
 
 from __future__ import annotations
 
+import json
 import math
 import random
 from collections import deque
 from pathlib import Path
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 import numpy as np
 import pyarrow as pa
@@ -47,6 +48,7 @@ NLP_NODE_DIM: int = 768
 TEMPORAL_DEPTH_DIM: int = 2
 TOTAL_NODE_FEATURE_DIM: int = NLP_NODE_DIM + TEMPORAL_DEPTH_DIM  # 770
 CASCADE_STATS_DIM: int = 8
+DEFAULT_FORECAST_MIN_REPLIES: int = 25
 
 
 class CascadeData(Data):
@@ -211,11 +213,14 @@ def inductive_topic_split(
 def leave_one_event_out_splits(
     items: Sequence[Any],
     seed: int = 42,
+    min_cascades_per_fold: int = 1,
 ) -> list[dict[str, Any]]:
     """Build Leave-One-Event-Out (LOO) inductive splits grouped by `topic_id`.
 
-    For each held-out `test` topic, selects one remaining `val` topic and puts
-    all other topics in `train`. Requires at least 3 distinct topics.
+    For each held-out `test` topic with at least `min_cascades_per_fold` cascades,
+    selects one remaining eligible `val` topic and puts all other topics (including
+    micro-events below `min_cascades_per_fold`) in `train`. Falls back to all topics
+    if fewer than 3 topics meet `min_cascades_per_fold`. Requires >= 3 distinct topics.
     """
     if len(items) == 0:
         raise ValueError("Cannot build LOO splits for empty items")
@@ -231,8 +236,13 @@ def leave_one_event_out_splits(
             f"Leave-One-Event-Out requires at least 3 distinct topics; found {len(topics)}"
         )
 
+    eligible = [t for t in topics if topic_counts[t] >= int(min_cascades_per_fold)]
+    if len(eligible) < 3:
+        eligible = list(topics)
+    small_topics = [t for t in topics if t not in set(eligible)]
+
     rng = random.Random(seed)
-    ordered = sorted(topics)
+    ordered = sorted(eligible)
     rng.shuffle(ordered)
 
     folds: list[dict[str, Any]] = []
@@ -241,7 +251,7 @@ def leave_one_event_out_splits(
         val_topic = ordered[(idx + 1) % len(ordered)]
         if val_topic == test_topic:
             val_topic = remaining[0]
-        train_topics = [t for t in remaining if t != val_topic]
+        train_topics = [t for t in remaining if t != val_topic] + small_topics
         folds.append(
             {
                 "fold_name": test_topic,
@@ -251,6 +261,108 @@ def leave_one_event_out_splits(
             }
         )
     return folds
+
+
+def compute_canonical_topic_splits(
+    nodes_table: pa.Table,
+    *,
+    min_total_replies: int = 0,
+    label_scheme: Literal["veracity4", "binary"] = "veracity4",
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42,
+) -> dict[str, set[str]]:
+    """Compute canonical cascade-level topic splits AFTER min_total_replies filtering.
+
+    Guarantees identical topic assignment across NLP Cross-Encoder distillation and
+    downstream GNN evaluation so held-out test topics never leak into Phase 2 training.
+    """
+    rows = nodes_table.to_pylist()
+    nodes_by_cascade: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        nodes_by_cascade.setdefault(str(row["cascade_id"]), []).append(row)
+
+    label_map = BINARY_RUMOR_LABEL_TO_IDX if label_scheme == "binary" else RUMOR_LABEL_TO_IDX
+    cascade_items: list[dict[str, Any]] = []
+    for cid in sorted(nodes_by_cascade.keys()):
+        c_nodes = nodes_by_cascade[cid]
+        n_total = len(c_nodes) - 1
+        if n_total < int(min_total_replies):
+            continue
+        root_row = next((n for n in c_nodes if bool(n.get("is_root"))), c_nodes[0])
+        raw_lbl = root_row.get("rumor_label")
+        y_rumor = (
+            label_map[str(raw_lbl)]
+            if raw_lbl is not None and str(raw_lbl) in label_map
+            else None
+        )
+        cascade_items.append(
+            {
+                "cascade_id": cid,
+                "topic_id": str(root_row["topic_id"]),
+                "y_rumor": y_rumor,
+            }
+        )
+
+    # Graceful fallback if overly strict filter leaves < 3 topics (e.g. tiny smoke fixtures)
+    distinct_topics = {it["topic_id"] for it in cascade_items}
+    if len(distinct_topics) < 3 and int(min_total_replies) > 0:
+        return compute_canonical_topic_splits(
+            nodes_table,
+            min_total_replies=0,
+            label_scheme=label_scheme,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            seed=seed,
+        )
+
+    split_indices = inductive_topic_split(
+        cascade_items,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+        seed=seed,
+    )
+    out = {
+        sp: {cascade_items[i]["topic_id"] for i in split_indices[sp]}
+        for sp in ("train", "val", "test")
+    }
+    assert out["train"].isdisjoint(out["val"])
+    assert out["train"].isdisjoint(out["test"])
+    assert out["val"].isdisjoint(out["test"])
+    return out
+
+
+def save_topic_splits_json(
+    splits: Mapping[str, Iterable[str]],
+    path: Path,
+    *,
+    meta: Mapping[str, Any] | None = None,
+) -> Path:
+    """Persist canonical topic_id sets to JSON."""
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "train": sorted({str(t) for t in splits.get("train", ())}),
+        "val": sorted({str(t) for t in splits.get("val", ())}),
+        "test": sorted({str(t) for t in splits.get("test", ())}),
+    }
+    if meta is not None:
+        payload["meta"] = dict(meta)
+    dest.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return dest
+
+
+def load_topic_splits_json(path: Path) -> dict[str, set[str]]:
+    """Load canonical topic_id split sets from JSON."""
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    return {
+        "train": {str(t) for t in raw.get("train", [])},
+        "val": {str(t) for t in raw.get("val", [])},
+        "test": {str(t) for t in raw.get("test", [])},
+    }
 
 
 def _resolve_node_embeddings(
@@ -555,6 +667,7 @@ class EarlyCascadeDataset(Dataset):
         polar_target_mode: Literal["full", "future_only"] = "full",
         label_scheme: Literal["veracity4", "binary"] = "veracity4",
         custom_topic_splits: Mapping[str, set[str]] | None = None,
+        edge_source: Literal["auto", "student", "teacher"] = "auto",
     ) -> None:
         super().__init__()
         if k_horizon < 1:
@@ -565,6 +678,8 @@ class EarlyCascadeDataset(Dataset):
             raise ValueError(f"Unsupported polar_target_mode {polar_target_mode!r}")
         if label_scheme not in {"veracity4", "binary"}:
             raise ValueError(f"Unsupported label_scheme {label_scheme!r}")
+        if edge_source not in {"auto", "student", "teacher"}:
+            raise ValueError(f"Unsupported edge_source {edge_source!r}")
 
         self.root_dir = Path(root_dir)
         self.k_horizon = int(k_horizon)
@@ -574,8 +689,10 @@ class EarlyCascadeDataset(Dataset):
         self.min_total_replies = int(min_total_replies)
         self.polar_target_mode = polar_target_mode
         self.label_scheme = label_scheme
+        self.edge_source = edge_source
 
-        if nodes_table is None or edges_table is None:
+        used_disk_tables = nodes_table is None or edges_table is None
+        if used_disk_tables:
             nodes_table, edges_table = load_cascade_parquet(self.root_dir, validate=True)
         else:
             validate_cascade_contract(nodes_table, edges_table, raise_on_error=True)
@@ -588,16 +705,50 @@ class EarlyCascadeDataset(Dataset):
                 )
             nlp_features = torch.load(feat_path, map_location="cpu", weights_only=False)
 
+        has_teacher_edges = (
+            "teacher_edge_stance" in nlp_features or "teacher_edge_attr" in nlp_features
+        )
+        if self.edge_source == "teacher" and not has_teacher_edges:
+            raise ValueError(
+                "edge_source='teacher' requires 100% Teacher edge coverage in nlp_features.pt "
+                "(run dual_edge_scorer without --max-teacher-pairs or use legacy_nli --score-only)."
+            )
+        self._use_teacher_edges = bool(
+            self.edge_source == "teacher"
+            or (
+                self.edge_source == "auto"
+                and custom_topic_splits is not None
+                and has_teacher_edges
+            )
+        )
+
         self._all_cascades = self._build_all_cascades(
             nodes_table=nodes_table,
             edges_table=edges_table,
             nlp_features=nlp_features,
         )
 
+        effective_custom_splits = custom_topic_splits
+        canonical_splits_path = self.root_dir / "topic_splits.json"
+        if (
+            effective_custom_splits is None
+            and split != "all"
+            and used_disk_tables
+            and canonical_splits_path.is_file()
+        ):
+            disk_splits = load_topic_splits_json(canonical_splits_path)
+            all_topics_present = {str(c.topic_id) for c in self._all_cascades}
+            covered = disk_splits["train"] | disk_splits["val"] | disk_splits["test"]
+            if all_topics_present.issubset(covered) and all(
+                any(str(c.topic_id) in disk_splits[sp] for c in self._all_cascades)
+                for sp in ("train", "val", "test")
+            ):
+                effective_custom_splits = disk_splits
+
         if split == "all":
             self.data_list: list[CascadeData] = list(self._all_cascades)
-        elif custom_topic_splits is not None:
-            allowed_topics = set(custom_topic_splits[split])
+        elif effective_custom_splits is not None:
+            allowed_topics = set(effective_custom_splits[split])
             self.data_list = [
                 c for c in self._all_cascades if str(c.topic_id) in allowed_topics
             ]
@@ -634,11 +785,26 @@ class EarlyCascadeDataset(Dataset):
         nlp_features: Mapping[str, Any],
     ) -> list[CascadeData]:
         node_emb_map = _resolve_node_embeddings(nlp_features)
-        stance_map = nlp_features.get("edge_stance")
-        hostility_map = nlp_features.get("edge_hostility")
-        irr_map = nlp_features.get("edge_irrationality")
-        con_map = nlp_features.get("edge_constructive")
-        root_stance_map = nlp_features.get("node_root_stance")
+        if getattr(self, "_use_teacher_edges", False) and "teacher_edge_stance" in nlp_features:
+            stance_map = nlp_features.get("teacher_edge_stance")
+            hostility_map = nlp_features.get("teacher_edge_hostility", nlp_features.get("edge_hostility"))
+            irr_map = nlp_features.get("teacher_edge_irrationality", nlp_features.get("edge_irrationality"))
+            con_map = nlp_features.get("teacher_edge_constructive", nlp_features.get("edge_constructive"))
+        else:
+            stance_map = nlp_features.get("edge_stance")
+            hostility_map = nlp_features.get("edge_hostility")
+            irr_map = nlp_features.get("edge_irrationality")
+            con_map = nlp_features.get("edge_constructive")
+        # Ground-truth targets always prefer independent teacher maps when present
+        target_stance_map = nlp_features.get("teacher_edge_stance") or stance_map
+        target_hostility_map = nlp_features.get("teacher_edge_hostility") or hostility_map
+        target_irr_map = nlp_features.get("teacher_edge_irrationality") or irr_map
+        root_stance_map = (
+            nlp_features.get("teacher_node_root_stance") or nlp_features.get("node_root_stance")
+            if getattr(self, "_use_teacher_edges", False)
+            or "teacher_node_root_stance" in nlp_features
+            else nlp_features.get("node_root_stance")
+        )
 
         raw_feat_edge_attr = nlp_features.get("edge_attr")
         use_4d_edges = bool(
@@ -729,7 +895,7 @@ class EarlyCascadeDataset(Dataset):
                 root_id=root_id,
                 children_adj=children_adj,
                 edge_lookup=edge_lookup,
-                stance_map=stance_map,
+                stance_map=target_stance_map,
                 root_stance_map=root_stance_map,
                 excluded_pairs=kept_pair_set if self.polar_target_mode == "future_only" else None,
             )
@@ -745,8 +911,8 @@ class EarlyCascadeDataset(Dataset):
                 if self.polar_target_mode == "future_only" and pair in kept_pair_set:
                     continue
                 eid_t = str(e["edge_id"])
-                h_t = max(0.0, min(1.0, _lookup_edge_scalar(hostility_map, eid_t, pair[0], pair[1], 0.0)))
-                r_t = max(0.0, min(1.0, _lookup_edge_scalar(irr_map, eid_t, pair[0], pair[1], 0.0)))
+                h_t = max(0.0, min(1.0, _lookup_edge_scalar(target_hostility_map, eid_t, pair[0], pair[1], 0.0)))
+                r_t = max(0.0, min(1.0, _lookup_edge_scalar(target_irr_map, eid_t, pair[0], pair[1], 0.0)))
                 target_toxicity_scores.append(0.6 * h_t + 0.4 * r_t)
             mean_tox = float(np.mean(target_toxicity_scores)) if target_toxicity_scores else 0.0
             y_toxic_polar_val = float(min(1.0, max(0.0, 0.5 * y_polar_val + 0.5 * mean_tox)))

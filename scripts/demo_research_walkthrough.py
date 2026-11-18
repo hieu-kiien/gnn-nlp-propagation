@@ -11,6 +11,7 @@ Demonstrates step-by-step on a 13-node Vietnamese debate tree (root + K = 12 rep
 from __future__ import annotations
 
 import math
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -131,6 +132,8 @@ def _mean_camp_cosine(node_emb: torch.Tensor, pro_idx: list[int], con_idx: list[
 
 
 def run_walkthrough() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     print("=" * 88)
     print("[MINH HỌA CƠ CHẾ HỌC THUẬT - DỮ LIỆU GIẢ LẬP ĐỂ GIẢI THÍCH TOÁN HỌC]")
     print("[TUYỆT ĐỐI KHÔNG DÙNG ĐẦU RA NÀY LÀM SỐ LIỆU BÁO CÁO KHOA HỌC]")

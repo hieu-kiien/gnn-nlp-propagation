@@ -29,6 +29,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import requests
 import torch
+from transformers import AutoModel
 
 from src.data.arctic_shift_vn import (
     ARCTIC_SHIFT_API_BASE,
@@ -44,7 +45,14 @@ from src.data.pyg_dataset import (
     compute_early_cascade_burst_stats,
 )
 from src.models.sbi_fagat import SBiFAGAT
-from src.nlp.dual_edge_scorer import DualHeadCrossEncoder, STANCE_LABELS
+from src.nlp.dual_edge_scorer import (
+    DualHeadCrossEncoder,
+    ROBERTA_BASE_MODEL_NAME,
+    STANCE_LABELS,
+    VISOBERT_MODEL_NAME,
+    load_tokenizer_safe,
+)
+from src.nlp.extract_features import compute_masked_mean_pooling
 from src.nlp.qwen_teacher import (
     BEHAVIOR_LABEL_VI,
     DISCOURSE_BEHAVIOR_LABELS,
@@ -288,6 +296,7 @@ def predict_live_cascade(
     k_horizon: int = 20,
     cross_encoder_ckpt: Path | None = None,
     gnn_ckpt: Path | None = None,
+    node_backbone: str | None = None,
     lang: str = "vi",
     allow_untrained: bool = False,
     is_demo: bool = False,
@@ -332,22 +341,44 @@ def predict_live_cascade(
     kept_ids = {str(n["node_id"]) for n in kept_nodes}
     kept_id_to_idx = {str(n["node_id"]): idx for idx, n in enumerate(kept_nodes)}
 
-    # Score edges (all edges if we want post-hoc actual polar comparison; strictly isolated to edge_map)
+    # Score edges (all edges for post-hoc check; strictly isolated from model features beyond K)
     ce_model: DualHeadCrossEncoder | None = None
     ce_tok: Any | None = None
+    frozen_node_encoder: Any | None = None
+    frozen_node_tok: Any | None = None
     if cross_encoder_ckpt is not None and Path(cross_encoder_ckpt).exists():
         ce_model, ce_tok = DualHeadCrossEncoder.load_checkpoint(Path(cross_encoder_ckpt), map_location="cpu")
         ce_model.eval()
+        # Use frozen pre-trained backbone + masked mean pooling matching extract_features.py
+        backbone_id = node_backbone or (
+            VISOBERT_MODEL_NAME if lang == "vi" else ROBERTA_BASE_MODEL_NAME
+        )
+        try:
+            frozen_node_encoder = AutoModel.from_pretrained(backbone_id)
+            frozen_node_encoder.eval()
+            for p in frozen_node_encoder.parameters():
+                p.requires_grad_(False)
+            frozen_node_tok = load_tokenizer_safe(backbone_id)
+        except Exception:
+            frozen_node_encoder = ce_model.encoder
+            frozen_node_tok = ce_tok
 
+    use_root_ctx = bool(getattr(ce_model, "include_root_context", False)) if ce_model is not None else False
+    root_text_str = str(root_row["text"])
     edge_scores: dict[str, dict[str, Any]] = {}
     for e in edge_records:
         eid = str(e["edge_id"])
         p_txt = str(node_by_id[str(e["source_id"])]["text"])
         r_txt = str(node_by_id[str(e["target_id"])]["text"])
         if ce_model is not None and ce_tok is not None:
-            enc = ce_tok([p_txt], [r_txt], padding=True, truncation=True, max_length=256, return_tensors="pt")
+            pair_u = f"{root_text_str[:220]} | {p_txt}" if (use_root_ctx and root_text_str and root_text_str != p_txt) else p_txt
+            enc = ce_tok([pair_u], [r_txt], padding=True, truncation=True, max_length=256, return_tensors="pt")
             with torch.no_grad():
-                out = ce_model(enc["input_ids"], enc["attention_mask"])
+                out = ce_model(
+                    enc["input_ids"],
+                    enc["attention_mask"],
+                    token_type_ids=enc.get("token_type_ids"),
+                )
             s_v = float(out["s_uv"][0].item())
             h_v = float(out["h_uv"][0].item())
             r_v = float(out["r_uv"][0].item()) if "r_uv" in out else 0.10
@@ -371,10 +402,14 @@ def predict_live_cascade(
     x_rows = []
     for n, dt_sec in zip(kept_nodes, delays_k):
         nid = str(n["node_id"])
-        if ce_model is not None and ce_tok is not None:
-            enc_n = ce_tok([str(n["text"])], padding=True, truncation=True, max_length=256, return_tensors="pt")
+        if frozen_node_encoder is not None and frozen_node_tok is not None:
+            enc_n = frozen_node_tok([str(n["text"])], padding=True, truncation=True, max_length=256, return_tensors="pt")
             with torch.no_grad():
-                emb_768 = ce_model.encoder(input_ids=enc_n["input_ids"], attention_mask=enc_n["attention_mask"]).last_hidden_state[:, 0, :].squeeze(0)
+                node_out = frozen_node_encoder(
+                    input_ids=enc_n["input_ids"],
+                    attention_mask=enc_n["attention_mask"],
+                )
+                emb_768 = compute_masked_mean_pooling(node_out.last_hidden_state, enc_n["attention_mask"]).squeeze(0)
         else:
             emb_768 = _deterministic_text_projection(str(n["text"]), 768)
         t_norm = min(1.0, math.log1p(dt_sec) / denom_t)
@@ -459,7 +494,7 @@ def predict_live_cascade(
         is_demo_post = bool(is_demo or str(post.get("id", "")).startswith("demo_"))
         if not allow_untrained and not is_demo_post:
             raise RuntimeError(
-                "Không tìm thấy checkpoint mô hình GNN đã huấn luyện (--gnn-ckpt). "
+                "Không tìm thấy checkpoint mô hình GNN đã huấn luyện (--gnn-ckpt / --checkpoint). "
                 "Để ngăn ngừa kết quả ngẫu nhiên chưa huấn luyện bị hiểu nhầm là dự báo khoa học thực tế, "
                 "hãy cung cấp đường dẫn checkpoint hợp lệ qua --gnn-ckpt, hoặc truyền cờ --allow-untrained "
                 "(hoặc dùng --demo-offline) nếu bạn chỉ muốn chạy thử nghiệm kiểm tra cấu trúc pipeline."
@@ -537,12 +572,20 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
         "=" * 78,
         "BAO CAO DU BAO SOM & PHAN TICH HANH VI TRANH LUAN (SBi-FAGAT v2)",
         "=" * 78,
-        f"Bai goc      : {result['root_title']}",
-        f"Cua so quan sat (V_K): {result['k_observed']} binh luan dau tien",
-        f"Trang thai GNN       : {'Da nap checkpoint huan luyen' if result['checkpoint_loaded'] else 'CHE DO KIEM THU CAU TRUC (CHUA NAP CHECKPOINT - KHONG CO GIA TRI DU BAO)'}",
-        "",
-        "[1] PHAN LOAI 5 NHOM HANH VI TRONG 20 BINH LUAN DAU:",
     ]
+    if not result["checkpoint_loaded"]:
+        lines.append(
+            "[CHẾ ĐỘ DEMO OFFLINE - TRỌNG SỐ KHỞI TẠO NGẪU NHIÊN, CHỈ KIỂM TRA ĐƯỜNG ỐNG]"
+        )
+    lines.extend(
+        [
+            f"Bai goc      : {result['root_title']}",
+            f"Cua so quan sat (V_K): {result['k_observed']} binh luan dau tien",
+            f"Trang thai GNN       : {'Da nap checkpoint huan luyen' if result['checkpoint_loaded'] else 'CHE DO KIEM THU CAU TRUC (CHUA NAP CHECKPOINT - KHONG CO GIA TRI DU BAO)'}",
+            "",
+            "[1] PHAN LOAI 5 NHOM HANH VI TRONG 20 BINH LUAN DAU:",
+        ]
+    )
     for lbl in DISCOURSE_BEHAVIOR_LABELS:
         cnt = result["behavior_counts"].get(lbl, 0)
         lines.append(f"  - {BEHAVIOR_LABEL_VI.get(lbl, lbl):38s}: {cnt} binh luan")
@@ -582,12 +625,17 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
         lines.append(f"     \"{item['reply_text'][:160]}\"")
 
     act = result["actual_post_hoc_comparison"]
+    polar_note = (
+        "(toan bo cay chua nhieu binh luan hon K)"
+        if act.get("has_future_replies")
+        else "(do so binh luan thuc te <= K nen E[y_polar | stances quan sat])"
+    )
     lines.extend(
         [
             "",
             "[5] DOI CHIEU THUC TE (KHONG LOT VAO DAU VAO MO HINH):",
             f"  - Tong so binh luan thuc te toan bai       : {act['actual_total_replies']} binh luan",
-            f"  - Do phan cuc thuc te toan bai             : {act['actual_full_polarization']:.4f}",
+            f"  - Do phan cuc quan sat/cuoi ky thuc te     : {act['actual_full_polarization']:.4f} {polar_note}",
             "=" * 78,
         ]
     )
@@ -598,17 +646,18 @@ def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Live social thread early polarization & virality forecast.")
-    parser.add_argument("--reddit-url", type=str, default=None)
+    parser.add_argument("--reddit-url", "--url", dest="reddit_url", type=str, default=None)
     parser.add_argument("--thread-id", type=str, default=None)
     parser.add_argument("--input-json", type=Path, default=None)
     parser.add_argument("--demo-offline", action="store_true")
     parser.add_argument(
         "--allow-untrained",
         action="store_true",
-        help="Cho phép chạy với trọng số ngẫu nhiên chưa nạp checkpoint (chỉ phục vụ kiểm tra cấu trúc kỹ thuật).",
+        help="Cho phep chay voi trong so ngau nhien chua nap checkpoint (chi phuc vu kiem tra cau truc ky thuat).",
     )
     parser.add_argument("--cross-encoder-ckpt", type=Path, default=None)
-    parser.add_argument("--gnn-ckpt", type=Path, default=None)
+    parser.add_argument("--gnn-ckpt", "--checkpoint", dest="gnn_ckpt", type=Path, default=None)
+    parser.add_argument("--node-backbone", type=str, default=None)
     parser.add_argument("--k-horizon", type=int, default=20)
     parser.add_argument("--lang", choices=["vi", "en"], default="vi")
     parser.add_argument("--output-json", type=Path, default=None)
@@ -630,6 +679,7 @@ def main() -> None:
         k_horizon=args.k_horizon,
         cross_encoder_ckpt=args.cross_encoder_ckpt,
         gnn_ckpt=args.gnn_ckpt,
+        node_backbone=args.node_backbone,
         lang=args.lang,
         allow_untrained=args.allow_untrained,
         is_demo=args.demo_offline,
