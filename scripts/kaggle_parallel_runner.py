@@ -530,8 +530,12 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                 crawl_cmd.extend(["--before-epoch", str(args.before_epoch)])
             _run_cmd(crawl_cmd, cwd=work_dir)
 
-        # Stage 2: Qwen3.8-27B QLoRA System-2 -> Student System-1 (zero test-topic leakage)
+        # Stage 2: Qwen3.8-27B (default Zero-Shot 1-Pass G-Eval Logit; opt-in QLoRA) or v1 legacy NLI -> Cross-Encoder
         use_legacy_bootstrap = bool(args.role == "model_gnn_only" and args.bootstrap_if_missing and args.skip_qlora)
+        use_v1 = bool(getattr(args, "pipeline_version", "v2") == "v1" or use_legacy_bootstrap)
+        enable_qlora = bool(getattr(args, "enable_qlora", False) and not getattr(args, "skip_qlora", False) and not use_v1)
+        active_edge_dim = "2" if use_v1 else "4"
+
         scorer_cmd = [
             py,
             "-m",
@@ -549,7 +553,7 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             "--pilot-csv",
             str(pilot_csv),
             "--teacher-backend",
-            "legacy_nli" if use_legacy_bootstrap else "qwen_qlora",
+            "legacy_nli" if use_v1 else "qwen_qlora",
             "--teacher-model",
             args.teacher_model,
             "--scoring-mode",
@@ -561,7 +565,7 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             "--qlora-adapter-dir",
             str(qlora_dir),
             "--edge-dim",
-            "4" if not use_legacy_bootstrap else "2",
+            active_edge_dim,
             "--student-backbone",
             student_backbone,
             "--epochs",
@@ -573,15 +577,15 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             "--export-audit",
             "--distill",
         ]
-        if lang == "vi" and use_legacy_bootstrap:
+        if lang == "vi" and use_v1:
             scorer_cmd.append("--train-vihsd")
-        if not use_legacy_bootstrap:
+        if (not use_v1) and args.max_teacher_pairs is not None and int(args.max_teacher_pairs) > 0:
             scorer_cmd.extend(["--max-teacher-pairs", str(args.max_teacher_pairs)])
-        if not args.skip_qlora and not use_legacy_bootstrap:
+        if enable_qlora:
             scorer_cmd.append("--train-qwen-qlora")
         _run_cmd(scorer_cmd, cwd=work_dir)
 
-        # Stage 3: Frozen 768-d node embeddings + 4D edge attributes
+        # Stage 3: Frozen 768-d node embeddings + 2D/4D edge attributes
         extract_cmd = [
             py,
             "-m",
@@ -597,7 +601,7 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             "--cross-encoder-ckpt",
             str(ce_ckpt),
             "--edge-dim",
-            "4" if not use_legacy_bootstrap else "2",
+            active_edge_dim,
             "--node-backbone",
             student_backbone,
             "--k-horizon",
@@ -608,11 +612,14 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
         ]
         _run_cmd(extract_cmd, cwd=work_dir)
 
+    use_legacy_bootstrap_gnn = bool(args.role == "model_gnn_only" and args.bootstrap_if_missing and args.skip_qlora)
+    use_v1_gnn = bool(getattr(args, "pipeline_version", "v2") == "v1" or use_legacy_bootstrap_gnn)
+
     best_cfg: dict[str, Any] = {
         "hidden_dim": args.hidden_dim,
         "eps": 0.5,
         "dropout": 0.1,
-        "lambda_uncertainty": 0.05,
+        "lambda_uncertainty": 0.0 if use_v1_gnn else 0.05,
         "lr": 1e-3,
     }
     loop_res: dict[str, Any] | None = None
@@ -635,8 +642,9 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
         inferred_edge_dim = (
             int(train_ds[0].edge_attr.size(1))
             if len(train_ds) > 0 and train_ds[0].edge_attr.ndim == 2
-            else 4
+            else (2 if use_v1_gnn else 4)
         )
+        use_v2_gnn = bool((not use_v1_gnn) and inferred_edge_dim == 4)
         num_cls = 4
         loop_res = run_self_auditing_validation_loop(
             DataLoader(train_ds, batch_size=args.batch_size_gnn, shuffle=True),
@@ -644,8 +652,8 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             in_dim=TOTAL_NODE_FEATURE_DIM,
             edge_dim=inferred_edge_dim,
             num_rumor_classes=num_cls,
-            use_cascade_stats=True,
-            predict_uncertainty=True,
+            use_cascade_stats=use_v2_gnn,
+            predict_uncertainty=use_v2_gnn,
             epochs=min(60, args.epochs_gnn),
             patience=10,
             output_dir=work_dir / "outputs" / f"auto_loop_{ds_name}",
@@ -674,29 +682,38 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             "--lr",
             str(best_cfg["lr"]),
             "--lambda-uncertainty",
-            str(best_cfg["lambda_uncertainty"]),
+            str(best_cfg["lambda_uncertainty"] if use_v2_gnn else 0.0),
             "--epochs",
             str(args.epochs_gnn),
             "--batch-size",
             str(args.batch_size_gnn),
-            "--v2",
         ]
+        if use_v2_gnn:
+            exp_cmd.append("--v2")
         _run_cmd(exp_cmd, cwd=work_dir)
 
         if lang == "en":
-            _run_cmd(
-                exp_cmd
-                + [
-                    "--eval-protocol",
-                    "loo",
-                    "--output-table",
-                    f"paper/tables_loo_{ds_name}.tex",
-                    "--output-json",
-                    f"paper/results_loo_{ds_name}.json",
-                    "--skip-figures",
-                ],
-                cwd=work_dir,
-            )
+            pt_path = processed_dir / "nlp_features.pt"
+            pt_payload = torch.load(pt_path, map_location="cpu", weights_only=False) if pt_path.exists() else {}
+            if "teacher_edge_stance" in pt_payload:
+                _run_cmd(
+                    exp_cmd
+                    + [
+                        "--eval-protocol",
+                        "loo",
+                        "--output-table",
+                        f"paper/tables_loo_{ds_name}.tex",
+                        "--output-json",
+                        f"paper/results_loo_{ds_name}.json",
+                        "--skip-figures",
+                    ],
+                    cwd=work_dir,
+                )
+            else:
+                print(
+                    "[SKIP LOO] nlp_features.pt lacks full teacher_edge_stance coverage "
+                    "(pass --max-teacher-pairs 0 or --pipeline-version v1 for full PHEME LOO)."
+                )
 
         # Full component & K-horizon ablations
         abl_cmd = [
@@ -720,14 +737,57 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             "--lr",
             str(best_cfg["lr"]),
             "--lambda-uncertainty",
-            str(best_cfg["lambda_uncertainty"]),
+            str(best_cfg["lambda_uncertainty"] if use_v2_gnn else 0.0),
             "--epochs",
             str(args.epochs_gnn),
             "--batch-size",
             str(args.batch_size_gnn),
-            "--v2",
         ]
+        if use_v2_gnn:
+            abl_cmd.append("--v2")
         _run_cmd(abl_cmd, cwd=work_dir)
+
+        # Export Table 1 Dataset EDA + Early-K Persistence Baseline & Efficiency LaTeX Table
+        _run_cmd(
+            [
+                py,
+                "-m",
+                "scripts.export_dataset_stats",
+                "--data-dir",
+                str(processed_dir),
+                "--names",
+                ds_name,
+                "--k-horizon",
+                str(args.k_horizon),
+                "--min-total-replies",
+                str(args.min_total_replies),
+                "--edge-dim",
+                str(inferred_edge_dim),
+                "--output-table",
+                f"paper/tables_dataset_eda_{ds_name}.tex",
+                "--output-json",
+                f"paper/results_dataset_eda_{ds_name}.json",
+            ],
+            cwd=work_dir,
+        )
+        eff_cmd = [
+            py,
+            "-m",
+            "scripts.benchmark_efficiency",
+            "--k-horizon",
+            str(args.k_horizon),
+            "--hidden-dim",
+            str(best_cfg["hidden_dim"]),
+            "--edge-dim",
+            str(inferred_edge_dim),
+            "--output-table",
+            f"paper/tables_efficiency_{ds_name}.tex",
+            "--output-json",
+            f"paper/results_efficiency_{ds_name}.json",
+        ]
+        if use_v2_gnn:
+            eff_cmd.append("--v2")
+        _run_cmd(eff_cmd, cwd=work_dir)
 
         if args.run_upfd and lang == "en":
             _run_cmd(
@@ -791,6 +851,8 @@ def main() -> None:
     parser.add_argument("--epochs-gnn", type=int, default=100)
     parser.add_argument("--batch-size-nlp", type=int, default=16)
     parser.add_argument("--batch-size-gnn", type=int, default=32)
+    parser.add_argument("--pipeline-version", choices=["v1", "v2"], default="v2")
+    parser.add_argument("--enable-qlora", action="store_true")
     parser.add_argument("--skip-qlora", action="store_true")
     parser.add_argument("--bootstrap-if-missing", action="store_true")
     parser.add_argument("--run-upfd", action="store_true")
