@@ -1005,6 +1005,17 @@ def distill_dual_cross_encoder(
 
     optimizer = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=0.01)
     scaler = _make_grad_scaler(enabled=use_amp)
+    total_steps = max(1, max(1, epochs) * max(1, len(train_loader)))
+    warmup_steps = max(1, int(round(0.10 * total_steps)))
+
+    def _lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return 0.1 + 0.9 * (float(step + 1) / float(warmup_steps))
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        progress = min(1.0, max(0.0, progress))
+        return 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
     train_losses: list[float] = []
     best_val_loss = float("inf")
@@ -1059,8 +1070,11 @@ def distill_dual_cross_encoder(
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
+            scale_before = scaler.get_scale() if use_amp else 1.0
             scaler.step(optimizer)
             scaler.update()
+            if not use_amp or scaler.get_scale() >= scale_before:
+                scheduler.step()
 
             running_loss += float(loss.detach().cpu().item())
             step_count += 1

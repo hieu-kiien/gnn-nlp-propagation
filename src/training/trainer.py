@@ -232,6 +232,11 @@ def train_and_evaluate_single_seed(
             class_weights = _estimate_balanced_class_weights(train_loader, num_cls)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, epochs),
+        eta_min=lr * 0.05,
+    )
     early_stopper = EarlyStopping(patience=patience, mode="min")
 
     for _epoch in range(epochs):
@@ -253,6 +258,9 @@ def train_and_evaluate_single_seed(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
+
+        if len(train_loader) > 0:
+            scheduler.step()
 
         val_metrics = evaluate_loader(
             model,

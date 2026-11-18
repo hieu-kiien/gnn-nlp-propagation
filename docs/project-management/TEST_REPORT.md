@@ -1,7 +1,7 @@
 # SBi-FAGAT: Test & Verification Report
 
 **Platform:** Windows (`win32`, CPU verification pass)  
-**Overall Result:** **86 / 86 PASSED (100% Pass Rate, 0 failed, 0 skipped, 127.41s)**
+**Overall Result:** **87 / 87 PASSED (100% Pass Rate, 0 failed, 0 skipped, 129.95s)**
 
 ---
 
@@ -33,9 +33,9 @@
 | `tests/test_pipeline_and_viz.py` | 3 | **PASSED** | Vector figure generation (`.pdf`/`.svg`), UMAP, top-5 trigger export, reporting |
 | `tests/test_round2_research_fixes.py` | 4 | **PASSED** | Loss balancing, statistical tests, Sarle's BC & Signed Assortativity |
 | `tests/test_schema.py` | 31 | **PASSED** | `NodeRecord`/`EdgeRecord` Pydantic contracts, UTC enforcement, cycle/leakage rejection |
-| `tests/test_sota_v2_upgrades.py` | 7 | **PASSED** | G-Eval logits, $\beta$-NLL, LOO `edge_source="teacher"`, EDA/Persistence & Efficiency LaTeX, CLI aliases |
+| `tests/test_sota_v2_upgrades.py` | 8 | **PASSED** | G-Eval logits, $\beta$-NLL, LOO `edge_source="teacher"`, EDA/Persistence & Efficiency LaTeX, CLI aliases, Cosine LR & Kaggle runner optimizations |
 | `tests/test_vn_tree.py` | 3 | **PASSED** | Arctic Shift VN tree builder & salted SHA-256 pseudonymization |
-| **TOTAL** | **86** | **PASSED** | **86 passed, 0 failed, 0 skipped (`127.41s`)** |
+| **TOTAL** | **87** | **PASSED** | **87 passed, 0 failed, 0 skipped (`129.95s`)** |
 
 ---
 

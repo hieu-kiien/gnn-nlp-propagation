@@ -917,3 +917,147 @@ def test_dataset_eda_persistence_efficiency_latex_and_live_cli_aliases(
     with pytest.raises(FileNotFoundError):
         live_main()
 
+
+def test_cosine_lr_schedules_and_kaggle_runner_optimizations(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Verify CosineAnnealingLR in trainer, warmup+cosine in distillation, and optimized kaggle_parallel_runner."""
+    from types import SimpleNamespace
+
+    from torch_geometric.loader import DataLoader
+
+    import scripts.kaggle_parallel_runner as kpr
+    from src.training.trainer import train_and_evaluate_single_seed
+
+    # 1. Trainer CosineAnnealingLR runs cleanly over multiple epochs
+    graphs = []
+    for i in range(6):
+        td = torch.tensor([[0, 0], [1, 2]], dtype=torch.long)
+        bu = torch.tensor([[1, 2], [0, 0]], dtype=torch.long)
+        ea = torch.tensor([[0.6, 0.1], [-0.4, 0.3]], dtype=torch.float32)
+        graphs.append(
+            CascadeData(
+                x=torch.randn((3, 16), dtype=torch.float32),
+                edge_index=td,
+                edge_index_td=td,
+                edge_index_bu=bu,
+                edge_attr=ea,
+                cascade_stats=torch.zeros((1, 8), dtype=torch.float32),
+                root_index=torch.tensor([0], dtype=torch.long),
+                y_size=torch.tensor([2.0 + 0.1 * i], dtype=torch.float32),
+                y_polar=torch.tensor([0.2 + 0.1 * (i % 5)], dtype=torch.float32),
+                y_rumor=torch.tensor([i % 4], dtype=torch.long),
+            )
+        )
+    tr_l = DataLoader(graphs[:4], batch_size=2, shuffle=True)
+    va_l = DataLoader(graphs[4:5], batch_size=1, shuffle=False)
+    te_l = DataLoader(graphs[5:6], batch_size=1, shuffle=False)
+    _, metrics_out = train_and_evaluate_single_seed(
+        lambda: SBiFAGAT(in_dim=16, hidden_dim=16, edge_dim=2, use_cascade_stats=False, predict_uncertainty=False),
+        tr_l,
+        va_l,
+        te_l,
+        seed=42,
+        epochs=4,
+        lr=1e-3,
+        patience=3,
+        device=torch.device("cpu"),
+    )
+    assert math.isfinite(float(metrics_out["rmse"])) and math.isfinite(float(metrics_out["msle"]))
+
+    # 2. Student Cross-Encoder 10% linear warmup + cosine decay
+    from src.nlp.dual_edge_scorer import DualHeadCrossEncoder, distill_dual_cross_encoder
+
+    tok, enc = _build_smoke_offline_tokenizer_and_encoder()
+    ce = DualHeadCrossEncoder(lang="en", model_name="smoke-ce", encoder=enc, edge_dim=2)
+    dummy_pairs = [
+        {"parent_text": "root claim", "reply_text": "support evidence", "s_uv": 0.8, "h_uv": 0.05, "topic_id": f"t{i}"}
+        for i in range(4)
+    ]
+    rep = distill_dual_cross_encoder(
+        dummy_pairs[:3],
+        dummy_pairs[3:],
+        lang="en",
+        edge_dim=2,
+        epochs=3,
+        batch_size=2,
+        lr=1e-4,
+        output_dir=tmp_path / "ce_sched",
+        model=ce,
+        tokenizer=tok,
+        device=torch.device("cpu"),
+    )
+    assert len(rep["train_losses"]) == 3 and math.isfinite(float(rep["val_loss"]))
+
+    # 3. kaggle_parallel_runner Zero-Shot default, v1 mode, --max-teacher-pairs 0, and LOO skip guard
+    recorded_cmds: list[list[str]] = []
+
+    def _fake_run(cmd: Sequence[str], cwd: Path | None = None) -> None:
+        recorded_cmds.append([str(x) for x in cmd])
+
+    monkeypatch.setattr(kpr, "_run_cmd", _fake_run)
+    monkeypatch.setattr(
+        kpr,
+        "EarlyCascadeDataset",
+        lambda **_kw: graphs[:2],
+    )
+    monkeypatch.setattr(
+        kpr,
+        "run_self_auditing_validation_loop",
+        lambda *_a, **_kw: {"best_config": {"hidden_dim": 128, "eps": 0.5, "dropout": 0.1, "lr": 1e-3, "lambda_uncertainty": 0.05}},
+    )
+    monkeypatch.setattr(kpr, "_bundle_outputs", lambda zip_path, **_kw: Path(zip_path))
+
+    # Case A: v2 default on PHEME with max_teacher_pairs=0 & no teacher_edge_stance in .pt
+    w_v2 = tmp_path / "work_v2"
+    proc_en = w_v2 / "data" / "processed" / "pheme"
+    proc_en.mkdir(parents=True, exist_ok=True)
+    torch.save({"node_features_770": {}}, proc_en / "nlp_features.pt")
+    args_v2 = SimpleNamespace(
+        role="member2_en",
+        lang="en",
+        smoke_test=False,
+        work_dir=w_v2,
+        processed_dir=None,
+        vn_target_count=800,
+        max_teacher_pairs=0,
+        before_epoch=None,
+        teacher_model="unsloth/Qwen3.8-27B-unsloth-bnb-4bit",
+        scoring_mode="logit",
+        k_horizon=20,
+        min_total_replies=25,
+        hidden_dim=128,
+        epochs_qlora=1,
+        epochs_nlp=1,
+        epochs_gnn=2,
+        batch_size_nlp=8,
+        batch_size_gnn=2,
+        pipeline_version="v2",
+        enable_qlora=False,
+        skip_qlora=False,
+        bootstrap_if_missing=False,
+        run_upfd=False,
+        bundle_weights=False,
+    )
+    kpr.run_kaggle_parallel_role(args_v2)
+    scorer_cmds = [c for c in recorded_cmds if "src.nlp.dual_edge_scorer" in c]
+    assert len(scorer_cmds) == 1
+    assert "--train-qwen-qlora" not in scorer_cmds[0]
+    assert "--max-teacher-pairs" not in scorer_cmds[0]
+    assert "--eval-protocol" not in [x for cmd in recorded_cmds for x in cmd]
+    assert any("scripts.export_dataset_stats" in c for c in recorded_cmds)
+    assert any("scripts.benchmark_efficiency" in c for c in recorded_cmds)
+
+    # Case B: pipeline_version="v1" uses legacy_nli, edge_dim=2, --train-vihsd, and no --v2
+    recorded_cmds.clear()
+    w_v1 = tmp_path / "work_v1"
+    (w_v1 / "data" / "processed" / "vn").mkdir(parents=True, exist_ok=True)
+    args_v1 = SimpleNamespace(**{**vars(args_v2), "role": "member1_vn", "lang": "vi", "work_dir": w_v1, "pipeline_version": "v1"})
+    kpr.run_kaggle_parallel_role(args_v1)
+    scorer_v1 = [c for c in recorded_cmds if "src.nlp.dual_edge_scorer" in c][0]
+    exp_v1 = [c for c in recorded_cmds if "scripts.run_experiments" in c][0]
+    assert "legacy_nli" in scorer_v1 and "--train-vihsd" in scorer_v1
+    assert "--edge-dim" in scorer_v1 and scorer_v1[scorer_v1.index("--edge-dim") + 1] == "2"
+    assert "--v2" not in exp_v1
+
+
