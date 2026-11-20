@@ -27,6 +27,8 @@ import torch
 import torch.nn as nn
 from torch_geometric.data import Batch
 
+from transformers import RobertaConfig, RobertaForSequenceClassification, RobertaModel
+
 from scripts.compute_kappa import evaluate_audit_csv
 from scripts.kaggle_parallel_runner import _build_smoke_offline_tokenizer_and_encoder
 from scripts.run_experiments import _build_loaders
@@ -52,187 +54,283 @@ from src.models.baselines import (
     TextMLP,
 )
 from src.models.sbi_fagat import SBiFAGAT, StanceGuidedFAConv
+from src.nlp.discourse_labels import DISCOURSE_BEHAVIOR_LABELS
 from src.nlp.dual_edge_scorer import (
+    TWITTER_ROBERTA_MODEL_NAME,
     DualHeadCrossEncoder,
+    distill_dual_cross_encoder,
+    encode_cross_encoder_batch,
     export_stratified_human_audit_csv,
     extract_parent_reply_pairs_from_parquet,
+    finetune_visobert_vihsd,
     split_pairs_by_inductive_topics,
 )
-from src.nlp.extract_features import extract_and_save_features
-from src.nlp.qwen_teacher import (
-    BEHAVIOR_PROTOTYPE_C,
-    BEHAVIOR_PROTOTYPE_H,
-    BEHAVIOR_PROTOTYPE_R,
-    BEHAVIOR_PROTOTYPE_S,
-    DISCOURSE_BEHAVIOR_LABELS,
-    QwenBehavioralTeacherScorer,
-    finetune_qwen_qlora,
-)
+from src.nlp.extract_features import encode_node_embeddings, extract_and_save_features
 from src.training.metrics import compute_multitask_loss, evaluate_predictions
 from src.training.trainer import _compute_sample_level_bootstrap_pvalues, evaluate_loader
 
 
-class _ToyDigitTokenizer:
-    pad_token = "<pad>"
-    eos_token = "</s>"
-    pad_token_id = 0
-    eos_token_id = 1
-    padding_side = "left"
+def test_step2_spanpool_segment_isolation_and_distillation_fixes(tmp_path: Path) -> None:
+    tok, enc = _build_smoke_offline_tokenizer_and_encoder()
+    enc.eval()
 
-    def __init__(self) -> None:
-        self._digit_map = {"1": 10, "2": 11, "3": 12, "4": 13, "5": 14}
-
-    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        if text.strip() in self._digit_map:
-            return [self._digit_map[text.strip()]]
-        return [
-            self._digit_map[tok]
-            if tok in self._digit_map
-            else (20 + (zlib.crc32(tok.encode("utf-8")) % 12))
-            for tok in str(text).split()
-        ] or [2]
-
-    def apply_chat_template(
-        self,
-        messages: list[dict[str, str]],
-        tokenize: bool = False,
-        add_generation_prompt: bool = False,
-        enable_thinking: bool = False,
-    ) -> str:
-        text = " | ".join(f"{m['role']}: {m['content']}" for m in messages)
-        if add_generation_prompt:
-            text += " | assistant:"
-        return text
-
-    def __call__(
-        self,
-        texts,
-        padding: bool = False,
-        truncation: bool = True,
-        max_length: int = 512,
-        return_tensors: str = "pt",
-    ) -> dict[str, torch.Tensor]:
-        single = isinstance(texts, str)
-        batch_texts = [texts] if single else list(texts)
-        seqs = [self.encode(t)[:max_length] for t in batch_texts]
-        max_len = max(len(s) for s in seqs)
-        ids = torch.full((len(seqs), max_len), self.pad_token_id, dtype=torch.long)
-        mask = torch.zeros((len(seqs), max_len), dtype=torch.long)
-        for idx, seq in enumerate(seqs):
-            if self.padding_side == "left":
-                ids[idx, max_len - len(seq) :] = torch.tensor(seq, dtype=torch.long)
-                mask[idx, max_len - len(seq) :] = 1
-            else:
-                ids[idx, : len(seq)] = torch.tensor(seq, dtype=torch.long)
-                mask[idx, : len(seq)] = 1
-        return {"input_ids": ids, "attention_mask": mask}
-
-
-class _ToyCausalLogitLM(nn.Module):
-    def __init__(self, target_digit_idx: int = 2) -> None:
-        super().__init__()
-        self.embed = nn.Embedding(64, 8)
-        self.proj = nn.Linear(8, 64)
-        self.target_digit_idx = target_digit_idx  # 0..4 maps to '1'..'5' (token 10..14)
-        self.seen_labels: list[torch.Tensor] = []
-
-    def get_input_embeddings(self) -> nn.Embedding:
-        return self.embed
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        labels: torch.Tensor | None = None,
-    ) -> SimpleNamespace:
-        bsz, seq_len = input_ids.shape
-        hidden = self.embed(input_ids)
-        logits = self.proj(hidden)
-        # Boost chosen rubric digit logit cleanly at final position
-        logits = logits.clone()
-        logits[:, :, 10:15] = 0.0
-        logits[:, -1, 10 + self.target_digit_idx] = 6.0
-        loss = torch.tensor(0.0, device=logits.device)
-        if labels is not None:
-            self.seen_labels.append(labels.detach().cpu())
-            loss = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
-                ignore_index=-100,
-            )
-        return SimpleNamespace(logits=logits, loss=loss)
-
-
-def test_geval_logit_teacher_and_qlora_prompt_masking(tmp_path: Path) -> None:
-    tok = _ToyDigitTokenizer()
-    model_oppose = _ToyCausalLogitLM(target_digit_idx=2)  # digit '3' -> constructive_oppose
-    scorer = QwenBehavioralTeacherScorer(
-        lang="en",
-        scoring_mode="logit",
-        model=model_oppose,
+    # 1a. SpanPool avoids duplicating root/parent on depth-1
+    emb_dup = encode_node_embeddings(
+        ["root topic", "agree support"],
+        encoder=enc,
         tokenizer=tok,
-        max_fallback_rate=0.05,
-        batch_size=2,
-    )
-    out = scorer.score_triplets(
-        ["City toll proposal"],
-        ["Everyone can take midnight trains."],
-        ["Shift workers lack late-night transit coverage."],
-    )
-    assert out["fallback_count"] == 0
-    assert out["fallback_rate"] == 0.0
-    assert out["behavior_label"] == ["constructive_oppose"]
-    probs = out["behavior_probs"][0].astype(np.float64)
-    assert math.isclose(float(probs.sum()), 1.0, rel_tol=1e-5)
-    assert math.isclose(float(out["s_uv"][0]), float(np.dot(probs, BEHAVIOR_PROTOTYPE_S)), abs_tol=1e-4)
-    assert math.isclose(float(out["h_uv"][0]), float(np.dot(probs, BEHAVIOR_PROTOTYPE_H)), abs_tol=1e-4)
-    assert math.isclose(float(out["r_uv"][0]), float(np.dot(probs, BEHAVIOR_PROTOTYPE_R)), abs_tol=1e-4)
-    assert math.isclose(float(out["c_uv"][0]), float(np.dot(probs, BEHAVIOR_PROTOTYPE_C)), abs_tol=1e-4)
-
-    # Verify fallback threshold enforcement in generate mode
-    bad_scorer = QwenBehavioralTeacherScorer(
-        lang="vi",
-        custom_generate_fn=lambda prompts: ["corrupted unparseable"] * len(prompts),
-        max_fallback_rate=0.05,
-    )
-    with pytest.raises(RuntimeError, match="fallback_rate"):
-        bad_scorer.score_triplets(["r"], ["p"], ["c"])
-
-    # Verify QLoRA prompt masking masks prompt prefix tokens as -100 while preserving target token
-    tok_right = _ToyDigitTokenizer()
-    tok_right.padding_side = "right"
-    sft_model = _ToyCausalLogitLM(target_digit_idx=0)
-    examples = [
-        {
-            "lang": "en",
-            "root_text": "Root debate post",
-            "parent_text": "Parent claim",
-            "reply_text": "Constructive agreement with evidence",
-            "label": "support",
-            "s_uv": 0.85,
-            "h_uv": 0.02,
-            "r_uv": 0.02,
-            "c_uv": 0.90,
-            "probs": [0.85, 0.08, 0.04, 0.02, 0.01],
-        }
-    ]
-    out_dir = finetune_qwen_qlora(
-        output_dir=tmp_path / "qlora_mask",
+        parent_texts=[None, "root topic"],
+        root_texts=[None, "root topic"],
         lang="en",
-        examples=examples,
-        scoring_mode="logit",
-        epochs=1,
-        batch_size=1,
-        model=sft_model,
-        tokenizer=tok_right,
+        max_length=48,
+        device=torch.device("cpu"),
     )
-    assert (out_dir / "qlora_report.json").exists()
-    rep = json.loads((out_dir / "qlora_report.json").read_text(encoding="utf-8"))
-    assert rep["prompt_masked"] is True
-    assert sft_model.seen_labels
-    lbl_tensor = sft_model.seen_labels[0][0]
-    assert int((lbl_tensor == -100).sum().item()) > 0
-    assert int((lbl_tensor >= 0).sum().item()) >= 1
+    emb_single = encode_node_embeddings(
+        ["root topic", "agree support"],
+        encoder=enc,
+        tokenizer=tok,
+        parent_texts=[None, "root topic"],
+        root_texts=[None, None],
+        lang="en",
+        max_length=48,
+        device=torch.device("cpu"),
+    )
+    assert torch.allclose(emb_dup, emb_single, atol=1e-6)
+
+    # 1b. Guaranteed reply token budget survives 400+ word ancestors without NaN or empty span
+    long_root = " ".join(["topic"] * 420)
+    long_parent = " ".join(["reply"] * 420)
+    emb_long = encode_node_embeddings(
+        ["agree support"],
+        encoder=enc,
+        tokenizer=tok,
+        parent_texts=[long_parent],
+        root_texts=[long_root],
+        lang="en",
+        max_length=48,
+        min_target_tokens=16,
+        device=torch.device("cpu"),
+    )
+    assert emb_long.shape == (1, 768)
+    assert torch.isfinite(emb_long).all()
+
+    # 1c. Contextual disambiguation: identical short reply under distinct parents differs
+    emb_ctx = encode_node_embeddings(
+        ["question", "question"],
+        encoder=enc,
+        tokenizer=tok,
+        parent_texts=["agree support", "hate trash"],
+        root_texts=["root topic", "root topic"],
+        lang="en",
+        max_length=48,
+        device=torch.device("cpu"),
+    )
+    assert float(torch.norm(emb_ctx[0] - emb_ctx[1]).item()) > 1e-4
+
+    # 1d. Zero Future Leakage: mutating post-K replies leaves K<=20 SpanPool embeddings invariant
+    def _make_22_cascade(extra_text: str) -> tuple[list[dict], list[dict]]:
+        base_ts = datetime(2026, 8, 1, 10, 0, 0, tzinfo=timezone.utc)
+        n_rows = [
+            {
+                "node_id": "c_r",
+                "cascade_id": "c0",
+                "topic_id": "top0",
+                "parent_id": None,
+                "is_root": True,
+                "text": "root topic agree",
+                "created_at_utc": base_ts,
+                "lang": "en",
+                "source_dataset": "pheme",
+                "user_id_hash": "a" * 64,
+                "rumor_label": "true",
+            }
+        ]
+        e_rows = []
+        for idx in range(1, 22):
+            pid = "c_r" if idx <= 5 else f"c_n{idx - 5}"
+            n_rows.append(
+                {
+                    "node_id": f"c_n{idx}",
+                    "cascade_id": "c0",
+                    "topic_id": "top0",
+                    "parent_id": pid,
+                    "is_root": False,
+                    "text": extra_text if idx == 21 else "agree support",
+                    "created_at_utc": base_ts + timedelta(seconds=30 * idx),
+                    "lang": "en",
+                    "source_dataset": "pheme",
+                    "user_id_hash": "b" * 64,
+                    "rumor_label": None,
+                }
+            )
+            e_rows.append(
+                {
+                    "edge_id": f"{pid}->c_n{idx}",
+                    "cascade_id": "c0",
+                    "source_id": pid,
+                    "target_id": f"c_n{idx}",
+                    "created_at_utc": base_ts + timedelta(seconds=30 * idx),
+                    "time_delay_sec": 30.0,
+                    "edge_type": "reply",
+                }
+            )
+        return n_rows, e_rows
+
+    ce_init = DualHeadCrossEncoder(lang="en", model_name="offline-ce", encoder=enc, edge_dim=2)
+    ce_ckpt = ce_init.save_checkpoint(tmp_path / "span_ce_ckpt", tokenizer=tok)
+
+    int_a, int_b = tmp_path / "int_a", tmp_path / "int_b"
+    n_a, e_a = _make_22_cascade("agree support")
+    n_b, e_b = _make_22_cascade("hate trash oppose")
+    save_cascade_parquet(build_nodes_table(n_a), build_edges_table(e_a), int_a, validate=True)
+    save_cascade_parquet(build_nodes_table(n_b), build_edges_table(e_b), int_b, validate=True)
+    pt_a = extract_and_save_features(
+        dataset="pheme",
+        interim_dir=int_a,
+        output_dir=tmp_path / "proc_a",
+        cross_encoder_ckpt=ce_ckpt,
+        node_encoder=enc,
+        tokenizer=tok,
+        device=torch.device("cpu"),
+    )
+    pt_b = extract_and_save_features(
+        dataset="pheme",
+        interim_dir=int_b,
+        output_dir=tmp_path / "proc_b",
+        cross_encoder_ckpt=ce_ckpt,
+        node_encoder=enc,
+        tokenizer=tok,
+        device=torch.device("cpu"),
+    )
+    pl_a = torch.load(pt_a, map_location="cpu", weights_only=False)
+    pl_b = torch.load(pt_b, map_location="cpu", weights_only=False)
+    assert torch.allclose(pl_a["node_embeddings"][:21], pl_b["node_embeddings"][:21], atol=1e-6)
+    assert not torch.allclose(pl_a["node_embeddings"][21], pl_b["node_embeddings"][21])
+
+    # 2. Segment-isolated DualHeadCrossEncoder eliminates parent-toxicity bleed
+    class _TokenWiseMockEncoder(nn.Module):
+        def __init__(self, vocab_size: int = 128, hidden_size: int = 16) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(
+                hidden_size=hidden_size,
+                max_position_embeddings=64,
+                pad_token_id=1,
+                type_vocab_size=1,
+                model_type="roberta",
+            )
+            self.embed = nn.Embedding(vocab_size, hidden_size)
+
+        def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> SimpleNamespace:
+            return SimpleNamespace(last_hidden_state=self.embed(input_ids))
+
+    tok_wise_enc = _TokenWiseMockEncoder()
+    ce_isolated = DualHeadCrossEncoder(
+        lang="en", model_name="tok-wise", encoder=tok_wise_enc, edge_dim=2, dropout=0.0
+    )
+    ce_isolated.eval()
+    batch_clean = encode_cross_encoder_batch(
+        ["root topic agree support"],
+        ["neutral question"],
+        tokenizer=tok,
+        include_root_context=False,
+        lang="en",
+        encoder=tok_wise_enc,
+    )
+    batch_toxic = encode_cross_encoder_batch(
+        ["hate trash hate trash hate"],
+        ["neutral question"],
+        tokenizer=tok,
+        include_root_context=False,
+        lang="en",
+        encoder=tok_wise_enc,
+    )
+    with torch.no_grad():
+        out_clean = ce_isolated(**batch_clean)
+        out_toxic = ce_isolated(**batch_toxic)
+    assert torch.allclose(out_clean["h_uv"], out_toxic["h_uv"], atol=1e-6)
+    assert not torch.allclose(out_clean["stance_logits"], out_toxic["stance_logits"], atol=1e-5)
+
+    # 3. distill_dual_cross_encoder best-epoch tracking & deep root pair augmentation
+    deep_train_recs = [
+        {
+            "root_id": "r0",
+            "parent_id": f"p{i}",
+            "root_text": "root topic debate",
+            "parent_text": "agree support" if i % 2 == 0 else "oppose civil",
+            "reply_text": "agree support" if i % 2 == 0 else "hate trash",
+            "s_uv": 0.85 if i % 2 == 0 else -0.85,
+            "root_s_uv": -0.75,
+            "h_uv": 0.05 if i % 2 == 0 else 0.90,
+            "stance_probs": [0.85, 0.10, 0.05] if i % 2 == 0 else [0.05, 0.10, 0.85],
+        }
+        for i in range(6)
+    ]
+    deep_val_recs = deep_train_recs[:2]
+    ce_dist = DualHeadCrossEncoder(lang="en", model_name="tiny-dist", encoder=enc, edge_dim=2, dropout=0.0)
+    dist_rep = distill_dual_cross_encoder(
+        deep_train_recs,
+        deep_val_recs,
+        output_dir=tmp_path / "dist_step2",
+        lang="en",
+        model=ce_dist,
+        tokenizer=tok,
+        edge_dim=2,
+        include_root_context=True,
+        use_multi_gpu=False,
+        epochs=3,
+        batch_size=4,
+        lr=1e-4,
+        device=torch.device("cpu"),
+    )
+    assert dist_rep["train_root_aug_count"] == len(deep_train_recs)
+    assert dist_rep["val_loss"] == pytest.approx(dist_rep["best_val_loss"])
+    rep_json = json.loads((tmp_path / "dist_step2" / "distill_report.json").read_text(encoding="utf-8"))
+    assert "best_epoch" in rep_json
+    assert rep_json["val_loss"] == pytest.approx(rep_json["best_val_loss"])
+
+    # 4. finetune_visobert_vihsd class weights & warmup+cosine metrics logging
+    vihsd_cfg = RobertaConfig(
+        vocab_size=enc.config.vocab_size,
+        hidden_size=enc.config.hidden_size,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=128,
+        max_position_embeddings=64,
+        type_vocab_size=1,
+        pad_token_id=1,
+        bos_token_id=0,
+        eos_token_id=2,
+        num_labels=3,
+        id2label={0: "clean", 1: "offensive", 2: "hate"},
+        label2id={"clean": 0, "offensive": 1, "hate": 2},
+    )
+    vihsd_clf = RobertaForSequenceClassification(vihsd_cfg)
+    toy_vihsd = {
+        "train": {
+            "free_text": ["agree support"] * 10 + ["oppose civil"] * 2 + ["hate trash"] * 2,
+            "label_id": [0] * 10 + [1] * 2 + [2] * 2,
+        },
+        "validation": {
+            "free_text": ["agree", "oppose", "hate"],
+            "label_id": [0, 1, 2],
+        },
+    }
+    vihsd_dir = finetune_visobert_vihsd(
+        tmp_path / "vihsd_ckpt",
+        epochs=2,
+        batch_size=4,
+        lr=1e-4,
+        dataset_dict=toy_vihsd,
+        model=vihsd_clf,
+        tokenizer=tok,
+        device=torch.device("cpu"),
+    )
+    vihsd_metrics = json.loads((vihsd_dir / "vihsd_metrics.json").read_text(encoding="utf-8"))
+    assert math.isfinite(float(vihsd_metrics["best_val_macro_f1"]))
+    assert len(vihsd_metrics["class_weights"]) == 3
+    assert vihsd_metrics["class_weights"][1] > vihsd_metrics["class_weights"][0]
+    assert vihsd_metrics["class_weights"][2] > vihsd_metrics["class_weights"][0]
+    assert len(vihsd_metrics["val_macro_f1_history"]) == 2
 
 
 def test_canonical_topic_splits_and_vn_clustering(tmp_path: Path) -> None:
@@ -989,11 +1087,16 @@ def test_cosine_lr_schedules_and_kaggle_runner_optimizations(
     )
     assert len(rep["train_losses"]) == 3 and math.isfinite(float(rep["val_loss"]))
 
-    # 3. kaggle_parallel_runner Zero-Shot default, v1 mode, --max-teacher-pairs 0, and LOO skip guard
+    # 3. Unified 2D kaggle_parallel_runner for EN and VI with LOO skip guard and fair fixed hyperparams
     recorded_cmds: list[list[str]] = []
+    auto_loop_calls: list[dict[str, Any]] = []
 
     def _fake_run(cmd: Sequence[str], cwd: Path | None = None) -> None:
         recorded_cmds.append([str(x) for x in cmd])
+
+    def _fake_auto_loop(*_a: Any, **kw: Any) -> dict[str, Any]:
+        auto_loop_calls.append(dict(kw))
+        return {"best_config": {"hidden_dim": 128, "eps": 0.4, "dropout": 0.2, "lr": 5e-4, "lambda_uncertainty": 0.0}}
 
     monkeypatch.setattr(kpr, "_run_cmd", _fake_run)
     monkeypatch.setattr(
@@ -1001,63 +1104,68 @@ def test_cosine_lr_schedules_and_kaggle_runner_optimizations(
         "EarlyCascadeDataset",
         lambda **_kw: graphs[:2],
     )
-    monkeypatch.setattr(
-        kpr,
-        "run_self_auditing_validation_loop",
-        lambda *_a, **_kw: {"best_config": {"hidden_dim": 128, "eps": 0.5, "dropout": 0.1, "lr": 1e-3, "lambda_uncertainty": 0.05}},
-    )
+    monkeypatch.setattr(kpr, "run_self_auditing_validation_loop", _fake_auto_loop)
     monkeypatch.setattr(kpr, "_bundle_outputs", lambda zip_path, **_kw: Path(zip_path))
 
-    # Case A: v2 default on PHEME with max_teacher_pairs=0 & no teacher_edge_stance in .pt
-    w_v2 = tmp_path / "work_v2"
-    proc_en = w_v2 / "data" / "processed" / "pheme"
+    # Case A: member2_en uses cardiffnlp/twitter-roberta-base, dual_nli, edge_dim=2, fair hidden_dim=64 (auto_loop off by default)
+    w_en = tmp_path / "work_en"
+    proc_en = w_en / "data" / "processed" / "pheme"
     proc_en.mkdir(parents=True, exist_ok=True)
     torch.save({"node_features_770": {}}, proc_en / "nlp_features.pt")
-    args_v2 = SimpleNamespace(
+    args_en = SimpleNamespace(
         role="member2_en",
         lang="en",
         smoke_test=False,
-        work_dir=w_v2,
+        work_dir=w_en,
         processed_dir=None,
         vn_target_count=800,
-        max_teacher_pairs=0,
         before_epoch=None,
-        teacher_model="unsloth/Qwen3.8-27B-unsloth-bnb-4bit",
-        scoring_mode="logit",
         k_horizon=20,
         min_total_replies=25,
-        hidden_dim=128,
-        epochs_qlora=1,
+        hidden_dim=64,
         epochs_nlp=1,
         epochs_gnn=2,
         batch_size_nlp=8,
         batch_size_gnn=2,
-        pipeline_version="v2",
-        enable_qlora=False,
-        skip_qlora=False,
         bootstrap_if_missing=False,
+        run_auto_loop=False,
         run_upfd=False,
         bundle_weights=False,
     )
-    kpr.run_kaggle_parallel_role(args_v2)
-    scorer_cmds = [c for c in recorded_cmds if "src.nlp.dual_edge_scorer" in c]
-    assert len(scorer_cmds) == 1
-    assert "--train-qwen-qlora" not in scorer_cmds[0]
-    assert "--max-teacher-pairs" not in scorer_cmds[0]
+    kpr.run_kaggle_parallel_role(args_en)
+    assert auto_loop_calls == []
+    scorer_en = [c for c in recorded_cmds if "src.nlp.dual_edge_scorer" in c][0]
+    exp_en = [c for c in recorded_cmds if "scripts.run_experiments" in c][0]
+    abl_en = [c for c in recorded_cmds if "scripts.run_ablation" in c][0]
+    eff_en = [c for c in recorded_cmds if "scripts.benchmark_efficiency" in c][0]
+    assert "dual_nli" in scorer_en
+    assert TWITTER_ROBERTA_MODEL_NAME in scorer_en
+    assert "--edge-dim" in scorer_en and scorer_en[scorer_en.index("--edge-dim") + 1] == "2"
+    assert "--train-vihsd" not in scorer_en
+    assert "--v2" not in exp_en
+    assert "--use-cascade-stats" in exp_en
+    assert exp_en[exp_en.index("--hidden-dim") + 1] == "64"
+    assert abl_en[abl_en.index("--hidden-dim") + 1] == "64"
+    assert eff_en[eff_en.index("--hidden-dim") + 1] == "64"
     assert "--eval-protocol" not in [x for cmd in recorded_cmds for x in cmd]
     assert any("scripts.export_dataset_stats" in c for c in recorded_cmds)
-    assert any("scripts.benchmark_efficiency" in c for c in recorded_cmds)
 
-    # Case B: pipeline_version="v1" uses legacy_nli, edge_dim=2, --train-vihsd, and no --v2
+    # Case B: member1_vn with --run-auto-loop runs diagnostic loop at hidden_dim=64 without overriding benchmark config
     recorded_cmds.clear()
-    w_v1 = tmp_path / "work_v1"
-    (w_v1 / "data" / "processed" / "vn").mkdir(parents=True, exist_ok=True)
-    args_v1 = SimpleNamespace(**{**vars(args_v2), "role": "member1_vn", "lang": "vi", "work_dir": w_v1, "pipeline_version": "v1"})
-    kpr.run_kaggle_parallel_role(args_v1)
-    scorer_v1 = [c for c in recorded_cmds if "src.nlp.dual_edge_scorer" in c][0]
-    exp_v1 = [c for c in recorded_cmds if "scripts.run_experiments" in c][0]
-    assert "legacy_nli" in scorer_v1 and "--train-vihsd" in scorer_v1
-    assert "--edge-dim" in scorer_v1 and scorer_v1[scorer_v1.index("--edge-dim") + 1] == "2"
-    assert "--v2" not in exp_v1
+    auto_loop_calls.clear()
+    w_vi = tmp_path / "work_vi"
+    (w_vi / "data" / "processed" / "vn").mkdir(parents=True, exist_ok=True)
+    args_vi = SimpleNamespace(
+        **{**vars(args_en), "role": "member1_vn", "lang": "vi", "work_dir": w_vi, "run_auto_loop": True}
+    )
+    kpr.run_kaggle_parallel_role(args_vi)
+    assert len(auto_loop_calls) == 1 and auto_loop_calls[0]["hidden_dim"] == 64
+    scorer_vi = [c for c in recorded_cmds if "src.nlp.dual_edge_scorer" in c][0]
+    exp_vi = [c for c in recorded_cmds if "scripts.run_experiments" in c][0]
+    assert "dual_nli" in scorer_vi and "--train-vihsd" in scorer_vi
+    assert "--include-root-context" in scorer_vi
+    assert "--edge-dim" in scorer_vi and scorer_vi[scorer_vi.index("--edge-dim") + 1] == "2"
+    assert "--v2" not in exp_vi
+    assert exp_vi[exp_vi.index("--hidden-dim") + 1] == "64"
 
 

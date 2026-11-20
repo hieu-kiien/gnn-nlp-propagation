@@ -33,7 +33,7 @@ def main() -> None:
         choices=["bert", "spacy", "profile", "content"],
         help="UPFD PyG node feature representation.",
     )
-    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)

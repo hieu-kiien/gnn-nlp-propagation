@@ -24,11 +24,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch_geometric.nn import MessagePassing, global_mean_pool
-from torch_geometric.utils import degree, softmax
+from torch_geometric.utils import degree, scatter, softmax
 
 from src.models.baselines import (
     LatentConflictMLP,
     MultiTaskHead,
+    TwoStreamNodeStem,
     broadcast_root_features,
     resolve_root_indices,
 )
@@ -48,8 +49,11 @@ class StanceGuidedFAConv(MessagePassing):
         super().__init__(aggr="add", flow="source_to_target", node_dim=0)
         if gate_mode not in {"tanh", "sigmoid"}:
             raise ValueError(f"gate_mode must be 'tanh' or 'sigmoid', got {gate_mode!r}")
+        if hidden_dim < 2:
+            raise ValueError(f"hidden_dim must be >= 2, got {hidden_dim}")
 
         self.hidden_dim = hidden_dim
+        self.pol_dim = hidden_dim // 2
         self.edge_dim = edge_dim
         self.eps = eps
         self.gate_mode = gate_mode
@@ -57,6 +61,19 @@ class StanceGuidedFAConv(MessagePassing):
         self.lin = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.lin_root = nn.Linear(hidden_dim, hidden_dim, bias=True)
         self.att = nn.Parameter(torch.empty(1, 2 * hidden_dim + edge_dim))
+        self.cos_weight = nn.Parameter(torch.tensor(0.25))
+
+        if edge_dim >= 4:
+            basis_dim = edge_dim + 2
+        elif edge_dim == 2:
+            basis_dim = 4
+        else:
+            basis_dim = 2 * max(1, edge_dim)
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(basis_dim, 16),
+            nn.GELU(),
+            nn.Linear(16, 2),
+        )
         self.norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -77,9 +94,43 @@ class StanceGuidedFAConv(MessagePassing):
                         device=self.att.device,
                     )
                 )
+        elif self.edge_dim == 2:
+            with torch.no_grad():
+                self.att[:, node_att_dim:].copy_(
+                    torch.tensor(
+                        [[0.6, -0.4]],
+                        dtype=self.att.dtype,
+                        device=self.att.device,
+                    )
+                )
         elif self.edge_dim > 0:
             edge_scale = 1.0 / math.sqrt(float(self.edge_dim))
             nn.init.constant_(self.att[:, node_att_dim:], edge_scale)
+
+        with torch.no_grad():
+            self.cos_weight.fill_(0.25)
+        nn.init.xavier_uniform_(self.edge_mlp[0].weight)
+        nn.init.zeros_(self.edge_mlp[0].bias)
+        nn.init.normal_(self.edge_mlp[2].weight, std=0.02)
+        nn.init.zeros_(self.edge_mlp[2].bias)
+
+    def _edge_basis(self, edge_attr: Tensor) -> Tensor:
+        if self.edge_dim == 0 or edge_attr.size(1) == 0:
+            return edge_attr.new_zeros((edge_attr.size(0), 2))
+        if self.edge_dim >= 4 and edge_attr.size(1) >= 4:
+            s = edge_attr[:, 0:1]
+            h = edge_attr[:, 1:2]
+            r = edge_attr[:, 2:3]
+            c = edge_attr[:, 3:4]
+            parts = [s, h, r, c, s * h, s.abs()]
+            if edge_attr.size(1) > 4:
+                parts.append(edge_attr[:, 4:])
+            return torch.cat(parts, dim=-1)
+        if self.edge_dim == 2 and edge_attr.size(1) >= 2:
+            s = edge_attr[:, 0:1]
+            h = edge_attr[:, 1:2]
+            return torch.cat([s, h, s * h, s.abs()], dim=-1)
+        return torch.cat([edge_attr, edge_attr.abs()], dim=-1)
 
     def forward(
         self,
@@ -97,15 +148,32 @@ class StanceGuidedFAConv(MessagePassing):
             deg_out = degree(src, num_nodes=num_nodes, dtype=z.dtype)
             deg_in = degree(dst, num_nodes=num_nodes, dtype=z.dtype)
             edge_norm = ((deg_out[src] + 1.0) * (deg_in[dst] + 1.0)).pow(-0.5)
+
             z_gate = F.layer_norm(z, (self.hidden_dim,))
-            cat_feat = torch.cat([z_gate[src], z_gate[dst], edge_attr], dim=-1)
-            score = (cat_feat * self.att).sum(dim=-1)
+            node_att_dim = 2 * self.hidden_dim
+            node_cat = torch.cat([z_gate[src], z_gate[dst]], dim=-1)
+            node_score = (node_cat * self.att[:, :node_att_dim]).sum(dim=-1) / math.sqrt(
+                float(max(1, node_att_dim))
+            )
+            cos_sim = F.cosine_similarity(z_gate[src], z_gate[dst], dim=-1, eps=1e-6)
+            edge_delta = self.edge_mlp(self._edge_basis(edge_attr))
+            if self.edge_dim > 0 and edge_attr.size(1) > 0:
+                edge_score = (edge_attr * self.att[:, node_att_dim:]).sum(dim=-1) + edge_delta[:, 0]
+            else:
+                edge_score = edge_delta[:, 0]
+
+            score = node_score + self.cos_weight * cos_sim + edge_score
             gamma = torch.tanh(score) if self.gate_mode == "tanh" else torch.sigmoid(score)
-            edge_weight = edge_norm * gamma
+
+            s_abs = edge_attr[:, 0].abs() if edge_attr.size(1) >= 1 else gamma.abs()
+            h_val = edge_attr[:, 1] if edge_attr.size(1) >= 2 else torch.zeros_like(s_abs)
+            alpha_int = torch.sigmoid(0.8 * s_abs + 0.8 * h_val + edge_delta[:, 1])
+
+            edge_weights_2ch = torch.stack([edge_norm * gamma, edge_norm * alpha_int], dim=-1)
             m = self.propagate(
                 edge_index,
                 z=z,
-                edge_weight=edge_weight,
+                edge_weights_2ch=edge_weights_2ch,
                 size=(num_nodes, num_nodes),
             )
         else:
@@ -120,9 +188,70 @@ class StanceGuidedFAConv(MessagePassing):
     def message(
         self,
         z_j: Tensor,
-        edge_weight: Tensor,
+        edge_weights_2ch: Tensor,
     ) -> Tensor:
-        return edge_weight.unsqueeze(-1) * z_j
+        m_pol = edge_weights_2ch[:, 0:1] * z_j[:, : self.pol_dim]
+        m_exc = edge_weights_2ch[:, 1:2] * z_j[:, self.pol_dim :]
+        return torch.cat([m_pol, m_exc], dim=-1)
+
+
+def _propagate_root_aligned_edge_signal(
+    edge_index_td: Tensor,
+    edge_sig: Tensor,
+    root_idx: Tensor,
+    num_nodes: int,
+    neutral_eps: float = 0.1,
+) -> Tensor:
+    """Project local parent->reply gate/stance signals into root-aligned orientation via BFS."""
+    if num_nodes <= 0 or edge_index_td.numel() == 0 or edge_sig.numel() == 0:
+        return edge_sig
+
+    device = edge_sig.device
+    src = edge_index_td[0].long()
+    dst = edge_index_td[1].long()
+
+    valid_roots = root_idx.long()
+    valid_roots = valid_roots[(valid_roots >= 0) & (valid_roots < num_nodes)]
+    if valid_roots.numel() == 0:
+        return edge_sig
+
+    node_ori = edge_sig.new_zeros((num_nodes,))
+    node_ori = node_ori.scatter(
+        0, valid_roots, torch.ones_like(valid_roots, dtype=edge_sig.dtype)
+    )
+    visited = torch.zeros((num_nodes,), dtype=torch.bool, device=device)
+    visited = visited.scatter(
+        0, valid_roots, torch.ones_like(valid_roots, dtype=torch.bool)
+    )
+
+    max_hops = min(int(num_nodes), 64)
+    for _ in range(max_hops):
+        frontier = visited[src] & (~visited[dst])
+        if not bool(frontier.any()):
+            break
+        f_src = src[frontier]
+        f_dst = dst[frontier]
+        u_ori = node_ori[f_src].detach()
+        p_sign = torch.where(
+            u_ori.abs() <= neutral_eps,
+            torch.ones_like(u_ori),
+            torch.where(u_ori > 0.0, torch.ones_like(u_ori), -torch.ones_like(u_ori)),
+        )
+        aligned_f = p_sign * edge_sig[frontier]
+        updated = scatter(aligned_f, f_dst, dim=0, dim_size=num_nodes, reduce="mean")
+        new_vis = torch.zeros((num_nodes,), dtype=torch.bool, device=device).scatter(
+            0, f_dst, torch.ones_like(f_dst, dtype=torch.bool)
+        )
+        node_ori = torch.where(new_vis, updated, node_ori)
+        visited = visited | new_vis
+
+    u_all = node_ori[src].detach()
+    p_sign_all = torch.where(
+        u_all.abs() <= neutral_eps,
+        torch.ones_like(u_all),
+        torch.where(u_all > 0.0, torch.ones_like(u_all), -torch.ones_like(u_all)),
+    )
+    return p_sign_all * edge_sig
 
 
 class GlobalAttentionReadout(nn.Module):
@@ -148,7 +277,7 @@ class SBiFAGAT(nn.Module):
     def __init__(
         self,
         in_dim: int = 770,
-        hidden_dim: int = 128,
+        hidden_dim: int = 64,
         num_layers: int = 2,
         edge_dim: int = 2,
         num_rumor_classes: int = 4,
@@ -185,10 +314,8 @@ class SBiFAGAT(nn.Module):
         self.cascade_feat_dim = int(cascade_feat_dim)
         self.predict_uncertainty = bool(predict_uncertainty)
 
-        self.input_proj = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
+        self.input_proj = TwoStreamNodeStem(
+            in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout
         )
 
         self.latent_edge_mlp = (
@@ -227,6 +354,20 @@ class SBiFAGAT(nn.Module):
             if use_bottom_up
             else None
         )
+        if use_bottom_up:
+            self.dir_mix_td: nn.ModuleList | None = nn.ModuleList(
+                [nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(num_layers)]
+            )
+            self.dir_mix_bu: nn.ModuleList | None = nn.ModuleList(
+                [nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(num_layers)]
+            )
+            self.dir_mix_scale: nn.Parameter | None = nn.Parameter(
+                torch.full((num_layers,), 0.25)
+            )
+        else:
+            self.dir_mix_td = None
+            self.dir_mix_bu = None
+            self.dir_mix_scale = None
 
         self.td_readout = (
             GlobalAttentionReadout(hidden_dim) if readout_mode == "attention" else None
@@ -236,13 +377,20 @@ class SBiFAGAT(nn.Module):
             if (use_bottom_up and readout_mode == "attention")
             else None
         )
+        self.readout_proj = nn.Sequential(
+            nn.Linear(5 * hidden_dim + 6, 2 * hidden_dim),
+            nn.LayerNorm(2 * hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
         self.head = MultiTaskHead(
-            4 * hidden_dim,
+            2 * hidden_dim,
             hidden_dim,
             num_rumor_classes,
             dropout,
             cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
             predict_uncertainty=self.predict_uncertainty,
+            mask_semantic_stats=bool(self.ablate_stance or self.ablate_hostility),
         )
 
     def _prepare_edge_attr(
@@ -292,7 +440,8 @@ class SBiFAGAT(nn.Module):
         self, data: Any
     ) -> tuple[dict[str, Tensor], list[Tensor], list[Tensor]]:
         x = data.x.float()
-        root_idx, batch_vec = resolve_root_indices(data, x.size(0))
+        num_nodes = x.size(0)
+        root_idx, batch_vec = resolve_root_indices(data, num_nodes)
         num_graphs = root_idx.size(0)
 
         edge_index_td = getattr(data, "edge_index_td", data.edge_index)
@@ -303,41 +452,130 @@ class SBiFAGAT(nn.Module):
         )
         edge_attr = self._prepare_edge_attr(x, edge_index_td, data)
 
-        h0 = self.input_proj(x)
+        h0 = self.input_proj(x, data, root_idx)
         h_root_0 = broadcast_root_features(h0, root_idx, batch_vec)
 
         h_td = h0
+        h_bu = h0
         gamma_td_layers: list[Tensor] = []
-        for conv in self.td_convs:
-            h_td, gamma_td = conv(h_td, h0, h_root_0, edge_index_td, edge_attr)
-            gamma_td_layers.append(gamma_td)
-
-        z_root_td = h_td[root_idx]
-        z_att_td = (
-            self.td_readout(h_td, batch_vec, num_graphs)
-            if self.td_readout is not None
-            else global_mean_pool(h_td, batch_vec)
-        )
-
         gamma_bu_layers: list[Tensor] = []
-        if self.use_bottom_up and self.bu_convs is not None:
-            h_bu = h0
-            for conv in self.bu_convs:
-                h_bu, gamma_bu = conv(h_bu, h0, h_root_0, edge_index_bu, edge_attr)
-                gamma_bu_layers.append(gamma_bu)
-            z_root_bu = h_bu[root_idx]
-            z_att_bu = (
-                self.bu_readout(h_bu, batch_vec, num_graphs)
-                if self.bu_readout is not None
-                else global_mean_pool(h_bu, batch_vec)
-            )
-            node_emb = 0.5 * (h_td + h_bu)
-        else:
-            z_root_bu = z_root_td
-            z_att_bu = z_att_td
-            node_emb = h_td
 
-        graph_emb = torch.cat([z_root_td, z_att_td, z_root_bu, z_att_bu], dim=-1)
+        if (
+            self.use_bottom_up
+            and self.bu_convs is not None
+            and self.dir_mix_td is not None
+            and self.dir_mix_bu is not None
+            and self.dir_mix_scale is not None
+        ):
+            for l_idx in range(self.num_layers):
+                h_td_next, gamma_td = self.td_convs[l_idx](
+                    h_td, h0, h_root_0, edge_index_td, edge_attr
+                )
+                h_bu_next, gamma_bu = self.bu_convs[l_idx](
+                    h_bu, h0, h_root_0, edge_index_bu, edge_attr
+                )
+                gamma_td_layers.append(gamma_td)
+                gamma_bu_layers.append(gamma_bu)
+                mix_scale = torch.tanh(self.dir_mix_scale[l_idx])
+                h_td = h_td_next + mix_scale * self.dir_mix_td[l_idx](h_bu_next)
+                h_bu = h_bu_next + mix_scale * self.dir_mix_bu[l_idx](h_td_next)
+
+            node_emb = 0.5 * (h_td + h_bu)
+            z_root = 0.5 * (h_td[root_idx] + h_bu[root_idx])
+            if self.td_readout is not None and self.bu_readout is not None:
+                z_att = 0.5 * (
+                    self.td_readout(h_td, batch_vec, num_graphs)
+                    + self.bu_readout(h_bu, batch_vec, num_graphs)
+                )
+            else:
+                z_att = global_mean_pool(node_emb, batch_vec, size=num_graphs)
+        else:
+            for conv in self.td_convs:
+                h_td, gamma_td = conv(h_td, h0, h_root_0, edge_index_td, edge_attr)
+                gamma_td_layers.append(gamma_td)
+            node_emb = h_td
+            z_root = h_td[root_idx]
+            z_att = (
+                self.td_readout(h_td, batch_vec, num_graphs)
+                if self.td_readout is not None
+                else global_mean_pool(h_td, batch_vec, size=num_graphs)
+            )
+
+        node_cnt = scatter(
+            x.new_ones((num_nodes, 1), dtype=node_emb.dtype),
+            batch_vec,
+            dim=0,
+            dim_size=num_graphs,
+            reduce="sum",
+        )
+        mean_h = global_mean_pool(node_emb, batch_vec, size=num_graphs)
+        var_h = global_mean_pool((node_emb - mean_h[batch_vec]).pow(2), batch_vec, size=num_graphs)
+        z_disp = torch.where(node_cnt > 1.0, torch.sqrt(var_h + 1e-6), torch.zeros_like(var_h))
+
+        if edge_index_td.numel() > 0:
+            dst = edge_index_td[1]
+            edge_batch = batch_vec[dst]
+            h_dst = node_emb[dst]
+            gamma_td_last = gamma_td_layers[-1]
+            if self.gate_mode == "tanh":
+                camp_sig = _propagate_root_aligned_edge_signal(
+                    edge_index_td,
+                    gamma_td_last,
+                    root_idx,
+                    num_nodes,
+                    neutral_eps=0.1,
+                )
+            else:
+                camp_sig = gamma_td_last
+
+            w_pos = torch.sigmoid(12.0 * (camp_sig - 0.25)).unsqueeze(-1)
+            w_neg = torch.sigmoid(12.0 * (-camp_sig - 0.25)).unsqueeze(-1)
+            sum_pos = scatter(w_pos, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+            sum_neg = scatter(w_neg, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+            ones_e = x.new_ones((edge_index_td.size(1), 1), dtype=node_emb.dtype)
+            edge_cnt = scatter(ones_e, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+            has_edges = edge_cnt > 0.0
+
+            mu_pos = scatter(w_pos * h_dst, edge_batch, dim=0, dim_size=num_graphs, reduce="sum") / (
+                sum_pos + 1.0
+            )
+            mu_neg = scatter(w_neg * h_dst, edge_batch, dim=0, dim_size=num_graphs, reduce="sum") / (
+                sum_neg + 1.0
+            )
+            denom_e = edge_cnt.clamp(min=1.0)
+            frac_pos = torch.where(
+                has_edges, (sum_pos / denom_e).clamp(0.0, 1.0), torch.zeros_like(sum_pos)
+            )
+            frac_neg = torch.where(
+                has_edges, (sum_neg / denom_e).clamp(0.0, 1.0), torch.zeros_like(sum_neg)
+            )
+            camp_balance = 4.0 * frac_pos * frac_neg
+
+            diff_camp = mu_pos - mu_neg
+            z_dipole_polar = camp_balance * torch.sqrt(diff_camp.pow(2) + 1e-8)
+            z_dipole_signed = diff_camp
+
+            g_col = gamma_td_last.unsqueeze(-1)
+            g_sum = scatter(g_col, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+            g_sq_sum = scatter(g_col.pow(2), edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+            g_abs_sum = scatter(
+                torch.sqrt(g_col.pow(2) + 1e-8), edge_batch, dim=0, dim_size=num_graphs, reduce="sum"
+            )
+            g_mean = torch.where(has_edges, g_sum / denom_e, torch.zeros_like(g_sum))
+            g_sq_mean = torch.where(has_edges, g_sq_sum / denom_e, torch.zeros_like(g_sq_sum))
+            g_abs_mean = torch.where(has_edges, g_abs_sum / denom_e, torch.zeros_like(g_abs_sum))
+            g_var = (g_sq_mean - g_mean.pow(2)).clamp(min=0.0)
+            g_std = torch.where(edge_cnt >= 2.0, torch.sqrt(g_var + 1e-8), torch.zeros_like(g_var))
+            g_mom = torch.cat([g_mean, g_std, g_abs_mean, frac_pos, frac_neg, camp_balance], dim=-1)
+        else:
+            z_dipole_polar = node_emb.new_zeros((num_graphs, self.hidden_dim))
+            z_dipole_signed = node_emb.new_zeros((num_graphs, self.hidden_dim))
+            g_mom = node_emb.new_zeros((num_graphs, 6))
+
+        readout_in = torch.cat(
+            [z_root, z_att, z_disp, z_dipole_polar, z_dipole_signed, g_mom], dim=-1
+        )
+        graph_emb = self.readout_proj(readout_in)
         c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
         outputs = self.head(graph_emb, node_emb, cascade_stats=c_stats)
         return outputs, gamma_td_layers, gamma_bu_layers
@@ -366,8 +604,9 @@ class SBiFAGAT(nn.Module):
             conf = torch.full_like(y_polar, 0.75)
 
         c_stats = getattr(data, "cascade_stats", None)
-        if c_stats is not None and c_stats.numel() >= 7:
-            stats_2d = c_stats.detach().cpu().float().view(-1, self.cascade_feat_dim)
+        if c_stats is not None and c_stats.numel() >= 8:
+            feat_w = c_stats.size(-1) if c_stats.dim() >= 2 else max(8, self.cascade_feat_dim)
+            stats_2d = c_stats.detach().cpu().float().view(-1, feat_w)
             substantive_ratio = stats_2d[:, 6]
             one_sided_host = stats_2d[:, 7]
         else:
@@ -385,6 +624,12 @@ class SBiFAGAT(nn.Module):
             attr_cpu = raw_attr.detach().cpu() if raw_attr is not None else None
             order = torch.argsort(edge_imp, descending=True)[: max(1, int(top_k_edges))]
             edge_pairs = getattr(data, "edge_pairs", None)
+            flat_edge_pairs: list[Any] | None = None
+            if isinstance(edge_pairs, (list, tuple)):
+                if edge_pairs and isinstance(edge_pairs[0], list):
+                    flat_edge_pairs = [pair for sub in edge_pairs for pair in sub]
+                else:
+                    flat_edge_pairs = list(edge_pairs)
             for idx_t in order:
                 e_i = int(idx_t.item())
                 item: dict[str, Any] = {
@@ -392,8 +637,8 @@ class SBiFAGAT(nn.Module):
                     "importance": float(edge_imp[e_i].item()),
                     "gamma_td": float(gamma_td[e_i].item()),
                 }
-                if edge_pairs is not None and e_i < len(edge_pairs):
-                    item["pair"] = edge_pairs[e_i]
+                if flat_edge_pairs is not None and e_i < len(flat_edge_pairs):
+                    item["pair"] = flat_edge_pairs[e_i]
                 if attr_cpu is not None and e_i < attr_cpu.size(0):
                     item["s_uv"] = float(attr_cpu[e_i, 0].item())
                     if attr_cpu.size(1) >= 2:

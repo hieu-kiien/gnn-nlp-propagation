@@ -218,6 +218,8 @@ def test_zero_data_leakage_future_perturbation_invariant(tmp_path: Path) -> None
 
         # Input features & topology up to K=20 MUST be bitwise identical (Zero Leakage!)
         assert torch.equal(g_clean.x, g_alt.x)
+        assert torch.equal(g_clean.struct_x, g_alt.struct_x)
+        assert torch.equal(g_clean.cascade_stats, g_alt.cascade_stats)
         assert torch.equal(g_clean.edge_index_td, g_alt.edge_index_td)
         assert torch.equal(g_clean.edge_index_bu, g_alt.edge_index_bu)
         assert torch.equal(g_clean.edge_attr, g_alt.edge_attr)

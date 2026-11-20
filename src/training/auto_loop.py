@@ -24,11 +24,12 @@ from src.models.sbi_fagat import SBiFAGAT
 from src.training.trainer import evaluate_loader, train_and_evaluate_single_seed
 
 DEFAULT_V2_CANDIDATES: tuple[dict[str, Any], ...] = (
-    {"hidden_dim": 256, "lr": 1e-3, "eps": 0.5, "dropout": 0.10, "lambda_uncertainty": 0.05},
-    {"hidden_dim": 256, "lr": 5e-4, "eps": 0.4, "dropout": 0.15, "lambda_uncertainty": 0.05},
-    {"hidden_dim": 256, "lr": 1e-3, "eps": 0.6, "dropout": 0.20, "lambda_uncertainty": 0.08},
-    {"hidden_dim": 128, "lr": 1e-3, "eps": 0.5, "dropout": 0.10, "lambda_uncertainty": 0.05},
+    {"hidden_dim": 64, "lr": 1e-3, "eps": 0.5, "dropout": 0.10, "lambda_uncertainty": 0.0},
+    {"hidden_dim": 64, "lr": 5e-4, "eps": 0.4, "dropout": 0.15, "lambda_uncertainty": 0.0},
+    {"hidden_dim": 64, "lr": 1e-3, "eps": 0.6, "dropout": 0.20, "lambda_uncertainty": 0.0},
+    {"hidden_dim": 64, "lr": 5e-4, "eps": 0.5, "dropout": 0.10, "lambda_uncertainty": 0.0},
 )
+DEFAULT_CANDIDATES = DEFAULT_V2_CANDIDATES
 
 
 def _compute_regime_metrics(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -52,10 +53,11 @@ def run_self_auditing_validation_loop(
     val_loader: DataLoader,
     *,
     in_dim: int = 770,
-    edge_dim: int = 4,
+    hidden_dim: int = 64,
+    edge_dim: int = 2,
     num_rumor_classes: int = 4,
     use_cascade_stats: bool = True,
-    predict_uncertainty: bool = True,
+    predict_uncertainty: bool = False,
     candidates: Sequence[Mapping[str, Any]] | None = None,
     epochs: int = 60,
     patience: int = 10,
@@ -70,7 +72,10 @@ def run_self_auditing_validation_loop(
         if device is not None
         else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     )
-    grid = [dict(c) for c in (candidates or DEFAULT_V2_CANDIDATES)]
+    if candidates is not None:
+        grid = [dict(c) for c in candidates]
+    else:
+        grid = [{**c, "hidden_dim": int(hidden_dim)} for c in DEFAULT_V2_CANDIDATES]
     if not grid:
         raise ValueError("candidates grid must be non-empty")
 
@@ -82,7 +87,7 @@ def run_self_auditing_validation_loop(
     best_model: torch.nn.Module | None = None
 
     for idx, cfg in enumerate(grid):
-        h_dim = int(cfg.get("hidden_dim", 256))
+        h_dim = int(cfg.get("hidden_dim", hidden_dim))
         lr = float(cfg.get("lr", 1e-3))
         eps = float(cfg.get("eps", 0.5))
         dropout = float(cfg.get("dropout", 0.1))

@@ -1,13 +1,14 @@
 """Offline frozen NLP feature extractor exporting clean `.pt` feature banks.
 
 Extracts:
-  1. 768-dimensional semantic node embeddings `e_v` via masked mean pooling on
-     the frozen backbone (`uitnlp/visobert` for Vietnamese, `roberta-base` for PHEME).
+  1. 768-dimensional semantic node embeddings `e_v` via leakage-free
+     `Ancestor-Conditioned SpanPool` on the frozen backbone (`uitnlp/visobert`
+     for Vietnamese, `cardiffnlp/twitter-roberta-base` for English PHEME).
   2. Leakage-free intra-K normalized temporal delay `t_norm` and tree depth
      `depth_norm`, concatenated into `node_features_770` (`[N_nodes, 770]`).
-  3. 2D edge attribute vectors `e_uv = [s_uv, h_uv]` (`[N_edges, 2]`) plus
-     `edge_stance`, `edge_hostility`, `edge_oppose_flag`, and `edge_pred_label`
-     dictionaries compatible with `EarlyCascadeDataset`.
+  3. 2D edge attribute vectors `e_uv = [s_uv, h_uv]` (`[N_edges, 2]`, or
+     optional 4D) plus `edge_stance`, `edge_hostility`, `edge_oppose_flag`,
+     and `edge_pred_label` dictionaries compatible with `EarlyCascadeDataset`.
 
 All tensors are verified strictly finite (no NaN or Inf) before saving to
 `data/processed/{pheme,vn}/`.
@@ -31,17 +32,23 @@ from transformers import AutoModel
 
 from src.data.pyg_dataset import TEMPORAL_REF_SECONDS
 from src.data.schema import load_cascade_parquet, save_cascade_parquet
+from src.nlp.discourse_labels import DISCOURSE_BEHAVIOR_LABELS
 from src.nlp.dual_edge_scorer import (
     DualHeadCrossEncoder,
     HostilityTeacherScorer,
     NLIStanceTeacherScorer,
-    ROBERTA_BASE_MODEL_NAME,
     STANCE_LABELS,
+    TWITTER_ROBERTA_MODEL_NAME,
     VISOBERT_MODEL_NAME,
+    _cuda_autocast,
+    _effective_max_length,
+    _encode_no_specials,
+    _inspect_pair_tokenizer,
     _normalize_nfc,
+    encode_cross_encoder_batch,
     load_tokenizer_safe,
+    normalize_social_text,
 )
-from src.nlp.qwen_teacher import DISCOURSE_BEHAVIOR_LABELS
 
 
 def compute_masked_mean_pooling(last_hidden_state: Tensor, attention_mask: Tensor) -> Tensor:
@@ -66,35 +73,124 @@ def encode_node_embeddings(
     *,
     encoder: torch.nn.Module,
     tokenizer: Any,
+    parent_texts: Sequence[str | None] | None = None,
+    root_texts: Sequence[str | None] | None = None,
+    lang: str = "vi",
     batch_size: int = 32,
     max_length: int = 256,
+    min_target_tokens: int = 96,
     device: torch.device | None = None,
 ) -> Tensor:
-    """Encode a list of node texts into `[N, 768]` float32 tensors using a frozen backbone."""
-    if not texts:
-        return torch.empty((0, 768), dtype=torch.float32)
+    """Encode node texts into `[N, D]` float32 tensors using leakage-free Ancestor SpanPool.
+
+    When `parent_texts` / `root_texts` are provided for a node `v`:
+      - Root / standalone: `[CLS] v [SEP]` -> pool over `v`.
+      - Depth 1 (`parent == root`): `[CLS] root [SEP] v [SEP]` (no duplication) -> pool strictly over `v`.
+      - Depth >= 2: `[CLS] root [SEP] parent [SEP] v [SEP]` -> pool strictly over `v`.
+    At least `min_target_tokens` (up to half of budget) are reserved for `v` so `v` is never truncated away.
+    """
+    n = len(texts)
+    if parent_texts is not None and len(parent_texts) != n:
+        raise ValueError("parent_texts must match texts length when provided")
+    if root_texts is not None and len(root_texts) != n:
+        raise ValueError("root_texts must match texts length when provided")
+    hidden_dim = int(getattr(getattr(encoder, "config", None), "hidden_size", 768))
+    if n == 0:
+        return torch.empty((0, hidden_dim), dtype=torch.float32)
 
     target_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _freeze_module(encoder).to(target_device)
     use_amp = target_device.type == "cuda"
 
+    spec = _inspect_pair_tokenizer(tokenizer, encoder=encoder)
+    pad_id = spec["pad_id"]
+    cls_id = spec["cls_id"]
+    sep_id = spec["sep_id"]
+    num_specials = spec["num_specials"]
+    eff_max = _effective_max_length(max_length, encoder=encoder, tokenizer=tokenizer)
+
     chunks: list[Tensor] = []
-    for start in range(0, len(texts), batch_size):
-        batch = [_normalize_nfc(t) for t in texts[start : start + batch_size]]
-        enc = tokenizer(
-            batch,
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt",
-        )
-        enc_dev = {k: v.to(target_device) for k, v in enc.items()}
-        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-            outputs = encoder(**enc_dev)
-            pooled = compute_masked_mean_pooling(
-                outputs.last_hidden_state,
-                enc_dev["attention_mask"],
-            )
+    for start in range(0, n, batch_size):
+        end = min(n, start + batch_size)
+        seqs: list[list[int]] = []
+        span_masks: list[list[int]] = []
+
+        for idx in range(start, end):
+            t_norm = normalize_social_text(texts[idx], lang=lang)
+            p_raw = parent_texts[idx] if parent_texts is not None else None
+            r_raw = root_texts[idx] if root_texts is not None else None
+            p_norm = normalize_social_text(p_raw, lang=lang) if p_raw else ""
+            r_norm = normalize_social_text(r_raw, lang=lang) if r_raw else ""
+
+            target_ids = _encode_no_specials(tokenizer, t_norm)
+            if not p_norm and not r_norm:
+                content_budget = max(1, eff_max - 2)
+                target_keep = target_ids[:content_budget]
+                seq = [cls_id] + target_keep + [sep_id]
+                span = (
+                    [0] + [1] * len(target_keep) + [0]
+                    if target_keep
+                    else [1] * len(seq)
+                )
+            else:
+                content_budget = max(4, eff_max - num_specials)
+                guaranteed_target = min(
+                    len(target_ids),
+                    max(1, min(int(min_target_tokens), content_budget // 2)),
+                )
+                ctx_budget = max(0, content_budget - guaranteed_target)
+
+                if r_norm and p_norm and r_norm != p_norm and ctx_budget >= 3:
+                    root_ids = _encode_no_specials(tokenizer, r_norm)
+                    parent_ids = _encode_no_specials(tokenizer, p_norm)
+                    root_cap = min(len(root_ids), max(1, ctx_budget // 3))
+                    parent_cap = min(len(parent_ids), max(0, ctx_budget - 1 - root_cap))
+                    root_keep = root_ids[: min(len(root_ids), max(0, ctx_budget - 1 - parent_cap))]
+                    parent_keep = parent_ids[:parent_cap]
+                    if root_keep and parent_keep:
+                        ctx_ids = root_keep + [sep_id] + parent_keep
+                    else:
+                        ctx_ids = root_keep or parent_keep
+                else:
+                    ctx_str = p_norm or r_norm
+                    ctx_ids = _encode_no_specials(tokenizer, ctx_str)[:ctx_budget]
+
+                reply_budget = max(1, content_budget - len(ctx_ids))
+                target_keep = target_ids[:reply_budget]
+                mid_seps = [sep_id, sep_id] if num_specials >= 4 else [sep_id]
+                seq = [cls_id] + ctx_ids + mid_seps + target_keep + [sep_id]
+                span = (
+                    [0] * (1 + len(ctx_ids) + len(mid_seps)) + [1] * len(target_keep) + [0]
+                    if target_keep
+                    else [1] * len(seq)
+                )
+
+            seqs.append(seq)
+            span_masks.append(span)
+
+        batch_max_len = max(len(s) for s in seqs)
+        bsz = len(seqs)
+        input_ids = torch.full((bsz, batch_max_len), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((bsz, batch_max_len), dtype=torch.long)
+        span_mask = torch.zeros((bsz, batch_max_len), dtype=torch.long)
+        for row_i, (seq, sm) in enumerate(zip(seqs, span_masks)):
+            cur_len = len(seq)
+            input_ids[row_i, :cur_len] = torch.tensor(seq, dtype=torch.long)
+            attention_mask[row_i, :cur_len] = 1
+            span_mask[row_i, :cur_len] = torch.tensor(sm, dtype=torch.long)
+
+        input_ids_dev = input_ids.to(target_device)
+        attn_mask_dev = attention_mask.to(target_device)
+        span_mask_dev = span_mask.to(target_device)
+
+        with _cuda_autocast(enabled=use_amp):
+            outputs = encoder(input_ids=input_ids_dev, attention_mask=attn_mask_dev)
+            pooled = compute_masked_mean_pooling(outputs.last_hidden_state, span_mask_dev)
+        if not torch.isfinite(pooled).all():
+            with _cuda_autocast(enabled=False):
+                outputs = encoder(input_ids=input_ids_dev, attention_mask=attn_mask_dev)
+                pooled = compute_masked_mean_pooling(outputs.last_hidden_state, span_mask_dev)
+
         chunks.append(pooled.cpu().to(dtype=torch.float32))
 
     return torch.cat(chunks, dim=0)
@@ -107,14 +203,19 @@ def encode_edges_with_cross_encoder(
     *,
     cross_encoder: DualHeadCrossEncoder,
     tokenizer: Any,
+    root_texts: Sequence[str | None] | None = None,
+    include_root_context: bool = False,
+    lang: str | None = None,
     batch_size: int = 32,
     max_length: int = 256,
     device: torch.device | None = None,
 ) -> dict[str, Any]:
-    """Run frozen `DualHeadCrossEncoder` inference on `(u, v)` edge text pairs."""
+    """Run frozen segment-isolated `DualHeadCrossEncoder` inference on `(u, v)` edge text pairs."""
     n_edges = len(parent_texts)
     if n_edges != len(reply_texts):
         raise ValueError("parent_texts and reply_texts must have equal length")
+    if root_texts is not None and len(root_texts) != n_edges:
+        raise ValueError("root_texts must match parent_texts length when provided")
     ce_edge_dim = int(getattr(cross_encoder, "edge_dim", 2))
     if n_edges == 0:
         empty_res: dict[str, Any] = {
@@ -128,6 +229,7 @@ def encode_edges_with_cross_encoder(
             empty_res["behavior_label"] = []
         return empty_res
 
+    eff_lang = str(lang or getattr(cross_encoder, "lang", "vi") or "vi")
     target_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _freeze_module(cross_encoder).to(target_device)
     use_amp = target_device.type == "cuda"
@@ -140,19 +242,24 @@ def encode_edges_with_cross_encoder(
     all_b_probs: list[Tensor] = []
 
     for start in range(0, n_edges, batch_size):
-        u_batch = [_normalize_nfc(t) for t in parent_texts[start : start + batch_size]]
-        v_batch = [_normalize_nfc(t) for t in reply_texts[start : start + batch_size]]
-        enc = tokenizer(
-            u_batch,
-            v_batch,
-            padding=True,
-            truncation=True,
+        end = min(n_edges, start + batch_size)
+        root_slice = root_texts[start:end] if root_texts is not None else None
+        enc = encode_cross_encoder_batch(
+            parent_texts[start:end],
+            reply_texts[start:end],
+            tokenizer=tokenizer,
+            root_texts=root_slice,
+            include_root_context=include_root_context,
+            lang=eff_lang,
             max_length=max_length,
-            return_tensors="pt",
+            encoder=cross_encoder.encoder,
         )
         enc_dev = {k: v.to(target_device) for k, v in enc.items()}
-        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+        with _cuda_autocast(enabled=use_amp):
             out = cross_encoder(**enc_dev)
+        if not torch.isfinite(out["s_uv"]).all() or not torch.isfinite(out["h_uv"]).all():
+            with _cuda_autocast(enabled=False):
+                out = cross_encoder(**enc_dev)
         all_s.append(out["s_uv"].cpu().to(dtype=torch.float32))
         all_h.append(out["h_uv"].cpu().to(dtype=torch.float32))
         all_probs.append(out["stance_probs"].cpu().to(dtype=torch.float32))
@@ -314,6 +421,7 @@ def extract_and_save_features(
     edge_dim: int | None = None,
     include_root_context: bool = False,
     node_backbone: str | None = None,
+    use_ancestor_span_pool: bool = True,
     batch_size: int = 32,
     max_length: int = 256,
     k_horizon: int = 20,
@@ -324,7 +432,9 @@ def extract_and_save_features(
     if edge_dim is not None and edge_dim not in {2, 4}:
         raise ValueError(f"edge_dim must be 2 or 4, got {edge_dim}")
     lang = "en" if dataset == "pheme" else "vi"
-    default_backbone = node_backbone or (ROBERTA_BASE_MODEL_NAME if lang == "en" else VISOBERT_MODEL_NAME)
+    default_backbone = node_backbone or (
+        TWITTER_ROBERTA_MODEL_NAME if lang == "en" else VISOBERT_MODEL_NAME
+    )
     target_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     nodes_tbl, edges_tbl = load_cascade_parquet(interim_dir, validate=True)
@@ -340,6 +450,21 @@ def extract_and_save_features(
     for r in node_rows:
         if bool(r.get("is_root")) or int(r.get("depth", -1)) == 0:
             cascade_root_id[str(r["cascade_id"])] = str(r["node_id"])
+
+    node_parent_texts: list[str | None] | None = None
+    node_root_texts: list[str | None] | None = None
+    if use_ancestor_span_pool:
+        node_parent_texts = []
+        node_root_texts = []
+        for r in node_rows:
+            if bool(r.get("is_root")) or r.get("parent_id") is None:
+                node_parent_texts.append(None)
+                node_root_texts.append(None)
+            else:
+                pid = str(r["parent_id"])
+                rid = cascade_root_id.get(str(r["cascade_id"]), pid)
+                node_parent_texts.append(node_text_by_id.get(pid))
+                node_root_texts.append(node_text_by_id.get(rid))
 
     edge_ids = [str(r["edge_id"]) for r in edge_rows]
     edge_id_to_idx = {eid: idx for idx, eid in enumerate(edge_ids)}
@@ -382,6 +507,9 @@ def extract_and_save_features(
         node_texts,
         encoder=active_encoder,
         tokenizer=active_tok,
+        parent_texts=node_parent_texts,
+        root_texts=node_root_texts,
+        lang=lang,
         batch_size=batch_size,
         max_length=max_length,
         device=target_device,
@@ -442,15 +570,14 @@ def extract_and_save_features(
             include_root_context or getattr(loaded_ckpt_model, "include_root_context", False)
         )
         edge_tok = loaded_ckpt_tok if loaded_ckpt_tok is not None else active_tok
-        pair_parents = [
-            f"{r[:220]} | {p}" if (effective_root_ctx and r and r != p) else p
-            for r, p in zip(edge_root_texts, parent_texts)
-        ]
         edge_pred = encode_edges_with_cross_encoder(
-            pair_parents,
+            parent_texts,
             reply_texts,
             cross_encoder=loaded_ckpt_model,
             tokenizer=edge_tok,
+            root_texts=edge_root_texts,
+            include_root_context=effective_root_ctx,
+            lang=lang,
             batch_size=batch_size,
             max_length=max_length,
             device=target_device,
@@ -467,12 +594,25 @@ def extract_and_save_features(
         ]
         for i in range(len(edge_ids)):
             node_root_stance[edge_target_ids[i]] = max(-1.0, min(1.0, float(s_arr[i])))
-        if deep_idx:
+        has_full_teacher_root = bool(
+            full_teacher_coverage
+            and all("root_s_uv" in cache_by_eid[eid] for eid in edge_ids)
+        )
+        # Only use Teacher root_s_uv when Teacher cache covers 100% of edges;
+        # partial caches avoid target drift between Train/Val and Test.
+        if has_full_teacher_root:
+            for idx, eid in enumerate(edge_ids):
+                node_root_stance[edge_target_ids[idx]] = max(
+                    -1.0, min(1.0, float(cache_by_eid[eid]["root_s_uv"]))
+                )
+        elif deep_idx:
             deep_pred = encode_edges_with_cross_encoder(
                 [edge_root_texts[i] for i in deep_idx],
                 [reply_texts[i] for i in deep_idx],
                 cross_encoder=loaded_ckpt_model,
                 tokenizer=edge_tok,
+                include_root_context=False,
+                lang=lang,
                 batch_size=batch_size,
                 max_length=max_length,
                 device=target_device,
@@ -480,13 +620,6 @@ def extract_and_save_features(
             for pos, i in enumerate(deep_idx):
                 node_root_stance[edge_target_ids[i]] = max(
                     -1.0, min(1.0, float(deep_pred["s_uv"][pos]))
-                )
-        # Only use Teacher root_s_uv when Teacher cache covers 100% of edges;
-        # partial caches keep uniform Student root_s_uv across Train/Val/Test to avoid target drift.
-        if full_teacher_coverage and all("root_s_uv" in cache_by_eid[eid] for eid in edge_ids):
-            for idx, eid in enumerate(edge_ids):
-                node_root_stance[edge_target_ids[idx]] = max(
-                    -1.0, min(1.0, float(cache_by_eid[eid]["root_s_uv"]))
                 )
     elif scored_cache_json is not None:
         cache_file = Path(scored_cache_json)
@@ -580,7 +713,11 @@ def extract_and_save_features(
         ]
         if stance_scorer is not None:
             nli_out = stance_scorer.score_pairs(
-                parent_texts, reply_texts, batch_size=max(1, batch_size // 2), max_length=max_length
+                parent_texts,
+                reply_texts,
+                batch_size=max(1, batch_size // 2),
+                max_length=max_length,
+                lang=lang,
             )
             root_nli_out = (
                 stance_scorer.score_pairs(
@@ -588,14 +725,19 @@ def extract_and_save_features(
                     [reply_texts[i] for i in deep_idx],
                     batch_size=max(1, batch_size // 2),
                     max_length=max_length,
+                    lang=lang,
                 )
                 if deep_idx
                 else None
             )
         else:
-            tmp_nli = NLIStanceTeacherScorer(device=target_device)
+            tmp_nli = NLIStanceTeacherScorer(lang=lang, device=target_device)
             nli_out = tmp_nli.score_pairs(
-                parent_texts, reply_texts, batch_size=max(1, batch_size // 2), max_length=max_length
+                parent_texts,
+                reply_texts,
+                batch_size=max(1, batch_size // 2),
+                max_length=max_length,
+                lang=lang,
             )
             root_nli_out = (
                 tmp_nli.score_pairs(
@@ -603,6 +745,7 @@ def extract_and_save_features(
                     [reply_texts[i] for i in deep_idx],
                     batch_size=max(1, batch_size // 2),
                     max_length=max_length,
+                    lang=lang,
                 )
                 if deep_idx
                 else None
@@ -669,6 +812,8 @@ def extract_and_save_features(
         "lang": lang,
         "edge_dim": effective_edge_dim,
         "k_horizon_metadata": int(k_horizon),
+        "node_backbone": default_backbone,
+        "node_pooling": "ancestor_span_pool" if use_ancestor_span_pool else "standalone_mean",
         "node_embeddings": node_embeddings,
         "node_id_to_idx": node_id_to_idx,
         "edge_attr": edge_attr,
@@ -686,7 +831,6 @@ def extract_and_save_features(
             payload["edge_behavior_label"] = edge_behavior_label
     if full_teacher_coverage:
         # Preserve isolated zero-shot Teacher edge scores only under 100% coverage
-        # (partial caches with --max-teacher-pairs must never emit partial maps that default missing Test edges to 0.0).
         t_stance: dict[str, float] = {}
         t_hostility: dict[str, float] = {}
         t_irrat: dict[str, float] = {}
@@ -751,6 +895,7 @@ def main() -> None:
     parser.add_argument("--edge-dim", type=int, choices=[2, 4], default=None)
     parser.add_argument("--node-backbone", type=str, default=None)
     parser.add_argument("--include-root-context", action="store_true")
+    parser.add_argument("--disable-ancestor-span-pool", action="store_true")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--k-horizon", type=int, default=20)
@@ -770,6 +915,7 @@ def main() -> None:
         edge_dim=args.edge_dim,
         node_backbone=args.node_backbone,
         include_root_context=bool(args.include_root_context),
+        use_ancestor_span_pool=not bool(args.disable_ancestor_span_pool),
         batch_size=args.batch_size,
         max_length=args.max_length,
         k_horizon=args.k_horizon,

@@ -123,7 +123,7 @@ def test_sbifagat_gate_extraction_ablation_and_upfd_latent_mlp() -> None:
     # Bottom-up ablation runs cleanly
     no_bu_model = SBiFAGAT(in_dim=770, hidden_dim=128, edge_dim=2, use_bottom_up=False)
     out_no_bu = no_bu_model(batch)
-    assert out_no_bu["graph_emb"].shape == (8, 512)
+    assert out_no_bu["graph_emb"].shape == (8, 256)
 
     # UPFD latent edge MLP mode (768-d BERT input without edge_attr)
     _, upfd_batch = _make_8_graph_batch(in_dim=768)
@@ -153,6 +153,7 @@ def test_all_four_baselines_forward_and_backward(model_cls: type) -> None:
     assert out["y_size_pred"].shape == (8,)
     assert out["y_polar_pred"].shape == (8,)
     assert out["rumor_logits"].shape == (8, 4)
+    assert out["graph_emb"].shape == (8, 256)
     assert out["node_emb"].shape == (batch.num_nodes, 128)
 
     loss = compute_multitask_loss(out, batch)

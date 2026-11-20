@@ -1,5 +1,24 @@
 # SBi-FAGAT: Changelog & Audit Modification Record
 
+## [Steps 1–3] - Unified 2D Architecture, Optimization & Leakage/Fairness Audits
+
+### Step 1 — Core GNN Upgrade (`SBi-FAGAT` & 8-Model Parity)
+- Upgraded `StanceGuidedFAConv` to dual-channel `[Signed Polarity || Unsigned Excitation]` message passing with `1/sqrt(2d)` attention scaling and Dir-GNN TD–BU cross-mixing.
+- Added `10`-D causal `struct_x` (`pyg_dataset.py`) + `TwoStreamNodeStem` (`baselines.py`, topology masking for `TextMLP`) + `64`-hop BFS root-aligned camp dipole readout and standardized `hidden_dim = 64` across all 8 neural models.
+
+### Step 2 — Unified 2D NLP Distillation & Teacher Coverage
+- Replaced LLM QLoRA teacher path with 100%-coverage bilingual teachers: `mDeBERTa-v3-base-xnli` Symmetric 2-Hypothesis Stance Verbalizer + class-weighted `ViSoBERT` (`UIT-ViHSD`) / `twitter-roberta-base-offensive`.
+- Added segment-isolated pooling (`BCEWithLogitsLoss` + $T=2.0$ KL + differential AdamW + deep `(root, reply)` pairs) in `DualHeadCrossEncoder`, switched EN node/student backbone to `cardiffnlp/twitter-roberta-base`, implemented causal **Ancestor-Conditioned SpanPool** in `extract_features.py`, extracted `src/nlp/discourse_labels.py`, and updated `GEMINI.md` & Kaggle notebooks.
+
+### Step 3 — Multi-Task Optimization, 4 Audit Fixes & Docs Sync
+- **Multi-Task Training:** Exposed `y_polar_logit` in `MultiTaskHead`; replaced sigmoid Huber with zero-minimum KL-calibrated `BCEWithLogitsLoss + SmoothL1(beta=0.08)`; added train-only target scaling & bias init, linear warmup + `ReduceLROnPlateau` + EMA (`0.985`), and validation-best seed checkpointing in `trainer.py`.
+- **Fairness & Security (`auto_loop.py`, `kaggle_parallel_runner.py`):** Centered `auto_loop` on `hidden_dim=64`, kept 8-model benchmark hyperparameters uniform (`--run-auto-loop` diagnostic opt-in only), and unconditionally stripped `*_machine_key.csv`, `*.secret`, `.env` from zip bundles.
+- **Canonical Split Lock (`pyg_dataset.py`, `run_ablation.py`):** Removed `used_disk_tables` bypass and fallback re-splitting so `topic_splits.json` is enforced uniformly across in-memory tables and `K=50` subsets.
+- **NLP Text & Pipeline Cleanups (`dual_edge_scorer.py`, `extract_features.py`, `sbi_fagat.py`):** Extended URL/whitespace normalization to `lang="vi"`, raised NLI scorer budget to `max_length=384` with reply-preserving token allocation, skipped redundant deep Student forward pass when full teacher `root_s_uv` is cached, and raised BFS camp propagation to `max_hops=64`.
+- **Evaluation & Tooling:** Attached `Early-K Persistence` to main `run_experiments.py` outputs (excluded from neural comparator ranking), added disagreement/coverage warnings & `--strict-adjudication` in `compute_kappa.py`, loosened `numpy<3.0.0`, unified `run_all.sh`, and synced `paper/main.tex`, `README.md`, and `docs/`.
+
+---
+
 ## [v2.0-rc1] - PR #1 Reconciliation, EGM Hardening & Paper Tooling
 
 ### Reconciled & Merged (`5820e71` + v2 + EGM `F1–F6`)

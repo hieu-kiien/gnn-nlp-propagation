@@ -40,6 +40,8 @@ class EarlyStopping:
         self.should_stop = False
 
     def _is_improved(self, score: float) -> bool:
+        if not math.isfinite(float(score)):
+            return False
         if self.best_score is None:
             return True
         if self.mode == "min":
@@ -60,6 +62,111 @@ class EarlyStopping:
     def restore_best(self, model: nn.Module) -> None:
         if self.best_state is not None:
             model.load_state_dict(self.best_state)
+
+
+class _ModelEMA:
+    """Exponential Moving Average tracker with step-debiasing for stable validation."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.985) -> None:
+        self.decay = float(decay)
+        self.num_updates = 0
+        self.shadow_params: dict[str, torch.Tensor] = {
+            name: p.detach().clone()
+            for name, p in model.named_parameters()
+            if p.requires_grad
+        }
+        self.buffers: dict[str, torch.Tensor] = {
+            name: b.detach().clone() for name, b in model.named_buffers()
+        }
+
+    def update(self, model: nn.Module) -> None:
+        self.num_updates += 1
+        eff_decay = min(
+            self.decay,
+            (1.0 + float(self.num_updates)) / (10.0 + float(self.num_updates)),
+        )
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if p.requires_grad and name in self.shadow_params:
+                    self.shadow_params[name].mul_(eff_decay).add_(
+                        p.detach(), alpha=1.0 - eff_decay
+                    )
+            for name, b in model.named_buffers():
+                if name in self.buffers:
+                    self.buffers[name].copy_(b.detach())
+
+    def copy_to(self, target_model: nn.Module) -> None:
+        with torch.no_grad():
+            for name, p in target_model.named_parameters():
+                if name in self.shadow_params:
+                    p.copy_(self.shadow_params[name])
+            for name, b in target_model.named_buffers():
+                if name in self.buffers:
+                    b.copy_(self.buffers[name])
+
+
+def _estimate_train_target_stats(loader: DataLoader) -> dict[str, Any]:
+    """Compute target means and inverse-std loss scales strictly from `train_loader`."""
+    size_vals: list[np.ndarray] = []
+    polar_vals: list[np.ndarray] = []
+    for batch in loader:
+        ys = getattr(batch, "y_size", None)
+        yp = getattr(batch, "y_polar", None)
+        if ys is not None:
+            size_vals.append(ys.view(-1).detach().cpu().numpy())
+        if yp is not None:
+            polar_vals.append(yp.view(-1).detach().cpu().numpy())
+
+    size_arr = np.concatenate(size_vals) if size_vals else np.array([], dtype=np.float64)
+    polar_arr = np.concatenate(polar_vals) if polar_vals else np.array([], dtype=np.float64)
+    size_arr = size_arr[np.isfinite(size_arr)] if size_arr.size > 0 else size_arr
+    polar_arr = polar_arr[np.isfinite(polar_arr)] if polar_arr.size > 0 else polar_arr
+
+    mean_size = float(np.mean(size_arr)) if size_arr.size > 0 else None
+    std_size = float(np.std(size_arr)) if size_arr.size >= 2 else 0.0
+    mean_polar = float(np.mean(polar_arr)) if polar_arr.size > 0 else None
+    std_polar = float(np.std(polar_arr)) if polar_arr.size >= 2 else 0.0
+
+    size_scale = (
+        float(np.clip(1.0 / max(std_size, 0.25), 0.5, 4.0))
+        if size_arr.size >= 2 and std_size > 1e-6
+        else 1.0
+    )
+    polar_scale = (
+        float(np.clip(1.0 / max(std_polar, 0.12), 0.5, 4.0))
+        if polar_arr.size >= 2 and std_polar > 1e-6
+        else 1.0
+    )
+    return {
+        "count": int(min(size_arr.size, polar_arr.size)) if size_vals and polar_vals else int(size_arr.size),
+        "mean_size": mean_size,
+        "std_size": std_size,
+        "mean_polar": mean_polar,
+        "std_polar": std_polar,
+        "size_loss_scale": size_scale,
+        "polar_loss_scale": polar_scale,
+    }
+
+
+def _init_multitask_head_biases(model: nn.Module, stats: Mapping[str, Any]) -> None:
+    """Initialize output biases of MultiTaskHead from train-set target means."""
+    head = getattr(model, "head", None)
+    if head is None:
+        return
+    with torch.no_grad():
+        mean_size = stats.get("mean_size")
+        if mean_size is not None and hasattr(head, "size_head") and len(head.size_head) > 0:
+            last_size = head.size_head[-1]
+            if getattr(last_size, "bias", None) is not None:
+                size_bias = math.log(math.expm1(max(0.1, float(mean_size))))
+                last_size.bias.fill_(float(size_bias))
+        mean_polar = stats.get("mean_polar")
+        if mean_polar is not None and hasattr(head, "polar_head") and len(head.polar_head) > 0:
+            last_polar = head.polar_head[-1]
+            if getattr(last_polar, "bias", None) is not None:
+                p_clamped = min(0.95, max(0.05, float(mean_polar)))
+                polar_bias = math.log(p_clamped / (1.0 - p_clamped))
+                last_polar.bias.fill_(float(polar_bias))
 
 
 def _estimate_balanced_class_weights(
@@ -95,8 +202,10 @@ def evaluate_loader(
     device: torch.device,
     *,
     alpha_size: float = 1.0,
-    alpha_polar: float = 4.0,
+    alpha_polar: float = 1.0,
     alpha_rumor: float = 1.0,
+    size_loss_scale: float = 1.0,
+    polar_loss_scale: float = 1.0,
     lambda_uncertainty: float = 0.0,
     class_weights: Tensor | None = None,
     classification_only: bool = False,
@@ -125,6 +234,8 @@ def evaluate_loader(
             alpha_size=alpha_size,
             alpha_polar=alpha_polar,
             alpha_rumor=alpha_rumor,
+            size_loss_scale=size_loss_scale,
+            polar_loss_scale=polar_loss_scale,
             lambda_uncertainty=lambda_uncertainty,
             class_weights=class_weights,
             classification_only=classification_only,
@@ -136,6 +247,8 @@ def evaluate_loader(
                 alpha_size=alpha_size,
                 alpha_polar=alpha_polar,
                 alpha_rumor=alpha_rumor,
+                size_loss_scale=size_loss_scale,
+                polar_loss_scale=polar_loss_scale,
                 lambda_uncertainty=0.0,
                 class_weights=class_weights,
                 classification_only=classification_only,
@@ -204,15 +317,19 @@ def train_and_evaluate_single_seed(
     weight_decay: float = 1e-4,
     patience: int = 10,
     alpha_size: float = 1.0,
-    alpha_polar: float = 4.0,
+    alpha_polar: float = 1.0,
     alpha_rumor: float = 1.0,
     lambda_uncertainty: float = 0.0,
     use_class_weights: bool = True,
+    use_target_scaling: bool = True,
+    use_bias_init: bool = True,
+    use_ema: bool = True,
+    ema_decay: float = 0.985,
     classification_only: bool = False,
     device: torch.device | str | None = None,
     return_predictions: bool = False,
 ) -> tuple[nn.Module, dict[str, Any]]:
-    """Train one model for a single random seed with Early Stopping and return test metrics."""
+    """Train one model for a single random seed with warmup, ReduceLROnPlateau, EMA & Early Stopping."""
     seed_everything(seed)
     target_device = (
         torch.device(device)
@@ -231,15 +348,36 @@ def train_and_evaluate_single_seed(
         if num_cls is not None:
             class_weights = _estimate_balanced_class_weights(train_loader, num_cls)
 
+    s_scale = 1.0
+    p_scale = 1.0
+    if not classification_only:
+        train_stats = _estimate_train_target_stats(train_loader)
+        if use_bias_init and train_stats["count"] > 0:
+            _init_multitask_head_biases(model, train_stats)
+        if use_target_scaling:
+            s_scale = float(train_stats["size_loss_scale"])
+            p_scale = float(train_stats["polar_loss_scale"])
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    warmup_epochs = min(5, max(1, epochs // 10)) if epochs >= 10 else 0
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        T_max=max(1, epochs),
-        eta_min=lr * 0.05,
+        mode="min",
+        factor=0.5,
+        patience=max(3, patience // 2),
+        min_lr=lr * 0.02,
     )
+    ema_active = bool(use_ema and epochs >= 10)
+    ema = _ModelEMA(model, decay=ema_decay) if ema_active else None
+    ema_eval_model = copy.deepcopy(model) if ema_active else None
     early_stopper = EarlyStopping(patience=patience, mode="min")
 
-    for _epoch in range(epochs):
+    for epoch in range(epochs):
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            warmup_lr = lr * float(epoch + 1) / float(warmup_epochs)
+            for pg in optimizer.param_groups:
+                pg["lr"] = warmup_lr
+
         model.train()
         for batch in train_loader:
             batch = batch.to(target_device)
@@ -251,6 +389,8 @@ def train_and_evaluate_single_seed(
                 alpha_size=alpha_size,
                 alpha_polar=alpha_polar,
                 alpha_rumor=alpha_rumor,
+                size_loss_scale=s_scale,
+                polar_loss_scale=p_scale,
                 lambda_uncertainty=lambda_uncertainty,
                 class_weights=class_weights,
                 classification_only=classification_only,
@@ -258,22 +398,50 @@ def train_and_evaluate_single_seed(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
+            if ema is not None:
+                ema.update(model)
 
-        if len(train_loader) > 0:
-            scheduler.step()
-
-        val_metrics = evaluate_loader(
+        raw_val_metrics = evaluate_loader(
             model,
             val_loader,
             target_device,
             alpha_size=alpha_size,
             alpha_polar=alpha_polar,
             alpha_rumor=alpha_rumor,
+            size_loss_scale=s_scale,
+            polar_loss_scale=p_scale,
             lambda_uncertainty=lambda_uncertainty,
             class_weights=class_weights,
             classification_only=classification_only,
         )
-        if early_stopper.step(val_metrics.get("task_loss", val_metrics["loss"]), model):
+        raw_val_score = float(raw_val_metrics.get("task_loss", raw_val_metrics["loss"]))
+        chosen_model = model
+        chosen_score = raw_val_score
+
+        if ema is not None and ema_eval_model is not None:
+            ema.copy_to(ema_eval_model)
+            ema_val_metrics = evaluate_loader(
+                ema_eval_model,
+                val_loader,
+                target_device,
+                alpha_size=alpha_size,
+                alpha_polar=alpha_polar,
+                alpha_rumor=alpha_rumor,
+                size_loss_scale=s_scale,
+                polar_loss_scale=p_scale,
+                lambda_uncertainty=lambda_uncertainty,
+                class_weights=class_weights,
+                classification_only=classification_only,
+            )
+            ema_val_score = float(ema_val_metrics.get("task_loss", ema_val_metrics["loss"]))
+            if math.isfinite(ema_val_score) and ema_val_score <= raw_val_score:
+                chosen_model = ema_eval_model
+                chosen_score = ema_val_score
+
+        if epoch >= warmup_epochs and math.isfinite(chosen_score):
+            scheduler.step(chosen_score)
+
+        if early_stopper.step(chosen_score, chosen_model):
             break
 
     early_stopper.restore_best(model)
@@ -284,10 +452,17 @@ def train_and_evaluate_single_seed(
         alpha_size=alpha_size,
         alpha_polar=alpha_polar,
         alpha_rumor=alpha_rumor,
+        size_loss_scale=s_scale,
+        polar_loss_scale=p_scale,
         lambda_uncertainty=lambda_uncertainty,
         class_weights=class_weights,
         classification_only=classification_only,
         return_predictions=return_predictions,
+    )
+    test_metrics["val_task_loss"] = (
+        float(early_stopper.best_score)
+        if early_stopper.best_score is not None
+        else float("nan")
     )
     return model, test_metrics
 
@@ -382,13 +557,22 @@ def holm_bonferroni_adjust(p_values: Mapping[str, float]) -> dict[str, float]:
     return adjusted
 
 
+_NON_LEARNED_BASELINES: frozenset[str] = frozenset({"Early-K Persistence"})
+
+
 def select_best_comparator(
     summary_stats: Mapping[str, Mapping[str, tuple[float, float]]],
     *,
     reference_model: str = "SBiFAGAT",
 ) -> str:
-    """Choose the strongest competing baseline by average rank across non-NaN metrics."""
-    candidates = [m for m in summary_stats.keys() if m != reference_model]
+    """Choose the strongest competing learned baseline by average rank across non-NaN metrics."""
+    candidates = [
+        m
+        for m in summary_stats.keys()
+        if m != reference_model and m not in _NON_LEARNED_BASELINES
+    ]
+    if not candidates:
+        candidates = [m for m in summary_stats.keys() if m != reference_model]
     if not candidates:
         return "BiGCN"
 
@@ -632,7 +816,7 @@ def run_multi_seed_benchmark(
     weight_decay: float = 1e-4,
     patience: int = 10,
     alpha_size: float = 1.0,
-    alpha_polar: float = 4.0,
+    alpha_polar: float = 1.0,
     alpha_rumor: float = 1.0,
     lambda_uncertainty: float = 0.0,
     use_class_weights: bool = True,
@@ -646,7 +830,9 @@ def run_multi_seed_benchmark(
     """Run all models over the official 5 random seeds and compute paired t-tests & bootstrap p-values."""
     raw_results: dict[str, list[dict[str, float]]] = {}
     summary_stats: dict[str, dict[str, tuple[float, float]]] = {}
-    trained_last_models: dict[str, nn.Module] = {}
+    best_val_models: dict[str, nn.Module] = {}
+    best_val_scores: dict[str, float] = {}
+    best_seed_by_model: dict[str, int] = {}
     model_predictions: dict[str, list[dict[str, Any]]] = {}
 
     metric_keys = (
@@ -694,7 +880,16 @@ def run_multi_seed_benchmark(
             if preds_blob is not None:
                 pred_runs.append(preds_blob)
             seed_runs.append(test_metrics)
-            trained_last_models[model_name] = model
+
+            val_score = float(test_metrics.get("val_task_loss", float("nan")))
+            prev_best = best_val_scores.get(model_name, float("inf"))
+            if model_name not in best_val_models or (
+                math.isfinite(val_score) and val_score < prev_best
+            ):
+                best_val_models[model_name] = model
+                if math.isfinite(val_score):
+                    best_val_scores[model_name] = val_score
+                best_seed_by_model[model_name] = int(seed)
 
         raw_results[model_name] = seed_runs
         model_predictions[model_name] = pred_runs
@@ -772,5 +967,6 @@ def run_multi_seed_benchmark(
         "adjusted_bootstrap_p_values": adjusted_bootstrap_p_values,
         "reference_model": reference_model,
         "comparator_model": effective_comparator,
-        "models": trained_last_models,
+        "best_seed_by_model": best_seed_by_model,
+        "models": best_val_models,
     }

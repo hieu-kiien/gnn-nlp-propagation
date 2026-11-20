@@ -347,10 +347,10 @@ def test_construct_validity_loo_seed_and_salted_hash(monkeypatch: pytest.MonkeyP
 
 
 def test_temporal_mlp_conv_init_auc_bootstrap_and_holm_bonferroni() -> None:
-    # 1. Edge attention weights initialized to 1/sqrt(edge_dim)
+    # 1. 2D edge attention weights initialized with opposing hostility sign (+0.6 stance, -0.4 hostility)
     conv = StanceGuidedFAConv(hidden_dim=32, edge_dim=2)
     edge_slice = conv.att[0, 64:].detach()
-    assert torch.allclose(edge_slice, torch.full((2,), 1.0 / math.sqrt(2.0)), atol=1e-5)
+    assert torch.allclose(edge_slice, torch.tensor([0.6, -0.4], dtype=edge_slice.dtype), atol=1e-5)
 
     # 2. TemporalStanceMLP forward/backward including zero-edge cascade
     torch.manual_seed(0)

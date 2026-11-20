@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
 from torch_geometric.loader import DataLoader
 
+from scripts.export_dataset_stats import compute_early_k_persistence_metrics
 from src.data.pyg_dataset import (
     DEFAULT_FORECAST_MIN_REPLIES,
     EarlyCascadeDataset,
@@ -57,6 +58,18 @@ def _resolve_output_paths(
     jsn = output_json or Path(f"paper/results_main{suffix}.json")
     figs = figures_dir or (Path("paper/figures") / ds_name if ds_name else Path("paper/figures"))
     return tbl, jsn, figs
+
+
+def _resolve_main_table_label(data_dir: Path, eval_protocol: str, out_table: Path) -> str:
+    ds_tag = data_dir.name.lower() if data_dir.name.lower() in {"pheme", "vn"} else ""
+    if not ds_tag:
+        stem = out_table.stem.lower()
+        if "pheme" in stem:
+            ds_tag = "pheme"
+        elif "vn" in stem:
+            ds_tag = "vn"
+    prefix = "loo" if str(eval_protocol).lower() == "loo" else "main"
+    return f"tab:{prefix}_{ds_tag}" if ds_tag else f"tab:{prefix}_results"
 
 
 def _build_loaders(
@@ -170,11 +183,56 @@ def _infer_edge_dim(data_dir: Path, nlp_features: dict[str, Any] | None = None) 
     return 2
 
 
+def _build_persistence_summary_row(
+    metrics: dict[str, float] | dict[str, tuple[float, float]],
+) -> dict[str, tuple[float, float]]:
+    """Convert single-split or aggregated Early-K Persistence dict into summary_stats format."""
+    reg_keys = (
+        "msle",
+        "mae",
+        "rmse_size",
+        "r2_size",
+        "spearman_size",
+        "rmse",
+        "mae_polar",
+        "r2_polar",
+        "pearson_r",
+        "spearman_polar",
+    )
+    all_keys = reg_keys + ("macro_f1", "accuracy", "auc_roc", "loss", "task_loss")
+    row: dict[str, tuple[float, float]] = {}
+    for k in all_keys:
+        if k in reg_keys and k in metrics:
+            val = metrics[k]
+            if isinstance(val, tuple):
+                row[k] = (float(val[0]), float(val[1]))
+            else:
+                v = float(val)
+                row[k] = (v, 0.0 if not np.isnan(v) else float("nan"))
+        else:
+            row[k] = (float("nan"), float("nan"))
+    return row
+
+
+def attach_early_k_persistence_to_result(
+    result: dict[str, Any],
+    test_cascades: Sequence[Any],
+) -> dict[str, Any]:
+    """Attach the non-learned Early-K Persistence baseline row onto a benchmark result."""
+    persist_m = compute_early_k_persistence_metrics(list(test_cascades))
+    result["early_k_persistence"] = persist_m
+    result["summary_stats"] = {
+        "Early-K Persistence": _build_persistence_summary_row(persist_m),
+        **result["summary_stats"],
+    }
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run 5-seed benchmark for SBi-FAGAT and baselines.")
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--k-horizon", type=int, default=20)
-    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--edge-dim", type=int, choices=[2, 4], default=None)
     parser.add_argument("--eps", type=float, default=0.5)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -312,6 +370,7 @@ def main() -> None:
             primary_hypothesis_keys=active_keys,
             device=device,
         )
+        attach_early_k_persistence_to_result(result, list(test_ds))
     else:
         nodes_tbl, edges_tbl = load_cascade_parquet(args.data_dir, validate=True)
         nlp_feats = torch.load(
@@ -336,6 +395,7 @@ def main() -> None:
         active_metrics = MAIN_METRICS if has_rumor_labels else VN_MAIN_METRICS
         active_keys = [k for k, _, _ in active_metrics]
         fold_raw: dict[str, list[dict[str, float]]] = {m: [] for m in model_factories}
+        persist_folds: list[dict[str, Any]] = []
         last_bundle: dict[str, Any] = {}
         for fold in folds:
             t_ds, tr_l, va_l, te_l = _build_loaders(
@@ -351,6 +411,7 @@ def main() -> None:
                 edges_table=edges_tbl,
                 nlp_features=nlp_feats,
             )
+            persist_folds.append(compute_early_k_persistence_metrics(list(t_ds)))
             fold_res = run_multi_seed_benchmark(
                 model_factories,
                 tr_l,
@@ -384,6 +445,32 @@ def main() -> None:
                     else (float("nan"), float("nan"))
                 )
             summary_stats[m_name] = agg
+
+        persist_agg: dict[str, tuple[float, float]] = {}
+        for pk in (
+            "msle",
+            "mae",
+            "rmse_size",
+            "r2_size",
+            "spearman_size",
+            "rmse",
+            "mae_polar",
+            "r2_polar",
+            "pearson_r",
+            "spearman_polar",
+        ):
+            parr = np.asarray([float(pf.get(pk, float("nan"))) for pf in persist_folds], dtype=np.float64)
+            parr = parr[~np.isnan(parr)]
+            persist_agg[pk] = (
+                (float(np.mean(parr)), float(np.std(parr, ddof=1)) if parr.size >= 2 else 0.0)
+                if parr.size > 0
+                else (float("nan"), float("nan"))
+            )
+        summary_stats = {
+            "Early-K Persistence": _build_persistence_summary_row(persist_agg),
+            **summary_stats,
+        }
+
         cmp_name = (
             select_best_comparator(summary_stats, reference_model="SBiFAGAT")
             if args.comparator_model == "auto"
@@ -411,6 +498,10 @@ def main() -> None:
             "seeds": list(OFFICIAL_SEEDS),
             "raw_results": fold_raw,
             "summary_stats": summary_stats,
+            "early_k_persistence": {
+                k: [None if np.isnan(v[0]) else v[0], None if np.isnan(v[1]) else v[1]]
+                for k, v in persist_agg.items()
+            },
             "p_values": p_vals,
             "adjusted_p_values": {k: adj_p_scoped.get(k, float("nan")) for k in metric_keys},
             "bootstrap_p_values": boot_p_vals,
@@ -426,6 +517,7 @@ def main() -> None:
     print(build_markdown_table(result, active_metrics))
 
     cmp_caption = str(result.get("comparator_model") or "BiGCN").replace("_", "\\_")
+    table_label = _resolve_main_table_label(args.data_dir, args.eval_protocol, out_table)
     export_latex_table(
         result,
         out_table,
@@ -434,7 +526,7 @@ def main() -> None:
             f"({args.eval_protocol.upper()}, Mean $\\pm$ Std). Stars indicate significance "
             f"vs. {cmp_caption} ($^{{*}}p<0.05$, $^{{**}}p<0.01$)."
         ),
-        label="tab:main_results",
+        label=table_label,
         metrics=active_metrics,
     )
     serialize_benchmark_json(
@@ -447,6 +539,7 @@ def main() -> None:
             "min_total_replies": args.min_total_replies,
             "label_scheme": args.label_scheme,
             "use_cascade_stats": use_stats,
+            "early_k_persistence": result.get("early_k_persistence"),
         },
     )
 

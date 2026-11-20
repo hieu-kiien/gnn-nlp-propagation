@@ -34,6 +34,7 @@ from transformers import AutoModel
 from src.data.arctic_shift_vn import (
     ARCTIC_SHIFT_API_BASE,
     build_vn_cascade_from_thread,
+    hash_author_sha256,
 )
 from src.data.pyg_dataset import (
     CASCADE_STATS_DIM,
@@ -42,21 +43,26 @@ from src.data.pyg_dataset import (
     TOTAL_NODE_FEATURE_DIM,
     _compute_full_tree_polarization,
     _compute_root_aligned_stances,
+    compute_causal_structural_node_features,
     compute_early_cascade_burst_stats,
 )
 from src.models.sbi_fagat import SBiFAGAT
-from src.nlp.dual_edge_scorer import (
-    DualHeadCrossEncoder,
-    ROBERTA_BASE_MODEL_NAME,
-    STANCE_LABELS,
-    VISOBERT_MODEL_NAME,
-    load_tokenizer_safe,
-)
-from src.nlp.extract_features import compute_masked_mean_pooling
-from src.nlp.qwen_teacher import (
+from src.nlp.discourse_labels import (
     BEHAVIOR_LABEL_VI,
     DISCOURSE_BEHAVIOR_LABELS,
     _heuristic_behavior_fallback,
+)
+from src.nlp.dual_edge_scorer import (
+    DualHeadCrossEncoder,
+    STANCE_LABELS,
+    TWITTER_ROBERTA_MODEL_NAME,
+    VISOBERT_MODEL_NAME,
+    load_tokenizer_safe,
+)
+from src.nlp.extract_features import (
+    compute_masked_mean_pooling,
+    encode_edges_with_cross_encoder,
+    encode_node_embeddings,
 )
 
 _REDDIT_POST_ID_RE = re.compile(r"/comments/([A-Za-z0-9_]+)")
@@ -113,7 +119,7 @@ def _make_demo_offline_thread() -> tuple[dict[str, Any], list[dict[str, Any]]]:
             "text": body,
             "created_utc": base_ts + dt,
             "author": f"user_{idx}",
-            "author_hash": hashlib.sha256(f"user_{idx}".encode("utf-8")).hexdigest(),
+            "author_hash": hash_author_sha256(f"user_{idx}"),
         }
         for idx, (cid, pid, dt, body) in enumerate(sample_comments, start=1)
     ]
@@ -155,6 +161,7 @@ def _fetch_reddit_thread(post_id: str, timeout: int = 20) -> tuple[dict[str, Any
             comments = []
             for c in raw_comments:
                 cid = str(c.get("id") or "").removeprefix("t1_")
+                raw_author = c.get("author")
                 comments.append(
                     {
                         "fullname": f"t1_{cid}",
@@ -164,8 +171,10 @@ def _fetch_reddit_thread(post_id: str, timeout: int = 20) -> tuple[dict[str, Any
                         "body": str(c.get("body") or c.get("text") or ""),
                         "text": str(c.get("body") or c.get("text") or ""),
                         "created_utc": c.get("created_utc"),
-                        "author": c.get("author"),
-                        "author_hash": hashlib.sha256(str(c.get("author") or cid).encode("utf-8")).hexdigest(),
+                        "author": raw_author,
+                        "author_hash": hash_author_sha256(
+                            str(raw_author) if raw_author is not None else None
+                        ),
                     }
                 )
             return post, comments
@@ -187,6 +196,7 @@ def _fetch_reddit_thread(post_id: str, timeout: int = 20) -> tuple[dict[str, Any
                 continue
             d = child.get("data", {})
             cid = str(d.get("id") or "")
+            raw_author = d.get("author")
             flat_comments.append(
                 {
                     "fullname": f"t1_{cid}",
@@ -196,8 +206,10 @@ def _fetch_reddit_thread(post_id: str, timeout: int = 20) -> tuple[dict[str, Any
                     "body": str(d.get("body") or ""),
                     "text": str(d.get("body") or ""),
                     "created_utc": d.get("created_utc"),
-                    "author": d.get("author"),
-                    "author_hash": hashlib.sha256(str(d.get("author") or cid).encode("utf-8")).hexdigest(),
+                    "author": raw_author,
+                    "author_hash": hash_author_sha256(
+                        str(raw_author) if raw_author is not None else None
+                    ),
                 }
             )
             replies = d.get("replies")
@@ -222,6 +234,7 @@ def _load_thread_from_json(path: Path) -> tuple[dict[str, Any], list[dict[str, A
                     continue
                 d = ch.get("data", {})
                 cid = str(d.get("id") or "")
+                raw_author = d.get("author")
                 flat.append(
                     {
                         "fullname": f"t1_{cid}",
@@ -230,7 +243,10 @@ def _load_thread_from_json(path: Path) -> tuple[dict[str, Any], list[dict[str, A
                         "parent_id": str(d.get("parent_id") or f"t3_{post_id}"),
                         "text": str(d.get("body") or ""),
                         "created_utc": d.get("created_utc"),
-                        "author_hash": hashlib.sha256(str(d.get("author") or cid).encode("utf-8")).hexdigest(),
+                        "author": raw_author,
+                        "author_hash": hash_author_sha256(
+                            str(raw_author) if raw_author is not None else None
+                        ),
                     }
                 )
                 rep = d.get("replies")
@@ -257,6 +273,8 @@ def _load_thread_from_json(path: Path) -> tuple[dict[str, Any], list[dict[str, A
             pid = str(c.get("parent_id") or f"t3_{post_id}")
             if not pid.startswith(("t3_", "t1_")):
                 pid = f"t3_{post_id}" if pid == post_id else f"t1_{pid}"
+            raw_author = c["author"] if "author" in c else f"u_{idx}"
+            author_str = str(raw_author) if raw_author is not None else None
             comments.append(
                 {
                     "fullname": f"t1_{cid.removeprefix('t1_')}",
@@ -265,8 +283,8 @@ def _load_thread_from_json(path: Path) -> tuple[dict[str, Any], list[dict[str, A
                     "parent_id": pid,
                     "text": str(c.get("text") or c.get("body") or ""),
                     "created_utc": float(c.get("created_utc") or (base_ts + idx * 45.0)),
-                    "author": str(c.get("author") or f"u_{idx}"),
-                    "author_hash": hashlib.sha256(str(c.get("author") or cid).encode("utf-8")).hexdigest(),
+                    "author": author_str,
+                    "author_hash": hash_author_sha256(author_str),
                 }
             )
         return post, comments
@@ -349,9 +367,9 @@ def predict_live_cascade(
     if cross_encoder_ckpt is not None and Path(cross_encoder_ckpt).exists():
         ce_model, ce_tok = DualHeadCrossEncoder.load_checkpoint(Path(cross_encoder_ckpt), map_location="cpu")
         ce_model.eval()
-        # Use frozen pre-trained backbone + masked mean pooling matching extract_features.py
+        # Use frozen pre-trained backbone + SpanPool matching extract_features.py
         backbone_id = node_backbone or (
-            VISOBERT_MODEL_NAME if lang == "vi" else ROBERTA_BASE_MODEL_NAME
+            VISOBERT_MODEL_NAME if lang == "vi" else TWITTER_ROBERTA_MODEL_NAME
         )
         try:
             frozen_node_encoder = AutoModel.from_pretrained(backbone_id)
@@ -366,55 +384,83 @@ def predict_live_cascade(
     use_root_ctx = bool(getattr(ce_model, "include_root_context", False)) if ce_model is not None else False
     root_text_str = str(root_row["text"])
     edge_scores: dict[str, dict[str, Any]] = {}
-    for e in edge_records:
-        eid = str(e["edge_id"])
-        p_txt = str(node_by_id[str(e["source_id"])]["text"])
-        r_txt = str(node_by_id[str(e["target_id"])]["text"])
-        if ce_model is not None and ce_tok is not None:
-            pair_u = f"{root_text_str[:220]} | {p_txt}" if (use_root_ctx and root_text_str and root_text_str != p_txt) else p_txt
-            enc = ce_tok([pair_u], [r_txt], padding=True, truncation=True, max_length=256, return_tensors="pt")
-            with torch.no_grad():
-                out = ce_model(
-                    enc["input_ids"],
-                    enc["attention_mask"],
-                    token_type_ids=enc.get("token_type_ids"),
-                )
-            s_v = float(out["s_uv"][0].item())
-            h_v = float(out["h_uv"][0].item())
-            r_v = float(out["r_uv"][0].item()) if "r_uv" in out else 0.10
-            c_v = float(out["c_uv"][0].item()) if "c_uv" in out else 0.50
-            if "behavior_probs" in out:
-                blbl = DISCOURSE_BEHAVIOR_LABELS[int(out["behavior_probs"][0].argmax().item())]
+    all_edge_ids = [str(e["edge_id"]) for e in edge_records]
+    all_parent_texts = [str(node_by_id[str(e["source_id"])]["text"]) for e in edge_records]
+    all_reply_texts = [str(node_by_id[str(e["target_id"])]["text"]) for e in edge_records]
+
+    if all_edge_ids and ce_model is not None and ce_tok is not None:
+        ce_out = encode_edges_with_cross_encoder(
+            all_parent_texts,
+            all_reply_texts,
+            cross_encoder=ce_model,
+            tokenizer=ce_tok,
+            root_texts=[root_text_str] * len(edge_records),
+            include_root_context=use_root_ctx,
+            lang=lang,
+            batch_size=32,
+            device=torch.device("cpu"),
+        )
+        for pos, eid in enumerate(all_edge_ids):
+            s_v = float(ce_out["s_uv"][pos])
+            h_v = float(ce_out["h_uv"][pos])
+            r_v = float(ce_out["r_uv"][pos]) if "r_uv" in ce_out else 0.10
+            c_v = float(ce_out["c_uv"][pos]) if "c_uv" in ce_out else 0.50
+            if "behavior_label" in ce_out:
+                blbl = str(ce_out["behavior_label"][pos])
             else:
                 blbl = "support" if s_v > 0.1 else ("hostile_conflict" if h_v > 0.6 else ("constructive_oppose" if s_v < -0.1 else "neutral"))
-        else:
+            edge_scores[eid] = {"s_uv": s_v, "h_uv": h_v, "r_uv": r_v, "c_uv": c_v, "behavior_label": blbl}
+    else:
+        for eid, r_txt in zip(all_edge_ids, all_reply_texts):
             heur = _heuristic_behavior_fallback(r_txt)
-            s_v = float(heur["s_uv"])
-            h_v = float(heur["h_uv"])
-            r_v = float(heur["r_uv"])
-            c_v = float(heur["c_uv"])
-            blbl = str(heur["label"])
-        edge_scores[eid] = {"s_uv": s_v, "h_uv": h_v, "r_uv": r_v, "c_uv": c_v, "behavior_label": blbl}
+            edge_scores[eid] = {
+                "s_uv": float(heur["s_uv"]),
+                "h_uv": float(heur["h_uv"]),
+                "r_uv": float(heur["r_uv"]),
+                "c_uv": float(heur["c_uv"]),
+                "behavior_label": str(heur["label"]),
+            }
 
     # Build early PyG CascadeData restricted strictly to V_K
     delays_k = [max(0.0, (n["created_at_utc"] - root_ts).total_seconds()) for n in kept_nodes]
     denom_t = math.log1p(TEMPORAL_REF_SECONDS)
     x_rows = []
-    for n, dt_sec in zip(kept_nodes, delays_k):
-        nid = str(n["node_id"])
-        if frozen_node_encoder is not None and frozen_node_tok is not None:
-            enc_n = frozen_node_tok([str(n["text"])], padding=True, truncation=True, max_length=256, return_tensors="pt")
-            with torch.no_grad():
-                node_out = frozen_node_encoder(
-                    input_ids=enc_n["input_ids"],
-                    attention_mask=enc_n["attention_mask"],
-                )
-                emb_768 = compute_masked_mean_pooling(node_out.last_hidden_state, enc_n["attention_mask"]).squeeze(0)
-        else:
+    if frozen_node_encoder is not None and frozen_node_tok is not None:
+        kept_texts = [str(n["text"]) for n in kept_nodes]
+        kept_parents = [
+            None
+            if (bool(n["is_root"]) or n.get("parent_id") is None)
+            else str(node_by_id.get(str(n["parent_id"]), {}).get("text", ""))
+            for n in kept_nodes
+        ]
+        kept_roots = [
+            None
+            if (bool(n["is_root"]) or n.get("parent_id") is None)
+            else root_text_str
+            for n in kept_nodes
+        ]
+        emb_mat = encode_node_embeddings(
+            kept_texts,
+            encoder=frozen_node_encoder,
+            tokenizer=frozen_node_tok,
+            parent_texts=kept_parents,
+            root_texts=kept_roots,
+            lang=lang,
+            batch_size=32,
+            device=torch.device("cpu"),
+        )
+        for idx_n, (n, dt_sec) in enumerate(zip(kept_nodes, delays_k)):
+            nid = str(n["node_id"])
+            t_norm = min(1.0, math.log1p(dt_sec) / denom_t)
+            d_norm = min(1.0, float(depth_map.get(nid, 0)) / float(max(1, k_horizon)))
+            x_rows.append(torch.cat([emb_mat[idx_n].cpu(), torch.tensor([t_norm, d_norm], dtype=torch.float32)], dim=0))
+    else:
+        for n, dt_sec in zip(kept_nodes, delays_k):
+            nid = str(n["node_id"])
             emb_768 = _deterministic_text_projection(str(n["text"]), 768)
-        t_norm = min(1.0, math.log1p(dt_sec) / denom_t)
-        d_norm = min(1.0, float(depth_map.get(nid, 0)) / float(max(1, k_horizon)))
-        x_rows.append(torch.cat([emb_768.cpu(), torch.tensor([t_norm, d_norm], dtype=torch.float32)], dim=0))
+            t_norm = min(1.0, math.log1p(dt_sec) / denom_t)
+            d_norm = min(1.0, float(depth_map.get(nid, 0)) / float(max(1, k_horizon)))
+            x_rows.append(torch.cat([emb_768.cpu(), torch.tensor([t_norm, d_norm], dtype=torch.float32)], dim=0))
     x = torch.stack(x_rows, dim=0)
 
     td_src, td_dst = [], []
@@ -446,6 +492,12 @@ def predict_live_cascade(
     edge_index_td = torch.tensor([td_src, td_dst], dtype=torch.long) if td_src else torch.empty((2, 0), dtype=torch.long)
     edge_index_bu = edge_index_td[[1, 0], :] if edge_index_td.numel() > 0 else edge_index_td
     edge_attr = torch.tensor(edge_attr_rows, dtype=torch.float32) if edge_attr_rows else torch.empty((0, 4), dtype=torch.float32)
+    struct_x = compute_causal_structural_node_features(
+        kept_nodes=kept_nodes,
+        delays_k=delays_k,
+        depth_map=depth_map,
+        k_horizon=k_horizon,
+    )
     cascade_stats = compute_early_cascade_burst_stats(
         kept_nodes=kept_nodes,
         delays_k=delays_k,
@@ -456,6 +508,7 @@ def predict_live_cascade(
 
     data = CascadeData(
         x=x,
+        struct_x=struct_x,
         edge_index=edge_index_td,
         edge_index_td=edge_index_td,
         edge_index_bu=edge_index_bu,
@@ -478,15 +531,16 @@ def predict_live_cascade(
         if not isinstance(payload, Mapping) or "model_state_dict" not in payload:
             raise ValueError(f"Checkpoint GNN tại '{gnn_path}' thiếu trường 'model_state_dict'.")
         cfg = payload.get("config", {})
+        target_edge_dim = int(cfg.get("edge_dim", 2))
         gnn_model = SBiFAGAT(
             in_dim=int(payload.get("in_dim", TOTAL_NODE_FEATURE_DIM)),
-            hidden_dim=int(cfg.get("hidden_dim", 256)),
-            edge_dim=int(cfg.get("edge_dim", 4)),
+            hidden_dim=int(cfg.get("hidden_dim", 64)),
+            edge_dim=target_edge_dim,
             num_rumor_classes=int(payload.get("num_rumor_classes", 4)),
             eps=float(cfg.get("eps", 0.5)),
             dropout=float(cfg.get("dropout", 0.1)),
             use_cascade_stats=bool(cfg.get("use_cascade_stats", True)),
-            predict_uncertainty=bool(cfg.get("predict_uncertainty", True)),
+            predict_uncertainty=bool(cfg.get("predict_uncertainty", False)),
         )
         gnn_model.load_state_dict(payload["model_state_dict"])
         checkpoint_loaded = True
@@ -499,14 +553,20 @@ def predict_live_cascade(
                 "hãy cung cấp đường dẫn checkpoint hợp lệ qua --gnn-ckpt, hoặc truyền cờ --allow-untrained "
                 "(hoặc dùng --demo-offline) nếu bạn chỉ muốn chạy thử nghiệm kiểm tra cấu trúc pipeline."
             )
+        target_edge_dim = int(ce_model.edge_dim) if ce_model is not None else 2
         gnn_model = SBiFAGAT(
             in_dim=TOTAL_NODE_FEATURE_DIM,
-            hidden_dim=128,
-            edge_dim=4,
+            hidden_dim=64,
+            edge_dim=target_edge_dim,
             use_cascade_stats=True,
-            predict_uncertainty=True,
+            predict_uncertainty=False,
         )
         checkpoint_loaded = False
+
+    if data.edge_attr.numel() > 0:
+        data.edge_attr = data.edge_attr[:, :target_edge_dim]
+    else:
+        data.edge_attr = torch.empty((0, target_edge_dim), dtype=torch.float32)
 
     diag = gnn_model.predict_with_diagnostics(data, top_k_edges=5)
 

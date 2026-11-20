@@ -165,10 +165,26 @@ def test_extract_features_uses_independent_node_encoder_not_student(tmp_path: Pa
 
     torch.manual_seed(99)
     frozen_node_encoder = RobertaModel(cfg, add_pooling_layer=False)
+    node_parents = [None if bool(r.get("is_root")) else n_rows[0]["text"] for r in n_rows]
+    node_roots = [None if bool(r.get("is_root")) else n_rows[0]["text"] for r in n_rows]
     expected_emb = encode_node_embeddings(
         [r["text"] for r in n_rows],
         encoder=frozen_node_encoder,
         tokenizer=tok,
+        parent_texts=node_parents,
+        root_texts=node_roots,
+        lang="en",
+        batch_size=8,
+        max_length=32,
+        device=torch.device("cpu"),
+    )
+    student_emb = encode_node_embeddings(
+        [r["text"] for r in n_rows],
+        encoder=student_enc,
+        tokenizer=tok,
+        parent_texts=node_parents,
+        root_texts=node_roots,
+        lang="en",
         batch_size=8,
         max_length=32,
         device=torch.device("cpu"),
@@ -182,11 +198,14 @@ def test_extract_features_uses_independent_node_encoder_not_student(tmp_path: Pa
         node_encoder=frozen_node_encoder,
         tokenizer=tok,
         batch_size=8,
+        max_length=32,
         k_horizon=20,
     )
     payload = torch.load(pt_path, map_location="cpu", weights_only=False)
     assert "node_features_770" not in payload
+    assert payload["node_pooling"] == "ancestor_span_pool"
     assert torch.allclose(payload["node_embeddings"], expected_emb, atol=1e-5)
+    assert not torch.allclose(payload["node_embeddings"], student_emb)
 
 
 def test_distillation_inductive_topic_split_zero_test_overlap() -> None:

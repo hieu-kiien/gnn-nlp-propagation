@@ -17,55 +17,51 @@ Hãy tưởng tượng lúc 8 giờ sáng, một người đăng một bài gây
 
 ## 2. Giải nghĩa từng ký hiệu & thành phần trong mô hình
 
-Đừng lo ký hiệu toán học! Mỗi ký hiệu chỉ tương ứng với một ý nghĩa rất cụ thể:
-
-| Ký hiệu | Tên gọi trong bài báo | Hiểu nôm na bằng đời thường | Nằm ở file nào? |
+| Ký hiệu | Tên gọi trong code / bài báo | Hiểu nôm na bằng đời thường | Nằm ở file nào? |
 | :--- | :--- | :--- | :--- |
 | $K = 20$ | Early Horizon Window | "Cửa sổ sớm": AI **chỉ được nhìn** bài gốc + tối đa 20 bình luận đến sớm nhất theo giờ UTC. Bình luận thứ 21 trở đi bị khóa kín để tính đáp án, **cấm rò rỉ**. | `src/data/pyg_dataset.py` |
-| $h_i^{(0)}$ | Node Features (770 chiều) | Bộ não NLP (`ViSoBERT` tiếng Việt / `RoBERTa` tiếng Anh) đọc nội dung bình luận $i$ thành 768 con số, ghép thêm **thời gian đến trễ** ($t_{\text{norm}}$) và **độ sâu tầng cây** ($d_{\text{norm}}$). | `src/nlp/extract_features.py` |
-| $\mathbf{a}_{uv} = [s, h, r, c]^\top$ | Behavioral Edge Vector (4D / 2D) | Đọc `(bài gốc, cha u, con v)`: $s_{uv} \in [-1, 1]$ (lập trường), $h_{uv} \in [0, 1]$ (gay gắt), $r_{uv} \in [0, 1]$ (vô lý/ngụy biện), $c_{uv} \in [0, 1]$ (lập luận xây dựng). | `qwen_teacher.py` $\to$ `dual_edge_scorer.py` |
-| **TD / BU** | Top-Down & Bottom-Up | Hai luồng truyền tin: **TD** (từ bài gốc truyền xuống nhánh con) và **BU** (từ các cãi vã ở lá dội ngược lên bài gốc). | `src/models/sbi_fagat.py` |
-| $\gamma_{uv} \in (-1, +1)$ | Signed Frequency Gate | **Trái tim của SBi-FAGAT v2**: Chiếc van thông minh tiền chuẩn hóa (`LayerNorm`) trên từng cạnh! Đồng thuận có lý lẽ $\to \gamma_{uv} > 0$; phản bác / công kích $\to \gamma_{uv} < 0$ đẩy hai phe tách xa nhờ hàm kích hoạt **lẻ đối xứng dấu** $x + 0.2\tanh(x)$. | `StanceGuidedFAConv` trong `src/models/sbi_fagat.py` |
-| $y_{\text{polar}} \in [0, 1]$ | Polarization Target | Mức độ chia rẽ hai phe ở toàn cây cuối kỳ (kết hợp phương sai lập trường $\sigma_s^2$ và độ cân bằng 2 phe $4 p_+ p_-$). | `_compute_full_tree_polarization` |
-| $BC \in [0, 1]$ | Sarle's Bimodality Coefficient | Chỉ số thống kê độc lập ($BC > 0.555$) kiểm tra xem cộng đồng thực sự tách thành **2 đỉnh (Ủng hộ vs Phản đối)** hay chỉ là nhiễu 1 đỉnh. | `compute_bimodality_coefficient` |
+| **SpanPool** (`770` + `10`) | Ancestor-Conditioned Node & `struct_x` | Đọc `[root | parent | reply]` qua encoder đóng băng (`uitnlp/visobert` / `cardiffnlp/twitter-roberta-base`) và chỉ lấy vector ở phần `reply` để hiểu câu ngắn kiểu *"Đúng rồi!"*, ghép thêm 10 chỉ số cấu trúc–thời gian nhân quả `struct_x`. | `src/nlp/extract_features.py` & `TwoStreamNodeStem` |
+| $\mathbf{a}_{uv} = [s_{uv}, h_{uv}]^\top$ | 2D Stance–Hostility Edge Vector | Mô hình thầy NLI (`mDeBERTa-v3-xnli` với *Symmetric Verbalizer*) + thầy Độ gay gắt (`UIT-ViHSD` / `TweetEval`) chưng cất về Student tách đoạn `DualHeadCrossEncoder`. | `src/nlp/dual_edge_scorer.py` |
+| **TD / BU + Dir-GNN** | Top-Down & Bottom-Up Mixing | Hai luồng truyền tin hai hướng: **TD** (từ gốc xuống lá) và **BU** (từ bình luận lá dội ngược lên gốc), có ma trận trộn chéo giữa 2 hướng qua từng tầng. | `src/models/sbi_fagat.py` |
+| $\gamma_{uv}, \alpha_{uv}^{\text{exc}}$ | 2-Channel Adaptive Gates | **Trái tim của SBi-FAGAT**: Nửa kênh đầu dùng van có dấu $\gamma_{uv} \in (-1, +1)$ để **đẩy hai phe đối lập tách xa nhau**; nửa kênh sau dùng van không dấu $\alpha_{uv}^{\text{exc}} \in (0, 1)$ đo mức **kích thích / gay gắt** làm câu tranh luận lan rộng hơn. | `StanceGuidedFAConv` trong `src/models/sbi_fagat.py` |
+| **BFS Dipole** (`max_hops=64`) | Root-Aligned Camp Readout | Lần ngược dấu cạnh từ gốc $r$: *"phản đối của phản đối = ủng hộ gốc"*, nhờ vậy gom đúng 2 cụm Ủng hộ gốc vs. Phản đối gốc ở tầng sâu. | `_propagate_root_aligned_edge_signal` |
+| $y_{\text{polar}} \in [0, 1]$ | Polarization Target | Mức độ chia rẽ hai phe ở toàn cây tương lai ($t > K$), kết hợp phương sai lập trường $\sigma_{\tilde{s}}^2$ và cân bằng 2 phe $4 p_+ p_-$. | `_compute_full_tree_polarization` |
 
 ---
 
 ## 3. Tại sao GCN truyền thống thất bại, còn SBi-FAGAT lại hiệu quả?
 
 * **Bệnh "San phẳng quan điểm" (Over-smoothing) của GCN thường (`StandardGCN`, `BiGCN`)**:  
-  Các Mạng Nơ-ron Đồ thị (GNN) thông thường mặc định **cộng trung bình** vector của bạn với những người trả lời bạn. Kết quả là nếu Phe Ủng hộ ($+1$) và Phe Phản đối ($-1$) cãi nhau kịch liệt ở cùng một nhánh, GCN cộng trung bình lại thành... $0$ (**trung lập giả tạo**)! Nhìn bề ngoài cây cãi nhau nảy lửa, nhưng qua 2 lớp GCN thì vector cả đám trông giống nhau như một cuộc thảo luận hòa bình.
-* **Cách SBi-FAGAT v2 giải quyết**:  
-  Nhờ đọc thêm vector hành vi 4D $\mathbf{a}_{uv} = [s_{uv}, h_{uv}, r_{uv}, c_{uv}]^\top$, lớp `StanceGuidedFAConv` học cổng $\gamma_{uv} = \tanh(\dots)$ có thể nhận **giá trị ÂM** trên các cạnh đối lập/gay gắt. Khối cập nhật dùng kết hợp thặng dư $+ 0.5\,\mathbf{h}_v$ và hàm kích hoạt **lẻ đối xứng dấu** thay cho ELU (vốn làm lệch dấu dương/âm), giúp giữ ranh giới hai phe sắc nét ngay từ 20 bình luận đầu tiên!
+  GNN thông thường mặc định **cộng trung bình** vector của bạn với người phản bác bạn. Khi Phe Ủng hộ ($+1$) và Phe Phản đối ($-1$) cãi nhau kịch liệt ở cùng một nhánh, GCN cộng trung bình lại thành $0$ (**trung lập giả tạo**)!
+* **Cách SBi-FAGAT (2D hợp nhất) giải quyết**:  
+  Nhờ đọc trực tiếp cặp $[s_{uv}, h_{uv}]^\top$, kênh phân cực của `StanceGuidedFAConv` sinh cổng $\gamma_{uv} < 0$ trên cạnh phản bác để trừ ngược hướng phe đối lập (kèm hàm kích hoạt lẻ đối xứng $x + 0.2\tanh(x)$), đồng thời kênh kích thích $\alpha_{uv}^{\text{exc}}$ giữ lại năng lượng tranh cãi giúp dự báo bùng nổ quy mô $y_{\text{size}}$ và độ chia rẽ $y_{\text{polar}}$ ngay từ 20 bình luận đầu!
 
 👉 **Tự chạy minh họa 5 giây ngay trên máy CPU (không cần GPU hay tải dữ liệu lớn):**
 
 ```bash
 python -m scripts.demo_research_walkthrough
 python -m scripts.predict_live_thread --demo-offline
-python -m scripts.benchmark_efficiency --v2 --edge-dim 4
+python -m scripts.benchmark_efficiency --use-cascade-stats --hidden-dim 64 --edge-dim 2
 ```
 
 ---
 
-## 4. Những nâng cấp SOTA & Chặt chẽ Khoa học (SBi-FAGAT v2)
+## 4. Điểm chuẩn Khoa học & Kiểm soát Lỗi của Hệ thống
 
-Toàn bộ pipeline đã được nâng cấp để vừa chạy nhanh gấp 10–20$\times$ trên Kaggle `T4 x 2`, vừa đạt chuẩn kiểm định quốc tế:
-1. **G-Eval 1-Pass Logit Teacher + QLoRA sạch**: Teacher `Qwen3.8-27B QLoRA` đọc phân phối xác suất chữ số `1..5` chỉ trong **1 lượt forward** (`--scoring-mode logit`) thay vì sinh JSON 96 token chậm/dễ lỗi, rồi chưng cất về Student nhanh (`ViSoBERT` / `DeBERTa-v3-base`) cô lập hoàn toàn khỏi tập Test qua `topic_splits.json`.
-2. **Chặt chẽ `min_total_replies = 25` & Cô lập LOO**: Mọi cây đánh giá có tối thiểu $\ge 5$ bình luận tương lai sau $K=20$ (loại bỏ suy biến phương sai tại $N=21$); trên PHEME Leave-One-Event-Out dùng cô lập `edge_source="teacher"`.
-3. **Đo phân cực tương lai (`future_only`) & Công bằng 8 mô hình**: Đáp án `y_polar` chỉ tính từ các bình luận tương lai $t > K$; trong chế độ `--v2`, đặc trưng tốc độ 8 chiều (`cascade_stats`) được cấp **công bằng cho cả 8 mô hình** (`TextMLP`, `TemporalStanceMLP`, ..., `SBiFAGAT`) để chứng minh phần thắng thực sự đến từ cấu trúc đồ thị có dấu.
-4. **Đầu đo tự tin $\beta$-NLL & Dừng sớm theo `task_loss`**: Dùng $\beta$-NLL ($\beta=0.5$, `detach()` phần dư) để đầu đo độ tự tin $\exp(-\hat{\sigma}_{\text{polar}}/0.25)$ không làm hỏng đầu hồi quy, đồng thời Early Stopping và `auto_loop` luôn chọn mô hình tốt nhất dựa trên `task_loss` ($\alpha_{\text{polar}}=4.0$).
-5. **Kiểm định thống kê chặt (`Holm-Bonferroni` + Sample-level Bootstrap từng seed)**: Tính Bootstrap trên từng hạt giống rồi lấy trung bình ($5$ seeds) kèm hiệu chỉnh Holm-Bonferroni và chấm đồng thuận người (`compute_kappa.py`) cho cả stance 3 lớp lẫn behavior 5 lớp.
+1. **Độ phủ 100% Teacher sạch**: Bỏ hoàn toàn mô hình 27B nặng nề dễ lỗi OOM/timeout; thay bằng bộ thầy NLI + ViHSD/TweetEval độ phủ 100%, chưng cất cô lập trên tập Train của `topic_splits.json`.
+2. **Chặt chẽ `min_total_replies = 25` & Không rò rỉ khi quét $K=50$**: Mọi cây đều có tối thiểu $\ge 5$ bình luận tương lai ngoài $K=20$; `EarlyCascadeDataset` và `run_ablation.py` luôn khóa cứng phân hoạch từ `topic_splits.json` dù ở mức lọc `K=50`.
+3. **Thi đấu Công bằng 8 Mô hình ở `hidden_dim = 64`**: Không tune riêng siêu tham số cho `SBiFAGAT`; cả 8 mô hình cùng chia sẻ `TwoStreamNodeStem`, đầu ra 128 chiều, `cascade_stats` 8 chiều và hàm mất mát KL-calibrated BCE + Huber tối ưu, so sánh thêm với baseline không cần học **Early-K Persistence**.
+4. **Kiểm định Người–Máy Nghiêm ngặt**: `compute_kappa.py` cảnh báo nếu còn cặp hai người chấm lệch nhau chưa hòa giải (`gold_adjudicated_*`) để không làm đẹp giả tạo độ chính xác trên các câu dễ.
 
 ---
 
-## 5. Lộ trình 4 bước đọc code & thực hành (Từ dễ đến khó)
+## 5. Lộ trình 4 bước đọc code & thực hành
 
 1. **Bước 1 — Chạy kiểm thử & Demo (5 phút, trên laptop CPU)**:  
-   Chạy `pytest -q` và `python -m scripts.demo_research_walkthrough` để thấy dòng dữ liệu chạy qua SBi-FAGAT.
+   Chạy `pytest -q` và `python -m scripts.demo_research_walkthrough`.
 2. **Bước 2 — Đọc luồng dữ liệu chống rò rỉ (15 phút)**:  
-   Đọc `src/data/schema.py` $\to$ `src/data/pheme_loader.py` $\to$ `src/data/arctic_shift_vn.py` $\to$ `src/data/pyg_dataset.py` (chú ý đoạn cắt $K=20$ và `future_only`).
+   Đọc `src/data/schema.py` $\to$ `src/data/pheme_loader.py` $\to$ `src/data/arctic_shift_vn.py` $\to$ `src/data/pyg_dataset.py`.
 3. **Bước 3 — Đọc mô hình SBi-FAGAT (15 phút)**:  
-   Đọc `src/models/baselines.py` (xem `TemporalStanceMLP`, `BiGCN`) rồi sang `src/models/sbi_fagat.py` (`StanceGuidedFAConv` chỉ dài hơn 60 dòng!).
-4. **Bước 4 — Chạy thực nghiệm thật trên GPU 16GB & Kiểm định người (Khi sẵn sàng)**:  
-   Làm đúng các ticket Jira Sprint 2 & Sprint 3: tải PHEME/crawl 500 cây VN $\to$ 2 thành viên chấm pilot 30 câu rồi chấm mù độc lập 300 cặp câu (`compute_kappa.py`) $\to$ xuất `.pt` $\to$ chạy 5 seeds (`run_experiments.py`, `run_ablation.py`, `run_upfd_extension.py`). Chỉ khi có đủ số liệu thật sạch mới chuyển sang viết bài báo!
+   Đọc `src/models/baselines.py` (`TwoStreamNodeStem`, `MultiTaskHead`, `BiGCN`) rồi sang `src/models/sbi_fagat.py` (`StanceGuidedFAConv`).
+4. **Bước 4 — Chạy thực nghiệm thật trên Kaggle T4x2 & Kiểm định người**:  
+   Chạy 2 sổ tay song song trong `notebooks/` $\to$ 2 thành viên chấm mù 300 cặp câu (`compute_kappa.py --strict-adjudication`) + chấm tay 50 cây Test VN $\to$ ghép bảng LaTeX thật vào `paper/main.tex`!
