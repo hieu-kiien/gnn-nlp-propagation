@@ -1,30 +1,25 @@
-# Hướng dẫn Chạy Song Song trên Kaggle `GPU T4 x 2` (32 GB VRAM) — Phiên bản v2
+# Hướng dẫn Chạy Song Song trên Kaggle `GPU T4 x 2` (32 GB VRAM) — Pipeline 2D Hợp nhất
 
-Tài liệu này hướng dẫn trực tiếp cho **2 thành viên trong nhóm** cách đưa mã nguồn mới nhất từ GitHub lên **Kaggle `T4 x 2`** (mỗi bạn có **30 giờ GPU miễn phí/tuần**, tổng **60 giờ GPU/tuần**) để chạy song song không phải chờ nhau.
+Tài liệu này hướng dẫn trực tiếp cho **2 thành viên trong nhóm** cách đưa mã nguồn mới nhất từ GitHub lên **Kaggle `T4 x 2`** (mỗi bạn có **30 giờ GPU miễn phí/tuần**, tổng **60 giờ GPU/tuần**) để chạy song song không phải chờ nhau trên **kiến trúc 2D hợp nhất** (`hidden_dim = 64`, `min_total_replies = 25`).
 
 ---
 
-## 1. Hệ thống v2 mới nâng cấp có gì bên trong?
+## 1. Kiến trúc Hợp nhất 2D bên trong hệ thống có gì?
 
-Hệ thống AI của nhóm hoạt động theo **dây chuyền 3 mô hình nối tiếp nhau**:
+Hệ thống AI của nhóm hoạt động theo **dây chuyền 3 tầng sạch và gọn (phủ 100% nhãn Teacher)**:
 
-1. **Mô hình 1 — Thầy Thông minh (`Qwen/Qwen3.8-27B` gắn mảnh ghép thích nghi `QLoRA`):**
-   - Nạp chế độ nén **4-bit NF4 + `float16`** trải đều trên cả **2 card T4 (32 GB VRAM)**, đóng băng phần xử lý ảnh để tiết kiệm bộ nhớ; sử dụng **G-Eval single-pass logit scoring** (`--scoring-mode logit`, đọc trực tiếp phân phối chữ số `1..5` trong 1 lượt forward thay vì sinh JSON 96 token) để đạt **0% lỗi JSON** và tăng tốc 10–20×.
-   - Đọc đầy đủ *(Bài gốc + Bình luận trước + Bình luận trả lời)* để phân loại **5 nhóm hành vi thực tế** (không gộp thô thành ủng hộ/phản đối nữa):
-     1. `support`: Tán thành / ủng hộ hợp lý
-     2. `neutral`: Trung lập / hỏi thông tin
-     3. `constructive_oppose`: Phản biện văn minh có lý lẽ
-     4. `irrational_fallacy`: Bình luận vô lý, ngụy biện, nói cùn, bẻ lái phá đám
-     5. `hostile_conflict`: Chống đối gay gắt, công kích, kích động xung đột
-   - Xuất 4 chỉ số liên tục `[s_uv, h_uv, r_uv, c_uv]` làm nhãn dạy cho Mô hình 2 dựa trên phân hoạch chuẩn hóa `topic_splits.json` (`--min-total-replies 25`, tuyệt đối không chạm vào tập Kiểm tra `Test`; nhánh PHEME LOO dùng cô lập `edge_source="teacher"`).
+1. **Tầng 1 — Teacher Kép NLI & Hostility Độ phủ 100% (`dual_nli`):**
+   - **Thầy Lập trường (`MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7`)**: Đọc cặp `(Parent, Reply)` trong ngân sách `384` token (bảo toàn trọn vẹn phần `Reply`) bằng **Symmetric 2-Hypothesis Stance Verbalizer** để tính xác suất `[p_support, p_neutral, p_oppose]` và $s_{uv} \in [-1, 1]$ (đồng thời tính luôn `root_s_uv` cho các bình luận sâu `depth >= 2`).
+   - **Thầy Độ gay gắt (`h_uv`)**: Tinh chỉnh `uitnlp/visobert` với trọng số lớp cân bằng trên **UIT-ViHSD** (cho Tiếng Việt), hoặc dùng `cardiffnlp/twitter-roberta-base-offensive` (cho Tiếng Anh).
+   - Toàn bộ cặp được chấm dựa trên phân hoạch chuẩn hóa `topic_splits.json` (`--min-total-replies 25`, tuyệt đối không chạm vào tập Kiểm tra `Test`; nhánh PHEME LOO dùng cô lập `edge_source="teacher"`).
 
-2. **Mô hình 2 — Bộ Đọc Nhanh Trực Chiến NLP (`ViSoBERT` cho Tiếng Việt / `DeBERTa-v3-base` cho Tiếng Anh):**
-   - Chưng cất từ Mô hình 1 **chỉ trên tập Học (`70%` chủ đề chuẩn hóa)** bằng cả 2 card T4 song song (`DataParallel`).
-   - Nhỏ gọn, suy luận cực nhanh trong thực tế để gắn nhãn 5 hành vi và 4 chỉ số trên từng mũi tên bình luận.
+2. **Tầng 2 — Student `DualHeadCrossEncoder` & Node *Ancestor-Conditioned SpanPool* (`ViSoBERT` VN / `twitter-roberta-base` EN):**
+   - Chưng cất `DualHeadCrossEncoder` 2D **chỉ trên tập Học (`70%` chủ đề chuẩn hóa)** bằng kỹ thuật tách đoạn (`h_uv` chỉ pool trên token thuộc `Reply`, tránh lời gay gắt ở bình luận cha lây sang bình luận con), hàm mất mát `BCEWithLogitsLoss + KL (T=2.0)`, và tăng cường cặp sâu `(root, reply)`.
+   - Trích xuất nhúng nút 768 chiều bằng **Ancestor-Conditioned SpanPool** đóng băng (`[CLS] root [SEP] parent [SEP] reply [SEP]`, chỉ pool trên token `reply`) kèm `struct_x` 10 chiều và `cascade_stats` 8 chiều xuống tệp `.pt`.
 
-3. **Mô hình 3 — Mạng Nơ-ron Đồ thị `SBi-FAGAT v2` (Trọng tâm bài báo):**
-   - Nhận dữ liệu từ Mô hình 2 + **Đồng hồ tốc độ & hình dáng 8 chiều của 20 câu đầu** (được truyền công bằng cho **cả 8 mô hình** khi bật `--v2`) + **Đầu đo Độ tự tin dự báo β-NLL (`beta=0.5`, $\exp(-\hat{\sigma}_{\text{polar}}/0.25)$)**.
-   - Chạy vòng lặp tự tối ưu trên tập Validation (`run_self_auditing_validation_loop` xếp hạng theo `task_loss`), xuất báo cáo các ca đoán lệch nhiều nhất (`worst_val_cases_for_review.json`), rồi chạy thi đấu 8 mô hình × 5 hạt giống ngẫu nhiên và xuất tệp nén `.zip` gọn nhẹ (mặc định bỏ qua trọng số nặng nhiều GB trừ khi truyền `--bundle-weights`, có thể bật `--run-upfd` trên track `en`).
+3. **Tầng 3 — Mạng Nơ-ron Đồ thị `SBi-FAGAT` (`hidden_dim = 64`) & Kiểm định Công bằng 8 Mô hình:**
+   - Thi đấu công bằng **8 mô hình** với cùng `hidden_dim = 64`, `TwoStreamNodeStem` (`struct_x` 10 chiều), `cascade_stats` 8 chiều, và hàm mất mát tối ưu (**KL-calibrated `BCEWithLogitsLoss` + Smooth-L1** cho $y_{\text{polar}}$, Warmup + `ReduceLROnPlateau` + EMA) qua 5 hạt giống `[42, 100, 2024, 777, 999]` + **Early-K Persistence Baseline**.
+   - Xuất tệp nén `.zip` kết quả gọn nhẹ `sbifagat_{role}_bundle.zip` (luôn chặn không đóng gói `*_machine_key.csv` hay `.secret`/`.env` kể cả khi truyền `--bundle-weights`), đồng thời đóng gói riêng file đáp án chấm mù vào tệp niêm phong `sbifagat_{role}_sealed_machine_keys.zip` để không bị mất khi tắt máy ảo Kaggle. Tùy chọn bật `--run-auto-loop` để xuất thêm chẩn đoán các ca lệch nhiều nhất trên tập Validation mà không chỉnh thiên vị siêu tham số cho riêng `SBiFAGAT`.
 
 ---
 
@@ -32,23 +27,23 @@ Hệ thống AI của nhóm hoạt động theo **dây chuyền 3 mô hình nố
 
 ### Cách A — Chia theo Track Dữ liệu (Khuyên dùng: Hai bạn chạy độc lập 100% cùng lúc)
 * **Thành viên 1** mở sổ tay [kaggle_member1_nlp_and_vn_t4x2.ipynb](../notebooks/kaggle_member1_nlp_and_vn_t4x2.ipynb), chọn `ROLE = "member1_vn"`:
-  - Thu thập **1.500 cây thảo luận Tiếng Việt** (`r/vozforums`, `r/VietNam`).
-  - Chạy trọn gói `Qwen3.8-27B QLoRA -> ViSoBERT 4D -> SBi-FAGAT v2` cho Tiếng Việt.
+  - Thu thập **1.500 cây thảo luận Tiếng Việt** (`r/vozforums`, `r/VietNam`, `r/TroChuyenLinhTinh`).
+  - Chạy trọn gói `Dual-Teacher (mDeBERTa-v3-xnli + ViHSD) -> ViSoBERT DualHeadCrossEncoder 2D + SpanPool -> SBi-FAGAT (hidden_dim=64)` cho Tiếng Việt.
   - Tải về `sbifagat_member1_vn_bundle.zip`.
 * **Thành viên 2** mở sổ tay [kaggle_member2_gnn_and_en_t4x2.ipynb](../notebooks/kaggle_member2_gnn_and_en_t4x2.ipynb), chọn `ROLE = "member2_en"`:
   - Tải bộ chuẩn quốc tế **PHEME** (có kiểm tra MD5).
-  - Chạy trọn gói `Qwen3.8-27B QLoRA -> DeBERTa-v3-base 4D -> SBi-FAGAT v2 (Inductive + Leave-One-Event-Out + Ablation + UPFD)`.
+  - Chạy trọn gói `Dual-Teacher -> Twitter-RoBERTa DualHeadCrossEncoder 2D + SpanPool -> SBi-FAGAT (Inductive + LOO + Ablation + EDA + Efficiency)` cho Tiếng Anh (có thể bật `--run-upfd`).
   - Tải về `sbifagat_member2_en_bundle.zip`.
 
 ### Cách B — Chia mỗi người chuyên trách một loại Mô hình (NLP vs GNN)
-* **Thành viên 1 (Chuyên NLP):** Đổi `ROLE = "model_nlp_only"` trong sổ tay 1 để train Mô hình 1 + Mô hình 2 và xuất `data/processed/{vn,pheme}/nlp_features.pt`.
-* **Thành viên 2 (Chuyên GNN):** Đổi `ROLE = "model_gnn_only"` trong sổ tay 2 để nạp `nlp_features.pt` (hoặc bật thêm `--bootstrap-if-missing` để chạy ngay không cần chờ), chuyên tâm chạy vòng lặp tối ưu `SBi-FAGAT v2` + 7 mô hình đối chứng + vẽ biểu đồ bài báo.
+* **Thành viên 1 (Chuyên NLP):** Đổi `ROLE = "model_nlp_only"` trong sổ tay 1 để train Teacher/Student 2D và xuất `data/processed/{vn,pheme}/nlp_features.pt`.
+* **Thành viên 2 (Chuyên GNN):** Đổi `ROLE = "model_gnn_only"` trong sổ tay 2 để nạp `nlp_features.pt` (hoặc bật thêm `--bootstrap-if-missing`), chuyên tâm chạy benchmark 8 mô hình × 5 hạt giống + ablation `K in {10, 20, 30, 50}` + vẽ biểu đồ bài báo.
 
 ---
 
 ## 3. Tự kiểm tra THẬT bằng link bài viết trên mạng (Sau khi train xong)
 
-Sau khi có checkpoint, dùng trực tiếp công cụ [predict_live_thread.py](../scripts/predict_live_thread.py) để thử với bất kỳ bài thảo luận Reddit mới nào vừa đăng trên mạng:
+Sau khi có checkpoint, dùng trực tiếp công cụ [predict_live_thread.py](../scripts/predict_live_thread.py) để thử với bất kỳ bài thảo luận Reddit nào:
 
 ```bash
 # Chạy thử mẫu có sẵn không cần mạng:
@@ -57,19 +52,20 @@ python -m scripts.predict_live_thread --demo-offline
 # Kiểm tra trực tiếp bằng đường link bài viết thật trên Reddit:
 python -m scripts.predict_live_thread \
     --reddit-url "https://www.reddit.com/r/vozforums/comments/<MA_BAI_VIET>/" \
-    --cross-encoder-ckpt checkpoints/dual_ce_vn_v2 \
-    --gnn-ckpt outputs/auto_loop_vn/best_validated_sbifagat.pt
+    --cross-encoder-ckpt checkpoints/dual_ce_vn \
+    --gnn-ckpt checkpoints/best_sbifagat_vn.pt
 ```
 
-Hệ thống sẽ tự động **bịt mắt từ bình luận thứ 21 trở đi**, phân loại 5 hành vi cho 20 câu đầu, chỉ điểm những câu vô lý/chống đối nguy hiểm nhất, dự báo quy mô + phân cực + độ tự tin, rồi đặt cạnh kết quả thực tế (nếu bài đó đã vượt mốc 20 bình luận) để bạn kiểm chứng tận mắt!
+Hệ thống sẽ tự động **bịt mắt từ bình luận thứ 21 trở đi**, phân tích lập trường & độ gay gắt cho 20 bình luận đầu, chỉ điểm các bình luận kích hoạt xung đột mạnh nhất, dự báo quy mô + phân cực, rồi đối chiếu kết quả thực tế!
 
 ---
 
-## 4. Vòng lặp kiểm tra cùng AI sau mỗi mẻ chạy Kaggle
+## 4. Kiểm tra chéo con người (Human Audit) sau mỗi mẻ chạy Kaggle
 
-Sau khi chạy xong trên Kaggle, chỉ cần tải về và gửi cho AI đọc 3 file gọn nhẹ (vài chục KB):
-1. `outputs/auto_loop_vn/loop_diagnostics.json` (và bản `auto_loop_pheme` của Thành viên 2)
-2. `outputs/auto_loop_vn/worst_val_cases_for_review.json` (danh sách các ca trên tập Validation bị đoán lệch nhất để AI chấm lỗi và tinh chỉnh thuật toán)
-3. `paper/results_main_vn.json` & `paper/results_main_pheme.json`
+Sau khi chạy xong trên Kaggle, trước khi tắt máy ảo hãy tải đồng thời `sbifagat_{role}_bundle.zip` và gói niêm phong `sbifagat_{role}_sealed_machine_keys.zip` (giữ niêm phong, tuyệt đối không mở trước khi chấm). Sau khi **2 bạn tự chấm chéo độc lập** 300 cặp câu trong `data/interim/human_audit_vi_300.csv` (bằng Excel/Google Sheets), giải nén `*_machine_key.csv` từ gói niêm phong về `data/interim/` rồi chạy:
 
-Và **2 bạn nhớ tự chấm chéo độc lập** 300 cặp câu trong `human_audit_vi_300.csv` (mở bằng Excel/Google Sheets) rồi chạy `python -m scripts.compute_kappa` để hoàn thiện con số xác thực người bản xứ cho bài báo!
+```bash
+python -m scripts.compute_kappa --input data/interim/human_audit_vi_300.csv --strict-adjudication
+```
+
+Lệnh này đảm bảo mọi cặp 2 người chấm lệch nhau đều đã được hòa giải (`gold_adjudicated_*`) trước khi đưa số liệu Cohen's Kappa và Machine-vs-Gold vào bài báo!

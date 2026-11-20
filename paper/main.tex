@@ -28,7 +28,7 @@ Thai Nguyen, Vietnam}
 \maketitle
 
 \begin{abstract}
-Predicting the eventual reach and community polarization of social media discussions from only the initial replies is challenging due to extreme early-stage sparsity, heterophilic conflict interactions, and asymmetric parent--child propagation dynamics. Existing rumor and cascade predictors predominantly rely on edge-sign-agnostic graph convolutions or post-hoc full-tree features that induce temporal leakage. We present \textbf{SBi-FAGAT} (\emph{Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network}), a multi-task framework operating strictly on the source post and the earliest $K = 20$ chronological interactions. Our architecture pairs offline distilled pairwise stance and hostility attributes $e_{uv}$ with independent Top-Down dispersion and Bottom-Up community-feedback message passing modulated by bounded signed frequency gates $\gamma_{uv} \in (-1, +1)$. Furthermore, we propose a reproducible two-tier pipeline separating an accessible 2D NLI-distilled default profile (\texttt{v1}) from an opt-in 4D behavioral LLM-distilled profile (\texttt{v2}) equipped with heteroscedastic $\beta$-NLL uncertainty estimation. Across inductive benchmarks on English PHEME and Vietnamese Reddit discussions, as well as the external UPFD transfer setting, SBi-FAGAT provides an interpretable, leakage-free baseline verified against eight fair competitors, a non-learned Early-$K$ Persistence Baseline, and human reliability audits.
+Predicting the eventual reach and community polarization of social media discussions from only the initial replies is challenging due to extreme early-stage sparsity, heterophilic conflict interactions, and asymmetric parent--child propagation dynamics. Existing rumor and cascade predictors predominantly rely on edge-sign-agnostic graph convolutions or post-hoc full-tree features that induce temporal leakage. We present \textbf{SBi-FAGAT} (\emph{Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network}), a unified multi-task framework operating strictly on the source post and the earliest $K = 20$ chronological interactions. Our pipeline combines frozen \emph{Ancestor-Conditioned SpanPool} node embeddings and $10$-D causal structural-temporal descriptors with distilled 2D pairwise discourse attributes $e_{uv} = [s_{uv}, h_{uv}]^\top$ obtained from multilingual NLI stance verbalizers and class-weighted hostility teachers via segment-isolated cross-encoders. Inside the graph backbone, dual-channel Top-Down and Bottom-Up \texttt{StanceGuidedFAConv} layers pair signed frequency gates $\gamma_{uv} \in (-1, +1)$ with unsigned excitation gates, Dir-GNN bidirectional mixing, and root-aligned camp dipole readouts. Across inductive benchmarks on English PHEME and Vietnamese Reddit discussions, leave-one-event-out evaluation, and external UPFD transfer, SBi-FAGAT provides an interpretable, leakage-free baseline verified against seven matched neural competitors, a non-learned Early-$K$ Persistence Baseline, and dual-annotator human reliability audits.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -36,68 +36,83 @@ Graph Neural Networks, Social Media Polarization, Information Cascades, Stance D
 \end{IEEEkeywords}
 
 \section{Introduction}
-Online information cascades frequently trigger rapid viral amplification alongside sharp ideological polarization. Forecasting both the ultimate cascade size $y_{\text{size}} = \ln(1 + N_{\text{total}})$ and future community polarization $y_{\text{polar}} \in [0, 1]$ before a thread matures enables proactive moderation and misinformation triage \cite{zubiaga2016analysing,li2017deepcas}. However, early prediction restricted strictly to the root post and the first $K=20$ interactions ($t \le t_K$) exposes three fundamental obstacles: (i) standard graph neural networks assume homophily (low-pass smoothing), erasing crucial disagreement signals between conflicting commenters \cite{bo2021beyond,platonov2023critical}; (ii) unidirectional top-down convolutions ignore how reply subtrees synthesize conflict back toward the root \cite{bian2020rumor}; and (iii) unguarded feature engineering often leaks post-$t_K$ timestamps, tree depth statistics, or global splits into early inputs.
+Online information cascades frequently trigger rapid viral amplification alongside sharp ideological polarization. Forecasting both the ultimate cascade size $y_{\text{size}} = \ln(1 + N_{\text{total}})$ and future community polarization $y_{\text{polar}} \in [0, 1]$ before a thread matures enables proactive moderation and misinformation triage \cite{zubiaga2016analysing,li2017deepcas}. However, early prediction restricted strictly to the root post and the first $K=20$ interactions ($t \le t_K$) exposes three fundamental obstacles: (i) standard graph neural networks assume homophily (low-pass smoothing), erasing disagreement signals between conflicting commenters \cite{bo2021beyond,platonov2023critical}; (ii) unidirectional top-down convolutions ignore how reply subtrees synthesize conflict back toward the root \cite{bian2020rumor}; and (iii) unguarded feature engineering often leaks post-$t_K$ timestamps, tree depth statistics, or shared topic splits into early inputs.
 
-To address these gaps cleanly on commodity 16~GB GPUs (with optional scaling to dual Tesla T4 accelerators), we make the following contributions:
+To address these gaps within commodity 16~GB GPU and dual Tesla T4 budgets without sacrificing teacher coverage, we present a unified 2D architecture with the following contributions:
 \begin{enumerate}
-    \item \textbf{Leakage-Free Early Cascade Contract:} We formalize strict Parquet/PyG validation requiring UTC causality, root-relative normalization inside $t \le t_K$, forecasting eligibility ($N_{\text{reply}} \ge 25$), topic-disjoint canonical splits, and leave-one-out teacher edge isolation.
-    \item \textbf{Stance-Guided Bidirectional Frequency-Adaptive Attention (\texttt{SBiFAGAT}):} We introduce bounded signed gates $\gamma_{uv} = \tanh(\mathbf{a}^\top [z_u^{\text{norm}} \Vert z_v^{\text{norm}} \Vert e_{uv}])$ over independent Top-Down and Bottom-Up graph stacks, allowing each reply edge to perform low-pass reinforcement under agreement or high-pass differentiation under hostility/opposition.
-    \item \textbf{Bilingual Offline Distillation \& Dual Profile:} Profile \texttt{v1} freezes bilingual encoders (\texttt{uitnlp/visobert} \cite{nguyen2023visobert}, \texttt{roberta-base} \cite{liu2019roberta}) and distills 2D stance-hostility vectors $[s_{uv}, h_{uv}]$ via \texttt{mDeBERTa-v3} \cite{laurer2024less} and \texttt{UIT-ViHSD} \cite{luu2021vihsd}. Profile \texttt{v2} opts into 5-class G-Eval \cite{liu2023geval} QLoRA \cite{dettmers2023qlora} teachers (\texttt{Qwen/Qwen3.8-27B} \cite{yang2025qwen3}), 4D edge attributes $[s_{uv}, h_{uv}, r_{uv}, c_{uv}]$, 8D early burst statistics, and $\beta$-NLL \cite{seitzer2022pitfalls} uncertainty calibration.
-    \item \textbf{Multi-Faceted Scientific Verification:} Beyond accuracy against 7 matched baselines, we evaluate non-learned Early-$K$ Persistence, Sarle's Bimodality Coefficient \cite{pfister2013good}, signed assortativity, UPFD \cite{dou2021upfd} transfer with latent conflict MLPs, and human annotation agreement.
+    \item \textbf{Leakage-Free Early Cascade Contract:} We formalize strict Parquet/PyG validation requiring UTC causality, fixed-horizon temporal normalization inside $t \le t_K$, forecasting eligibility ($N_{\text{reply}} \ge 25$), unified canonical topic splits (\texttt{topic\_splits.json}) shared across distillation, benchmark, and $K$-ablation subsets, and leave-one-out teacher edge isolation.
+    \item \textbf{Ancestor-Conditioned SpanPool \& Segment-Isolated 2D Distillation:} Frozen bilingual social encoders (\texttt{uitnlp/visobert} \cite{nguyen2023visobert} for Vietnamese; \texttt{cardiffnlp/twitter-roberta-base} \cite{barbieri2020tweeteval} for English) extract contextual reply embeddings conditioned solely on causal ancestors (\texttt{[root, parent, reply]}). Pairwise $e_{uv} = [s_{uv}, h_{uv}]^\top$ teachers fuse a symmetric two-hypothesis \texttt{mDeBERTa-v3-xnli} stance verbalizer \cite{laurer2024less,he2023debertav3} with class-weighted hostility classifiers (\texttt{UIT-ViHSD} \cite{luu2021vihsd} / \texttt{TweetEval-Offensive} \cite{barbieri2020tweeteval}), distilling into a segment-isolated \texttt{DualHeadCrossEncoder}.
+    \item \textbf{Dual-Channel Bidirectional SBi-FAGAT (\texttt{hidden\_dim=64}):} Two-stream node stems separate semantic embeddings from $10$-D causal topology descriptors, feeding Top-Down and Bottom-Up \texttt{StanceGuidedFAConv} stacks with explicit Dir-GNN cross-direction mixing, dual polarity/excitation message channels, and root-aligned BFS camp dipole readouts.
+    \item \textbf{Multi-Faceted Scientific Verification:} Beyond fixed-hyperparameter comparison against seven matched neural baselines (\texttt{hidden\_dim=64}), we evaluate non-learned Early-$K$ Persistence, Sarle's Bimodality Coefficient \cite{pfister2013good}, signed assortativity, UPFD \cite{dou2021upfd} transfer via \texttt{LatentConflictMLP}, and dual-annotator human agreement.
 \end{enumerate}
 
 \section{Related Work}
 \subsection{Graph Neural Networks for Cascades and Heterophily}
-Conventional GCN \cite{kipf2017semisupervised} and dynamic GATv2 \cite{brody2022how} aggregate neighborhood features via strictly positive weights, acting as low-pass filters that degrade when adjacent nodes hold opposing viewpoints \cite{platonov2023critical}. Bi-GCN \cite{bian2020rumor} introduced bidirectional top-down and bottom-up propagation with root enhancement for rumor detection, while FAGCN \cite{bo2021beyond} and Signed GCN \cite{derr2018signed} introduced negative edge weights to separate low- and high-frequency components. SBi-FAGAT unifies directional tree asymmetry with explicitly NLP-guided continuous edge vectors $e_{uv}$.
+Conventional GCN \cite{kipf2017semisupervised} and dynamic GATv2 \cite{brody2022how} aggregate neighborhood features via strictly positive weights, acting as low-pass filters that degrade when adjacent nodes hold opposing viewpoints \cite{platonov2023critical}. Bi-GCN \cite{bian2020rumor} introduced bidirectional top-down and bottom-up propagation with root enhancement for rumor detection, while FAGCN \cite{bo2021beyond} and Signed GCN \cite{derr2018signed} introduced negative edge weights to separate low- and high-frequency components. SBi-FAGAT unifies directional tree asymmetry with explicitly NLP-guided continuous 2D edge vectors $e_{uv}$, symmetric activations, and root-aligned dipole pooling.
 
 \subsection{NLP Stance Detection and Controversy Quantification}
-Discourse stance benchmarks such as PHEME \cite{zubiaga2016analysing,kochkina2018pheme} and RumourEval-2019 \cite{gorrell2019semeval} classify replies relative to claims. Multilingual NLI transfer \cite{laurer2024less}, offensive language detection \cite{barbieri2020tweeteval,luu2021vihsd}, and DeBERTaV3 \cite{he2023debertav3} / ViSoBERT \cite{nguyen2023visobert} cross-encoders provide lightweight pairwise discourse representations. While graph-level controversy metrics such as Random Walk Controversy (RWC) \cite{garimella2016quantifying,garimella2018quantifying} require large stationary topologies, we adopt local root-aligned stance dispersion paired with Sarle's Bimodality Coefficient \cite{pfister2013good} for sparse $K=20$ cascades.
+Discourse stance benchmarks such as PHEME \cite{zubiaga2016analysing,kochkina2018pheme} and RumourEval-2019 \cite{gorrell2019semeval} classify replies relative to claims. Multilingual NLI transfer \cite{laurer2024less}, social hate/offensive detection \cite{barbieri2020tweeteval,luu2021vihsd}, and DeBERTaV3 \cite{he2023debertav3} / ViSoBERT \cite{nguyen2023visobert} backbones provide domain-adapted discourse representations. Because random-walk controversy metrics such as RWC \cite{garimella2016quantifying,garimella2018quantifying} degenerate on sparse shallow trees ($|\mathcal{V}_K| \le 21$), we quantify polarization via root-aligned future stance dispersion verified against Sarle's Bimodality Coefficient \cite{pfister2013good}.
 
 \section{Methodology}
 \subsection{Problem Formulation and Zero-Leakage Protocol}
-Given a propagation tree observed up to the earliest $K=20$ chronological replies $\mathcal{G}_K = (\mathcal{V}_K, \mathcal{E}_K^{\text{TD}}, \mathcal{E}_K^{\text{BU}})$, each node $v \in \mathcal{V}_K$ receives a static 770-D representation $x_v = [\mathbf{e}_v^{\text{NLP}} \Vert t_{\text{norm}}(v) \Vert d_{\text{norm}}(v)]$ computed using only $t_v \le t_K$. Post-observation replies ($t > t_K$) define targets:
+Given a propagation tree observed up to the earliest $K=20$ chronological replies $\mathcal{G}_K = (\mathcal{V}_K, \mathcal{E}_K^{\text{TD}}, \mathcal{E}_K^{\text{BU}})$, each node $v \in \mathcal{V}_K$ carries a $770$-D feature vector $x_v = [\mathbf{e}_v^{\text{Span}} \Vert t_{\text{norm}}(v) \Vert d_{\text{norm}}(v)]$ paired with a $10$-D causal structural vector $s_v \in [0, 1]^{10}$ and an $8$-D cascade summary vector $c_{\mathcal{G}}$ (all computed strictly from $t \le t_K$). Post-observation replies ($t > t_K$) define targets:
 \begin{equation}
 y_{\text{size}} = \ln(1 + N_{\text{total}}), \quad
 y_{\text{polar}} = \operatorname{clip}\!\left(\lambda_p \sigma_{\tilde{s}}^2 + (1-\lambda_p)(4 p_+ p_-), 0, 1\right),
 \end{equation}
-where $\lambda_p = 0.5$, $\tilde{s}_v \in [-1, 1]$ denotes root-aligned future stances over $t > t_K$ (\texttt{future\_only}), $p_+$ and $p_-$ are shares with $|\tilde{s}_v| > 0.1$, and PHEME cascades additionally supervise $y_{\text{rumor}}$. Forecasting splits filter for $N_{\text{reply}} \ge 25$ so non-trivial future evolution exists. Topic splits partition Train/Val/Test (70\%/15\%/15\%) canonically across news events (PHEME) or via a \emph{Heuristic Temporal-Keyword / 14-day TF-IDF Grouped Inductive Split} (Vietnamese Reddit).
+where $\lambda_p = 0.5$, $\tilde{s}_v \in [-1, 1]$ denotes root-aligned future stances over $t > t_K$ (\texttt{future\_only}), $p_+ = P(\tilde{s}_v > 0.1), p_- = P(\tilde{s}_v < -0.1)$ denote the empirical proportions of future replies supporting or opposing the root, and PHEME cascades additionally supervise $y_{\text{rumor}}$. Forecasting splits require $N_{\text{reply}} \ge 25$ so non-trivial future evolution exists. Topic splits partition Train/Val/Test (70\%/15\%/15\%) canonically across news events (PHEME) or via a \emph{Heuristic Temporal-Keyword / 14-day TF-IDF Grouped Inductive Split} (Vietnamese Reddit), persisting \texttt{topic\_splits.json} so distillation, evaluation, and $K \in \{10, 20, 30, 50\}$ sensitivity runs never re-split Train topics into Test.
 
-\subsection{Offline Stance-Hostility Distillation}
-To decouple transformer memory from GNN sweeps, node embeddings and pairwise edge attributes are serialized to disk before training. In default profile \texttt{v1}, frozen teachers compute $s_{uv} = P(\text{entail}|u,v) - P(\text{contradict}|u,v)$ and hostility $h_{uv} \in [0, 1]$, distilling into a dual-head cross-encoder evaluated with leave-one-out teacher edge isolation and label-shuffle sanity checks. In opt-in \texttt{v2}, a QLoRA-tuned \texttt{Qwen/Qwen3.8-27B} teacher yields 5-class discourse logits projected into $e_{uv} = [s_{uv}, h_{uv}, r_{uv}, c_{uv}]$.
+\subsection{Offline Ancestor-Conditioned SpanPool and 2D Distillation}
+To decouple transformer memory from multi-seed GNN sweeps, node embeddings and edge scores are precomputed offline in mixed precision (\texttt{FP16}). For node embeddings $\mathbf{e}_v^{\text{Span}} \in \mathbb{R}^{768}$, frozen encoders (\texttt{uitnlp/visobert} for VI, \texttt{cardiffnlp/twitter-roberta-base} for EN) process causal context sequences \texttt{[CLS] root [SEP] parent [SEP] reply [SEP]} and mean-pool exclusively over reply tokens, disambiguating short replies without accessing future nodes.
 
-\subsection{SBi-FAGAT Architecture}
-After projecting node inputs $h^{(0)} = \operatorname{LN}(\operatorname{GELU}(W_0 X))$ and broadcasting root states $h_{\text{root}}^{(0)}$, each \texttt{StanceGuidedFAConv} layer computes normalized transformed states $z^{\text{norm}}$ and edge gates:
+For 2D edge attributes $e_{uv} = [s_{uv}, h_{uv}]^\top \in [-1, 1] \times [0, 1]$:
+\begin{itemize}
+    \item \textbf{Symmetric NLI Stance Teacher ($s_{uv}$):} Within a 384-token budget preserving the full reply span, \texttt{mDeBERTa-v3-base-xnli} evaluates two symmetric hypotheses (support vs.\ opposition) over parent--reply pairs, combining probabilities orthogonally on the 3-class stance simplex so $s_{uv} = P(\text{support}) - P(\text{oppose})$.
+    \item \textbf{Class-Weighted Hostility Teacher ($h_{uv}$):} Inverse-frequency class weighting fine-tunes \texttt{uitnlp/visobert} on \texttt{UIT-ViHSD} \cite{luu2021vihsd} (VI), paired with \texttt{twitter-roberta-base-offensive} \cite{barbieri2020tweeteval} (EN).
+    \item \textbf{Segment-Isolated Student (\texttt{DualHeadCrossEncoder}):} Trained strictly on $\mathcal{T}_{\text{train}}$ with a 5-block relational interaction vector $[h_{\text{CLS}} \Vert h_{\text{ctx}} \Vert h_{\text{reply}} \Vert h_{\text{ctx}} \odot h_{\text{reply}} \Vert |h_{\text{ctx}} - h_{\text{reply}}|]$ for stance and target-only span pooling for $h_{uv}$ (preventing parent profanity from contaminating clean replies), KL ($T=2.0$) + \texttt{BCEWithLogitsLoss}, deep \texttt{(root, reply)} pairs, differential AdamW learning rates, and LOO \texttt{edge\_source="teacher"} isolation.
+\end{itemize}
+
+\subsection{Dual-Channel Bidirectional SBi-FAGAT Architecture}
+A shared \texttt{TwoStreamNodeStem} projects semantic and $10$-D causal structural inputs into $h^{(0)} \in \mathbb{R}^{64}$ (masking topology columns for \texttt{TextMLP}). Each \texttt{StanceGuidedFAConv} layer normalizes linear node projections $z^{\text{norm}} = \operatorname{LN}(W h^{(l-1)})$ and evaluates scaled node--edge gates:
 \begin{equation}
-\gamma_{uv} = \tanh\!\left(\mathbf{a}^\top \left[z_u^{\text{norm}} \,\Vert\, z_v^{\text{norm}} \,\Vert\, e_{uv}\right]\right), \quad
-w_{uv} = \frac{\gamma_{uv}}{\sqrt{(d_{\text{out}}(u)+1)(d_{\text{in}}(v)+1)}}.
+\gamma_{uv} = \tanh\!\left(\frac{\mathbf{a}_{\text{node}}^\top [z_u^{\text{norm}} \Vert z_v^{\text{norm}}]}{\sqrt{2d}} + \omega \cos(z_u^{\text{norm}}, z_v^{\text{norm}}) + \mathbf{a}_{\text{edge}}^\top e_{uv} + \delta_{\gamma}(e_{uv})\right),
 \end{equation}
-Messages propagate independently along $\mathcal{E}_K^{\text{TD}}$ and $\mathcal{E}_K^{\text{BU}}$ with initial residual anchoring:
-\begin{equation}
-\tilde{h}_v^{(l+1)} = 0.5 h_v^{(l)} + \epsilon h_v^{(0)} + \sum_{u \in \mathcal{N}(v)} w_{uv} z_u^{(l)} + W_{\text{root}} h_{\text{root}}^{(0)},
-\end{equation}
-followed by $h_v^{(l+1)} = \operatorname{Dropout}(\operatorname{LN}(\tilde{h}_v^{(l+1)} + 0.2\tanh(\tilde{h}_v^{(l+1)})))$. Attention readouts pool both branches into $z_{\mathcal{G}} = [z_{\text{root}}^{\text{TD}} \Vert z_{\text{att}}^{\text{TD}} \Vert z_{\text{root}}^{\text{BU}} \Vert z_{\text{att}}^{\text{BU}}]$ feeding the shared \texttt{MultiTaskHead}.
+alongside an unsigned excitation gate $\alpha_{uv}^{\text{exc}} = \sigma(0.8|s_{uv}| + 0.8 h_{uv} + \delta_{\alpha}(e_{uv}))$. Messages split evenly into signed polarity ($\gamma_{uv} z_u[:d/2]$) and unsigned excitation ($\alpha_{uv}^{\text{exc}} z_u[d/2:]$) channels under symmetric degree normalization $c_{uv} = \sqrt{(d_{\text{out}}(u)+1)(d_{\text{in}}(v)+1)}$, updated with initial residual anchoring ($0.5 h^{(l-1)} + \epsilon h^{(0)} + m_v + W_{\text{root}} h_r^{(0)}$) and odd-symmetric stabilization $r + 0.2\tanh(r)$. After each layer, Dir-GNN cross-mixing couples TD and BU states ($\tilde{h}^{\delta} = h^{\delta} + \tanh(\eta_l) W_{\text{mix}}^{\delta} h^{\bar{\delta}}$). Finally, root/attention readouts concatenate node dispersion $z_{\text{disp}}$, BFS root-aligned camp dipoles $(z_{\text{dipole}}^{\text{polar}}, z_{\text{dipole}}^{\text{signed}})$ up to $64$ hops, and 6 scalar gate moments, projected to $2d = 128$ and fused with optional $8$-D \texttt{cascade\_stats} inside \texttt{MultiTaskHead}.
 
-\subsection{Multi-Task Optimization and $\beta$-NLL Uncertainty}
-The regression heads minimize Huber loss on $y_{\text{size}}$ and $y_{\text{polar}}$ jointly with masked Cross-Entropy on $y_{\text{rumor}}$ under AdamW ($lr$, weight decay $10^{-4}$), cosine scheduling, and early stopping on task loss. When uncertainty prediction is enabled in \texttt{v2}, detached residuals optimize heteroscedastic $\beta$-NLL ($\beta=0.5$) \cite{seitzer2022pitfalls} without biasing mean point predictions.
+\subsection{Multi-Task Optimization}
+To prevent sigmoid tail gradient starvation on $y_{\text{polar}}$, we replace raw sigmoid Huber loss with zero-minimum KL-calibrated binary cross-entropy over logits $z_{\text{polar}}$ combined with Smooth-L1 regression ($\beta=0.08$):
+\begin{equation}
+\mathcal{L}_{\text{polar}} = \operatorname{BCEWithLogits}(z_{\text{polar}}, y_{\text{polar}}) - H(y_{\text{polar}}) + \operatorname{SmoothL1}(\sigma(z_{\text{polar}}), y_{\text{polar}}),
+\end{equation}
+jointly with Huber loss on $y_{\text{size}}$ and masked class-weighted Cross-Entropy on $y_{\text{rumor}}$. Training applies strictly train-only target inverse-standard-deviation loss scaling and output bias initialization, linear warmup followed by \texttt{ReduceLROnPlateau}, Exponential Moving Average (EMA) validation selection, Early Stopping on validation task loss, and validation-best checkpoint selection across five deterministic seeds ($[42, 100, 2024, 777, 999]$).
 
 \section{Experimental Setup}
-All experiments evaluate 8 matched architectures (\texttt{TextMLP}, \texttt{TemporalStanceMLP}, \texttt{StandardGCN}, \texttt{StandardGATv2}, \texttt{EdgeGATv2}, \texttt{FAGCN}, \texttt{BiGCN}, \texttt{SBiFAGAT}) across five deterministic seeds ($[42, 100, 2024, 777, 999]$) with paired $t$-tests, bootstrap $p$-values, and Holm--Bonferroni correction. Table~\ref{tab:dataset_eda} reports dataset splits and the Early-$K$ Persistence Baseline generated directly from validated Parquet tables.
+All experiments evaluate 8 architectures fairly at fixed shared hyperparameters (\texttt{hidden\_dim=64}, matching $128$-D regression heads) alongside the non-learned Early-$K$ Persistence Baseline across 5 deterministic seeds, reporting paired $t$-tests, sample-level paired bootstrap $p$-values, and Holm--Bonferroni adjusted significance against the strongest learned comparator. \IfFileExists{tables_dataset_eda.tex}{Table~\ref{tab:dataset_eda}}{\IfFileExists{tables_dataset_eda_pheme.tex}{Tables~\ref{tab:dataset_eda_pheme}\IfFileExists{tables_dataset_eda_vn.tex}{--\ref{tab:dataset_eda_vn}}{}}{Table~\ref{tab:dataset_eda}}} reports dataset splits and Early-$K$ Persistence statistics generated directly from validated Parquet tables.
 
 \IfFileExists{tables_dataset_eda.tex}{
   \input{tables_dataset_eda}
 }{
-  \begin{table}[t]
-  \centering
-  \caption{Dataset EDA and Early-$K$ Persistence Baseline (pending \texttt{scripts/export\_dataset\_stats.py} execution on processed datasets).}
-  \label{tab:dataset_eda}
-  \begin{tabular}{lc}
-  \toprule
-  Artifact & Status \\
-  \midrule
-  \texttt{tables\_dataset\_eda.tex} & Pending corpus execution \\
-  \bottomrule
-  \end{tabular}
-  \end{table}
+  \IfFileExists{tables_dataset_eda_pheme.tex}{
+    \input{tables_dataset_eda_pheme}
+  }{}
+  \IfFileExists{tables_dataset_eda_vn.tex}{
+    \input{tables_dataset_eda_vn}
+  }{
+    \IfFileExists{tables_dataset_eda_pheme.tex}{}{
+      \begin{table}[t]
+      \centering
+      \caption{Dataset EDA and Early-$K$ Persistence Baseline (pending \texttt{scripts/export\_dataset\_stats.py} execution on processed datasets).}
+      \label{tab:dataset_eda}
+      \begin{tabular}{lc}
+      \toprule
+      Artifact & Status \\
+      \midrule
+      \texttt{tables\_dataset\_eda.tex} & Pending corpus execution \\
+      \bottomrule
+      \end{tabular}
+      \end{table}
+    }
+  }
 }
 
 \section{Results and Ablation Studies}
@@ -108,7 +123,7 @@ This manuscript template strictly forbids pre-filled or synthetic metric numbers
 }{
   \begin{table}[t]
   \centering
-  \caption{PHEME 5-Seed Benchmark Comparison (pending GPU run of \texttt{scripts/run\_experiments.py}).}
+  \caption{PHEME 5-Seed Inductive Benchmark Comparison (pending GPU run of \texttt{scripts/run\_experiments.py}).}
   \label{tab:main_pheme}
   \begin{tabular}{lc}
   \toprule
@@ -119,6 +134,10 @@ This manuscript template strictly forbids pre-filled or synthetic metric numbers
   \end{tabular}
   \end{table}
 }
+
+\IfFileExists{tables_loo_pheme.tex}{
+  \input{tables_loo_pheme}
+}{}
 
 \IfFileExists{tables_main_vn.tex}{
   \input{tables_main_vn}
@@ -143,7 +162,7 @@ This manuscript template strictly forbids pre-filled or synthetic metric numbers
   \begin{table}[t]
   \centering
   \caption{Component Ablation and Early Horizon Sensitivity $K \in \{10, 20, 30, 50\}$ (pending \texttt{scripts/run\_ablation.py}).}
-  \label{tab:ablation}
+  \label{tab:ablation_pheme}
   \begin{tabular}{lc}
   \toprule
   Artifact & Status \\
@@ -154,6 +173,10 @@ This manuscript template strictly forbids pre-filled or synthetic metric numbers
   \end{table}
 }
 
+\IfFileExists{tables_ablation_vn.tex}{
+  \input{tables_ablation_vn}
+}{}
+
 \IfFileExists{tables_upfd.tex}{
   \input{tables_upfd}
 }{}
@@ -161,34 +184,38 @@ This manuscript template strictly forbids pre-filled or synthetic metric numbers
 \IfFileExists{tables_efficiency.tex}{
   \input{tables_efficiency}
 }{
-  \begin{table}[t]
-  \centering
-  \caption{Computational Efficiency Benchmark (pending \texttt{scripts/benchmark\_efficiency.py --output-table}).}
-  \label{tab:efficiency}
-  \begin{tabular}{lc}
-  \toprule
-  Artifact & Status \\
-  \midrule
-  \texttt{tables\_efficiency.tex} & Pending profiler execution \\
-  \bottomrule
-  \end{tabular}
-  \end{table}
+  \IfFileExists{tables_efficiency_pheme.tex}{
+    \input{tables_efficiency_pheme}
+  }{
+    \begin{table}[t]
+    \centering
+    \caption{Computational Efficiency Benchmark (pending \texttt{scripts/benchmark\_efficiency.py --output-table}).}
+    \label{tab:efficiency}
+    \begin{tabular}{lc}
+    \toprule
+    Artifact & Status \\
+    \midrule
+    \texttt{tables\_efficiency.tex} & Pending profiler execution \\
+    \bottomrule
+    \end{tabular}
+    \end{table}
+  }
 }
 
 \section{Case Study and Limitations}
 \subsection{Trigger Comment Analysis}
-For qualitative interpretability, \texttt{extract\_edge\_gates} ranks edges by gate magnitude $|\gamma_{uv}|$ and signed conflict polarity, exporting tree visualizations (\texttt{paper/figures/fig3\_cascade\_heatmap.pdf}) alongside top trigger comments (\texttt{fig3\_top5\_trigger\_comments.txt}).
+For qualitative interpretability, \texttt{extract\_edge\_gates} ranks edges by gate magnitude $|\gamma_{uv}|$ and signed conflict polarity, exporting cascade tree heatmaps (\texttt{paper/figures/pheme/fig3\_cascade\_heatmap.pdf} and \texttt{paper/figures/vn/fig3\_cascade\_heatmap.pdf}) alongside top trigger comments (\texttt{fig3\_top5\_trigger\_comments.txt}).
 
 \subsection{Methodological Limitations and Ethical Safeguards}
 We explicitly acknowledge three methodological constraints:
 \begin{itemize}
-    \item \textbf{Silver-Standard Polarization Label:} $y_{\text{polar}}$ is derived from frozen or distilled NLP stance models over future interactions rather than exhaustive human tree annotation; reliability is audited via 300-pair blind human agreement (\texttt{scripts/compute\_kappa.py}), 50-thread VN manual grading, construct validity against Sarle's Bimodality Coefficient, and Early-$K$ Persistence comparison.
-    \item \textbf{Heuristic VN Inductive Split:} Lacking exogenous news event IDs on Reddit Vietnam, Train/Val/Test separation uses temporal windows and TF-IDF keyword clustering rather than strict crisis event boundaries.
-    \item \textbf{Privacy Preservation:} User identifiers are pseudonymized via salted SHA-256 hashing prior to persistence, avoiding raw username storage.
+    \item \textbf{Silver-Standard Polarization Label:} $y_{\text{polar}}$ is derived from NLP stance models over future interactions rather than exhaustive manual tree annotation; reliability is audited via 300-pair blind dual-annotator agreement reporting adjudication coverage (\texttt{scripts/compute\_kappa.py}), 50-thread VN manual grading, construct validity against Sarle's Bimodality Coefficient, and Early-$K$ Persistence comparison.
+    \item \textbf{Heuristic VN Inductive Split:} Lacking exogenous news event IDs on Reddit Vietnam, Train/Val/Test separation uses 14-day temporal windows and TF-IDF keyword clustering rather than strict crisis event boundaries.
+    \item \textbf{Privacy Preservation:} User identifiers are pseudonymized via salted SHA-256 hashing prior to persistence, avoiding raw username storage, and answer-key audit files are excluded from distribution archives.
 \end{itemize}
 
 \section{Conclusion}
-We presented SBi-FAGAT alongside a rigorously leakage-checked bilingual pipeline, separating reproducible CPU-compatible 2D baseline training from opt-in 4D behavioral LLM distillation. Following ingestion of full PHEME and Vietnamese Reddit splits and 5-seed GPU execution, empirical tables and camera-ready vector figures integrate directly into this IEEEtran manuscript.
+We presented SBi-FAGAT under a unified, leakage-checked 2D bilingual architecture combining Ancestor-Conditioned SpanPool node representations, segment-isolated stance--hostility distillation, dual-channel Top-Down/Bottom-Up signed graph attention, and KL-calibrated multi-task optimization. Following GPU execution on full PHEME and Vietnamese Reddit splits and human reliability audits, generated LaTeX tables and vector figures integrate directly into this IEEEtran manuscript.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}

@@ -1,6 +1,6 @@
 ## Summary
 - **Jira Ticket:** `[SBIF-xx]` (link to `https://sbifagat-research.atlassian.net/browse/SBIF-xx`)
-- **Profile Scope:** `v1` (2D `legacy_nli` MVP) / `v2` (opt-in 4D `qwen_qlora` + 8D stats + beta-NLL) / Docs / Governance
+- **Pipeline Scope:** Unified 2D NLP (`dual_nli` Stance Verbalizer + `SpanPool` + Segment-Isolated CE) / SBi-FAGAT GNN (`hidden_dim=64`, `struct_x` 10D, `cascade_stats` 8D) / Docs / Governance
 
 ## Five Iron Laws Verification Checklist
 - [ ] **No Fake Results:** No synthetic or mock tensors are used in benchmark result tables or `paper/*.tex`.

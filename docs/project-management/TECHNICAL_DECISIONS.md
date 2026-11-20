@@ -18,10 +18,13 @@
 
 ---
 
-## ADR-03: Stable Profile `v1` Default with Opt-In Profile `v2`
-- **Context:** Running `Qwen/Qwen3.8-27B` QLoRA requires `T4 x 2` (32 GB VRAM) and `transformers >= 5.8.0`, whereas `v1` runs cleanly on single 8–16 GB GPUs or CPU CI.
-- **Decision:** Keep `PIPELINE_VERSION=v1` (`--teacher-backend legacy_nli --edge-dim 2`, deterministic point heads) as default across `run_all.sh` and `scripts/run_phase2.sh`, and gate `v2` (`--teacher-backend qwen_qlora --edge-dim 4 --v2` with 8D `cascade_stats` and $\beta$-NLL uncertainty) behind explicit opt-in (`SBIF-27`, `SBIF-28` resolved).
-- **Status:** Accepted & Implemented.
+## ADR-03: Unified 2D Dual-Teacher Architecture & Model Parity
+- **Context:** Scaling to an oversized quantized 27B generative LLM teacher on Kaggle `T4 x 2` caused excessive VRAM pressure and time budgets that forced `--max-teacher-pairs` sampling, which would introduce train/test teacher–student distribution gaps and fallback risk. Meanwhile, fair GNN benchmarking across 8 models requires uniform capacity and non-leaky node/edge encoders.
+- **Decision:** Standardize the repository on a single **Unified 2D Architecture**:
+  1. Freeze `uitnlp/visobert` (VN) and `cardiffnlp/twitter-roberta-base` (EN) for **Ancestor-Conditioned SpanPool** (`[root | parent | reply]` pooling over reply tokens) paired with `10`-D causal `struct_x` and `8`-D `cascade_stats`.
+  2. Use dual full-coverage teachers (`MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7` with Symmetric 2-Hypothesis Stance Verbalizer inside a 384-token reply-preserving budget + class-weighted `uitnlp/visobert` on `UIT-ViHSD` / `cardiffnlp/twitter-roberta-base-offensive`) to distill a segment-isolated `DualHeadCrossEncoder` (`BCEWithLogitsLoss` + $T=2.0$ KL).
+  3. Benchmark all 8 neural models fairly at fixed `hidden_dim = 64` (matching `2 * hidden_dim = 128` heads, `auto_loop` disabled for benchmark tuning unless explicitly passed `--run-auto-loop` for diagnostics only), evaluated against non-learned `Early-K Persistence`.
+- **Status:** Accepted & Implemented (Steps 1–3).
 
 ---
 

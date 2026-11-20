@@ -8,12 +8,12 @@ Operates exclusively with open Hugging Face Hub models (no paid APIs):
          -> `h_uv = P(offensive)`.
   2. Stance NLI Teacher (`s_uv in [-1, 1]`):
        - `MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7`
-         reading `(parent_text u, reply_text v)` ->
-         `s_uv = P(entailment | u, v) - P(contradiction | u, v)`.
+         using a symmetric 2-hypothesis Stance Verbalizer over
+         `(parent_text u, reply_text v)` -> `s_uv = P(support) - P(oppose)`.
   3. Blind Stratified Human Audit CSV exporter (`data/interim/human_audit_300.csv`).
-  4. Unified 2-head Student `DualHeadCrossEncoder` (`uitnlp/visobert` for `vi`,
-     `roberta-base` for `en`) distilled from teacher soft labels with an
-     anti-cheating `--sanity-check-shuffle` flag.
+  4. Unified segment-isolated Student `DualHeadCrossEncoder` (`uitnlp/visobert`
+     for `vi`, `cardiffnlp/twitter-roberta-base` for `en`) distilled with
+     temperature-scaled KL, `BCEWithLogitsLoss`, and `--sanity-check-shuffle`.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import inspect
 import json
 import math
 import random
+import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -57,14 +58,7 @@ from src.data.pyg_dataset import (
     save_topic_splits_json,
 )
 from src.data.schema import load_cascade_parquet
-from src.nlp.qwen_teacher import (
-    DISCOURSE_BEHAVIOR_LABELS,
-    EN_DEBERTA_MODEL_NAME,
-    QWEN_TEACHER_MODEL_ID,
-    QwenBehavioralTeacherScorer,
-    behavior_probs_to_stance_probs,
-    finetune_qwen_qlora,
-)
+from src.nlp.discourse_labels import DISCOURSE_BEHAVIOR_LABELS, behavior_probs_to_stance_probs
 from src.utils.seed import seed_everything
 from src.utils.text import normalize_nfc
 
@@ -72,9 +66,14 @@ VISOBERT_MODEL_NAME = "uitnlp/visobert"
 UIT_VIHSD_DATASET_NAME = "ura-hcmut/UIT-ViHSD"
 EN_OFFENSIVE_MODEL_NAME = "cardiffnlp/twitter-roberta-base-offensive"
 MDEBERTA_NLI_MODEL_NAME = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
-ROBERTA_BASE_MODEL_NAME = "roberta-base"
+TWITTER_ROBERTA_MODEL_NAME = "cardiffnlp/twitter-roberta-base"
+DEFAULT_EN_BACKBONE = TWITTER_ROBERTA_MODEL_NAME
 
 STANCE_LABELS: tuple[str, ...] = ("support", "neutral", "oppose")
+
+_EN_MENTION_RE = re.compile(r"(?<!\w)@[A-Za-z0-9_]+")
+_EN_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_MULTI_WS_RE = re.compile(r"\s+")
 
 
 def _make_grad_scaler(enabled: bool) -> Any:
@@ -93,6 +92,38 @@ def _cuda_autocast(enabled: bool) -> Any:
 
 def _normalize_nfc(text: Any) -> str:
     return normalize_nfc(text)
+
+
+def normalize_social_text(text: Any, *, lang: str = "vi") -> str:
+    """Normalize social-media text (`@handle -> @user` EN-only, URLs -> `http` & whitespace collapse for EN/VI)."""
+    norm = _normalize_nfc(text)
+    if norm:
+        if lang == "en":
+            norm = _EN_MENTION_RE.sub("@user", norm)
+        norm = _EN_URL_RE.sub("http", norm)
+        norm = _MULTI_WS_RE.sub(" ", norm).strip()
+    return norm
+
+
+def _effective_max_length(
+    max_length: int,
+    *,
+    encoder: Any | None = None,
+    tokenizer: Any | None = None,
+) -> int:
+    """Clamp sequence max_length safely to encoder position-embedding capacity."""
+    eff = max(8, int(max_length))
+    cfg = getattr(encoder, "config", None) if encoder is not None else None
+    max_pos = getattr(cfg, "max_position_embeddings", None)
+    pad_id = getattr(cfg, "pad_token_id", None)
+    if pad_id is None and tokenizer is not None:
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        mtype = str(getattr(cfg, "model_type", "")).lower()
+        pad_id = 1 if ("roberta" in mtype or "xlm" in mtype) else 0
+    if isinstance(max_pos, int) and max_pos > 8:
+        eff = min(eff, max(8, max_pos - int(pad_id) - 1))
+    return eff
 
 
 def load_tokenizer_safe(model_name_or_path: str | Path) -> Any:
@@ -152,7 +183,7 @@ def finetune_visobert_vihsd(
     tokenizer: Any | None = None,
     device: torch.device | None = None,
 ) -> Path:
-    """Fine-tune ViSoBERT (FP16 AMP on CUDA) for 3-class UIT-ViHSD hostility detection."""
+    """Fine-tune ViSoBERT (FP16 AMP, class-weighted CE, warmup+cosine LR) for UIT-ViHSD."""
     seed_everything(seed)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -163,14 +194,29 @@ def finetune_visobert_vihsd(
     train_split = ds["train"]
     val_split = ds["validation"] if "validation" in ds else ds["test"]
 
-    train_texts = [str(x) for x in train_split["free_text"]]
+    train_texts = [normalize_social_text(x, lang="vi") for x in train_split["free_text"]]
     train_labels = [int(x) for x in train_split["label_id"]]
     if max_train_samples is not None and len(train_texts) > max_train_samples:
         train_texts = train_texts[:max_train_samples]
         train_labels = train_labels[:max_train_samples]
 
-    val_texts = [str(x) for x in val_split["free_text"]]
+    val_texts = [normalize_social_text(x, lang="vi") for x in val_split["free_text"]]
     val_labels = [int(x) for x in val_split["label_id"]]
+
+    # Dampened inverse-frequency class weights computed strictly on train_labels
+    counts = np.bincount(np.asarray(train_labels, dtype=np.int64), minlength=3)
+    total = float(counts.sum())
+    weights = np.ones(3, dtype=np.float32)
+    nonzero_mask = counts > 0
+    if total > 0.0 and bool(nonzero_mask.any()):
+        for c in range(3):
+            if counts[c] > 0:
+                weights[c] = math.sqrt(total / (3.0 * float(counts[c])))
+        mean_nz = float(weights[nonzero_mask].mean())
+        if mean_nz > 0.0:
+            weights = weights / mean_nz
+            weights[~nonzero_mask] = 1.0
+    class_weights_t = torch.tensor(weights, dtype=torch.float32, device=target_device)
 
     tok = tokenizer if tokenizer is not None else load_tokenizer_safe(model_name)
     if model is None:
@@ -183,6 +229,7 @@ def finetune_visobert_vihsd(
     else:
         clf = model
     clf = clf.to(target_device)
+    eff_max_len = _effective_max_length(max_length, encoder=clf, tokenizer=tok)
 
     train_loader = DataLoader(
         _TextClassificationDataset(train_texts, train_labels),
@@ -195,10 +242,38 @@ def finetune_visobert_vihsd(
         shuffle=False,
     )
 
-    optimizer = torch.optim.AdamW(clf.parameters(), lr=lr, weight_decay=0.01)
+    no_decay_tags = ("bias", "layernorm", "layer_norm")
+    decay_params, no_decay_params = [], []
+    for pname, param in clf.named_parameters():
+        if not param.requires_grad:
+            continue
+        low_p = pname.lower()
+        if low_p.endswith("bias") or any(tag in low_p for tag in no_decay_tags):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+    opt_groups = []
+    if decay_params:
+        opt_groups.append({"params": decay_params, "lr": lr, "weight_decay": 0.01})
+    if no_decay_params:
+        opt_groups.append({"params": no_decay_params, "lr": lr, "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(opt_groups or clf.parameters(), lr=lr)
     scaler = _make_grad_scaler(enabled=use_amp)
 
+    total_steps = max(1, max(1, epochs) * max(1, len(train_loader)))
+    warmup_steps = max(1, int(round(0.10 * total_steps)))
+
+    def _lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return 0.1 + 0.9 * (float(step + 1) / float(warmup_steps))
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        progress = min(1.0, max(0.0, progress))
+        return 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+
     best_f1 = -1.0
+    f1_history: list[float] = []
     best_state: dict[str, Tensor] = {k: v.detach().cpu().clone() for k, v in clf.state_dict().items()}
 
     for _epoch in range(max(1, epochs)):
@@ -208,7 +283,7 @@ def finetune_visobert_vihsd(
                 list(batch_texts),
                 padding=True,
                 truncation=True,
-                max_length=max_length,
+                max_length=eff_max_len,
                 return_tensors="pt",
             )
             enc = {k: v.to(target_device) for k, v in enc.items()}
@@ -216,13 +291,16 @@ def finetune_visobert_vihsd(
 
             optimizer.zero_grad(set_to_none=True)
             with _cuda_autocast(enabled=use_amp):
-                out = clf(**enc, labels=labels_t)
-                loss = out.loss
+                logits = clf(**enc).logits
+            loss = F.cross_entropy(logits.float(), labels_t, weight=class_weights_t)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(clf.parameters(), max_norm=1.0)
+            scale_before = scaler.get_scale() if use_amp else 1.0
             scaler.step(optimizer)
             scaler.update()
+            if not use_amp or scaler.get_scale() >= scale_before:
+                scheduler.step()
 
         clf.eval()
         preds: list[int] = []
@@ -233,16 +311,17 @@ def finetune_visobert_vihsd(
                     list(batch_texts),
                     padding=True,
                     truncation=True,
-                    max_length=max_length,
+                    max_length=eff_max_len,
                     return_tensors="pt",
                 )
                 enc = {k: v.to(target_device) for k, v in enc.items()}
                 with _cuda_autocast(enabled=use_amp):
                     logits = clf(**enc).logits
-                preds.extend(logits.argmax(dim=-1).cpu().tolist())
+                preds.extend(logits.float().argmax(dim=-1).cpu().tolist())
                 trues.extend(torch.as_tensor(batch_labels).tolist())
 
         macro_f1 = float(f1_score(trues, preds, average="macro", zero_division=0))
+        f1_history.append(macro_f1)
         if macro_f1 >= best_f1:
             best_f1 = macro_f1
             best_state = {k: v.detach().cpu().clone() for k, v in clf.state_dict().items()}
@@ -252,7 +331,14 @@ def finetune_visobert_vihsd(
     if hasattr(tok, "save_pretrained"):
         tok.save_pretrained(out_path)
     (out_path / "vihsd_metrics.json").write_text(
-        json.dumps({"best_val_macro_f1": best_f1}, indent=2),
+        json.dumps(
+            {
+                "best_val_macro_f1": best_f1,
+                "class_weights": [float(w) for w in weights.tolist()],
+                "val_macro_f1_history": f1_history,
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
     return out_path
@@ -339,30 +425,37 @@ class HostilityTeacherScorer:
             return np.zeros((0,), dtype=np.float32)
 
         use_amp = self.device.type == "cuda"
+        eff_max_len = _effective_max_length(max_length, encoder=self.model, tokenizer=self.tokenizer)
         id2label = getattr(getattr(self.model, "config", None), "id2label", None)
         scores: list[Tensor] = []
 
         for start in range(0, len(texts), batch_size):
-            batch = [_normalize_nfc(t) for t in texts[start : start + batch_size]]
+            batch = [
+                normalize_social_text(t, lang=self.lang)
+                for t in texts[start : start + batch_size]
+            ]
             enc = self.tokenizer(
                 batch,
                 padding=True,
                 truncation=True,
-                max_length=max_length,
+                max_length=eff_max_len,
                 return_tensors="pt",
             )
             enc = {k: v.to(self.device) for k, v in enc.items()}
             with _cuda_autocast(enabled=use_amp):
-                logits = self.model(**enc).logits
-                probs = torch.softmax(logits.float(), dim=-1)
-                h = self.hostility_from_probs(probs, lang=self.lang, id2label=id2label)
+                logits = self.model(**enc).logits.float()
+            if not torch.isfinite(logits).all():
+                with _cuda_autocast(enabled=False):
+                    logits = self.model(**enc).logits.float()
+            probs = torch.softmax(logits, dim=-1)
+            h = self.hostility_from_probs(probs, lang=self.lang, id2label=id2label)
             scores.append(h.cpu())
 
         return torch.cat(scores, dim=0).numpy().astype(np.float32)
 
 
 class NLIStanceTeacherScorer:
-    """Compute pairwise NLI stance signal `s_uv = P(entailment | u, v) - P(contradiction | u, v)`."""
+    """Compute pairwise NLI stance signal `s_uv` via symmetric 2-hypothesis Stance Verbalizer."""
 
     def __init__(
         self,
@@ -371,8 +464,12 @@ class NLIStanceTeacherScorer:
         model: Any | None = None,
         tokenizer: Any | None = None,
         device: torch.device | None = None,
+        lang: str = "vi",
+        use_stance_verbalizer: bool = True,
     ) -> None:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.lang = lang
+        self.use_stance_verbalizer = bool(use_stance_verbalizer)
         target = str(model_name_or_path)
         self.tokenizer = tokenizer if tokenizer is not None else load_tokenizer_safe(target)
         self.model = (
@@ -388,23 +485,98 @@ class NLIStanceTeacherScorer:
         self.entail_idx, self.neutral_idx, self.contra_idx = self._resolve_nli_indices()
 
     def _resolve_nli_indices(self) -> tuple[int, int, int]:
-        id2label = getattr(getattr(self.model, "config", None), "id2label", None) or {}
-        entail, neutral, contra = 0, 1, 2
+        cfg = getattr(self.model, "config", None)
+        id2label = getattr(cfg, "id2label", None) or {}
+        num_labels = getattr(cfg, "num_labels", None)
+        if num_labels is not None and int(num_labels) < 3:
+            raise ValueError(
+                f"Expected 3-class NLI model (entailment/neutral/contradiction), got num_labels={num_labels}"
+            )
+        if id2label and len(id2label) < 3:
+            raise ValueError(
+                f"Expected 3-class NLI id2label mapping, got {len(id2label)} labels: {id2label!r}"
+            )
+
+        entail: int | None = None
+        neutral: int | None = None
+        contra: int | None = None
+        saw_not_entail = False
         for k, name in id2label.items():
-            low = str(name).lower()
+            low = str(name).lower().strip()
             idx = int(k)
-            if "entail" in low:
+            if "not_entail" in low or "not entail" in low:
+                saw_not_entail = True
+            elif "entail" in low and "not" not in low:
                 entail = idx
             elif "neutral" in low:
                 neutral = idx
             elif "contradict" in low:
                 contra = idx
+
+        if saw_not_entail and contra is None:
+            raise ValueError(
+                f"2-class NLI label 'not_entailment' is unsupported; expected 3-class entailment/neutral/contradiction ({id2label!r})"
+            )
+
+        if entail is None and neutral is None and contra is None:
+            generic = all(str(v).lower().startswith("label_") for v in id2label.values())
+            if generic and (num_labels is None or int(num_labels) >= 3):
+                return 0, 1, 2
+            raise ValueError(f"Could not resolve 3-class NLI indices from id2label={id2label!r}")
+
+        if entail is None or neutral is None or contra is None or len({entail, neutral, contra}) != 3:
+            raise ValueError(
+                f"Incomplete 3-class NLI mapping resolved from id2label={id2label!r}: "
+                f"entail={entail}, neutral={neutral}, contra={contra}"
+            )
         return entail, neutral, contra
 
     @staticmethod
     def stance_from_canonical_probs(probs_3: Tensor) -> Tensor:
-        """Compute `s_uv = P(entailment) - P(contradiction)` from `[P_ent, P_neu, P_con]`."""
+        """Compute `s_uv = P(support) - P(oppose)` from `[P_sup, P_neu, P_opp]`."""
         return (probs_3[:, 0] - probs_3[:, 2]).clamp(-1.0, 1.0)
+
+    def _score_premise_hypothesis(
+        self,
+        premises: Sequence[str],
+        hypotheses: Sequence[str],
+        *,
+        effective_max_len: int,
+    ) -> Tensor:
+        use_amp = self.device.type == "cuda"
+        try:
+            enc = self.tokenizer(
+                list(premises),
+                list(hypotheses),
+                padding=True,
+                truncation="only_first",
+                max_length=effective_max_len,
+                return_tensors="pt",
+            )
+        except Exception:
+            enc = self.tokenizer(
+                list(premises),
+                list(hypotheses),
+                padding=True,
+                truncation=True,
+                max_length=effective_max_len,
+                return_tensors="pt",
+            )
+        enc = {k: v.to(self.device) for k, v in enc.items()}
+        with _cuda_autocast(enabled=use_amp):
+            logits = self.model(**enc).logits.float()
+        if not torch.isfinite(logits).all():
+            with _cuda_autocast(enabled=False):
+                logits = self.model(**enc).logits.float()
+        raw_probs = torch.softmax(logits, dim=-1)
+        return torch.stack(
+            [
+                raw_probs[:, self.entail_idx],
+                raw_probs[:, self.neutral_idx],
+                raw_probs[:, self.contra_idx],
+            ],
+            dim=-1,
+        )
 
     @torch.no_grad()
     def score_pairs(
@@ -413,7 +585,9 @@ class NLIStanceTeacherScorer:
         reply_texts: Sequence[str],
         *,
         batch_size: int = 16,
-        max_length: int = 256,
+        max_length: int = 384,
+        lang: str | None = None,
+        use_stance_verbalizer: bool | None = None,
     ) -> dict[str, Any]:
         if len(parent_texts) != len(reply_texts):
             raise ValueError("parent_texts and reply_texts must have equal length")
@@ -424,36 +598,88 @@ class NLIStanceTeacherScorer:
                 "pred_label": [],
             }
 
-        use_amp = self.device.type == "cuda"
+        eff_lang = str(lang or self.lang or "vi")
+        active_verbalizer = (
+            self.use_stance_verbalizer
+            if use_stance_verbalizer is None
+            else bool(use_stance_verbalizer)
+        )
+        eff_max_len = _effective_max_length(
+            max_length, encoder=self.model, tokenizer=self.tokenizer
+        )
         all_probs: list[Tensor] = []
         all_s: list[Tensor] = []
 
+        if eff_lang == "en":
+            h_sup_tmpl = "The reply agrees with or supports the parent comment."
+            h_opp_tmpl = "The reply disagrees with, criticizes, or opposes the parent comment."
+            tpl_prefix = "Parent comment: \nReply: "
+        else:
+            h_sup_tmpl = "Phản hồi đồng ý hoặc ủng hộ bình luận gốc."
+            h_opp_tmpl = "Phản hồi phản đối, chỉ trích hoặc không đồng ý với bình luận gốc."
+            tpl_prefix = "Bình luận gốc: \nPhản hồi: "
+
+        has_tok_encode = hasattr(self.tokenizer, "encode") and hasattr(self.tokenizer, "decode")
+        if active_verbalizer and has_tok_encode:
+            hyp_tok_len = max(
+                len(self.tokenizer.encode(h_sup_tmpl, add_special_tokens=False)),
+                len(self.tokenizer.encode(h_opp_tmpl, add_special_tokens=False)),
+            )
+            tpl_overhead = len(self.tokenizer.encode(tpl_prefix, add_special_tokens=False)) + 10
+            avail_premise_tok = max(16, eff_max_len - hyp_tok_len - tpl_overhead)
+        else:
+            avail_premise_tok = max(64, eff_max_len - 48)
+
         for start in range(0, len(parent_texts), batch_size):
-            u_batch = [_normalize_nfc(t) for t in parent_texts[start : start + batch_size]]
-            v_batch = [_normalize_nfc(t) for t in reply_texts[start : start + batch_size]]
-            enc = self.tokenizer(
-                u_batch,
-                v_batch,
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors="pt",
-            )
-            enc = {k: v.to(self.device) for k, v in enc.items()}
-            with _cuda_autocast(enabled=use_amp):
-                logits = self.model(**enc).logits.float()
-            if not torch.isfinite(logits).all():
-                with _cuda_autocast(enabled=False):
-                    logits = self.model(**enc).logits.float()
-            raw_probs = torch.softmax(logits, dim=-1)
-            canonical = torch.stack(
-                [
-                    raw_probs[:, self.entail_idx],
-                    raw_probs[:, self.neutral_idx],
-                    raw_probs[:, self.contra_idx],
-                ],
-                dim=-1,
-            )
+            u_raw = parent_texts[start : start + batch_size]
+            v_raw = reply_texts[start : start + batch_size]
+            if active_verbalizer:
+                premises = []
+                for u, v in zip(u_raw, v_raw):
+                    u_norm = normalize_social_text(u, lang=eff_lang)
+                    v_norm = normalize_social_text(v, lang=eff_lang)
+                    if has_tok_encode:
+                        u_ids = self.tokenizer.encode(u_norm, add_special_tokens=False)
+                        v_ids = self.tokenizer.encode(v_norm, add_special_tokens=False)
+                        v_reserve = min(len(v_ids), max(8, avail_premise_tok // 2))
+                        u_max_tok = max(8, avail_premise_tok - v_reserve)
+                        u_keep = u_ids[:u_max_tok]
+                        v_max_tok = max(8, avail_premise_tok - len(u_keep))
+                        v_keep = v_ids[:v_max_tok]
+                        u_trim = (
+                            self.tokenizer.decode(u_keep, skip_special_tokens=True).strip()
+                            if len(u_ids) > len(u_keep)
+                            else u_norm
+                        )
+                        v_trim = (
+                            self.tokenizer.decode(v_keep, skip_special_tokens=True).strip()
+                            if len(v_ids) > len(v_keep)
+                            else v_norm
+                        )
+                    else:
+                        u_trim = u_norm[:300]
+                        v_trim = v_norm[:500]
+                    if eff_lang == "en":
+                        premises.append(f"Parent comment: {u_trim}\nReply: {v_trim}")
+                    else:
+                        premises.append(f"Bình luận gốc: {u_trim}\nPhản hồi: {v_trim}")
+                p_sup_pass = self._score_premise_hypothesis(
+                    premises, [h_sup_tmpl] * len(premises), effective_max_len=eff_max_len
+                )
+                p_opp_pass = self._score_premise_hypothesis(
+                    premises, [h_opp_tmpl] * len(premises), effective_max_len=eff_max_len
+                )
+                # Symmetric simplex combination guarantees p_sup + p_neu + p_opp == 1.0
+                p_sup = 0.5 * (p_sup_pass[:, 0] + p_opp_pass[:, 2])
+                p_neu = 0.5 * (p_sup_pass[:, 1] + p_opp_pass[:, 1])
+                p_opp = 0.5 * (p_opp_pass[:, 0] + p_sup_pass[:, 2])
+                canonical = torch.stack([p_sup, p_neu, p_opp], dim=-1)
+            else:
+                u_batch = [normalize_social_text(t, lang=eff_lang) for t in u_raw]
+                v_batch = [normalize_social_text(t, lang=eff_lang) for t in v_raw]
+                canonical = self._score_premise_hypothesis(
+                    u_batch, v_batch, effective_max_len=eff_max_len
+                )
             s = self.stance_from_canonical_probs(canonical)
             all_probs.append(canonical.cpu())
             all_s.append(s.cpu())
@@ -661,8 +887,190 @@ def export_stratified_human_audit_csv(
     return out_path
 
 
+def _encode_no_specials(tokenizer: Any, text: str) -> list[int]:
+    if not text:
+        return []
+    if hasattr(tokenizer, "encode"):
+        try:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            return [int(x) for x in ids]
+        except TypeError:
+            pass
+    out = tokenizer(text, add_special_tokens=False)
+    ids = out["input_ids"] if isinstance(out, Mapping) else out.input_ids
+    if ids and isinstance(ids[0], list):
+        ids = ids[0]
+    return [int(x) for x in ids]
+
+
+def _inspect_pair_tokenizer(tokenizer: Any, encoder: Any | None = None) -> dict[str, Any]:
+    """Detect special token IDs and RoBERTa (4-special) vs BERT (3-special) pair formatting."""
+    cfg = getattr(encoder, "config", None) if encoder is not None else None
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(cfg, "pad_token_id", 0)
+    if pad_id is None:
+        pad_id = 0
+
+    cls_id = getattr(tokenizer, "cls_token_id", None)
+    if cls_id is None:
+        cls_id = getattr(tokenizer, "bos_token_id", None)
+    if cls_id is None:
+        cls_id = 0
+
+    sep_id = getattr(tokenizer, "sep_token_id", None)
+    if sep_id is None:
+        sep_id = getattr(tokenizer, "eos_token_id", None)
+    if sep_id is None:
+        sep_id = 2
+
+    num_specials = 3
+    use_type_ids = False
+    try:
+        probe = tokenizer("a", "b", add_special_tokens=True)
+        probe_ids = probe["input_ids"] if isinstance(probe, Mapping) else probe.input_ids
+        if hasattr(probe_ids, "tolist"):
+            probe_ids = probe_ids.tolist()
+        if probe_ids and isinstance(probe_ids[0], list):
+            probe_ids = probe_ids[0]
+        a_ids = _encode_no_specials(tokenizer, "a")
+        b_ids = _encode_no_specials(tokenizer, "b")
+        diff = len(probe_ids) - len(a_ids) - len(b_ids)
+        if diff >= 4:
+            num_specials = 4
+        elif diff == 3:
+            num_specials = 3
+        t_ids = probe.get("token_type_ids") if isinstance(probe, Mapping) else None
+        type_vocab_size = getattr(cfg, "type_vocab_size", None)
+        if t_ids is not None and type_vocab_size is not None and int(type_vocab_size) > 1:
+            use_type_ids = True
+    except Exception:
+        mtype = str(getattr(cfg, "model_type", "")).lower()
+        if "roberta" in mtype or "xlm" in mtype:
+            num_specials = 4
+
+    return {
+        "pad_id": int(pad_id),
+        "cls_id": int(cls_id),
+        "sep_id": int(sep_id),
+        "num_specials": int(num_specials),
+        "use_type_ids": bool(use_type_ids),
+    }
+
+
+def encode_cross_encoder_batch(
+    parent_texts: Sequence[str],
+    reply_texts: Sequence[str],
+    *,
+    tokenizer: Any,
+    root_texts: Sequence[str | None] | None = None,
+    include_root_context: bool = False,
+    lang: str = "vi",
+    max_length: int = 256,
+    encoder: Any | None = None,
+) -> dict[str, Tensor]:
+    """Tokenize `(context, reply)` pairs with guaranteed reply budget and segment masks."""
+    n = len(parent_texts)
+    if n != len(reply_texts):
+        raise ValueError("parent_texts and reply_texts must have equal length")
+    if root_texts is not None and len(root_texts) != n:
+        raise ValueError("root_texts must match parent_texts length when provided")
+    if n == 0:
+        empty = torch.empty((0, 0), dtype=torch.long)
+        return {
+            "input_ids": empty,
+            "attention_mask": empty,
+            "context_mask": empty,
+            "reply_mask": empty,
+        }
+
+    spec = _inspect_pair_tokenizer(tokenizer, encoder=encoder)
+    pad_id = spec["pad_id"]
+    cls_id = spec["cls_id"]
+    sep_id = spec["sep_id"]
+    num_specials = spec["num_specials"]
+    use_type_ids = spec["use_type_ids"]
+
+    eff_max = _effective_max_length(max_length, encoder=encoder, tokenizer=tokenizer)
+    content_budget = max(4, eff_max - num_specials)
+
+    seqs: list[list[int]] = []
+    ctx_masks: list[list[int]] = []
+    rep_masks: list[list[int]] = []
+    type_seqs: list[list[int]] = []
+
+    for i in range(n):
+        p_norm = normalize_social_text(parent_texts[i], lang=lang)
+        v_norm = normalize_social_text(reply_texts[i], lang=lang)
+        r_raw = root_texts[i] if root_texts is not None else None
+        r_norm = normalize_social_text(r_raw, lang=lang) if r_raw else ""
+
+        parent_ids = _encode_no_specials(tokenizer, p_norm)
+        reply_ids = _encode_no_specials(tokenizer, v_norm)
+
+        min_reply_budget = min(len(reply_ids), max(1, content_budget // 2))
+        ctx_budget = max(0, content_budget - min_reply_budget)
+
+        if include_root_context and r_norm and r_norm != p_norm and ctx_budget >= 3:
+            root_ids = _encode_no_specials(tokenizer, r_norm)
+            root_cap = min(len(root_ids), max(1, ctx_budget // 3))
+            parent_cap = min(len(parent_ids), max(0, ctx_budget - 1 - root_cap))
+            root_keep = root_ids[: min(len(root_ids), max(0, ctx_budget - 1 - parent_cap))]
+            parent_keep = parent_ids[:parent_cap]
+            if root_keep and parent_keep:
+                ctx_ids = root_keep + [sep_id] + parent_keep
+            elif root_keep:
+                ctx_ids = root_keep
+            else:
+                ctx_ids = parent_keep
+        else:
+            ctx_ids = parent_ids[:ctx_budget]
+
+        reply_budget = max(1, content_budget - len(ctx_ids))
+        reply_keep = reply_ids[:reply_budget]
+
+        mid_seps = [sep_id, sep_id] if num_specials >= 4 else [sep_id]
+        seq = [cls_id] + ctx_ids + mid_seps + reply_keep + [sep_id]
+        ctx_mask = [0] + [1] * len(ctx_ids) + [0] * len(mid_seps) + [0] * len(reply_keep) + [0]
+        rep_mask = [0] + [0] * len(ctx_ids) + [0] * len(mid_seps) + [1] * len(reply_keep) + [0]
+
+        seqs.append(seq)
+        ctx_masks.append(ctx_mask)
+        rep_masks.append(rep_mask)
+        if use_type_ids:
+            seg0_len = 1 + len(ctx_ids) + len(mid_seps)
+            seg1_len = len(reply_keep) + 1
+            type_seqs.append([0] * seg0_len + [1] * seg1_len)
+
+    max_len = max(len(s) for s in seqs)
+    input_ids = torch.full((n, max_len), pad_id, dtype=torch.long)
+    attention_mask = torch.zeros((n, max_len), dtype=torch.long)
+    context_mask = torch.zeros((n, max_len), dtype=torch.long)
+    reply_mask = torch.zeros((n, max_len), dtype=torch.long)
+    token_type_ids = torch.zeros((n, max_len), dtype=torch.long) if use_type_ids else None
+
+    for i, (seq, cm, rm) in enumerate(zip(seqs, ctx_masks, rep_masks)):
+        cur_len = len(seq)
+        input_ids[i, :cur_len] = torch.tensor(seq, dtype=torch.long)
+        attention_mask[i, :cur_len] = 1
+        context_mask[i, :cur_len] = torch.tensor(cm, dtype=torch.long)
+        reply_mask[i, :cur_len] = torch.tensor(rm, dtype=torch.long)
+        if token_type_ids is not None:
+            token_type_ids[i, :cur_len] = torch.tensor(type_seqs[i], dtype=torch.long)
+
+    out: dict[str, Tensor] = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "context_mask": context_mask,
+        "reply_mask": reply_mask,
+    }
+    if token_type_ids is not None:
+        out["token_type_ids"] = token_type_ids
+    return out
+
+
 class DualHeadCrossEncoder(nn.Module):
-    """Unified multi-head Cross-Encoder predicting 2D `[s_uv, h_uv]` or 4D `[s_uv, h_uv, r_uv, c_uv]`."""
+    """Segment-isolated multi-head Cross-Encoder predicting 2D `[s_uv, h_uv]` (or optional 4D)."""
 
     def __init__(
         self,
@@ -681,29 +1089,56 @@ class DualHeadCrossEncoder(nn.Module):
             raise ValueError(f"edge_dim must be 2 or 4, got {edge_dim}")
         self.lang = lang
         self.edge_dim = int(edge_dim)
-        self.model_name = model_name or (VISOBERT_MODEL_NAME if lang == "vi" else ROBERTA_BASE_MODEL_NAME)
+        self.model_name = model_name or (VISOBERT_MODEL_NAME if lang == "vi" else TWITTER_ROBERTA_MODEL_NAME)
         self.dropout_p = float(dropout)
         self.include_root_context = bool(include_root_context)
         self.encoder = encoder if encoder is not None else AutoModel.from_pretrained(self.model_name)
         hidden_size = int(self.encoder.config.hidden_size)
+        rel_proj_dim = min(256, hidden_size)
 
         self.dropout = nn.Dropout(self.dropout_p)
-        self.stance_head = nn.Linear(hidden_size, 3)  # [support, neutral, oppose]
+        self.stance_proj = nn.Sequential(
+            nn.Linear(5 * hidden_size, rel_proj_dim),
+            nn.LayerNorm(rel_proj_dim),
+            nn.GELU(),
+            nn.Dropout(self.dropout_p),
+        )
+        self.stance_head = nn.Linear(rel_proj_dim, 3)  # [support, neutral, oppose]
+        self.hostility_norm = nn.LayerNorm(hidden_size)
         self.hostility_head = nn.Linear(hidden_size, 1)
         if self.edge_dim == 4:
-            self.behavior_head = nn.Linear(hidden_size, len(DISCOURSE_BEHAVIOR_LABELS))
-            self.irrational_head = nn.Linear(hidden_size, 1)
-            self.constructive_head = nn.Linear(hidden_size, 1)
+            self.behavior_head = nn.Linear(rel_proj_dim, len(DISCOURSE_BEHAVIOR_LABELS))
+            self.irrational_head = nn.Linear(rel_proj_dim, 1)
+            self.constructive_head = nn.Linear(rel_proj_dim, 1)
         else:
             self.behavior_head = None
             self.irrational_head = None
             self.constructive_head = None
+
+    @staticmethod
+    def _masked_pool_or_fallback(
+        hidden: Tensor,
+        mask: Tensor | None,
+        fallback: Tensor,
+    ) -> Tensor:
+        if mask is None:
+            return fallback
+        m = (mask > 0).unsqueeze(-1).to(dtype=torch.float32)
+        m_sum = m.sum(dim=1)
+        pooled = (hidden.to(dtype=torch.float32) * m).sum(dim=1) / m_sum.clamp(min=1.0)
+        return torch.where(
+            m_sum > 0.0,
+            pooled,
+            fallback.to(dtype=torch.float32),
+        ).to(dtype=hidden.dtype)
 
     def forward(
         self,
         input_ids: Tensor,
         attention_mask: Tensor,
         token_type_ids: Tensor | None = None,
+        context_mask: Tensor | None = None,
+        reply_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
         kwargs: dict[str, Any] = {"input_ids": input_ids, "attention_mask": attention_mask}
         if token_type_ids is not None:
@@ -717,20 +1152,31 @@ class DualHeadCrossEncoder(nn.Module):
             if accepts_type_ids:
                 kwargs["token_type_ids"] = token_type_ids
         outputs = self.encoder(**kwargs)
-        cls_repr = self.dropout(outputs.last_hidden_state[:, 0, :])
+        hidden = outputs.last_hidden_state
+        h_cls = hidden[:, 0, :]
 
-        stance_logits = self.stance_head(cls_repr)
+        h_ctx = self._masked_pool_or_fallback(hidden, context_mask, h_cls)
+        h_reply = self._masked_pool_or_fallback(hidden, reply_mask, h_cls)
+
+        rel_in = torch.cat(
+            [h_cls, h_ctx, h_reply, h_ctx * h_reply, (h_ctx - h_reply).abs()],
+            dim=-1,
+        )
+        stance_repr = self.stance_proj(self.dropout(rel_in))
+        stance_logits = self.stance_head(stance_repr)
         stance_probs = torch.softmax(stance_logits.float(), dim=-1)
         s_uv = (stance_probs[:, 0] - stance_probs[:, 2]).clamp(-1.0, 1.0)
 
-        hostility_logit = self.hostility_head(cls_repr).squeeze(-1)
+        # Hostility reads strictly reply-only span representation to eliminate parent-toxicity bleed
+        host_repr = self.dropout(self.hostility_norm(h_reply))
+        hostility_logit = self.hostility_head(host_repr).squeeze(-1)
         h_uv = torch.sigmoid(hostility_logit.float()).clamp(0.0, 1.0)
 
         if self.edge_dim == 4 and self.behavior_head is not None:
-            behavior_logits = self.behavior_head(cls_repr)
+            behavior_logits = self.behavior_head(stance_repr)
             behavior_probs = torch.softmax(behavior_logits.float(), dim=-1)
-            irrational_logit = self.irrational_head(cls_repr).squeeze(-1)
-            constructive_logit = self.constructive_head(cls_repr).squeeze(-1)
+            irrational_logit = self.irrational_head(stance_repr).squeeze(-1)
+            constructive_logit = self.constructive_head(stance_repr).squeeze(-1)
             r_uv = torch.sigmoid(irrational_logit.float()).clamp(0.0, 1.0)
             c_uv = torch.sigmoid(constructive_logit.float()).clamp(0.0, 1.0)
             e_uv = torch.stack([s_uv, h_uv, r_uv, c_uv], dim=-1)
@@ -740,6 +1186,8 @@ class DualHeadCrossEncoder(nn.Module):
                 "hostility_logit": hostility_logit,
                 "behavior_logits": behavior_logits,
                 "behavior_probs": behavior_probs,
+                "irrational_logit": irrational_logit,
+                "constructive_logit": constructive_logit,
                 "s_uv": s_uv,
                 "h_uv": h_uv,
                 "r_uv": r_uv,
@@ -769,6 +1217,8 @@ class DualHeadCrossEncoder(nn.Module):
             "dropout": self.dropout_p,
             "include_root_context": bool(getattr(self, "include_root_context", False)),
             "has_pooler": getattr(self.encoder, "pooler", None) is not None,
+            "pooling_mode": "segment_isolated",
+            "arch_version": 2,
         }
         (out_path / "dual_head_meta.json").write_text(
             json.dumps(meta, indent=2),
@@ -883,11 +1333,13 @@ def distill_dual_cross_encoder(
     batch_size: int = 16,
     lr: float = 2e-5,
     max_length: int = 256,
+    distill_temperature: float = 2.0,
+    augment_root_pairs: bool = True,
     seed: int = 42,
     sanity_check_shuffle: bool = False,
     device: torch.device | None = None,
 ) -> dict[str, Any]:
-    """Distill unified `[s_uv, h_uv]` or 4D `[s_uv, h_uv, r_uv, c_uv]` Cross-Encoder."""
+    """Distill unified `[s_uv, h_uv]` (or optional 4D) segment-isolated Cross-Encoder."""
     if not train_records or not val_records:
         raise ValueError("Both train_records and val_records must be non-empty")
 
@@ -899,9 +1351,35 @@ def distill_dual_cross_encoder(
     val_data = [dict(r) for r in val_records]
 
     effective_edge_dim = int(model.edge_dim) if model is not None else int(edge_dim)
-    if any("r_uv" in r or "behavior_probs" in r for r in train_data[:10]) and model is None and edge_dim == 2:
-        # Respect explicit edge_dim=2 unless caller instantiated a 4D model or requested edge_dim=4
-        pass
+    train_root_aug_count = 0
+
+    if augment_root_pairs and not sanity_check_shuffle:
+        # Augment Train split with direct (root, deep_reply) pairs matching inference-time root stance queries
+        augmented_rows: list[dict[str, Any]] = []
+        for r in train_data:
+            if r.get("root_s_uv") is None:
+                continue
+            root_txt = _normalize_nfc(r.get("root_text") or "")
+            parent_txt = _normalize_nfc(r.get("parent_text") or "")
+            root_id = str(r.get("root_id") or "")
+            parent_id = str(r.get("parent_id") or "")
+            is_deep = bool(root_txt) and (
+                (root_id and parent_id and root_id != parent_id) or (root_txt != parent_txt)
+            )
+            if not is_deep:
+                continue
+            root_s = max(-1.0, min(1.0, float(r["root_s_uv"])))
+            aug_row = dict(r)
+            aug_row["parent_text"] = r["root_text"]
+            aug_row["root_text"] = r["root_text"]
+            aug_row["parent_id"] = root_id or parent_id
+            aug_row["s_uv"] = root_s
+            aug_row["stance_probs"] = r.get("root_stance_probs") or _build_default_stance_probs(root_s)
+            aug_row["h_uv"] = float(r["h_uv"])
+            augmented_rows.append(aug_row)
+        train_root_aug_count = len(augmented_rows)
+        if augmented_rows:
+            train_data.extend(augmented_rows)
 
     if sanity_check_shuffle:
         # Shuffle teacher target labels on TRAIN ONLY while preserving input pairs & VAL targets
@@ -950,27 +1428,21 @@ def distill_dual_cross_encoder(
     if use_multi_gpu and target_device.type == "cuda" and torch.cuda.device_count() > 1:
         active_student = nn.DataParallel(student)
 
-    def _format_u(item: Mapping[str, Any]) -> str:
-        parent_txt = _normalize_nfc(item["parent_text"])
-        if not include_root_context:
-            return parent_txt
-        root_txt = _normalize_nfc(item.get("root_text") or "")
-        if root_txt and root_txt != parent_txt:
-            return f"{root_txt[:220]} | {parent_txt}"
-        return parent_txt
-
     def _collate(
         batch: Sequence[Mapping[str, Any]],
     ) -> tuple[dict[str, Tensor], Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        u_texts = [_format_u(item) for item in batch]
-        v_texts = [_normalize_nfc(item["reply_text"]) for item in batch]
-        enc = tok(
+        u_texts = [str(item["parent_text"]) for item in batch]
+        v_texts = [str(item["reply_text"]) for item in batch]
+        r_texts = [item.get("root_text") for item in batch]
+        enc = encode_cross_encoder_batch(
             u_texts,
             v_texts,
-            padding=True,
-            truncation=True,
+            tokenizer=tok,
+            root_texts=r_texts,
+            include_root_context=include_root_context,
+            lang=lang,
             max_length=max_length,
-            return_tensors="pt",
+            encoder=student.encoder,
         )
         s_tgt = torch.tensor([float(item["s_uv"]) for item in batch], dtype=torch.float32)
         h_tgt = torch.tensor([float(item["h_uv"]) for item in batch], dtype=torch.float32)
@@ -1003,7 +1475,31 @@ def distill_dual_cross_encoder(
         collate_fn=_collate,
     )
 
-    optimizer = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=0.01)
+    head_lr = lr * 7.5 if lr <= 3e-5 else lr
+    no_decay_tags = ("bias", "layernorm", "layer_norm")
+    enc_decay, enc_no_decay, head_decay, head_no_decay = [], [], [], []
+    for pname, param in student.named_parameters():
+        if not param.requires_grad:
+            continue
+        low_name = pname.lower()
+        is_no_decay = low_name.endswith("bias") or any(t in low_name for t in no_decay_tags)
+        is_enc = pname.startswith("encoder.")
+        if is_enc:
+            (enc_no_decay if is_no_decay else enc_decay).append(param)
+        else:
+            (head_no_decay if is_no_decay else head_decay).append(param)
+
+    opt_groups = []
+    if enc_decay:
+        opt_groups.append({"params": enc_decay, "lr": lr, "weight_decay": 0.01})
+    if enc_no_decay:
+        opt_groups.append({"params": enc_no_decay, "lr": lr, "weight_decay": 0.0})
+    if head_decay:
+        opt_groups.append({"params": head_decay, "lr": head_lr, "weight_decay": 0.01})
+    if head_no_decay:
+        opt_groups.append({"params": head_no_decay, "lr": head_lr, "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(opt_groups or student.parameters(), lr=lr)
+
     scaler = _make_grad_scaler(enabled=use_amp)
     total_steps = max(1, max(1, epochs) * max(1, len(train_loader)))
     warmup_steps = max(1, int(round(0.10 * total_steps)))
@@ -1019,8 +1515,11 @@ def distill_dual_cross_encoder(
 
     train_losses: list[float] = []
     best_val_loss = float("inf")
+    best_epoch = 0
     best_state = copy.deepcopy({k: v.detach().cpu() for k, v in student.state_dict().items()})
+    best_val_metrics: dict[str, float] = {}
     last_val_metrics: dict[str, float] = {}
+    temp = max(1e-3, float(distill_temperature))
 
     def _batch_loss(
         out: Mapping[str, Tensor],
@@ -1031,22 +1530,33 @@ def distill_dual_cross_encoder(
         p_tgt_d: Tensor,
         bp_tgt_d: Tensor,
     ) -> Tensor:
-        kl_loss = F.kl_div(
-            torch.log_softmax(out["stance_logits"].float(), dim=-1),
-            p_tgt_d,
+        p_tgt_temp = torch.softmax(torch.log(p_tgt_d.clamp(min=1e-6)) / temp, dim=-1)
+        kl_loss = (temp * temp) * F.kl_div(
+            torch.log_softmax(out["stance_logits"].float() / temp, dim=-1),
+            p_tgt_temp,
             reduction="batchmean",
         )
-        s_loss = F.smooth_l1_loss(out["s_uv"], s_tgt_d)
-        h_loss = F.smooth_l1_loss(out["h_uv"], h_tgt_d)
-        loss = 0.5 * kl_loss + s_loss + h_loss
+        s_loss = F.smooth_l1_loss(out["s_uv"], s_tgt_d, beta=0.1)
+        h_loss = F.binary_cross_entropy_with_logits(
+            out["hostility_logit"].float(),
+            h_tgt_d.clamp(0.0, 1.0),
+        )
+        loss = kl_loss + 0.5 * s_loss + h_loss
         if student.edge_dim == 4 and "behavior_logits" in out:
-            kl_beh = F.kl_div(
-                torch.log_softmax(out["behavior_logits"].float(), dim=-1),
-                bp_tgt_d,
+            bp_tgt_temp = torch.softmax(torch.log(bp_tgt_d.clamp(min=1e-6)) / temp, dim=-1)
+            kl_beh = (temp * temp) * F.kl_div(
+                torch.log_softmax(out["behavior_logits"].float() / temp, dim=-1),
+                bp_tgt_temp,
                 reduction="batchmean",
             )
-            r_loss = F.smooth_l1_loss(out["r_uv"], r_tgt_d)
-            c_loss = F.smooth_l1_loss(out["c_uv"], c_tgt_d)
+            r_loss = F.binary_cross_entropy_with_logits(
+                out["irrational_logit"].float(),
+                r_tgt_d.clamp(0.0, 1.0),
+            )
+            c_loss = F.binary_cross_entropy_with_logits(
+                out["constructive_logit"].float(),
+                c_tgt_d.clamp(0.0, 1.0),
+            )
             loss = loss + 0.5 * kl_beh + r_loss + c_loss
         return loss
 
@@ -1135,7 +1645,12 @@ def distill_dual_cross_encoder(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_epoch = _epoch
+            best_val_metrics = dict(last_val_metrics)
             best_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
+
+    if not best_val_metrics:
+        best_val_metrics = dict(last_val_metrics)
 
     student.load_state_dict(best_state)
     ckpt_dir = student.save_checkpoint(Path(output_dir), tokenizer=tok)
@@ -1145,9 +1660,13 @@ def distill_dual_cross_encoder(
         "model_name": student.model_name,
         "edge_dim": student.edge_dim,
         "sanity_check_shuffle": bool(sanity_check_shuffle),
+        "distill_temperature": temp,
+        "train_root_aug_count": train_root_aug_count,
         "train_losses": train_losses,
+        "best_epoch": best_epoch,
         "best_val_loss": best_val_loss,
-        **last_val_metrics,
+        "final_val_loss": last_val_metrics.get("val_loss", best_val_loss),
+        **best_val_metrics,
         "checkpoint_dir": str(ckpt_dir),
     }
     (Path(output_dir) / "distill_report.json").write_text(
@@ -1275,15 +1794,10 @@ def _score_pairs_with_teachers(
     allow_untrained_fallback: bool = False,
     cache_path: Path | None = None,
     checkpoint_every: int = 250,
-    teacher_backend: str = "legacy_nli",
-    teacher_model: str = QWEN_TEACHER_MODEL_ID,
-    qlora_adapter_dir: Path | None = None,
-    qwen_scorer: QwenBehavioralTeacherScorer | None = None,
-    scoring_mode: str = "logit",
-    max_fallback_rate: float = 1.0,
+    teacher_backend: str = "dual_nli",
     telemetry: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Run teacher scorers (`legacy_nli` or `qwen_qlora`) with atomic shard checkpointing."""
+    """Run dual open-source teachers (Hostility + mDeBERTa Stance Verbalizer) with atomic caching."""
     if not pairs:
         return pairs
 
@@ -1310,6 +1824,7 @@ def _score_pairs_with_teachers(
         "stance_probs",
         "pred_label",
         "root_s_uv",
+        "root_stance_probs",
     )
     for p in pairs:
         eid = str(p.get("edge_id") or "")
@@ -1319,95 +1834,6 @@ def _score_pairs_with_teachers(
                 if field in cached:
                     p[field] = cached[field]
 
-    if teacher_backend == "qwen_qlora":
-        need_idx = [
-            i
-            for i, p in enumerate(pairs)
-            if any(k not in p for k in ("s_uv", "h_uv", "r_uv", "c_uv", "behavior_label", "root_s_uv"))
-        ]
-        total_fb_count = 0
-        total_scored_calls = 0
-        if need_idx:
-            owns_scorer = qwen_scorer is None
-            scorer = qwen_scorer or QwenBehavioralTeacherScorer(
-                model_name_or_path=teacher_model,
-                adapter_dir=qlora_adapter_dir,
-                lang=lang,
-                scoring_mode=scoring_mode,  # type: ignore[arg-type]
-                max_fallback_rate=max_fallback_rate,
-                batch_size=max(1, min(int(batch_size), 8)),
-            )
-            chunk_starts = range(0, len(need_idx), chunk_size)
-            for start in tqdm(chunk_starts, desc=f"Qwen Teacher ({scoring_mode}, {lang})"):
-                idx_slice = need_idx[start : start + chunk_size]
-                need_edge = [
-                    i
-                    for i in idx_slice
-                    if any(k not in pairs[i] for k in ("s_uv", "h_uv", "r_uv", "c_uv", "behavior_label"))
-                ]
-                if need_edge:
-                    out = scorer.score_triplets(
-                        [str(pairs[i].get("root_text") or pairs[i]["parent_text"]) for i in need_edge],
-                        [str(pairs[i]["parent_text"]) for i in need_edge],
-                        [str(pairs[i]["reply_text"]) for i in need_edge],
-                        lang=lang,
-                    )
-                    total_fb_count += int(out.get("fallback_count", 0))
-                    total_scored_calls += len(need_edge)
-                    for pos, i in enumerate(need_edge):
-                        pairs[i]["s_uv"] = float(out["s_uv"][pos])
-                        pairs[i]["h_uv"] = float(out["h_uv"][pos])
-                        pairs[i]["r_uv"] = float(out["r_uv"][pos])
-                        pairs[i]["c_uv"] = float(out["c_uv"][pos])
-                        pairs[i]["behavior_probs"] = out["behavior_probs"][pos].tolist()
-                        pairs[i]["behavior_label"] = out["behavior_label"][pos]
-                        pairs[i]["stance_probs"] = out["stance_probs"][pos].tolist()
-                        pairs[i]["pred_label"] = out["pred_label"][pos]
-
-                deep_indices: list[int] = []
-                for i in idx_slice:
-                    if "root_s_uv" in pairs[i]:
-                        continue
-                    root_txt = pairs[i].get("root_text")
-                    root_id = str(pairs[i].get("root_id") or "")
-                    parent_id = str(pairs[i].get("parent_id") or "")
-                    is_deep = bool(root_txt) and (
-                        (root_id and parent_id and root_id != parent_id)
-                        or str(root_txt) != str(pairs[i].get("parent_text") or "")
-                    )
-                    if is_deep:
-                        deep_indices.append(i)
-                    else:
-                        pairs[i]["root_s_uv"] = float(pairs[i]["s_uv"])
-
-                if deep_indices:
-                    root_out = scorer.score_triplets(
-                        [str(pairs[i]["root_text"]) for i in deep_indices],
-                        [str(pairs[i]["root_text"]) for i in deep_indices],
-                        [str(pairs[i]["reply_text"]) for i in deep_indices],
-                        lang=lang,
-                    )
-                    total_fb_count += int(root_out.get("fallback_count", 0))
-                    total_scored_calls += len(deep_indices)
-                    for pos, i in enumerate(deep_indices):
-                        pairs[i]["root_s_uv"] = float(root_out["s_uv"][pos])
-
-                if cache_path is not None:
-                    _atomic_write_json(Path(cache_path), pairs)
-
-            if owns_scorer:
-                del scorer
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        if telemetry is not None:
-            telemetry["teacher_backend"] = teacher_backend
-            telemetry["scoring_mode"] = scoring_mode
-            telemetry["fallback_count"] = int(total_fb_count)
-            telemetry["fallback_rate"] = float(total_fb_count / max(1, total_scored_calls))
-        return pairs
-
-    # Legacy dual teacher path (Hostility RoBERTa/ViSoBERT + mDeBERTa NLI)
     # Stage 1: Hostility intensity h_uv
     need_host_idx = [i for i, p in enumerate(pairs) if "h_uv" not in p]
     if need_host_idx:
@@ -1432,14 +1858,14 @@ def _score_pairs_with_teachers(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Stage 2: NLI stance score s_uv + direct (root -> reply) root_s_uv for depth >= 2
+    # Stage 2: NLI Stance Verbalizer score s_uv + direct (root -> reply) root_s_uv for depth >= 2
     need_nli_idx = [
         i for i, p in enumerate(pairs) if "s_uv" not in p or "root_s_uv" not in p
     ]
     if need_nli_idx:
-        nli_scorer = NLIStanceTeacherScorer()
+        nli_scorer = NLIStanceTeacherScorer(lang=lang, use_stance_verbalizer=True)
         chunk_starts = range(0, len(need_nli_idx), chunk_size)
-        for start in tqdm(chunk_starts, desc=f"NLI stance teacher ({lang})"):
+        for start in tqdm(chunk_starts, desc=f"NLI stance verbalizer ({lang})"):
             idx_slice = need_nli_idx[start : start + chunk_size]
             need_edge_pos = [i for i in idx_slice if "s_uv" not in pairs[i]]
             if need_edge_pos:
@@ -1447,6 +1873,7 @@ def _score_pairs_with_teachers(
                     [pairs[i]["parent_text"] for i in need_edge_pos],
                     [pairs[i]["reply_text"] for i in need_edge_pos],
                     batch_size=batch_size,
+                    lang=lang,
                 )
                 for pos, i in enumerate(need_edge_pos):
                     pairs[i]["s_uv"] = float(nli_out["s_uv"][pos])
@@ -1468,15 +1895,19 @@ def _score_pairs_with_teachers(
                     deep_indices.append(i)
                 else:
                     pairs[i]["root_s_uv"] = float(pairs[i]["s_uv"])
+                    if "stance_probs" in pairs[i]:
+                        pairs[i]["root_stance_probs"] = list(pairs[i]["stance_probs"])
 
             if deep_indices:
                 root_out = nli_scorer.score_pairs(
                     [str(pairs[i]["root_text"]) for i in deep_indices],
                     [str(pairs[i]["reply_text"]) for i in deep_indices],
                     batch_size=batch_size,
+                    lang=lang,
                 )
                 for pos, i in enumerate(deep_indices):
                     pairs[i]["root_s_uv"] = float(root_out["s_uv"][pos])
+                    pairs[i]["root_stance_probs"] = root_out["stance_probs"][pos].tolist()
 
             if cache_path is not None:
                 _atomic_write_json(Path(cache_path), pairs)
@@ -1484,6 +1915,32 @@ def _score_pairs_with_teachers(
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    if telemetry is not None:
+        telemetry["teacher_backend"] = teacher_backend
+        telemetry["stance_model"] = MDEBERTA_NLI_MODEL_NAME
+        telemetry["hostility_model"] = (
+            str(vihsd_ckpt)
+            if lang == "vi" and vihsd_ckpt is not None
+            else (VISOBERT_MODEL_NAME if lang == "vi" else EN_OFFENSIVE_MODEL_NAME)
+        )
+        telemetry["use_stance_verbalizer"] = True
+        telemetry["num_pairs"] = len(pairs)
+        telemetry["num_deep_pairs"] = int(
+            sum(
+                1
+                for p in pairs
+                if bool(p.get("root_text"))
+                and (
+                    (
+                        str(p.get("root_id") or "")
+                        and str(p.get("parent_id") or "")
+                        and str(p.get("root_id")) != str(p.get("parent_id"))
+                    )
+                    or str(p.get("root_text")) != str(p.get("parent_text") or "")
+                )
+            )
+        )
 
     return pairs
 
@@ -1500,25 +1957,10 @@ def main() -> None:
     parser.add_argument("--scored-cache-json", type=Path, default=None)
     parser.add_argument("--topic-splits-json", type=Path, default=None)
     parser.add_argument("--train-vihsd", action="store_true")
-    parser.add_argument("--train-qwen-qlora", action="store_true")
     parser.add_argument(
         "--teacher-backend",
-        choices=["legacy_nli", "qwen_qlora"],
-        default="legacy_nli",
-    )
-    parser.add_argument("--teacher-model", type=str, default=QWEN_TEACHER_MODEL_ID)
-    parser.add_argument(
-        "--scoring-mode",
-        choices=["logit", "generate"],
-        default="logit",
-        help="G-Eval single-pass digit logit scoring (default, fastest) vs generative JSON.",
-    )
-    parser.add_argument("--max-fallback-rate", type=float, default=1.0)
-    parser.add_argument("--qlora-epochs", type=int, default=2)
-    parser.add_argument(
-        "--qlora-adapter-dir",
-        type=Path,
-        default=Path("checkpoints/qwen38_27b_qlora"),
+        choices=["dual_nli", "legacy_nli"],
+        default="dual_nli",
     )
     parser.add_argument("--edge-dim", type=int, choices=[2, 4], default=2)
     parser.add_argument("--student-backbone", type=str, default=None)
@@ -1536,7 +1978,6 @@ def main() -> None:
         help="Canonical minimum replies threshold aligned with EarlyCascadeDataset (default: 25).",
     )
     parser.add_argument("--max-pairs", type=int, default=None)
-    parser.add_argument("--max-teacher-pairs", type=int, default=None)
     parser.add_argument("--checkpoint-every", type=int, default=250)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -1556,17 +1997,6 @@ def main() -> None:
             output_dir=args.vihsd_dir,
             epochs=args.epochs,
             batch_size=args.batch_size,
-        )
-
-    if args.train_qwen_qlora:
-        finetune_qwen_qlora(
-            output_dir=args.qlora_adapter_dir,
-            model_name_or_path=args.teacher_model,
-            lang=args.lang,
-            pilot_gold_csv=args.pilot_csv if (args.pilot_csv is not None and args.pilot_csv.exists()) else None,
-            scoring_mode=args.scoring_mode,
-            epochs=args.qlora_epochs,
-            batch_size=2,
         )
 
     if args.score_only or args.export_audit or args.distill:
@@ -1593,28 +2023,6 @@ def main() -> None:
         if args.max_pairs is not None:
             pairs = pairs[: args.max_pairs]
 
-        presplit_train_count: int | None = None
-        if (
-            args.teacher_backend == "qwen_qlora"
-            and args.max_teacher_pairs is not None
-            and len(pairs) > args.max_teacher_pairs
-        ):
-            # Budget Teacher scoring strictly inside canonical train + val topics (ZERO test-topic leakage)
-            topic_splits = split_pairs_by_inductive_topics(
-                pairs,
-                split_seed=args.split_seed,
-                canonical_topic_splits=canonical_splits,
-            )
-            rng_budget = random.Random(args.split_seed)
-            tr_pool = list(topic_splits["train"])
-            va_pool = list(topic_splits["val"])
-            rng_budget.shuffle(tr_pool)
-            rng_budget.shuffle(va_pool)
-            tr_quota = min(len(tr_pool), max(1, int(round(0.82 * args.max_teacher_pairs)))) if tr_pool else 0
-            va_quota = min(len(va_pool), max(1, int(args.max_teacher_pairs) - tr_quota)) if va_pool else 0
-            pairs = tr_pool[:tr_quota] + va_pool[:va_quota]
-            presplit_train_count = tr_quota
-
         telemetry: dict[str, Any] = {}
         scored = _score_pairs_with_teachers(
             pairs,
@@ -1625,10 +2033,6 @@ def main() -> None:
             cache_path=args.scored_cache_json,
             checkpoint_every=args.checkpoint_every,
             teacher_backend=args.teacher_backend,
-            teacher_model=args.teacher_model,
-            qlora_adapter_dir=args.qlora_adapter_dir,
-            scoring_mode=args.scoring_mode,
-            max_fallback_rate=args.max_fallback_rate,
             telemetry=telemetry,
         )
         if args.scored_cache_json is not None:
@@ -1649,19 +2053,15 @@ def main() -> None:
             print(f"Exported blind stratified human audit CSV: {csv_path} (key: {machine_key_csv})")
 
         if args.distill:
-            if presplit_train_count is not None:
-                train_distill = scored[:presplit_train_count]
-                val_distill = scored[presplit_train_count:]
-            else:
-                topic_splits = split_pairs_by_inductive_topics(
-                    scored,
-                    split_seed=args.split_seed,
-                    canonical_topic_splits=canonical_splits,
-                )
-                train_distill = topic_splits["train"]
-                val_distill = topic_splits["val"]
+            topic_splits = split_pairs_by_inductive_topics(
+                scored,
+                split_seed=args.split_seed,
+                canonical_topic_splits=canonical_splits,
+            )
+            train_distill = topic_splits["train"]
+            val_distill = topic_splits["val"]
             student_backbone = args.student_backbone or (
-                VISOBERT_MODEL_NAME if args.lang == "vi" else EN_DEBERTA_MODEL_NAME
+                VISOBERT_MODEL_NAME if args.lang == "vi" else TWITTER_ROBERTA_MODEL_NAME
             )
             report = distill_dual_cross_encoder(
                 train_distill,

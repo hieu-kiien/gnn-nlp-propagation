@@ -45,6 +45,10 @@ def compute_early_k_persistence_metrics(
         return {
             "num_cascades": 0,
             "msle": float("nan"),
+            "mae": float("nan"),
+            "rmse_size": float("nan"),
+            "r2_size": float("nan"),
+            "spearman_size": float("nan"),
             "rmse": float("nan"),
             "mae_polar": float("nan"),
             "r2_polar": float("nan"),
@@ -105,6 +109,10 @@ def compute_early_k_persistence_metrics(
     return {
         "num_cascades": len(test_cascades),
         "msle": float(metrics["msle"]),
+        "mae": float(metrics["mae"]),
+        "rmse_size": float(metrics["rmse_size"]),
+        "r2_size": float(metrics["r2_size"]),
+        "spearman_size": float(metrics["spearman_size"]),
         "rmse": float(metrics["rmse"]),
         "mae_polar": float(metrics["mae_polar"]),
         "r2_polar": float(metrics["r2_polar"]),
@@ -220,7 +228,6 @@ def compute_dataset_statistics(
                 split=sp,
                 min_total_replies=min_total_replies,
                 polar_target_mode=polar_target_mode,
-                edge_dim=edge_dim,
             )
             for sp in ("train", "val", "test")
         }
@@ -323,6 +330,20 @@ def format_dataset_stats_markdown(stats_list: Sequence[Mapping[str, Any]]) -> st
     return "\n".join(lines)
 
 
+def _resolve_eda_table_label(
+    output_table: Path, stats_list: Sequence[Mapping[str, Any]]
+) -> str:
+    stem = output_table.stem.lower()
+    if stem.startswith("tables_dataset_eda_") and len(stem) > len("tables_dataset_eda_"):
+        suffix = stem.removeprefix("tables_dataset_eda_")
+        return f"tab:dataset_eda_{suffix}"
+    if len(stats_list) == 1 and stem != "tables_dataset_eda":
+        ds_name = str(stats_list[0].get("name", "")).strip().lower()
+        if ds_name in {"pheme", "vn"}:
+            return f"tab:dataset_eda_{ds_name}"
+    return "tab:dataset_eda"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Export Table 1 Dataset EDA & Early-K Persistence Baseline."
@@ -376,7 +397,10 @@ def main() -> None:
 
     if args.output_table is not None:
         args.output_table.parent.mkdir(parents=True, exist_ok=True)
-        args.output_table.write_text(format_dataset_stats_latex(stats_list), encoding="utf-8")
+        eda_label = _resolve_eda_table_label(args.output_table, stats_list)
+        args.output_table.write_text(
+            format_dataset_stats_latex(stats_list, label=eda_label), encoding="utf-8"
+        )
         print(f"Saved LaTeX table -> {args.output_table}")
 
     if args.output_json is not None:

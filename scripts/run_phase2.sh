@@ -13,44 +13,42 @@ VN_BEFORE_EPOCH="${VN_BEFORE_EPOCH:-1763164800}"
 MIN_TOTAL_REPLIES="${MIN_TOTAL_REPLIES:-25}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 EPOCHS="${EPOCHS:-3}"
-PIPELINE_VERSION="${PIPELINE_VERSION:-v1}"
 
-TEACHER_BACKEND="legacy_nli"
+TEACHER_BACKEND="dual_nli"
 EDGE_DIM="2"
-if [[ "${PIPELINE_VERSION}" == "v2" ]]; then
-    TEACHER_BACKEND="qwen_qlora"
-    EDGE_DIM="4"
-    echo ">>> PIPELINE_VERSION=v2 selected: Using Qwen G-Eval teacher backend with 4D edge attributes."
-else
-    echo ">>> PIPELINE_VERSION=v1 selected (default MVP): Using legacy NLI teacher backend with 2D edge attributes."
-fi
+echo ">>> Unified SBi-FAGAT 2D NLP Pipeline: teacher=${TEACHER_BACKEND}, edge_dim=${EDGE_DIM}, Ancestor SpanPool"
 
 if [[ "${RUN_PHEME}" -eq 1 ]]; then
     echo "[Phase 2 - PHEME 1/3] Downloading & parsing PHEME cascades..."
     "${PYTHON_BIN}" -m src.data.pheme_loader --output-dir data/interim/pheme
 
-    echo "[Phase 2 - PHEME 2/3] Frozen teacher scoring & blind human audit export (en)..."
+    echo "[Phase 2 - PHEME 2/3] Dual NLI Verbalizer scoring, blind audit export & Cross-Encoder distillation (en)..."
     "${PYTHON_BIN}" -m src.nlp.dual_edge_scorer \
         --lang en \
         --interim-dir data/interim/pheme \
+        --output-dir checkpoints/dual_ce_pheme \
         --scored-cache-json data/interim/pheme/scored_pairs.json \
         --audit-csv data/interim/human_audit_en_300.csv \
         --pilot-csv data/interim/pilot_calibration_en_30.csv \
         --min-total-replies "${MIN_TOTAL_REPLIES}" \
         --teacher-backend "${TEACHER_BACKEND}" \
         --edge-dim "${EDGE_DIM}" \
-        --scoring-mode logit \
+        --epochs "${EPOCHS}" \
         --batch-size "${BATCH_SIZE}" \
+        --include-root-context \
         --score-only \
-        --export-audit
+        --export-audit \
+        --distill
 
-    echo "[Phase 2 - PHEME 3/3] Extracting frozen node embeddings & edge attributes from teacher cache..."
+    echo "[Phase 2 - PHEME 3/3] Extracting Ancestor SpanPool embeddings & 2D edge attributes (with isolated teacher cache)..."
     "${PYTHON_BIN}" -m src.nlp.extract_features \
         --dataset pheme \
         --interim-dir data/interim/pheme \
         --output-dir data/processed/pheme \
+        --cross-encoder-ckpt checkpoints/dual_ce_pheme \
         --scored-cache-json data/interim/pheme/scored_pairs.json \
         --edge-dim "${EDGE_DIM}" \
+        --include-root-context \
         --batch-size "$((BATCH_SIZE * 2))" \
         --k-horizon 20
 fi
@@ -68,32 +66,36 @@ if [[ "${RUN_VN}" -eq 1 ]]; then
     fi
     "${PYTHON_BIN}" -m src.data.arctic_shift_vn "${CRAWL_ARGS[@]}"
 
-    echo "[Phase 2 - VN 2/3] Fine-tuning ViSoBERT-ViHSD, frozen teacher scoring & blind audit export (vi)..."
+    echo "[Phase 2 - VN 2/3] Fine-tuning ViSoBERT-ViHSD, NLI Verbalizer scoring, audit export & Cross-Encoder distillation (vi)..."
     "${PYTHON_BIN}" -m src.nlp.dual_edge_scorer \
         --lang vi \
         --interim-dir data/interim/vn \
         --vihsd-dir checkpoints/visobert_vihsd \
+        --output-dir checkpoints/dual_ce_vn \
         --scored-cache-json data/interim/vn/scored_pairs.json \
         --audit-csv data/interim/human_audit_vi_300.csv \
         --pilot-csv data/interim/pilot_calibration_vi_30.csv \
         --min-total-replies "${MIN_TOTAL_REPLIES}" \
         --teacher-backend "${TEACHER_BACKEND}" \
         --edge-dim "${EDGE_DIM}" \
-        --scoring-mode logit \
         --epochs "${EPOCHS}" \
         --batch-size "${BATCH_SIZE}" \
+        --include-root-context \
         --train-vihsd \
         --score-only \
-        --export-audit
+        --export-audit \
+        --distill
 
-    echo "[Phase 2 - VN 3/3] Extracting frozen node embeddings & edge attributes from teacher cache..."
+    echo "[Phase 2 - VN 3/3] Extracting Ancestor SpanPool embeddings & 2D edge attributes..."
     "${PYTHON_BIN}" -m src.nlp.extract_features \
         --dataset vn \
         --interim-dir data/interim/vn \
         --output-dir data/processed/vn \
+        --cross-encoder-ckpt checkpoints/dual_ce_vn \
         --scored-cache-json data/interim/vn/scored_pairs.json \
         --vihsd-dir checkpoints/visobert_vihsd \
         --edge-dim "${EDGE_DIM}" \
+        --include-root-context \
         --batch-size "$((BATCH_SIZE * 2))" \
         --k-horizon 20
 fi

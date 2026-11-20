@@ -19,6 +19,8 @@ def compute_multitask_loss(
     alpha_size: float = 1.0,
     alpha_polar: float = 1.0,
     alpha_rumor: float = 1.0,
+    size_loss_scale: float = 1.0,
+    polar_loss_scale: float = 1.0,
     lambda_uncertainty: float = 0.0,
     beta_nll: float = 0.5,
     huber_delta: float | None = None,
@@ -27,7 +29,7 @@ def compute_multitask_loss(
     class_weights: Tensor | None = None,
     classification_only: bool = False,
 ) -> Tensor:
-    """Compute multi-task Huber + Cross-Entropy loss (plus optional beta-NLL uncertainty)."""
+    """Compute multi-task Huber + KL-calibrated BCEWithLogits + Cross-Entropy loss."""
     logits = outputs["rumor_logits"]
     ce_weight = (
         class_weights.to(device=logits.device, dtype=logits.dtype)
@@ -51,8 +53,24 @@ def compute_multitask_loss(
     y_polar_pred = outputs["y_polar_pred"].view(-1)
 
     loss_size = F.huber_loss(y_size_pred, y_size, delta=d_size)
-    loss_polar = F.huber_loss(y_polar_pred, y_polar, delta=d_polar)
-    total_loss = alpha_size * loss_size + alpha_polar * loss_polar
+    if "y_polar_logit" in outputs:
+        y_polar_logit = outputs["y_polar_logit"].view(-1)
+        y_p = y_polar.clamp(0.0, 1.0)
+        y_safe = y_p.clamp(1e-6, 1.0 - 1e-6)
+        target_entropy = -(
+            y_p * torch.log(y_safe) + (1.0 - y_p) * torch.log(1.0 - y_safe)
+        )
+        loss_polar_kl = (
+            F.binary_cross_entropy_with_logits(y_polar_logit, y_p, reduction="none")
+            - target_entropy
+        ).clamp_min(0.0).mean()
+        loss_polar = loss_polar_kl + F.smooth_l1_loss(y_polar_pred, y_p, beta=0.08)
+    else:
+        loss_polar = F.huber_loss(y_polar_pred, y_polar, delta=d_polar)
+    total_loss = (
+        (float(alpha_size) * float(size_loss_scale)) * loss_size
+        + (float(alpha_polar) * float(polar_loss_scale)) * loss_polar
+    )
 
     if lambda_uncertainty > 0.0 and "size_logvar" in outputs and "polar_logvar" in outputs:
         # Seitzer et al. (ICLR 2022) beta-NLL with detached residuals so uncertainty cannot corrupt means

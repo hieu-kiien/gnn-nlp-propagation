@@ -15,6 +15,7 @@ from src.data.pyg_dataset import (
     EarlyCascadeDataset,
     SUPPORTED_HORIZONS,
     TOTAL_NODE_FEATURE_DIM,
+    load_topic_splits_json,
 )
 from src.data.schema import load_cascade_parquet
 from src.models.baselines import BiGCN, StandardGCN
@@ -31,12 +32,23 @@ from src.utils.seed import OFFICIAL_SEEDS
 from src.utils.visualize import plot_early_k_curve
 
 
+def _resolve_ablation_table_label(data_dir: Path, out_table: Path) -> str:
+    ds_tag = data_dir.name.lower() if data_dir.name.lower() in {"pheme", "vn"} else ""
+    if not ds_tag:
+        stem = out_table.stem.lower()
+        if "pheme" in stem:
+            ds_tag = "pheme"
+        elif "vn" in stem:
+            ds_tag = "vn"
+    return f"tab:ablation_{ds_tag}" if ds_tag else "tab:ablation_results"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run SBi-FAGAT ablation study and K-horizon curve.")
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--k-horizon", type=int, default=20)
     parser.add_argument("--horizons", type=int, nargs="+", default=list(SUPPORTED_HORIZONS))
-    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--edge-dim", type=int, choices=[2, 4], default=None)
     parser.add_argument("--eps", type=float, default=0.5)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -94,6 +106,12 @@ def main() -> None:
         else (0.05 if use_unc else 0.0)
     )
     num_cls = 2 if args.label_scheme == "binary" else 4
+    canonical_splits_path = args.data_dir / "topic_splits.json"
+    canonical_splits = (
+        load_topic_splits_json(canonical_splits_path)
+        if canonical_splits_path.is_file()
+        else None
+    )
 
     common_ds_kwargs = {
         "root_dir": args.data_dir,
@@ -103,6 +121,7 @@ def main() -> None:
         "min_total_replies": args.min_total_replies,
         "polar_target_mode": args.polar_target_mode,
         "label_scheme": args.label_scheme,
+        "custom_topic_splits": canonical_splits,
     }
 
     # Part 1: Component Ablation at K=20
@@ -258,7 +277,7 @@ def main() -> None:
             "Separates stance polarity $s_{uv}$, hostility $h_{uv}$, signed $\\tanh$ gate, "
             "Bottom-Up feedback, and Global Attention Readout."
         ),
-        label="tab:ablation_results",
+        label=_resolve_ablation_table_label(args.data_dir, out_table),
         metrics=active_metrics,
     )
     del train_ds, val_ds, test_ds, train_loader, val_loader, test_loader

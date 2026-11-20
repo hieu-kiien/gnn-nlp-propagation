@@ -47,6 +47,7 @@ BINARY_RUMOR_LABEL_TO_IDX: dict[str, int] = {
 NLP_NODE_DIM: int = 768
 TEMPORAL_DEPTH_DIM: int = 2
 TOTAL_NODE_FEATURE_DIM: int = NLP_NODE_DIM + TEMPORAL_DEPTH_DIM  # 770
+STRUCTURAL_NODE_DIM: int = 10
 CASCADE_STATS_DIM: int = 8
 DEFAULT_FORECAST_MIN_REPLIES: int = 25
 
@@ -553,6 +554,120 @@ def _compute_full_tree_polarization(
     return float(min(1.0, max(0.0, y_polar)))
 
 
+_INVALID_AUTHOR_HASHES: frozenset[str] = frozenset(
+    {"", "none", "null", "[deleted]", "deleted", "unknown"}
+)
+
+
+def _is_valid_author_hash(val: Any) -> bool:
+    """Return True only when an author hash represents a known non-deleted account."""
+    if val is None:
+        return False
+    cleaned = str(val).strip().lower()
+    return cleaned not in _INVALID_AUTHOR_HASHES
+
+
+def compute_causal_structural_node_features(
+    kept_nodes: Sequence[Mapping[str, Any]],
+    delays_k: Sequence[float],
+    depth_map: Mapping[str, int],
+    *,
+    k_horizon: int = 20,
+) -> torch.Tensor:
+    """Compute strictly causal `[N_K, 10]` node structural/temporal/author descriptors within V_K.
+
+    Features (all bounded in [0, 1], computed strictly from V_K with zero future leakage):
+      0. `t_norm`: log-normalized lag from root post
+      1. `dt_parent_norm`: log-normalized parent->reply lag (0 for root)
+      2. `rel_phase_k`: intra-horizon relative arrival phase within [t_0, t_K]
+      3. `rank_norm_k`: chronological rank inside V_K divided by k_horizon
+      4. `d_norm`: tree depth divided by k_horizon
+      5. `is_root`: binary root indicator (1.0 root, 0.0 reply)
+      6. `early_out_deg_norm`: log-normalized early reply branching degree inside V_K
+      7. `is_early_leaf`: binary early frontier leaf indicator inside V_K (0 for root)
+      8. `is_op_reentry`: 1.0 when non-root author matches valid root author hash
+      9. `author_repeat_norm`: prior appearance count of valid author inside V_K up to rank-1
+    """
+    n_kept = len(kept_nodes)
+    if n_kept == 0:
+        return torch.zeros((0, STRUCTURAL_NODE_DIM), dtype=torch.float32)
+
+    kept_id_to_idx = {str(n["node_id"]): idx for idx, n in enumerate(kept_nodes)}
+    early_child_count: dict[str, int] = {}
+    for n in kept_nodes[1:]:
+        pid = n.get("parent_id")
+        if pid is not None:
+            pid_str = str(pid)
+            if pid_str in kept_id_to_idx:
+                early_child_count[pid_str] = early_child_count.get(pid_str, 0) + 1
+
+    max_dt_k = max((max(0.0, float(d)) for d in delays_k), default=0.0)
+    denom_t = math.log1p(TEMPORAL_REF_SECONDS)
+    denom_deg = math.log1p(float(max(1, k_horizon)))
+    k_scale = float(max(1, k_horizon))
+
+    raw_root_author = kept_nodes[0].get("user_id_hash")
+    valid_root_author = _is_valid_author_hash(raw_root_author)
+    root_author = str(raw_root_author).strip() if valid_root_author else ""
+
+    prior_counts: dict[str, int] = {}
+    rows: list[list[float]] = []
+
+    for idx, (n, dt_raw) in enumerate(zip(kept_nodes, delays_k)):
+        nid = str(n["node_id"])
+        dt_sec = max(0.0, float(dt_raw))
+        t_norm = min(1.0, math.log1p(dt_sec) / denom_t)
+
+        pid = n.get("parent_id")
+        pid_str = str(pid) if pid is not None else ""
+        if idx == 0 or pid_str not in kept_id_to_idx:
+            dt_parent_norm = 0.0
+        else:
+            p_dt = max(0.0, float(delays_k[kept_id_to_idx[pid_str]]))
+            dt_parent_norm = min(1.0, math.log1p(max(0.0, dt_sec - p_dt)) / denom_t)
+
+        if idx == 0 or max_dt_k <= 0.0:
+            rel_phase_k = 0.0
+        else:
+            rel_phase_k = min(1.0, max(0.0, dt_sec / max(1.0, max_dt_k)))
+
+        rank_norm_k = min(1.0, float(idx) / k_scale)
+        d_norm = min(1.0, float(depth_map.get(nid, 0)) / k_scale)
+        is_root = 1.0 if idx == 0 else 0.0
+
+        child_cnt = early_child_count.get(nid, 0)
+        early_out_deg_norm = min(1.0, math.log1p(float(child_cnt)) / denom_deg)
+        is_early_leaf = 1.0 if (idx > 0 and child_cnt == 0) else 0.0
+
+        raw_user = n.get("user_id_hash")
+        if _is_valid_author_hash(raw_user):
+            u_str = str(raw_user).strip()
+            is_op_reentry = 1.0 if (idx > 0 and valid_root_author and u_str == root_author) else 0.0
+            prior = prior_counts.get(u_str, 0)
+            author_repeat_norm = min(1.0, float(prior) / k_scale)
+            prior_counts[u_str] = prior + 1
+        else:
+            is_op_reentry = 0.0
+            author_repeat_norm = 0.0
+
+        rows.append(
+            [
+                t_norm,
+                dt_parent_norm,
+                rel_phase_k,
+                rank_norm_k,
+                d_norm,
+                is_root,
+                early_out_deg_norm,
+                is_early_leaf,
+                is_op_reentry,
+                author_repeat_norm,
+            ]
+        )
+
+    return torch.tensor(rows, dtype=torch.float32)
+
+
 def compute_early_cascade_burst_stats(
     kept_nodes: Sequence[Mapping[str, Any]],
     delays_k: Sequence[float],
@@ -606,11 +721,11 @@ def compute_early_cascade_burst_stats(
     max_depth = max((int(depth_map.get(str(n["node_id"]), 0)) for n in reply_nodes), default=0)
     max_depth_norm = min(1.0, float(max_depth) / float(max(1, k_horizon)))
 
-    hashed_users = [str(n["user_id_hash"]) for n in reply_nodes if n.get("user_id_hash")]
+    hashed_users = [str(n["user_id_hash"]).strip() for n in reply_nodes if _is_valid_author_hash(n.get("user_id_hash"))]
     if hashed_users:
         unique_user_ratio = min(1.0, float(len(set(hashed_users))) / float(len(reply_nodes)))
     else:
-        unique_user_ratio = 1.0
+        unique_user_ratio = 0.5
 
     substantive_count = sum(
         1 for n in reply_nodes if len(str(n.get("text") or "").split()) >= substantive_min_tokens
@@ -733,17 +848,19 @@ class EarlyCascadeDataset(Dataset):
         if (
             effective_custom_splits is None
             and split != "all"
-            and used_disk_tables
             and canonical_splits_path.is_file()
         ):
             disk_splits = load_topic_splits_json(canonical_splits_path)
             all_topics_present = {str(c.topic_id) for c in self._all_cascades}
             covered = disk_splits["train"] | disk_splits["val"] | disk_splits["test"]
-            if all_topics_present.issubset(covered) and all(
-                any(str(c.topic_id) in disk_splits[sp] for c in self._all_cascades)
-                for sp in ("train", "val", "test")
-            ):
-                effective_custom_splits = disk_splits
+            if not all_topics_present.issubset(covered):
+                missing = sorted(all_topics_present - covered)
+                raise ValueError(
+                    f"Canonical topic_splits.json at '{canonical_splits_path}' does not cover "
+                    f"{len(missing)} active topic_ids (e.g. {missing[:5]}). Refusing silent re-splitting "
+                    "to prevent train/val/test leakage; regenerate topic_splits.json for this min_total_replies."
+                )
+            effective_custom_splits = disk_splits
 
         if split == "all":
             self.data_list: list[CascadeData] = list(self._all_cascades)
@@ -996,6 +1113,13 @@ class EarlyCascadeDataset(Dataset):
                 edge_attr = torch.empty((0, active_edge_dim), dtype=torch.float32)
                 edge_stance = torch.empty((0, 1), dtype=torch.float32)
 
+            struct_x = compute_causal_structural_node_features(
+                kept_nodes=kept_nodes,
+                delays_k=delays_k,
+                depth_map=depth_map,
+                k_horizon=self.k_horizon,
+            )
+
             cascade_stats = compute_early_cascade_burst_stats(
                 kept_nodes=kept_nodes,
                 delays_k=delays_k,
@@ -1006,6 +1130,7 @@ class EarlyCascadeDataset(Dataset):
 
             data = CascadeData(
                 x=x,
+                struct_x=struct_x,
                 edge_index=edge_index_td,
                 edge_index_td=edge_index_td,
                 edge_index_bu=edge_index_bu,
@@ -1051,8 +1176,22 @@ class UPFDAdapterTransform:
             root_direct = float((edge_index_td[0] == 0).sum().item()) / float(max(1, num_nodes - 1))
             stats[0, 3] = min(1.0, max(0.0, root_direct))
 
+        struct_x = torch.zeros((num_nodes, STRUCTURAL_NODE_DIM), dtype=torch.float32)
+        if num_nodes > 0:
+            struct_x[0, 5] = 1.0
+            out_deg = torch.zeros((num_nodes,), dtype=torch.float32)
+            if edge_index_td.numel() > 0:
+                valid_src = edge_index_td[0][(edge_index_td[0] >= 0) & (edge_index_td[0] < num_nodes)]
+                if valid_src.numel() > 0:
+                    out_deg.scatter_add_(0, valid_src, torch.ones_like(valid_src, dtype=torch.float32))
+            struct_x[:, 6] = torch.clamp(torch.log1p(out_deg) / math.log1p(20.0), max=1.0)
+            is_leaf = (out_deg == 0.0).float()
+            is_leaf[0] = 0.0
+            struct_x[:, 7] = is_leaf
+
         return CascadeData(
             x=data.x.float(),
+            struct_x=struct_x,
             edge_index=edge_index_td,
             edge_index_td=edge_index_td,
             edge_index_bu=edge_index_bu,

@@ -8,33 +8,42 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 UPFD_ROOT="${UPFD_ROOT:-data/raw/upfd}"
 MIN_TOTAL_REPLIES="${MIN_TOTAL_REPLIES:-25}"
 POLAR_MODE="${POLAR_MODE:-future_only}"
-PIPELINE_VERSION="${PIPELINE_VERSION:-v1}"
+HIDDEN_DIM="${HIDDEN_DIM:-64}"
 
-EXTRA_FLAGS=()
-if [[ "${PIPELINE_VERSION}" == "v2" ]]; then
-    EXTRA_FLAGS+=("--v2" "--edge-dim" "4")
-    echo ">>> PIPELINE_VERSION=v2 selected: Enabling 4D edge attributes, 8D burst stats, and beta-NLL uncertainty."
-else
-    EXTRA_FLAGS+=("--edge-dim" "2")
-    echo ">>> PIPELINE_VERSION=v1 selected (default MVP): Running 2D edge attributes foundation."
-fi
+UNIFIED_FLAGS=("--edge-dim" "2" "--use-cascade-stats" "--hidden-dim" "${HIDDEN_DIM}")
+echo ">>> Running Unified 2D SBi-FAGAT pipeline (hidden_dim=${HIDDEN_DIM}, edge_dim=2, min_total_replies=${MIN_TOTAL_REPLIES})"
 
 echo "[1/4] Running full pytest verification suite..."
 "${PYTHON_BIN}" -m pytest tests/ -vv -o addopts=""
 
 run_dataset_suite() {
     local ddir="$1"
-    echo ">>> Benchmarking dataset: ${ddir} (min_total_replies=${MIN_TOTAL_REPLIES}, polar_mode=${POLAR_MODE}, pipeline=${PIPELINE_VERSION})"
+    local ds_name
+    ds_name="$(basename "${ddir}")"
+    echo ">>> Benchmarking dataset: ${ddir} (min_total_replies=${MIN_TOTAL_REPLIES}, polar_mode=${POLAR_MODE})"
     "${PYTHON_BIN}" -m scripts.run_experiments \
         --data-dir "${ddir}" \
         --min-total-replies "${MIN_TOTAL_REPLIES}" \
         --polar-target-mode "${POLAR_MODE}" \
-        "${EXTRA_FLAGS[@]}"
+        "${UNIFIED_FLAGS[@]}"
     "${PYTHON_BIN}" -m scripts.run_ablation \
         --data-dir "${ddir}" \
         --min-total-replies "${MIN_TOTAL_REPLIES}" \
         --polar-target-mode "${POLAR_MODE}" \
-        "${EXTRA_FLAGS[@]}"
+        "${UNIFIED_FLAGS[@]}"
+    "${PYTHON_BIN}" -m scripts.export_dataset_stats \
+        --data-dir "${ddir}" \
+        --names "${ds_name}" \
+        --min-total-replies "${MIN_TOTAL_REPLIES}" \
+        --edge-dim 2 \
+        --output-table "paper/tables_dataset_eda_${ds_name}.tex" \
+        --output-json "paper/results_dataset_eda_${ds_name}.json"
+    "${PYTHON_BIN}" -m scripts.benchmark_efficiency \
+        --hidden-dim "${HIDDEN_DIM}" \
+        --edge-dim 2 \
+        --use-cascade-stats \
+        --output-table "paper/tables_efficiency_${ds_name}.tex" \
+        --output-json "paper/results_efficiency_${ds_name}.json"
 }
 
 echo "[2/4] Discovering processed datasets..."
@@ -55,6 +64,6 @@ else
 fi
 
 echo "[3/4] Running UPFD GossipCop (BERT) 5-seed generalization benchmark..."
-"${PYTHON_BIN}" -m scripts.run_upfd_extension --upfd-root "${UPFD_ROOT}"
+"${PYTHON_BIN}" -m scripts.run_upfd_extension --upfd-root "${UPFD_ROOT}" --hidden-dim "${HIDDEN_DIM}"
 
 echo "[4/4] All tests and SBi-FAGAT Phase 3 experimental pipelines completed."

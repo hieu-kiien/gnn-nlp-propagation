@@ -1,4 +1,4 @@
-"""Unit & integration tests for SBi-FAGAT v2: 5-class discourse, Qwen3.8-27B QLoRA, 8D burst stats, auto-loop, live predictor & Kaggle T4x2 notebooks."""
+"""Unit & integration tests for unified 2D NLP + GNN pipeline, burst stats, auto-loop, live predictor & Kaggle notebooks."""
 
 from __future__ import annotations
 
@@ -16,7 +16,12 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.processors import TemplateProcessing
 from torch_geometric.loader import DataLoader
-from transformers import PreTrainedTokenizerFast, RobertaConfig, RobertaModel
+from transformers import (
+    PreTrainedTokenizerFast,
+    RobertaConfig,
+    RobertaForSequenceClassification,
+    RobertaModel,
+)
 
 from scripts.kaggle_parallel_runner import _run_smoke_pipeline
 from scripts.predict_live_thread import _make_demo_offline_thread, predict_live_cascade
@@ -27,24 +32,20 @@ from src.data.pyg_dataset import (
 )
 from src.data.schema import build_edges_table, build_nodes_table, save_cascade_parquet
 from src.models.sbi_fagat import SBiFAGAT
+from src.nlp.discourse_labels import (
+    DISCOURSE_BEHAVIOR_LABELS,
+    _heuristic_behavior_fallback,
+    behavior_probs_to_stance_probs,
+)
 from src.nlp.dual_edge_scorer import (
     DualHeadCrossEncoder,
+    NLIStanceTeacherScorer,
     distill_dual_cross_encoder,
     export_stratified_human_audit_csv,
+    normalize_social_text,
     split_pairs_by_inductive_topics,
 )
 from src.nlp.extract_features import extract_and_save_features, validate_feature_tensors
-from src.nlp.qwen_teacher import (
-    DISCOURSE_BEHAVIOR_LABELS,
-    QWEN_KAGGLE_4BIT_MODEL_ID,
-    QWEN_TEACHER_MODEL_ID,
-    QwenBehavioralTeacherScorer,
-    _freeze_vision_modules_for_text_qlora,
-    _resolve_text_lora_target_modules,
-    build_qlora_gold_examples,
-    build_t4x2_loading_config,
-    parse_behavioral_teacher_json,
-)
 from src.training.auto_loop import run_self_auditing_validation_loop
 from src.training.metrics import compute_multitask_loss
 
@@ -98,104 +99,99 @@ def _offline_tok_and_enc() -> tuple[PreTrainedTokenizerFast, RobertaModel]:
     return tok, enc
 
 
-def test_parse_behavioral_teacher_json_and_qlora_configs(tmp_path: Path) -> None:
-    raw = (
-        "<think>User used sarcasm and illogical whataboutism</think>\n"
-        "```json\n"
-        '{"label":"irrational_fallacy","s_uv":-1.4,"h_uv":0.42,"r_uv":0.91,"c_uv":0.08,'
-        '"probs":[0.02,0.03,0.10,0.75,0.10]}\n'
-        "```"
-    )
-    parsed = parse_behavioral_teacher_json(raw)
-    assert parsed["fallback_used"] is False
-    assert parsed["label"] == "irrational_fallacy"
-    assert parsed["s_uv"] == -1.0  # Clamped to [-1, 1]
-    assert math_close(sum(parsed["probs"]), 1.0)
-    assert len(parsed["stance_probs"]) == 3
-
-    bad_raw = "corrupted non-json text"
-    fb_hostile = parse_behavioral_teacher_json(bad_raw, reply_text="Đồ não tàn, cút đi!!!")
+def test_discourse_labels_and_social_text_normalization() -> None:
+    fb_hostile = _heuristic_behavior_fallback("Đồ não tàn, cút đi!!!")
     assert fb_hostile["fallback_used"] is True
     assert fb_hostile["label"] == "hostile_conflict"
     assert fb_hostile["h_uv"] > 0.7
+    assert math_close(sum(fb_hostile["probs"]), 1.0)
+    assert len(fb_hostile["stance_probs"]) == 3
 
-    t4_cfg = build_t4x2_loading_config(num_gpus=2, max_per_gpu_gib=14)
-    assert t4_cfg["torch_dtype"] == torch.float16
-    assert t4_cfg["device_map"] == "auto"
-    assert t4_cfg["max_memory"][0] == "14GiB"
-    assert t4_cfg["max_memory"][1] == "14GiB"
+    collapsed = behavior_probs_to_stance_probs([0.02, 0.03, 0.45, 0.30, 0.20])
+    assert math_close(collapsed[0], 0.02)
+    assert math_close(collapsed[1], 0.03)
+    assert math_close(collapsed[2], 0.95)
 
-    pilot_csv = tmp_path / "pilot.csv"
-    with pilot_csv.open("w", encoding="utf-8-sig", newline="") as fh:
-        w = csv.DictWriter(
-            fh,
-            fieldnames=["parent_text", "reply_text", "gold_adjudicated_stance", "gold_adjudicated_hostility"],
-        )
-        w.writeheader()
-        w.writerow(
-            {
-                "parent_text": "Cần kiểm tra khí thải xe máy cũ.",
-                "reply_text": "Nói ngu như bò, cút hết đi!",
-                "gold_adjudicated_stance": "hostile_conflict",
-                "gold_adjudicated_hostility": "hate",
-            }
-        )
-    examples = build_qlora_gold_examples(lang="vi", pilot_gold_csv=pilot_csv, max_samples=50)
-    labels_seen = {ex["label"] for ex in examples}
-    assert set(DISCOURSE_BEHAVIOR_LABELS).issubset(labels_seen)
+    assert (
+        normalize_social_text("Hey @Alice_99 check https://t.co/abc now!", lang="en")
+        == "Hey @user check http now!"
+    )
+    vi_raw = "Bạn @minh xem link   https://example.com   nhé"
+    assert normalize_social_text(vi_raw, lang="vi") == "Bạn @minh xem link http nhé"
 
 
 def math_close(a: float, b: float, tol: float = 1e-5) -> bool:
     return abs(a - b) <= tol
 
 
-def test_qwen_scorer_mock_and_vision_tower_freeze() -> None:
-    class _ToyVLM(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.visual = torch.nn.Linear(4, 4)
-            self.q_proj = torch.nn.Linear(4, 4)
-            self.in_proj_qkv = torch.nn.Linear(4, 12)
-            self.out_proj = torch.nn.Linear(4, 4)
+def test_nli_stance_verbalizer_simplex_and_2class_rejection() -> None:
+    tok, enc = _offline_tok_and_enc()
 
-    vlm = _ToyVLM()
-    frozen = _freeze_vision_modules_for_text_qlora(vlm)
-    assert any("visual" in n for n in frozen)
-    assert all(not p.requires_grad for p in vlm.visual.parameters())
-    assert all(p.requires_grad for p in vlm.q_proj.parameters())
-    targets = _resolve_text_lora_target_modules(vlm)
-    assert "q_proj" in targets and "in_proj_qkv" in targets and "out_proj" in targets
-
-    def _mock_gen(prompts):
-        return [
-            json.dumps(
-                {
-                    "label": "constructive_oppose" if "data" in p.lower() else "support",
-                    "s_uv": -0.75 if "data" in p.lower() else 0.80,
-                    "h_uv": 0.08,
-                    "r_uv": 0.05,
-                    "c_uv": 0.90,
-                    "probs": [0.02, 0.05, 0.88, 0.03, 0.02]
-                    if "data" in p.lower()
-                    else [0.85, 0.08, 0.04, 0.02, 0.01],
-                }
-            )
-            for p in prompts
-        ]
-
-    scorer = QwenBehavioralTeacherScorer(lang="vi", custom_generate_fn=_mock_gen)
-    out = scorer.score_triplets(
-        ["root post", "root post"],
-        ["parent a", "parent b"],
-        ["oppose based on data evidence", "agree strongly"],
-        batch_size=2,
+    # 1. Reject 2-class not_entailment NLI models loudly
+    cfg_2cls = RobertaConfig(
+        vocab_size=enc.config.vocab_size,
+        hidden_size=enc.config.hidden_size,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=128,
+        max_position_embeddings=64,
+        type_vocab_size=1,
+        pad_token_id=1,
+        bos_token_id=0,
+        eos_token_id=2,
+        num_labels=2,
+        id2label={0: "entailment", 1: "not_entailment"},
+        label2id={"entailment": 0, "not_entailment": 1},
     )
-    assert out["behavior_label"] == ["constructive_oppose", "support"]
-    assert out["s_uv"].shape == (2,)
-    assert out["r_uv"].shape == (2,)
-    assert out["c_uv"].shape == (2,)
-    assert out["behavior_probs"].shape == (2, 5)
-    assert out["stance_probs"].shape == (2, 3)
+    model_2cls = RobertaForSequenceClassification(cfg_2cls)
+    with pytest.raises(ValueError, match="not_entailment|num_labels=2|Expected 3-class"):
+        NLIStanceTeacherScorer(model=model_2cls, tokenizer=tok, device=torch.device("cpu"))
+
+    # 2. Symmetric 2-hypothesis verbalizer on 3-class NLI produces exact simplex sums & zero bias
+    cfg_3cls = RobertaConfig(
+        vocab_size=enc.config.vocab_size,
+        hidden_size=enc.config.hidden_size,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=128,
+        max_position_embeddings=64,
+        type_vocab_size=1,
+        pad_token_id=1,
+        bos_token_id=0,
+        eos_token_id=2,
+        num_labels=3,
+        id2label={0: "entailment", 1: "neutral", 2: "contradiction"},
+        label2id={"entailment": 0, "neutral": 1, "contradiction": 2},
+    )
+    model_3cls = RobertaForSequenceClassification(cfg_3cls)
+    with torch.no_grad():
+        model_3cls.classifier.dense.weight.zero_()
+        model_3cls.classifier.dense.bias.zero_()
+        model_3cls.classifier.out_proj.weight.zero_()
+        model_3cls.classifier.out_proj.bias.zero_()
+
+    scorer = NLIStanceTeacherScorer(
+        model=model_3cls,
+        tokenizer=tok,
+        device=torch.device("cpu"),
+        lang="en",
+        use_stance_verbalizer=True,
+    )
+    out_uniform = scorer.score_pairs(["root topic"], ["agree support"], batch_size=2, lang="en")
+    assert np.allclose(out_uniform["stance_probs"].sum(axis=-1), 1.0, atol=1e-5)
+    assert abs(float(out_uniform["s_uv"][0])) < 1e-5
+
+    out_vi = scorer.score_pairs(["root topic"], ["oppose civil"], batch_size=2, lang="vi")
+    assert np.allclose(out_vi["stance_probs"].sum(axis=-1), 1.0, atol=1e-5)
+    assert abs(float(out_vi["s_uv"][0])) < 1e-5
+
+    # Bias entailment class on classifier head -> support pass boosts p_sup, oppose pass boosts p_opp symmetrically,
+    # while distinct pass probs with neutral bias zeroed remain on exact simplex
+    with torch.no_grad():
+        model_3cls.classifier.out_proj.bias[0] = 2.0
+    out_bias = scorer.score_pairs(["root"], ["reply"], batch_size=1)
+    assert np.allclose(out_bias["stance_probs"].sum(axis=-1), 1.0, atol=1e-5)
+    assert -1.0 <= float(out_bias["s_uv"][0]) <= 1.0
 
 
 def test_dual_head_4d_distill_audit_and_extract(tmp_path: Path) -> None:
@@ -519,15 +515,15 @@ def test_auto_loop_live_predictor_smoke_runner_and_notebooks(tmp_path: Path) -> 
     assert live_res["behavior_counts"]["irrational_fallacy"] >= 1
     assert live_res["behavior_counts"]["hostile_conflict"] >= 1
 
-    # 3. Auto-loop direct API test with temporary loaders
+    # 3. Auto-loop direct API test with temporary loaders (unified 2D)
     proc_dir = tmp_path / "smoke_work" / "data" / "processed" / "vn"
     tr_ds = EarlyCascadeDataset(root_dir=proc_dir, k_horizon=20, split="train", min_total_replies=21)
     va_ds = EarlyCascadeDataset(root_dir=proc_dir, k_horizon=20, split="val", min_total_replies=21)
     loop_out = run_self_auditing_validation_loop(
         DataLoader(tr_ds, batch_size=2, shuffle=True),
         DataLoader(va_ds, batch_size=2, shuffle=False),
-        edge_dim=4,
-        candidates=[{"hidden_dim": 32, "lr": 1e-3, "eps": 0.5, "dropout": 0.1, "lambda_uncertainty": 0.05}],
+        edge_dim=2,
+        candidates=[{"hidden_dim": 32, "lr": 1e-3, "eps": 0.5, "dropout": 0.1, "lambda_uncertainty": 0.0}],
         epochs=1,
         patience=1,
         output_dir=tmp_path / "loop_direct",
@@ -535,7 +531,7 @@ def test_auto_loop_live_predictor_smoke_runner_and_notebooks(tmp_path: Path) -> 
     )
     assert Path(loop_out["best_checkpoint_path"]).exists()
 
-    # 4. Validate both Kaggle T4 x 2 notebooks are valid nbformat 4 JSON referencing Qwen3.8-27B
+    # 4. Validate both Kaggle notebooks are valid nbformat 4 JSON synced to unified 2D pipeline
     repo_root = Path(__file__).resolve().parents[1]
     for nb_name in ("kaggle_member1_nlp_and_vn_t4x2.ipynb", "kaggle_member2_gnn_and_en_t4x2.ipynb"):
         nb_path = repo_root / "notebooks" / nb_name
@@ -544,6 +540,8 @@ def test_auto_loop_live_predictor_smoke_runner_and_notebooks(tmp_path: Path) -> 
         assert nb_json["nbformat"] == 4
         assert len(nb_json["cells"]) >= 5
         joined_src = "\n".join("".join(c.get("source", [])) for c in nb_json["cells"])
-        assert QWEN_TEACHER_MODEL_ID in joined_src
-        assert QWEN_KAGGLE_4BIT_MODEL_ID in joined_src
+        assert "requirements.txt" in joined_src
+        assert "--hidden-dim 64" in joined_src
         assert "scripts.kaggle_parallel_runner" in joined_src
+        assert "Qwen3.8-27B" not in joined_src
+        assert "requirements-kaggle-t4x2.txt" not in joined_src

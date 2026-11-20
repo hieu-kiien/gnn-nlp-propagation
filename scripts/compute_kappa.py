@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import math
+import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -19,7 +20,7 @@ import numpy as np
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix, f1_score
 
-from src.nlp.qwen_teacher import DISCOURSE_BEHAVIOR_LABELS, _LABEL_SYNONYMS
+from src.nlp.discourse_labels import DISCOURSE_BEHAVIOR_LABELS, _LABEL_SYNONYMS
 
 _STANCE_SYNONYMS: dict[str, str] = {
     "support": "support",
@@ -142,6 +143,8 @@ def _safe_corr_pair(y_true: Sequence[float], y_pred: Sequence[float]) -> tuple[f
 def evaluate_machine_vs_human(
     audit_csv: Path,
     machine_key_csv: Path,
+    *,
+    strict_adjudication: bool = False,
 ) -> dict[str, Any]:
     """Compare hidden teacher predictions (`machine_key_csv`) against adjudicated human gold."""
     audit_path = Path(audit_csv)
@@ -176,6 +179,9 @@ def evaluate_machine_vs_human(
     behavior_pred: list[str] = []
     behavior_order = list(DISCOURSE_BEHAVIOR_LABELS)
 
+    matched_counts = {"stance": 0, "hostility": 0, "behavior_5class": 0}
+    unadj_counts = {"stance": 0, "hostility": 0, "behavior_5class": 0}
+
     with audit_path.open("r", encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
             eid = str(row.get("edge_id") or "").strip()
@@ -186,14 +192,17 @@ def evaluate_machine_vs_human(
 
             # Stance gold: adjudicated column or unanimous dual-annotator consensus
             raw_gs = str(row.get("gold_adjudicated_stance") or "").strip()
-            if not raw_gs:
-                s1 = str(row.get("annotator_1_stance") or "").strip()
-                s2 = str(row.get("annotator_2_stance") or "").strip()
-                if s1 and s2:
-                    n1 = _normalize_label(s1, _STANCE_SYNONYMS, "stance")
-                    n2 = _normalize_label(s2, _STANCE_SYNONYMS, "stance")
-                    if n1 == n2:
-                        raw_gs = n1
+            s1 = str(row.get("annotator_1_stance") or "").strip()
+            s2 = str(row.get("annotator_2_stance") or "").strip()
+            if raw_gs or (s1 and s2):
+                matched_counts["stance"] += 1
+            if not raw_gs and s1 and s2:
+                n1 = _normalize_label(s1, _STANCE_SYNONYMS, "stance")
+                n2 = _normalize_label(s2, _STANCE_SYNONYMS, "stance")
+                if n1 == n2:
+                    raw_gs = n1
+                else:
+                    unadj_counts["stance"] += 1
             if raw_gs:
                 g_lbl = _normalize_label(raw_gs, _STANCE_SYNONYMS, "stance")
                 s_uv = float(key_row.get("s_uv", 0.0))
@@ -209,14 +218,17 @@ def evaluate_machine_vs_human(
 
             # Hostility gold: adjudicated column or unanimous dual-annotator consensus
             raw_gh = str(row.get("gold_adjudicated_hostility") or "").strip()
-            if not raw_gh:
-                h1 = str(row.get("annotator_1_hostility") or "").strip()
-                h2 = str(row.get("annotator_2_hostility") or "").strip()
-                if h1 and h2:
-                    hn1 = _normalize_label(h1, _HOSTILITY_SYNONYMS, "hostility")
-                    hn2 = _normalize_label(h2, _HOSTILITY_SYNONYMS, "hostility")
-                    if hn1 == hn2:
-                        raw_gh = hn1
+            h1 = str(row.get("annotator_1_hostility") or "").strip()
+            h2 = str(row.get("annotator_2_hostility") or "").strip()
+            if raw_gh or (h1 and h2):
+                matched_counts["hostility"] += 1
+            if not raw_gh and h1 and h2:
+                hn1 = _normalize_label(h1, _HOSTILITY_SYNONYMS, "hostility")
+                hn2 = _normalize_label(h2, _HOSTILITY_SYNONYMS, "hostility")
+                if hn1 == hn2:
+                    raw_gh = hn1
+                else:
+                    unadj_counts["hostility"] += 1
             if raw_gh:
                 gh_lbl = _normalize_label(raw_gh, _HOSTILITY_SYNONYMS, "hostility")
                 h_uv = float(key_row.get("h_uv", 0.0))
@@ -227,21 +239,48 @@ def evaluate_machine_vs_human(
 
             # 5-class behavior gold vs machine behavior label
             raw_gb = str(row.get("gold_adjudicated_behavior") or "").strip().lower()
-            if not raw_gb:
-                b1 = str(row.get("annotator_1_behavior") or "").strip().lower()
-                b2 = str(row.get("annotator_2_behavior") or "").strip().lower()
-                nb1 = _LABEL_SYNONYMS.get(b1)
-                nb2 = _LABEL_SYNONYMS.get(b2)
-                if nb1 is not None and nb1 == nb2:
-                    raw_gb = nb1
-            gb_norm = _LABEL_SYNONYMS.get(raw_gb)
+            b1 = str(row.get("annotator_1_behavior") or "").strip().lower()
+            b2 = str(row.get("annotator_2_behavior") or "").strip().lower()
+            nb1 = _LABEL_SYNONYMS.get(b1)
+            nb2 = _LABEL_SYNONYMS.get(b2)
             pb_raw = str(key_row.get("machine_behavior_label") or "").strip().lower()
             pb_norm = _LABEL_SYNONYMS.get(pb_raw)
+            if (raw_gb in _LABEL_SYNONYMS or (nb1 is not None and nb2 is not None)) and pb_norm is not None:
+                matched_counts["behavior_5class"] += 1
+            if not raw_gb and nb1 is not None and nb2 is not None:
+                if nb1 == nb2:
+                    raw_gb = nb1
+                elif pb_norm is not None:
+                    unadj_counts["behavior_5class"] += 1
+            gb_norm = _LABEL_SYNONYMS.get(raw_gb)
             if gb_norm is not None and pb_norm is not None:
                 behavior_gold.append(gb_norm)
                 behavior_pred.append(pb_norm)
 
-    result: dict[str, Any] = {}
+    total_unadj = sum(unadj_counts.values())
+    if total_unadj > 0:
+        msg = (
+            f"Detected {total_unadj} dual-annotator disagreement rows without gold_adjudicated_* labels "
+            f"(stance={unadj_counts['stance']}, hostility={unadj_counts['hostility']}, "
+            f"behavior_5class={unadj_counts['behavior_5class']}). Adjudicate ties to prevent selection bias."
+        )
+        if strict_adjudication:
+            raise ValueError(msg)
+        warnings.warn(msg, UserWarning, stacklevel=2)
+
+    result: dict[str, Any] = {
+        "adjudication_summary": {
+            task: {
+                "total_matched_rows": matched_counts[task],
+                "unadjudicated_disagreements": unadj_counts[task],
+                "adjudication_coverage": float(
+                    (matched_counts[task] - unadj_counts[task]) / max(1, matched_counts[task])
+                ),
+            }
+            for task in ("stance", "hostility", "behavior_5class")
+            if matched_counts[task] > 0
+        }
+    }
     if stance_gold:
         kappa = float(cohen_kappa_score(stance_gold, stance_pred, labels=list(STANCE_ORDER)))
         if math.isnan(kappa):
@@ -249,6 +288,9 @@ def evaluate_machine_vs_human(
         pr, sr = _safe_corr_pair(stance_gold_num, stance_pred_s)
         result["stance"] = {
             "num_samples": len(stance_gold),
+            "total_matched_rows": matched_counts["stance"],
+            "unadjudicated_disagreements": unadj_counts["stance"],
+            "adjudication_coverage": float(len(stance_gold) / max(1, matched_counts["stance"])),
             "macro_f1": float(
                 f1_score(stance_gold, stance_pred, labels=list(STANCE_ORDER), average="macro", zero_division=0)
             ),
@@ -267,6 +309,9 @@ def evaluate_machine_vs_human(
         pr_h, sr_h = _safe_corr_pair(host_gold_num, host_pred_h)
         result["hostility"] = {
             "num_samples": len(host_gold_bin),
+            "total_matched_rows": matched_counts["hostility"],
+            "unadjudicated_disagreements": unadj_counts["hostility"],
+            "adjudication_coverage": float(len(host_gold_bin) / max(1, matched_counts["hostility"])),
             "macro_f1": float(
                 f1_score(host_gold_bin, host_pred_bin, labels=["clean", "hostile"], average="macro", zero_division=0)
             ),
@@ -281,6 +326,9 @@ def evaluate_machine_vs_human(
             b_kappa = 1.0 if behavior_gold == behavior_pred else 0.0
         result["behavior_5class"] = {
             "num_samples": len(behavior_gold),
+            "total_matched_rows": matched_counts["behavior_5class"],
+            "unadjudicated_disagreements": unadj_counts["behavior_5class"],
+            "adjudication_coverage": float(len(behavior_gold) / max(1, matched_counts["behavior_5class"])),
             "labels": behavior_order,
             "macro_f1": float(
                 f1_score(behavior_gold, behavior_pred, labels=behavior_order, average="macro", zero_division=0)
@@ -373,6 +421,7 @@ def evaluate_audit_csv(
     csv_path: Path,
     *,
     machine_key_csv: Path | None = None,
+    strict_adjudication: bool = False,
 ) -> dict[str, Any]:
     """Read dual-annotated audit CSV and compute Cohen's Kappa (+ optional machine-vs-gold)."""
     path = Path(csv_path)
@@ -422,7 +471,11 @@ def evaluate_audit_csv(
             "Fill annotator_1_* and annotator_2_* columns before running compute_kappa.py."
         )
     if machine_key_csv is not None:
-        report["machine_vs_gold"] = evaluate_machine_vs_human(path, machine_key_csv)
+        report["machine_vs_gold"] = evaluate_machine_vs_human(
+            path,
+            machine_key_csv,
+            strict_adjudication=strict_adjudication,
+        )
     return report
 
 
@@ -432,6 +485,7 @@ def main() -> None:
     parser.add_argument("--machine-key", type=Path, default=None)
     parser.add_argument("--rumoureval-json", type=Path, default=None)
     parser.add_argument("--output-json", type=Path, default=None)
+    parser.add_argument("--strict-adjudication", action="store_true")
     args = parser.parse_args()
 
     resolved_input = args.input
@@ -457,7 +511,13 @@ def main() -> None:
     if args.rumoureval_json is not None and not resolved_input.is_file():
         report["rumoureval_sdqc"] = evaluate_rumoureval_sdqc(args.rumoureval_json)
     else:
-        report.update(evaluate_audit_csv(resolved_input, machine_key_csv=resolved_key))
+        report.update(
+            evaluate_audit_csv(
+                resolved_input,
+                machine_key_csv=resolved_key,
+                strict_adjudication=bool(args.strict_adjudication),
+            )
+        )
         if args.rumoureval_json is not None:
             report["rumoureval_sdqc"] = evaluate_rumoureval_sdqc(args.rumoureval_json)
     print(json.dumps(report, indent=2, ensure_ascii=False))

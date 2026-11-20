@@ -175,7 +175,7 @@ def run_efficiency_benchmark(
     *,
     num_cascades: int = 32,
     k_horizon: int = 20,
-    hidden_dim: int = 128,
+    hidden_dim: int = 64,
     edge_dim: int = 2,
     use_cascade_stats: bool = False,
     predict_uncertainty: bool = False,
@@ -311,13 +311,21 @@ def format_efficiency_latex(
     )
 
 
+def _resolve_efficiency_table_label(output_table: Path) -> str:
+    stem = output_table.stem.lower()
+    if stem.startswith("tables_efficiency_") and len(stem) > len("tables_efficiency_"):
+        suffix = stem.removeprefix("tables_efficiency_")
+        return f"tab:efficiency_{suffix}"
+    return "tab:efficiency"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark parameter count, inference/train latency, and memory across all 8 models."
     )
     parser.add_argument("--num-cascades", type=int, default=32)
     parser.add_argument("--k-horizon", type=int, default=20)
-    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--edge-dim", type=int, choices=[2, 4], default=2)
     parser.add_argument("--v2", action="store_true")
     parser.add_argument("--use-cascade-stats", action="store_true")
@@ -354,7 +362,10 @@ def main() -> None:
 
     if args.output_table is not None:
         args.output_table.parent.mkdir(parents=True, exist_ok=True)
-        args.output_table.write_text(format_efficiency_latex(rows), encoding="utf-8")
+        eff_label = _resolve_efficiency_table_label(args.output_table)
+        args.output_table.write_text(
+            format_efficiency_latex(rows, label=eff_label), encoding="utf-8"
+        )
         print(f"Saved efficiency LaTeX table to: {args.output_table}")
 
 
