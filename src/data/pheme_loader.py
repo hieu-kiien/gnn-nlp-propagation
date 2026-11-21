@@ -21,7 +21,7 @@ import unicodedata
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import requests
 
@@ -110,11 +110,32 @@ def _resolve_figshare_file_metadata(timeout: int = 30) -> tuple[str, str]:
     return PHEME_FALLBACK_DOWNLOAD_URL, PHEME_EXPECTED_MD5
 
 
+def _discover_local_pheme_source(
+    raw_dir: Path,
+    extra_roots: Sequence[Path] = (Path("/kaggle/input"),),
+) -> tuple[Path | None, Path | None]:
+    """Locate a user-provided local/Kaggle-Input PHEME archive or extracted event directory."""
+    roots = [Path(raw_dir), *[Path(r) for r in extra_roots if Path(r).exists()]]
+    for root in roots:
+        if not root.exists():
+            continue
+        direct = root / PHEME_ARCHIVE_FILENAME
+        if direct.is_file():
+            return direct, None
+        for cand in sorted(root.rglob(PHEME_ARCHIVE_FILENAME)):
+            if cand.is_file():
+                return cand, None
+        for cand_dir in sorted(root.rglob("all-rnr-annotated-threads")):
+            if cand_dir.is_dir() and _find_event_directories(cand_dir):
+                return None, cand_dir
+    return None, None
+
+
 def download_pheme_from_figshare(
     raw_dir: Path = Path("data/raw/pheme"),
     timeout: int = 120,
 ) -> Path:
-    """Download `PHEME_veracity.tar.bz2` from Figshare and verify checksums."""
+    """Download `PHEME_veracity.tar.bz2` from Figshare (or use verified local/Kaggle-Input copy)."""
     dest_dir = Path(raw_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     archive_path = dest_dir / PHEME_ARCHIVE_FILENAME
@@ -124,14 +145,16 @@ def download_pheme_from_figshare(
     if "drive.google.com" in download_url or "api.twitter.com" in download_url:
         raise RuntimeError(f"Disallowed archive URL outside Figshare: {download_url}")
 
-    if archive_path.is_file():
+    local_archive, _ = _discover_local_pheme_source(dest_dir)
+    if local_archive is not None and local_archive.is_file():
         try:
-            _, sha256_hex = verify_archive_integrity(archive_path, expected_md5=expected_md5)
-            if not sha_sidecar.exists():
+            _, sha256_hex = verify_archive_integrity(local_archive, expected_md5=expected_md5)
+            if local_archive == archive_path and not sha_sidecar.exists():
                 sha_sidecar.write_text(f"{sha256_hex}  {archive_path.name}\n", encoding="utf-8")
-            return archive_path
+            return local_archive
         except ValueError:
-            archive_path.unlink(missing_ok=True)
+            if local_archive == archive_path:
+                archive_path.unlink(missing_ok=True)
 
     part_path = dest_dir / f"{PHEME_ARCHIVE_FILENAME}.part"
     last_exc: Exception | None = None
@@ -142,6 +165,15 @@ def download_pheme_from_figshare(
             try:
                 with session.get(download_url, stream=True, timeout=timeout) as resp:
                     resp.raise_for_status()
+                    if resp.status_code != 200:
+                        raise RuntimeError(
+                            f"Figshare returned HTTP {resp.status_code} (likely AWS WAF / anti-bot "
+                            f"challenge on {download_url}) instead of HTTP 200 archive bytes. "
+                            "Please download `PHEME_veracity.tar.bz2` manually in your browser from "
+                            "https://figshare.com/articles/dataset/PHEME_dataset_for_Rumour_Detection_and_Veracity_Classification/6392078 "
+                            "and attach it as a Kaggle Input Dataset (auto-detected under /kaggle/input) "
+                            "or place it at data/raw/pheme/PHEME_veracity.tar.bz2."
+                        )
                     with part_path.open("wb") as fh:
                         for chunk in resp.iter_content(chunk_size=1024 * 1024):
                             if chunk:
@@ -552,9 +584,10 @@ def main() -> None:
     args = parser.parse_args()
 
     default_extract_dir = args.raw_dir / "extracted"
+    discovered_archive, discovered_extracted = _discover_local_pheme_source(args.raw_dir)
     if args.extract_dir is not None:
         extract_dir = args.extract_dir
-        if not args.skip_download:
+        if not args.skip_download and not _find_event_directories(extract_dir):
             archive_path = download_pheme_from_figshare(raw_dir=args.raw_dir)
             if not (extract_dir / "all-rnr-annotated-threads").exists():
                 extract_pheme_archive(archive_path, extract_dir)
@@ -571,8 +604,21 @@ def main() -> None:
             output_dir=args.output_dir,
             max_threads=args.max_threads,
         )
+    elif discovered_extracted is not None:
+        print(f"Using pre-extracted PHEME directory: {discovered_extracted}")
+        nodes_path, edges_path = process_pheme_dataset(
+            raw_root=discovered_extracted,
+            output_dir=args.output_dir,
+            max_threads=args.max_threads,
+        )
     else:
-        archive_path = download_pheme_from_figshare(raw_dir=args.raw_dir)
+        archive_path = (
+            discovered_archive
+            if discovered_archive is not None
+            else download_pheme_from_figshare(raw_dir=args.raw_dir)
+        )
+        if discovered_archive is not None:
+            verify_archive_integrity(discovered_archive, expected_md5=PHEME_EXPECTED_MD5)
         with tempfile.TemporaryDirectory(prefix="pheme_extract_") as tmp_dir:
             tmp_extract = Path(tmp_dir)
             extract_pheme_archive(archive_path, tmp_extract)

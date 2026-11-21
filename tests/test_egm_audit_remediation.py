@@ -1254,3 +1254,14 @@ def test_round2_dataset_guard_crawler_resilience_and_50tree_window(tmp_path: Pat
     # Must NOT poison exhausted["vozforums"] = True on transient 502!
     assert state["exhausted"]["vozforums"] is False
 
+    # 5. pheme_loader auto-discovers Kaggle Input archive/extracted dir & rejects HTTP 202 anti-bot cleanly
+    import src.data.pheme_loader as pl
+
+    fake_input = tmp_path / "kaggle_input" / "pheme-ds"
+    fake_input.mkdir(parents=True)
+    fake_arc = fake_input / pl.PHEME_ARCHIVE_FILENAME
+    fake_arc.write_bytes(b"placeholder")
+    found_arc, found_dir = pl._discover_local_pheme_source(tmp_path / "empty_raw", extra_roots=(tmp_path / "kaggle_input",))
+    assert found_arc == fake_arc and found_dir is None
+
+
