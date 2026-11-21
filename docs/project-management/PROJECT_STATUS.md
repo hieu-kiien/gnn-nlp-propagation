@@ -1,7 +1,7 @@
 # SBi-FAGAT: Project Status & Module Verification Matrix
 
-**Branch:** `feat/step1-gnn-core-upgrade` (Steps 1–3 Unified 2D Upgrade complete)  
-**Test Suite:** 14 test modules in `tests/` (see [TEST_REPORT.md](TEST_REPORT.md) for latest observed run)
+**Branch:** `main` (Unified 2D + EGM 5-Goldfish Audit Hardening complete)  
+**Test Suite:** 15 test modules in `tests/` (see [TEST_REPORT.md](TEST_REPORT.md) for latest observed run)
 
 ---
 
@@ -36,7 +36,8 @@
 | `scripts/export_dataset_stats.py` | Dataset EDA (`Table 1` LaTeX) + Early-$K$ Persistence Baseline | Verified | Reports full size + polarization persistence metrics cleanly. |
 | `scripts/demo_research_walkthrough.py` | Offline CPU walkthrough (`<5s`) | Verified | Demonstrates `StandardGCN` vs. `SBiFAGAT`. |
 | `scripts/run_phase2.sh`, `run_all.sh` | Unified 2D Phase 2 & Phase 3 pipelines | Verified | Default `hidden_dim=64`, `--edge-dim 2`, `--min-total-replies 25`. |
-| `scripts/compute_kappa.py` | Cohen's Kappa & Machine-vs-Gold evaluator (`--strict-adjudication` option) | Verified | Warns & reports `unadjudicated_disagreements` and `adjudication_coverage`. |
-| `scripts/run_experiments.py`, `run_ablation.py`, `run_upfd_extension.py` | 5-seed benchmarks (+ `Early-K Persistence`), `topic_splits.json`-locked $K$-ablation, UPFD evaluation | Ready | Await full GPU execution in Step 4. |
+| `scripts/compute_kappa.py`, `audit_vn_50_trees.py` | Pair-level (300 pairs) & thread-level (50 VN Test trees) Cohen's Kappa, Machine-vs-Gold & LaTeX table exporter | Verified | Supports `--strict-adjudication` and `--output-table paper/tables_human_audit.tex`. |
+| `scripts/assemble_paper_artifacts.py` | Multi-track EDA/efficiency LaTeX table merger & unescaped-`_` syntax validator | Verified | Produces unified `tables_dataset_eda.tex`, `tables_efficiency.tex`, and `assembly_manifest.json`. |
+| `scripts/run_experiments.py`, `run_ablation.py`, `run_upfd_extension.py` | 5-seed benchmarks (+ Train-mean `Early-K Persistence`), fixed-horizon $K$-ablation + matched `BiEdgeGATv2`, UPFD structural transfer | Ready | Await full GPU execution in Step 4. |
 | `notebooks/*.ipynb` | Kaggle dual-T4 Member 1/2 notebooks | Ready | Mirror `scripts/kaggle_parallel_runner.py` unified 2D workflow. |
 | `paper/main.tex`, `paper/references.bib` | `IEEEtran` manuscript synced to unified 2D architecture | Ready | Tables populated via `\IfFileExists{tables_*.tex}` (zero fabricated results). |

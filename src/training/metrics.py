@@ -120,6 +120,7 @@ def evaluate_predictions(
     y_rumor_true: np.ndarray | None = None,
     rumor_logits: np.ndarray | None = None,
     y_bimodality_true: np.ndarray | None = None,
+    y_assortativity_true: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Compute size (MSLE/RMSE/MAE/R^2/Spearman), polarization (RMSE/MAE/R^2/Pearson/Spearman), and rumor metrics.
 
@@ -210,4 +211,8 @@ def evaluate_predictions(
         bc_arr = np.asarray(y_bimodality_true, dtype=np.float64).reshape(-1)
         if bc_arr.size >= 2 and bc_arr.size == y_polar_true.size:
             out["construct_corr_bc"] = _safe_spearman(y_polar_true, bc_arr)
+    if y_assortativity_true is not None:
+        assort_arr = np.asarray(y_assortativity_true, dtype=np.float64).reshape(-1)
+        if assort_arr.size >= 2 and assort_arr.size == y_polar_true.size:
+            out["construct_corr_assort"] = _safe_spearman(y_polar_true, assort_arr)
     return out

@@ -27,6 +27,8 @@ import json
 import math
 import random
 import re
+import sys
+import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -82,12 +84,50 @@ def _make_grad_scaler(enabled: bool) -> Any:
     return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
-def _cuda_autocast(enabled: bool) -> Any:
-    if not enabled:
+def _cuda_autocast(enabled: bool, *, dtype: torch.dtype = torch.float16) -> Any:
+    if not torch.cuda.is_available():
         return nullcontext()
     if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
-        return torch.amp.autocast("cuda", dtype=torch.float16, enabled=True)
-    return torch.cuda.amp.autocast(dtype=torch.float16, enabled=True)
+        return torch.amp.autocast("cuda", dtype=dtype, enabled=bool(enabled))
+    return torch.cuda.amp.autocast(dtype=dtype, enabled=bool(enabled))
+
+
+def _can_use_dataparallel(device: torch.device, use_multi_gpu: bool) -> bool:
+    return bool(
+        use_multi_gpu
+        and device.type == "cuda"
+        and (device.index is None or device.index == 0)
+        and torch.cuda.is_available()
+        and torch.cuda.device_count() > 1
+    )
+
+
+def _resolve_teacher_amp_policy(model: Any, device: torch.device) -> tuple[bool, torch.dtype]:
+    """Select numerically safe AMP dtype for inference (avoids mDeBERTa-v3 FP16 overflow on T4)."""
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False, torch.float32
+    cfg = getattr(model, "config", None)
+    model_type = str(getattr(cfg, "model_type", "") or "").lower()
+    cls_name = type(model).__name__.lower()
+    is_deberta = "deberta" in model_type or "deberta" in cls_name
+    if is_deberta:
+        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            return True, torch.bfloat16
+        # Tesla T4 (Turing) lacks native BF16 and DeBERTa-v2/v3 overflows FP16 attention logits.
+        return False, torch.float32
+    return True, torch.float16
+
+
+def _truncate_head_tail(token_ids: Sequence[int], budget: int, head_ratio: float = 0.6) -> list[int]:
+    """Preserve opening claim (60%) and closing verdict/TL;DR (40%) when over token budget."""
+    b = max(0, int(budget))
+    if b == 0:
+        return []
+    if len(token_ids) <= b or b < 4:
+        return list(token_ids[:b])
+    head_n = max(1, int(round(b * head_ratio)))
+    tail_n = max(0, b - head_n)
+    return list(token_ids[:head_n]) + (list(token_ids[-tail_n:]) if tail_n > 0 else [])
 
 
 def _normalize_nfc(text: Any) -> str:
@@ -192,7 +232,16 @@ def finetune_visobert_vihsd(
 
     ds = dataset_dict if dataset_dict is not None else load_uit_vihsd_dataset()
     train_split = ds["train"]
-    val_split = ds["validation"] if "validation" in ds else ds["test"]
+    if "validation" in ds:
+        val_split = ds["validation"]
+    else:
+        warnings.warn(
+            "UIT-ViHSD dataset has no 'validation' split; falling back to 'test' split "
+            "for early-checkpoint selection.",
+            UserWarning,
+            stacklevel=2,
+        )
+        val_split = ds["test"]
 
     train_texts = [normalize_social_text(x, lang="vi") for x in train_split["free_text"]]
     train_labels = [int(x) for x in train_split["label_id"]]
@@ -344,6 +393,27 @@ def finetune_visobert_vihsd(
     return out_path
 
 
+class _AutoCastLogitsWrapper(nn.Module):
+    """Wrap HF SequenceClassification models so `nn.DataParallel` runs AMP autocast per GPU thread."""
+
+    def __init__(
+        self,
+        inner: nn.Module,
+        *,
+        use_amp: bool = True,
+        amp_dtype: torch.dtype = torch.float16,
+    ) -> None:
+        super().__init__()
+        self.inner = inner
+        self.use_amp = bool(use_amp)
+        self.amp_dtype = amp_dtype
+
+    def forward(self, **kwargs: Tensor) -> Tensor:
+        with _cuda_autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            out = self.inner(**kwargs)
+            return out.logits.float()
+
+
 class HostilityTeacherScorer:
     """Compute hostility intensity `h_uv in [0, 1]` for reply texts."""
 
@@ -356,6 +426,7 @@ class HostilityTeacherScorer:
         tokenizer: Any | None = None,
         device: torch.device | None = None,
         allow_untrained_fallback: bool = False,
+        use_multi_gpu: bool = True,
     ) -> None:
         if lang not in {"vi", "en"}:
             raise ValueError(f"Unsupported lang {lang!r}; expected 'vi' or 'en'")
@@ -389,6 +460,21 @@ class HostilityTeacherScorer:
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
+
+        self._use_amp, self._amp_dtype = _resolve_teacher_amp_policy(self.model, self.device)
+        dp_ok = _can_use_dataparallel(self.device, use_multi_gpu) and isinstance(self.model, nn.Module)
+        self._num_gpus = torch.cuda.device_count() if dp_ok else 1
+        self._dp_model: nn.Module | None = (
+            nn.DataParallel(
+                _AutoCastLogitsWrapper(
+                    self.model,
+                    use_amp=self._use_amp,
+                    amp_dtype=self._amp_dtype,
+                )
+            )
+            if dp_ok
+            else None
+        )
 
     @staticmethod
     def hostility_from_probs(
@@ -424,15 +510,15 @@ class HostilityTeacherScorer:
         if not texts:
             return np.zeros((0,), dtype=np.float32)
 
-        use_amp = self.device.type == "cuda"
+        eff_batch = max(1, int(batch_size) * max(1, int(self._num_gpus)))
         eff_max_len = _effective_max_length(max_length, encoder=self.model, tokenizer=self.tokenizer)
         id2label = getattr(getattr(self.model, "config", None), "id2label", None)
         scores: list[Tensor] = []
 
-        for start in range(0, len(texts), batch_size):
+        for start in range(0, len(texts), eff_batch):
             batch = [
                 normalize_social_text(t, lang=self.lang)
-                for t in texts[start : start + batch_size]
+                for t in texts[start : start + eff_batch]
             ]
             enc = self.tokenizer(
                 batch,
@@ -442,11 +528,25 @@ class HostilityTeacherScorer:
                 return_tensors="pt",
             )
             enc = {k: v.to(self.device) for k, v in enc.items()}
-            with _cuda_autocast(enabled=use_amp):
-                logits = self.model(**enc).logits.float()
-            if not torch.isfinite(logits).all():
-                with _cuda_autocast(enabled=False):
+            if self._dp_model is not None and len(batch) >= self._num_gpus:
+                logits = self._dp_model(**enc).float()
+            else:
+                with _cuda_autocast(enabled=self._use_amp, dtype=self._amp_dtype):
                     logits = self.model(**enc).logits.float()
+            if not torch.isfinite(logits).all():
+                self._use_amp = False
+                self._amp_dtype = torch.float32
+                if self._dp_model is not None:
+                    self._dp_model.module.use_amp = False
+                    self._dp_model.module.amp_dtype = torch.float32
+                    if len(batch) >= self._num_gpus:
+                        logits = self._dp_model(**enc).float()
+                    else:
+                        with _cuda_autocast(enabled=False):
+                            logits = self.model(**enc).logits.float()
+                else:
+                    with _cuda_autocast(enabled=False):
+                        logits = self.model(**enc).logits.float()
             probs = torch.softmax(logits, dim=-1)
             h = self.hostility_from_probs(probs, lang=self.lang, id2label=id2label)
             scores.append(h.cpu())
@@ -466,6 +566,7 @@ class NLIStanceTeacherScorer:
         device: torch.device | None = None,
         lang: str = "vi",
         use_stance_verbalizer: bool = True,
+        use_multi_gpu: bool = True,
     ) -> None:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.lang = lang
@@ -481,6 +582,21 @@ class NLIStanceTeacherScorer:
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
+
+        self._use_amp, self._amp_dtype = _resolve_teacher_amp_policy(self.model, self.device)
+        dp_ok = _can_use_dataparallel(self.device, use_multi_gpu) and isinstance(self.model, nn.Module)
+        self._num_gpus = torch.cuda.device_count() if dp_ok else 1
+        self._dp_model: nn.Module | None = (
+            nn.DataParallel(
+                _AutoCastLogitsWrapper(
+                    self.model,
+                    use_amp=self._use_amp,
+                    amp_dtype=self._amp_dtype,
+                )
+            )
+            if dp_ok
+            else None
+        )
 
         self.entail_idx, self.neutral_idx, self.contra_idx = self._resolve_nli_indices()
 
@@ -543,7 +659,6 @@ class NLIStanceTeacherScorer:
         *,
         effective_max_len: int,
     ) -> Tensor:
-        use_amp = self.device.type == "cuda"
         try:
             enc = self.tokenizer(
                 list(premises),
@@ -563,11 +678,27 @@ class NLIStanceTeacherScorer:
                 return_tensors="pt",
             )
         enc = {k: v.to(self.device) for k, v in enc.items()}
-        with _cuda_autocast(enabled=use_amp):
-            logits = self.model(**enc).logits.float()
-        if not torch.isfinite(logits).all():
-            with _cuda_autocast(enabled=False):
+        if self._dp_model is not None and len(premises) >= self._num_gpus:
+            logits = self._dp_model(**enc).float()
+        else:
+            with _cuda_autocast(enabled=self._use_amp, dtype=self._amp_dtype):
                 logits = self.model(**enc).logits.float()
+        if not torch.isfinite(logits).all():
+            # Permanently disable AMP for the remainder of this session and rerun across
+            # DataParallel (avoiding single-GPU 2x batch OOM & repeated failed FP16 forwards).
+            self._use_amp = False
+            self._amp_dtype = torch.float32
+            if self._dp_model is not None:
+                self._dp_model.module.use_amp = False
+                self._dp_model.module.amp_dtype = torch.float32
+                if len(premises) >= self._num_gpus:
+                    logits = self._dp_model(**enc).float()
+                else:
+                    with _cuda_autocast(enabled=False):
+                        logits = self.model(**enc).logits.float()
+            else:
+                with _cuda_autocast(enabled=False):
+                    logits = self.model(**enc).logits.float()
         raw_probs = torch.softmax(logits, dim=-1)
         return torch.stack(
             [
@@ -604,6 +735,7 @@ class NLIStanceTeacherScorer:
             if use_stance_verbalizer is None
             else bool(use_stance_verbalizer)
         )
+        eff_batch = max(1, int(batch_size) * max(1, int(self._num_gpus)))
         eff_max_len = _effective_max_length(
             max_length, encoder=self.model, tokenizer=self.tokenizer
         )
@@ -615,9 +747,9 @@ class NLIStanceTeacherScorer:
             h_opp_tmpl = "The reply disagrees with, criticizes, or opposes the parent comment."
             tpl_prefix = "Parent comment: \nReply: "
         else:
-            h_sup_tmpl = "Phản hồi đồng ý hoặc ủng hộ bình luận gốc."
-            h_opp_tmpl = "Phản hồi phản đối, chỉ trích hoặc không đồng ý với bình luận gốc."
-            tpl_prefix = "Bình luận gốc: \nPhản hồi: "
+            h_sup_tmpl = "Phản hồi đồng ý hoặc ủng hộ bình luận trước."
+            h_opp_tmpl = "Phản hồi phản đối, chỉ trích hoặc không đồng ý với bình luận trước."
+            tpl_prefix = "Bình luận trước: \nPhản hồi: "
 
         has_tok_encode = hasattr(self.tokenizer, "encode") and hasattr(self.tokenizer, "decode")
         if active_verbalizer and has_tok_encode:
@@ -630,9 +762,9 @@ class NLIStanceTeacherScorer:
         else:
             avail_premise_tok = max(64, eff_max_len - 48)
 
-        for start in range(0, len(parent_texts), batch_size):
-            u_raw = parent_texts[start : start + batch_size]
-            v_raw = reply_texts[start : start + batch_size]
+        for start in range(0, len(parent_texts), eff_batch):
+            u_raw = parent_texts[start : start + eff_batch]
+            v_raw = reply_texts[start : start + eff_batch]
             if active_verbalizer:
                 premises = []
                 for u, v in zip(u_raw, v_raw):
@@ -662,17 +794,21 @@ class NLIStanceTeacherScorer:
                     if eff_lang == "en":
                         premises.append(f"Parent comment: {u_trim}\nReply: {v_trim}")
                     else:
-                        premises.append(f"Bình luận gốc: {u_trim}\nPhản hồi: {v_trim}")
+                        premises.append(f"Bình luận trước: {u_trim}\nPhản hồi: {v_trim}")
                 p_sup_pass = self._score_premise_hypothesis(
                     premises, [h_sup_tmpl] * len(premises), effective_max_len=eff_max_len
                 )
                 p_opp_pass = self._score_premise_hypothesis(
                     premises, [h_opp_tmpl] * len(premises), effective_max_len=eff_max_len
                 )
-                # Symmetric simplex combination guarantees p_sup + p_neu + p_opp == 1.0
-                p_sup = 0.5 * (p_sup_pass[:, 0] + p_opp_pass[:, 2])
-                p_neu = 0.5 * (p_sup_pass[:, 1] + p_opp_pass[:, 1])
-                p_opp = 0.5 * (p_opp_pass[:, 0] + p_sup_pass[:, 2])
+                # Symmetric simplex combination with double-contradiction neutral attribution:
+                # contradicting BOTH "agrees" and "disagrees" assigns min(c_sup, c_opp) to neutral.
+                e_sup, n_sup, c_sup = p_sup_pass[:, 0], p_sup_pass[:, 1], p_sup_pass[:, 2]
+                e_opp, n_opp, c_opp = p_opp_pass[:, 0], p_opp_pass[:, 1], p_opp_pass[:, 2]
+                double_contra = torch.minimum(c_sup, c_opp)
+                p_sup = 0.5 * (e_sup + (c_opp - double_contra).clamp_min(0.0))
+                p_opp = 0.5 * (e_opp + (c_sup - double_contra).clamp_min(0.0))
+                p_neu = 0.5 * (n_sup + n_opp) + double_contra
                 canonical = torch.stack([p_sup, p_neu, p_opp], dim=-1)
             else:
                 u_batch = [normalize_social_text(t, lang=eff_lang) for t in u_raw]
@@ -762,6 +898,29 @@ def export_stratified_human_audit_csv(
     selected: list[dict[str, Any]] = []
     base_quota = target_total // len(strata_order)
     offsets: dict[str, int] = {lbl: 0 for lbl in strata_order}
+
+    if not has_behavior:
+        # Joint stance x hostility stratification (hostile >= 0.4) preserving balanced stance quotas
+        ordered_buckets: dict[str, list[dict[str, Any]]] = {}
+        for lbl in strata_order:
+            hostile_items = [r for r in buckets[lbl] if float(r.get("h_uv", 0.0)) >= 0.4]
+            clean_items = [r for r in buckets[lbl] if float(r.get("h_uv", 0.0)) < 0.4]
+            target_h = min(len(hostile_items), max(1, base_quota // 2)) if hostile_items else 0
+            target_c = min(len(clean_items), max(0, base_quota - target_h))
+            rem_need = max(0, base_quota - (target_h + target_c))
+            if rem_need > 0:
+                extra_h = min(rem_need, len(hostile_items) - target_h)
+                target_h += extra_h
+                rem_need -= extra_h
+                extra_c = min(rem_need, len(clean_items) - target_c)
+                target_c += extra_c
+            ordered_buckets[lbl] = (
+                hostile_items[:target_h]
+                + clean_items[:target_c]
+                + hostile_items[target_h:]
+                + clean_items[target_c:]
+            )
+        buckets = ordered_buckets
 
     for lbl in strata_order:
         take = min(base_quota, len(buckets[lbl]))
@@ -1015,7 +1174,8 @@ def encode_cross_encoder_batch(
             root_ids = _encode_no_specials(tokenizer, r_norm)
             root_cap = min(len(root_ids), max(1, ctx_budget // 3))
             parent_cap = min(len(parent_ids), max(0, ctx_budget - 1 - root_cap))
-            root_keep = root_ids[: min(len(root_ids), max(0, ctx_budget - 1 - parent_cap))]
+            root_budget = min(len(root_ids), max(0, ctx_budget - 1 - parent_cap))
+            root_keep = _truncate_head_tail(root_ids, root_budget, head_ratio=0.6)
             parent_keep = parent_ids[:parent_cap]
             if root_keep and parent_keep:
                 ctx_ids = root_keep + [sep_id] + parent_keep
@@ -1024,7 +1184,11 @@ def encode_cross_encoder_batch(
             else:
                 ctx_ids = parent_keep
         else:
-            ctx_ids = parent_ids[:ctx_budget]
+            # Apply 60/40 Head+Tail truncation when parent IS the root post (depth 1) too
+            if include_root_context and r_norm and r_norm == p_norm:
+                ctx_ids = _truncate_head_tail(parent_ids, ctx_budget, head_ratio=0.6)
+            else:
+                ctx_ids = parent_ids[:ctx_budget]
 
         reply_budget = max(1, content_budget - len(ctx_ids))
         reply_keep = reply_ids[:reply_budget]
@@ -1092,6 +1256,7 @@ class DualHeadCrossEncoder(nn.Module):
         self.model_name = model_name or (VISOBERT_MODEL_NAME if lang == "vi" else TWITTER_ROBERTA_MODEL_NAME)
         self.dropout_p = float(dropout)
         self.include_root_context = bool(include_root_context)
+        self._amp_enabled = False
         self.encoder = encoder if encoder is not None else AutoModel.from_pretrained(self.model_name)
         hidden_size = int(self.encoder.config.hidden_size)
         rel_proj_dim = min(256, hidden_size)
@@ -1151,32 +1316,41 @@ class DualHeadCrossEncoder(nn.Module):
                 accepts_type_ids = "token_type_ids" in self.encoder.forward.__code__.co_varnames
             if accepts_type_ids:
                 kwargs["token_type_ids"] = token_type_ids
-        outputs = self.encoder(**kwargs)
-        hidden = outputs.last_hidden_state
-        h_cls = hidden[:, 0, :]
+        amp_on = bool(getattr(self, "_amp_enabled", False) and input_ids.is_cuda)
+        with _cuda_autocast(enabled=amp_on):
+            outputs = self.encoder(**kwargs)
+            hidden = outputs.last_hidden_state
+            h_cls = hidden[:, 0, :]
 
-        h_ctx = self._masked_pool_or_fallback(hidden, context_mask, h_cls)
-        h_reply = self._masked_pool_or_fallback(hidden, reply_mask, h_cls)
+            h_ctx = self._masked_pool_or_fallback(hidden, context_mask, h_cls)
+            h_reply = self._masked_pool_or_fallback(hidden, reply_mask, h_cls)
 
-        rel_in = torch.cat(
-            [h_cls, h_ctx, h_reply, h_ctx * h_reply, (h_ctx - h_reply).abs()],
-            dim=-1,
-        )
-        stance_repr = self.stance_proj(self.dropout(rel_in))
-        stance_logits = self.stance_head(stance_repr)
+            rel_in = torch.cat(
+                [h_cls, h_ctx, h_reply, h_ctx * h_reply, (h_ctx - h_reply).abs()],
+                dim=-1,
+            )
+            stance_repr = self.stance_proj(self.dropout(rel_in))
+            stance_logits = self.stance_head(stance_repr)
+
+            # Hostility reads strictly reply-only span representation to eliminate parent-toxicity bleed
+            host_repr = self.dropout(self.hostility_norm(h_reply))
+            hostility_logit = self.hostility_head(host_repr).squeeze(-1)
+
+            if self.edge_dim == 4 and self.behavior_head is not None:
+                behavior_logits = self.behavior_head(stance_repr)
+                irrational_logit = self.irrational_head(stance_repr).squeeze(-1)
+                constructive_logit = self.constructive_head(stance_repr).squeeze(-1)
+            else:
+                behavior_logits = None
+                irrational_logit = None
+                constructive_logit = None
+
         stance_probs = torch.softmax(stance_logits.float(), dim=-1)
         s_uv = (stance_probs[:, 0] - stance_probs[:, 2]).clamp(-1.0, 1.0)
-
-        # Hostility reads strictly reply-only span representation to eliminate parent-toxicity bleed
-        host_repr = self.dropout(self.hostility_norm(h_reply))
-        hostility_logit = self.hostility_head(host_repr).squeeze(-1)
         h_uv = torch.sigmoid(hostility_logit.float()).clamp(0.0, 1.0)
 
-        if self.edge_dim == 4 and self.behavior_head is not None:
-            behavior_logits = self.behavior_head(stance_repr)
+        if self.edge_dim == 4 and behavior_logits is not None and irrational_logit is not None and constructive_logit is not None:
             behavior_probs = torch.softmax(behavior_logits.float(), dim=-1)
-            irrational_logit = self.irrational_head(stance_repr).squeeze(-1)
-            constructive_logit = self.constructive_head(stance_repr).squeeze(-1)
             r_uv = torch.sigmoid(irrational_logit.float()).clamp(0.0, 1.0)
             c_uv = torch.sigmoid(constructive_logit.float()).clamp(0.0, 1.0)
             e_uv = torch.stack([s_uv, h_uv, r_uv, c_uv], dim=-1)
@@ -1421,11 +1595,12 @@ def distill_dual_cross_encoder(
         )
     )
     student.include_root_context = bool(include_root_context)
+    student._amp_enabled = bool(use_amp)
     student = student.to(target_device)
     tok = tokenizer if tokenizer is not None else load_tokenizer_safe(student.model_name)
 
     active_student: nn.Module = student
-    if use_multi_gpu and target_device.type == "cuda" and torch.cuda.device_count() > 1:
+    if _can_use_dataparallel(target_device, use_multi_gpu):
         active_student = nn.DataParallel(student)
 
     def _collate(
@@ -1560,44 +1735,12 @@ def distill_dual_cross_encoder(
             loss = loss + 0.5 * kl_beh + r_loss + c_loss
         return loss
 
-    for _epoch in range(max(1, epochs)):
-        active_student.train()
-        running_loss = 0.0
-        step_count = 0
-        for enc, s_tgt, h_tgt, r_tgt, c_tgt, p_tgt, bp_tgt in train_loader:
-            enc_dev = {k: v.to(target_device) for k, v in enc.items()}
-            s_tgt_d = s_tgt.to(target_device)
-            h_tgt_d = h_tgt.to(target_device)
-            r_tgt_d = r_tgt.to(target_device)
-            c_tgt_d = c_tgt.to(target_device)
-            p_tgt_d = p_tgt.to(target_device)
-            bp_tgt_d = bp_tgt.to(target_device)
-
-            optimizer.zero_grad(set_to_none=True)
-            with _cuda_autocast(enabled=use_amp):
-                out = active_student(**enc_dev)
-                loss = _batch_loss(out, s_tgt_d, h_tgt_d, r_tgt_d, c_tgt_d, p_tgt_d, bp_tgt_d)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
-            scale_before = scaler.get_scale() if use_amp else 1.0
-            scaler.step(optimizer)
-            scaler.update()
-            if not use_amp or scaler.get_scale() >= scale_before:
-                scheduler.step()
-
-            running_loss += float(loss.detach().cpu().item())
-            step_count += 1
-
-        train_losses.append(running_loss / max(1, step_count))
-
-        active_student.eval()
-        val_loss_sum = 0.0
-        val_steps = 0
-        s_preds, s_trues, h_preds, h_trues = [], [], [], []
-        r_preds, r_trues, c_preds, c_trues = [], [], [], []
-        with torch.no_grad():
-            for enc, s_tgt, h_tgt, r_tgt, c_tgt, p_tgt, bp_tgt in val_loader:
+    try:
+        for _epoch in range(max(1, epochs)):
+            active_student.train()
+            running_loss = 0.0
+            step_count = 0
+            for enc, s_tgt, h_tgt, r_tgt, c_tgt, p_tgt, bp_tgt in train_loader:
                 enc_dev = {k: v.to(target_device) for k, v in enc.items()}
                 s_tgt_d = s_tgt.to(target_device)
                 h_tgt_d = h_tgt.to(target_device)
@@ -1605,49 +1748,84 @@ def distill_dual_cross_encoder(
                 c_tgt_d = c_tgt.to(target_device)
                 p_tgt_d = p_tgt.to(target_device)
                 bp_tgt_d = bp_tgt.to(target_device)
+
+                optimizer.zero_grad(set_to_none=True)
                 with _cuda_autocast(enabled=use_amp):
                     out = active_student(**enc_dev)
-                    vloss = _batch_loss(out, s_tgt_d, h_tgt_d, r_tgt_d, c_tgt_d, p_tgt_d, bp_tgt_d)
+                    loss = _batch_loss(out, s_tgt_d, h_tgt_d, r_tgt_d, c_tgt_d, p_tgt_d, bp_tgt_d)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
+                scale_before = scaler.get_scale() if use_amp else 1.0
+                scaler.step(optimizer)
+                scaler.update()
+                if not use_amp or scaler.get_scale() >= scale_before:
+                    scheduler.step()
 
-                val_loss_sum += float(vloss.cpu().item())
-                val_steps += 1
-                s_preds.extend(out["s_uv"].cpu().tolist())
-                s_trues.extend(s_tgt.tolist())
-                h_preds.extend(out["h_uv"].cpu().tolist())
-                h_trues.extend(h_tgt.tolist())
-                if student.edge_dim == 4 and "r_uv" in out:
-                    r_preds.extend(out["r_uv"].cpu().tolist())
-                    r_trues.extend(r_tgt.tolist())
-                    c_preds.extend(out["c_uv"].cpu().tolist())
-                    c_trues.extend(c_tgt.tolist())
+                running_loss += float(loss.detach().cpu().item())
+                step_count += 1
 
-        val_loss = val_loss_sum / max(1, val_steps)
-        s_p_arr = np.asarray(s_preds, dtype=np.float32)
-        s_t_arr = np.asarray(s_trues, dtype=np.float32)
-        h_p_arr = np.asarray(h_preds, dtype=np.float32)
-        h_t_arr = np.asarray(h_trues, dtype=np.float32)
-        last_val_metrics = {
-            "val_loss": val_loss,
-            "val_mae_s": float(np.mean(np.abs(s_p_arr - s_t_arr))),
-            "val_mae_h": float(np.mean(np.abs(h_p_arr - h_t_arr))),
-            "val_pearson_s": _safe_pearsonr(s_p_arr, s_t_arr),
-            "val_pearson_h": _safe_pearsonr(h_p_arr, h_t_arr),
-        }
-        if r_preds:
-            r_p_arr = np.asarray(r_preds, dtype=np.float32)
-            r_t_arr = np.asarray(r_trues, dtype=np.float32)
-            c_p_arr = np.asarray(c_preds, dtype=np.float32)
-            c_t_arr = np.asarray(c_trues, dtype=np.float32)
-            last_val_metrics["val_mae_r"] = float(np.mean(np.abs(r_p_arr - r_t_arr)))
-            last_val_metrics["val_mae_c"] = float(np.mean(np.abs(c_p_arr - c_t_arr)))
-            last_val_metrics["val_pearson_r"] = _safe_pearsonr(r_p_arr, r_t_arr)
-            last_val_metrics["val_pearson_c"] = _safe_pearsonr(c_p_arr, c_t_arr)
+            train_losses.append(running_loss / max(1, step_count))
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = _epoch
-            best_val_metrics = dict(last_val_metrics)
-            best_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
+            active_student.eval()
+            val_loss_sum = 0.0
+            val_steps = 0
+            s_preds, s_trues, h_preds, h_trues = [], [], [], []
+            r_preds, r_trues, c_preds, c_trues = [], [], [], []
+            with torch.no_grad():
+                for enc, s_tgt, h_tgt, r_tgt, c_tgt, p_tgt, bp_tgt in val_loader:
+                    enc_dev = {k: v.to(target_device) for k, v in enc.items()}
+                    s_tgt_d = s_tgt.to(target_device)
+                    h_tgt_d = h_tgt.to(target_device)
+                    r_tgt_d = r_tgt.to(target_device)
+                    c_tgt_d = c_tgt.to(target_device)
+                    p_tgt_d = p_tgt.to(target_device)
+                    bp_tgt_d = bp_tgt.to(target_device)
+                    with _cuda_autocast(enabled=use_amp):
+                        out = active_student(**enc_dev)
+                        vloss = _batch_loss(out, s_tgt_d, h_tgt_d, r_tgt_d, c_tgt_d, p_tgt_d, bp_tgt_d)
+
+                    val_loss_sum += float(vloss.cpu().item())
+                    val_steps += 1
+                    s_preds.extend(out["s_uv"].cpu().tolist())
+                    s_trues.extend(s_tgt.tolist())
+                    h_preds.extend(out["h_uv"].cpu().tolist())
+                    h_trues.extend(h_tgt.tolist())
+                    if student.edge_dim == 4 and "r_uv" in out:
+                        r_preds.extend(out["r_uv"].cpu().tolist())
+                        r_trues.extend(r_tgt.tolist())
+                        c_preds.extend(out["c_uv"].cpu().tolist())
+                        c_trues.extend(c_tgt.tolist())
+
+            val_loss = val_loss_sum / max(1, val_steps)
+            s_p_arr = np.asarray(s_preds, dtype=np.float32)
+            s_t_arr = np.asarray(s_trues, dtype=np.float32)
+            h_p_arr = np.asarray(h_preds, dtype=np.float32)
+            h_t_arr = np.asarray(h_trues, dtype=np.float32)
+            last_val_metrics = {
+                "val_loss": val_loss,
+                "val_mae_s": float(np.mean(np.abs(s_p_arr - s_t_arr))),
+                "val_mae_h": float(np.mean(np.abs(h_p_arr - h_t_arr))),
+                "val_pearson_s": _safe_pearsonr(s_p_arr, s_t_arr),
+                "val_pearson_h": _safe_pearsonr(h_p_arr, h_t_arr),
+            }
+            if r_preds:
+                r_p_arr = np.asarray(r_preds, dtype=np.float32)
+                r_t_arr = np.asarray(r_trues, dtype=np.float32)
+                c_p_arr = np.asarray(c_preds, dtype=np.float32)
+                c_t_arr = np.asarray(c_trues, dtype=np.float32)
+                last_val_metrics["val_mae_r"] = float(np.mean(np.abs(r_p_arr - r_t_arr)))
+                last_val_metrics["val_mae_c"] = float(np.mean(np.abs(c_p_arr - c_t_arr)))
+                last_val_metrics["val_pearson_r"] = _safe_pearsonr(r_p_arr, r_t_arr)
+                last_val_metrics["val_pearson_c"] = _safe_pearsonr(c_p_arr, c_t_arr)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_epoch = _epoch
+                best_val_metrics = dict(last_val_metrics)
+                best_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
+    finally:
+        student._amp_enabled = False
 
     if not best_val_metrics:
         best_val_metrics = dict(last_val_metrics)
@@ -1785,6 +1963,24 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
     tmp_path.replace(path)
 
 
+def _append_score_deltas(
+    ckpt_jsonl: Path,
+    pairs: Sequence[Mapping[str, Any]],
+    indices: Sequence[int],
+    fields: Sequence[str],
+) -> None:
+    """Append compact score-only JSONL delta records (`O(chunk_size)` I/O, no text duplication)."""
+    ckpt_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with ckpt_jsonl.open("a", encoding="utf-8") as fh:
+        for i in indices:
+            rec: dict[str, Any] = {"edge_id": str(pairs[i].get("edge_id") or "")}
+            for f in fields:
+                if f in pairs[i]:
+                    rec[f] = pairs[i][f]
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        fh.flush()
+
+
 def _score_pairs_with_teachers(
     pairs: list[dict[str, Any]],
     *,
@@ -1797,22 +1993,45 @@ def _score_pairs_with_teachers(
     teacher_backend: str = "dual_nli",
     telemetry: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Run dual open-source teachers (Hostility + mDeBERTa Stance Verbalizer) with atomic caching."""
+    """Run dual open-source teachers (Hostility + mDeBERTa Stance Verbalizer) with O(N) JSONL delta checkpointing."""
     if not pairs:
         return pairs
 
     chunk_size = max(1, int(checkpoint_every))
+    cache_file = Path(cache_path) if cache_path is not None else None
+    ckpt_jsonl = (
+        cache_file.with_name(f"{cache_file.name}.checkpoint.jsonl")
+        if cache_file is not None
+        else None
+    )
     cached_by_eid: dict[str, dict[str, Any]] = {}
-    if cache_path is not None and Path(cache_path).exists():
+    if cache_file is not None and cache_file.exists():
         try:
-            loaded_cache = json.loads(Path(cache_path).read_text(encoding="utf-8"))
+            loaded_cache = json.loads(cache_file.read_text(encoding="utf-8"))
             if isinstance(loaded_cache, list):
                 for item in loaded_cache:
                     eid = str(item.get("edge_id") or "")
                     if eid:
-                        cached_by_eid[eid] = item
+                        cached_by_eid[eid] = dict(item)
         except (OSError, json.JSONDecodeError):
             cached_by_eid = {}
+
+    if ckpt_jsonl is not None and ckpt_jsonl.exists():
+        try:
+            with ckpt_jsonl.open("r", encoding="utf-8") as fh:
+                for raw_line in fh:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    eid = str(rec.get("edge_id") or "")
+                    if eid:
+                        cached_by_eid.setdefault(eid, {}).update(rec)
+        except OSError:
+            pass
 
     cache_fields = (
         "h_uv",
@@ -1834,9 +2053,12 @@ def _score_pairs_with_teachers(
                 if field in cached:
                     p[field] = cached[field]
 
+    did_compute = False
+
     # Stage 1: Hostility intensity h_uv
     need_host_idx = [i for i, p in enumerate(pairs) if "h_uv" not in p]
     if need_host_idx:
+        did_compute = True
         host_scorer = HostilityTeacherScorer(
             lang=lang,
             model_name_or_path=vihsd_ckpt if lang == "vi" else None,
@@ -1851,8 +2073,8 @@ def _score_pairs_with_teachers(
             )
             for pos, i in enumerate(idx_slice):
                 pairs[i]["h_uv"] = float(h_scores[pos])
-            if cache_path is not None:
-                _atomic_write_json(Path(cache_path), pairs)
+            if ckpt_jsonl is not None:
+                _append_score_deltas(ckpt_jsonl, pairs, idx_slice, ("h_uv",))
         del host_scorer
         gc.collect()
         if torch.cuda.is_available():
@@ -1863,6 +2085,7 @@ def _score_pairs_with_teachers(
         i for i, p in enumerate(pairs) if "s_uv" not in p or "root_s_uv" not in p
     ]
     if need_nli_idx:
+        did_compute = True
         nli_scorer = NLIStanceTeacherScorer(lang=lang, use_stance_verbalizer=True)
         chunk_starts = range(0, len(need_nli_idx), chunk_size)
         for start in tqdm(chunk_starts, desc=f"NLI stance verbalizer ({lang})"):
@@ -1909,12 +2132,25 @@ def _score_pairs_with_teachers(
                     pairs[i]["root_s_uv"] = float(root_out["s_uv"][pos])
                     pairs[i]["root_stance_probs"] = root_out["stance_probs"][pos].tolist()
 
-            if cache_path is not None:
-                _atomic_write_json(Path(cache_path), pairs)
+            if ckpt_jsonl is not None:
+                _append_score_deltas(
+                    ckpt_jsonl,
+                    pairs,
+                    idx_slice,
+                    ("s_uv", "stance_probs", "pred_label", "root_s_uv", "root_stance_probs"),
+                )
         del nli_scorer
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    if cache_file is not None and (did_compute or not cache_file.exists() or (ckpt_jsonl is not None and ckpt_jsonl.exists())):
+        _atomic_write_json(cache_file, pairs)
+        if ckpt_jsonl is not None and ckpt_jsonl.exists():
+            try:
+                ckpt_jsonl.unlink()
+            except OSError:
+                pass
 
     if telemetry is not None:
         telemetry["teacher_backend"] = teacher_backend
@@ -1946,6 +2182,8 @@ def _score_pairs_with_teachers(
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Dual open-source NLP edge scoring & distillation.")
     parser.add_argument("--lang", choices=["vi", "en"], default="vi")
     parser.add_argument("--interim-dir", type=Path, default=Path("data/interim/vn"))
@@ -1967,6 +2205,7 @@ def main() -> None:
     parser.add_argument("--score-only", action="store_true")
     parser.add_argument("--export-audit", action="store_true")
     parser.add_argument("--distill", action="store_true")
+    parser.add_argument("--skip-if-exists", action="store_true")
     parser.add_argument("--include-root-context", action="store_true")
     parser.add_argument("--sanity-check-shuffle", action="store_true")
     parser.add_argument("--allow-untrained-vihsd", action="store_true")
@@ -1993,11 +2232,14 @@ def main() -> None:
     splits_path = args.topic_splits_json or (args.interim_dir / "topic_splits.json")
 
     if args.train_vihsd:
-        finetune_visobert_vihsd(
-            output_dir=args.vihsd_dir,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-        )
+        if args.skip_if_exists and (args.vihsd_dir / "vihsd_metrics.json").exists():
+            print(f"[SKIP] Fine-tuned ViHSD checkpoint already exists: {args.vihsd_dir}")
+        else:
+            finetune_visobert_vihsd(
+                output_dir=args.vihsd_dir,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+            )
 
     if args.score_only or args.export_audit or args.distill:
         nodes_tbl, _ = load_cascade_parquet(args.interim_dir, validate=True)
@@ -2036,7 +2278,8 @@ def main() -> None:
             telemetry=telemetry,
         )
         if args.scored_cache_json is not None:
-            _atomic_write_json(args.scored_cache_json, scored)
+            if not args.scored_cache_json.exists():
+                _atomic_write_json(args.scored_cache_json, scored)
             if telemetry:
                 _atomic_write_json(
                     args.scored_cache_json.with_name("teacher_scoring_report.json"),
@@ -2044,45 +2287,55 @@ def main() -> None:
                 )
 
         if args.export_audit:
-            csv_path = export_stratified_human_audit_csv(
-                scored,
-                output_csv=audit_csv,
-                machine_key_csv=machine_key_csv,
-                pilot_csv=args.pilot_csv,
-            )
-            print(f"Exported blind stratified human audit CSV: {csv_path} (key: {machine_key_csv})")
+            if args.skip_if_exists and audit_csv.exists() and machine_key_csv.exists():
+                print(f"[SKIP] Blind human audit CSV already exists: {audit_csv}")
+            else:
+                csv_path = export_stratified_human_audit_csv(
+                    scored,
+                    output_csv=audit_csv,
+                    machine_key_csv=machine_key_csv,
+                    pilot_csv=args.pilot_csv,
+                )
+                print(f"Exported blind stratified human audit CSV: {csv_path} (key: {machine_key_csv})")
 
         if args.distill:
-            topic_splits = split_pairs_by_inductive_topics(
-                scored,
-                split_seed=args.split_seed,
-                canonical_topic_splits=canonical_splits,
-            )
-            train_distill = topic_splits["train"]
-            val_distill = topic_splits["val"]
-            student_backbone = args.student_backbone or (
-                VISOBERT_MODEL_NAME if args.lang == "vi" else TWITTER_ROBERTA_MODEL_NAME
-            )
-            report = distill_dual_cross_encoder(
-                train_distill,
-                val_distill,
-                output_dir=out_dir,
-                lang=args.lang,
-                model_name=student_backbone,
-                edge_dim=args.edge_dim,
-                include_root_context=bool(args.include_root_context),
-                epochs=args.epochs,
-                batch_size=args.batch_size,
-                sanity_check_shuffle=args.sanity_check_shuffle,
-            )
-            report["canonical_splits_path"] = str(splits_path)
-            if telemetry:
-                report["teacher_telemetry"] = telemetry
-                (out_dir / "distill_report.json").write_text(
-                    json.dumps(report, indent=2),
-                    encoding="utf-8",
+            if (
+                args.skip_if_exists
+                and (out_dir / "dual_head_weights.pt").exists()
+                and (out_dir / "distill_report.json").exists()
+            ):
+                print(f"[SKIP] Distilled Student checkpoint already exists: {out_dir}")
+            else:
+                topic_splits = split_pairs_by_inductive_topics(
+                    scored,
+                    split_seed=args.split_seed,
+                    canonical_topic_splits=canonical_splits,
                 )
-            print("Distillation summary:", json.dumps(report, indent=2))
+                train_distill = topic_splits["train"]
+                val_distill = topic_splits["val"]
+                student_backbone = args.student_backbone or (
+                    VISOBERT_MODEL_NAME if args.lang == "vi" else TWITTER_ROBERTA_MODEL_NAME
+                )
+                report = distill_dual_cross_encoder(
+                    train_distill,
+                    val_distill,
+                    output_dir=out_dir,
+                    lang=args.lang,
+                    model_name=student_backbone,
+                    edge_dim=args.edge_dim,
+                    include_root_context=bool(args.include_root_context),
+                    epochs=args.epochs,
+                    batch_size=args.batch_size,
+                    sanity_check_shuffle=args.sanity_check_shuffle,
+                )
+                report["canonical_splits_path"] = str(splits_path)
+                if telemetry:
+                    report["teacher_telemetry"] = telemetry
+                    (out_dir / "distill_report.json").write_text(
+                        json.dumps(report, indent=2),
+                        encoding="utf-8",
+                    )
+                print("Distillation summary:", json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":

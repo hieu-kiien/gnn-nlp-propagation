@@ -190,7 +190,9 @@ def _estimate_balanced_class_weights(
     total = float(counts.sum())
     weights = np.ones(num_classes, dtype=np.float32)
     num_present = float(present.sum())
-    weights[present] = (total / (num_present * counts[present])).astype(np.float32)
+    # Dampened square-root inverse-frequency weighting prevents rare veracity classes
+    # from dominating validation Early Stopping while preserving minority-class recall.
+    weights[present] = np.sqrt(total / (num_present * counts[present])).astype(np.float32)
     weights[present] = weights[present] / float(np.mean(weights[present]))
     return torch.tensor(weights, dtype=torch.float32)
 
@@ -222,8 +224,10 @@ def evaluate_loader(
     polar_true_list: list[np.ndarray] = []
     polar_pred_list: list[np.ndarray] = []
     bimodality_true_list: list[np.ndarray] = []
+    assortativity_true_list: list[np.ndarray] = []
     rumor_true_list: list[np.ndarray] = []
     rumor_logits_list: list[np.ndarray] = []
+    topic_ids_list: list[str] = []
 
     for batch in loader:
         batch = batch.to(device)
@@ -260,14 +264,24 @@ def evaluate_loader(
         total_task_loss += float(t_loss.item()) * num_graphs
         total_graphs += num_graphs
 
-        if hasattr(batch, "y_size") and batch.y_size is not None:
-            size_true_list.append(batch.y_size.view(-1).detach().cpu().numpy())
-            size_pred_list.append(outputs["y_size_pred"].view(-1).detach().cpu().numpy())
-        if hasattr(batch, "y_polar") and batch.y_polar is not None:
-            polar_true_list.append(batch.y_polar.view(-1).detach().cpu().numpy())
-            polar_pred_list.append(outputs["y_polar_pred"].view(-1).detach().cpu().numpy())
-        if hasattr(batch, "y_bimodality") and batch.y_bimodality is not None:
-            bimodality_true_list.append(batch.y_bimodality.view(-1).detach().cpu().numpy())
+        if not classification_only:
+            if hasattr(batch, "y_size") and batch.y_size is not None:
+                size_true_list.append(batch.y_size.view(-1).detach().cpu().numpy())
+                size_pred_list.append(outputs["y_size_pred"].view(-1).detach().cpu().numpy())
+            if hasattr(batch, "y_polar") and batch.y_polar is not None:
+                polar_true_list.append(batch.y_polar.view(-1).detach().cpu().numpy())
+                polar_pred_list.append(outputs["y_polar_pred"].view(-1).detach().cpu().numpy())
+            if hasattr(batch, "y_bimodality") and batch.y_bimodality is not None:
+                bimodality_true_list.append(batch.y_bimodality.view(-1).detach().cpu().numpy())
+            if hasattr(batch, "y_assortativity") and batch.y_assortativity is not None:
+                assortativity_true_list.append(batch.y_assortativity.view(-1).detach().cpu().numpy())
+
+        raw_tids = getattr(batch, "topic_id", None)
+        if raw_tids is not None:
+            if isinstance(raw_tids, (list, tuple)):
+                topic_ids_list.extend(str(t) for t in raw_tids)
+            else:
+                topic_ids_list.append(str(raw_tids))
 
         y_rumor = getattr(batch, "y_rumor", getattr(batch, "y", None))
         if y_rumor is not None:
@@ -279,6 +293,9 @@ def evaluate_loader(
     y_polar_true = np.concatenate(polar_true_list) if polar_true_list else np.array([])
     y_polar_pred = np.concatenate(polar_pred_list) if polar_pred_list else np.array([])
     y_bimodality_true = np.concatenate(bimodality_true_list) if bimodality_true_list else None
+    y_assortativity_true = (
+        np.concatenate(assortativity_true_list) if assortativity_true_list else None
+    )
     y_rumor_true = np.concatenate(rumor_true_list) if rumor_true_list else None
     rumor_logits = np.concatenate(rumor_logits_list, axis=0) if rumor_logits_list else None
 
@@ -290,10 +307,16 @@ def evaluate_loader(
         y_rumor_true=y_rumor_true,
         rumor_logits=rumor_logits,
         y_bimodality_true=y_bimodality_true,
+        y_assortativity_true=y_assortativity_true,
     )
     metrics["loss"] = total_loss / max(1, total_graphs)
     metrics["task_loss"] = total_task_loss / max(1, total_graphs)
     if return_predictions:
+        expected_n = (
+            int(y_size_true.size)
+            if y_size_true.size > 0
+            else (int(y_rumor_true.size) if y_rumor_true is not None else 0)
+        )
         metrics["_predictions"] = {
             "y_size_true": y_size_true,
             "y_size_pred": y_size_pred,
@@ -301,6 +324,7 @@ def evaluate_loader(
             "y_polar_pred": y_polar_pred,
             "y_rumor_true": y_rumor_true,
             "rumor_logits": rumor_logits,
+            "topic_ids": topic_ids_list if len(topic_ids_list) == expected_n else None,
         }
     return metrics
 
@@ -372,6 +396,29 @@ def train_and_evaluate_single_seed(
     ema_eval_model = copy.deepcopy(model) if ema_active else None
     early_stopper = EarlyStopping(patience=patience, mode="min")
 
+    # Reseed deterministically after model construction and attach a dedicated per-seed
+    # torch.Generator to shuffled train_loaders so every architecture receives the exact
+    # same minibatch order across ALL epochs regardless of internal Dropout/RNG draws.
+    seed_everything(int(seed) + 10000)
+    active_train_loader = train_loader
+    if isinstance(
+        getattr(train_loader, "sampler", None), torch.utils.data.RandomSampler
+    ) and hasattr(train_loader, "dataset"):
+        shuffle_gen = torch.Generator()
+        shuffle_gen.manual_seed(int(seed) + 10000)
+        try:
+            active_train_loader = DataLoader(
+                train_loader.dataset,
+                batch_size=train_loader.batch_size or 1,
+                shuffle=True,
+                drop_last=bool(getattr(train_loader, "drop_last", False)),
+                num_workers=int(getattr(train_loader, "num_workers", 0)),
+                pin_memory=bool(getattr(train_loader, "pin_memory", False)),
+                generator=shuffle_gen,
+            )
+        except Exception:
+            active_train_loader = train_loader
+
     for epoch in range(epochs):
         if warmup_epochs > 0 and epoch < warmup_epochs:
             warmup_lr = lr * float(epoch + 1) / float(warmup_epochs)
@@ -379,7 +426,7 @@ def train_and_evaluate_single_seed(
                 pg["lr"] = warmup_lr
 
         model.train()
-        for batch in train_loader:
+        for batch in active_train_loader:
             batch = batch.to(target_device)
             optimizer.zero_grad()
             outputs = model(batch)
@@ -492,21 +539,38 @@ def compute_paired_bootstrap_pvalue(
     n_resamples: int = 2000,
     seed: int = 42,
 ) -> float:
-    """Two-sided paired bootstrap test over sample-level or fold-level paired observations."""
+    """Two-sided paired test: exact sign-flip permutation for n < 6, +1-smoothed bootstrap for n >= 6."""
     arr_a = np.asarray(scores_a, dtype=np.float64)
     arr_b = np.asarray(scores_b, dtype=np.float64)
     valid = ~(np.isnan(arr_a) | np.isnan(arr_b))
     arr_a, arr_b = arr_a[valid], arr_b[valid]
-    if arr_a.size < 2:
+    n_obs = int(arr_a.size)
+    if n_obs < 2:
         return float("nan")
     diffs = arr_a - arr_b
     if np.allclose(diffs, 0.0):
         return 1.0
+    if n_obs < 6:
+        # Exact two-sided paired sign-flip permutation test over all 2^n flips
+        # (prevents small-sample bootstrap collapse such as fake p=0.0000 at F=4 LOO folds).
+        obs_mean = float(np.mean(diffs))
+        signs = np.array(
+            [
+                [1.0 if ((mask >> bit) & 1) else -1.0 for bit in range(n_obs)]
+                for mask in range(1 << n_obs)
+            ],
+            dtype=np.float64,
+        )
+        perm_means = (signs * diffs[None, :]).mean(axis=1)
+        p_right = float(np.mean(perm_means >= obs_mean - 1e-12))
+        p_left = float(np.mean(perm_means <= obs_mean + 1e-12))
+        return float(min(1.0, 2.0 * min(p_left, p_right)))
+
     rng = np.random.default_rng(seed)
-    idx = rng.integers(0, diffs.size, size=(n_resamples, diffs.size))
+    idx = rng.integers(0, n_obs, size=(n_resamples, n_obs))
     boot_means = diffs[idx].mean(axis=1)
-    p_left = float(np.mean(boot_means <= 0.0))
-    p_right = float(np.mean(boot_means >= 0.0))
+    p_left = float((np.sum(boot_means <= 0.0) + 1.0) / (n_resamples + 1.0))
+    p_right = float((np.sum(boot_means >= 0.0) + 1.0) / (n_resamples + 1.0))
     return float(min(1.0, 2.0 * min(p_left, p_right)))
 
 
@@ -564,6 +628,7 @@ def select_best_comparator(
     summary_stats: Mapping[str, Mapping[str, tuple[float, float]]],
     *,
     reference_model: str = "SBiFAGAT",
+    metric_keys: Sequence[str] | None = None,
 ) -> str:
     """Choose the strongest competing learned baseline by average rank across non-NaN metrics."""
     candidates = [
@@ -576,8 +641,14 @@ def select_best_comparator(
     if not candidates:
         return "BiGCN"
 
+    active_rank_metrics = (
+        tuple(m for m in metric_keys if m in _COMPARATOR_RANK_METRICS)
+        if metric_keys is not None
+        else _COMPARATOR_RANK_METRICS
+    ) or _COMPARATOR_RANK_METRICS
+
     ranks_by_model: dict[str, list[float]] = {c: [] for c in candidates}
-    for metric in _COMPARATOR_RANK_METRICS:
+    for metric in active_rank_metrics:
         scored: list[tuple[str, float]] = []
         for c in candidates:
             stat = summary_stats.get(c, {}).get(metric)
@@ -611,8 +682,8 @@ def _boot_pvalue_from_diffs(diffs: np.ndarray) -> float:
         return float("nan")
     if np.allclose(arr, 0.0):
         return 1.0
-    p_left = float(np.mean(arr <= 0.0))
-    p_right = float(np.mean(arr >= 0.0))
+    p_left = float((np.sum(arr <= 0.0) + 1.0) / (arr.size + 1.0))
+    p_right = float((np.sum(arr >= 0.0) + 1.0) / (arr.size + 1.0))
     return float(min(1.0, 2.0 * min(p_left, p_right)))
 
 
@@ -664,140 +735,308 @@ def _compute_sample_level_bootstrap_pvalues(
     *,
     metric_keys: Sequence[str],
     seed: int = 42,
-    n_resamples: int = 2000,
-    n_stat_resamples: int = 500,
+    n_resamples: int = 5000,
+    n_stat_resamples: int = 2500,
 ) -> dict[str, float]:
-    """Paired bootstrap across held-out test cascades averaging per-seed metrics per draw."""
+    """Paired bootstrap across held-out test cascades averaging per-seed metrics per draw.
+
+    Defaults (`n_resamples=5000`, `n_stat_resamples=2500`) ensure that even after `+1`
+    permutation smoothing and Holm-Bonferroni adjustment across up to 8–9 metrics, the
+    minimum achievable adjusted p-value (`<= 9 * 2 / 2501 = 0.0072`) stays below `0.01`.
+    """
     if not preds_ref or not preds_cmp:
         return {k: float("nan") for k in metric_keys}
     y_size_true = np.asarray(preds_ref[0]["y_size_true"], dtype=np.float64).reshape(-1)
     y_polar_true = np.asarray(preds_ref[0]["y_polar_true"], dtype=np.float64).reshape(-1)
-    n = int(y_size_true.size)
-    if n < 2:
+    y_rumor_raw = preds_ref[0].get("y_rumor_true")
+    y_rumor_len = (
+        int(np.asarray(y_rumor_raw, dtype=np.int64).reshape(-1).size)
+        if y_rumor_raw is not None
+        else 0
+    )
+    n_reg = int(y_size_true.size)
+    n_total = n_reg if n_reg >= 2 else y_rumor_len
+    if n_total < 2:
         return {k: float("nan") for k in metric_keys}
 
-    ref_size_seeds = [np.asarray(p["y_size_pred"], dtype=np.float64).reshape(-1) for p in preds_ref]
-    cmp_size_seeds = [np.asarray(p["y_size_pred"], dtype=np.float64).reshape(-1) for p in preds_cmp]
-    ref_polar_seeds = [np.asarray(p["y_polar_pred"], dtype=np.float64).reshape(-1) for p in preds_ref]
-    cmp_polar_seeds = [np.asarray(p["y_polar_pred"], dtype=np.float64).reshape(-1) for p in preds_cmp]
-
     rng = np.random.default_rng(seed)
-    idx_fast = rng.integers(0, n, size=(n_resamples, n))
-    idx_stat = idx_fast[: min(n_resamples, n_stat_resamples)]
+    raw_tids = preds_ref[0].get("topic_ids")
+    topic_groups: list[np.ndarray] | None = None
+    if isinstance(raw_tids, (list, tuple)) and len(raw_tids) == n_total:
+        group_map: dict[str, list[int]] = {}
+        for idx_i, tid in enumerate(raw_tids):
+            group_map.setdefault(str(tid), []).append(idx_i)
+        if len(group_map) >= 6:
+            topic_groups = [np.asarray(idxs, dtype=np.int64) for idxs in group_map.values()]
+
+    cluster_draws: list[np.ndarray] | None = None
+    n_draws = max(2, int(n_resamples))
+    n_stat_draws = min(n_draws, max(2, int(n_stat_resamples)))
+    if topic_groups is not None:
+        # Topic-cluster bootstrap prevents intra-topic correlation inflation when >= 6 test topics exist
+        n_topics = len(topic_groups)
+        cluster_draws = [
+            np.concatenate([topic_groups[g] for g in rng.integers(0, n_topics, size=n_topics)])
+            for _ in range(n_draws)
+        ]
 
     out: dict[str, float] = {}
-    se_ref_size_s = [(yp - y_size_true) ** 2 for yp in ref_size_seeds]
-    se_cmp_size_s = [(yp - y_size_true) ** 2 for yp in cmp_size_seeds]
-    se_ref_polar_s = [(yp - y_polar_true) ** 2 for yp in ref_polar_seeds]
-    se_cmp_polar_s = [(yp - y_polar_true) ** 2 for yp in cmp_polar_seeds]
 
-    ref_msle_b = np.mean([se[idx_fast].mean(axis=1) for se in se_ref_size_s], axis=0)
-    cmp_msle_b = np.mean([se[idx_fast].mean(axis=1) for se in se_cmp_size_s], axis=0)
-    out["msle"] = _boot_pvalue_from_diffs(ref_msle_b - cmp_msle_b)
+    if n_reg >= 2:
+        ref_size_seeds = [np.asarray(p["y_size_pred"], dtype=np.float64).reshape(-1) for p in preds_ref]
+        cmp_size_seeds = [np.asarray(p["y_size_pred"], dtype=np.float64).reshape(-1) for p in preds_cmp]
+        ref_polar_seeds = [np.asarray(p["y_polar_pred"], dtype=np.float64).reshape(-1) for p in preds_ref]
+        cmp_polar_seeds = [np.asarray(p["y_polar_pred"], dtype=np.float64).reshape(-1) for p in preds_cmp]
 
-    ref_rmses_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_ref_size_s], axis=0)
-    cmp_rmses_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_cmp_size_s], axis=0)
-    out["rmse_size"] = _boot_pvalue_from_diffs(ref_rmses_b - cmp_rmses_b)
+        se_ref_size_s = [(yp - y_size_true) ** 2 for yp in ref_size_seeds]
+        se_cmp_size_s = [(yp - y_size_true) ** 2 for yp in cmp_size_seeds]
+        se_ref_polar_s = [(yp - y_polar_true) ** 2 for yp in ref_polar_seeds]
+        se_cmp_polar_s = [(yp - y_polar_true) ** 2 for yp in cmp_polar_seeds]
+        ae_ref_size_s = [np.abs(yp - y_size_true) for yp in ref_size_seeds]
+        ae_cmp_size_s = [np.abs(yp - y_size_true) for yp in cmp_size_seeds]
+        ae_ref_polar_s = [np.abs(yp - y_polar_true) for yp in ref_polar_seeds]
+        ae_cmp_polar_s = [np.abs(yp - y_polar_true) for yp in cmp_polar_seeds]
 
-    ae_ref_size = np.mean([np.abs(yp - y_size_true) for yp in ref_size_seeds], axis=0)
-    ae_cmp_size = np.mean([np.abs(yp - y_size_true) for yp in cmp_size_seeds], axis=0)
-    out["mae"] = compute_paired_bootstrap_pvalue(ae_ref_size, ae_cmp_size, n_resamples=n_resamples, seed=seed + 1)
+        def _safe_sp(yt_arr: np.ndarray, yp_arr: np.ndarray) -> float:
+            if yt_arr.size < 2 or np.std(yt_arr) <= 1e-12 or np.std(yp_arr) <= 1e-12:
+                return 0.0
+            val = float(spearmanr(yt_arr, yp_arr).statistic)
+            return 0.0 if math.isnan(val) else val
 
-    ref_rmsep_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_ref_polar_s], axis=0)
-    cmp_rmsep_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_cmp_polar_s], axis=0)
-    out["rmse"] = _boot_pvalue_from_diffs(ref_rmsep_b - cmp_rmsep_b)
+        def _safe_r2_1d(yt_arr: np.ndarray, yp_arr: np.ndarray) -> float:
+            if yt_arr.size < 2:
+                return 0.0
+            ss_tot = float(np.sum((yt_arr - np.mean(yt_arr)) ** 2))
+            if ss_tot <= 1e-12:
+                return 0.0
+            return float(1.0 - np.sum((yt_arr - yp_arr) ** 2) / ss_tot)
 
-    ae_ref_polar = np.mean([np.abs(yp - y_polar_true) for yp in ref_polar_seeds], axis=0)
-    ae_cmp_polar = np.mean([np.abs(yp - y_polar_true) for yp in cmp_polar_seeds], axis=0)
-    out["mae_polar"] = compute_paired_bootstrap_pvalue(ae_ref_polar, ae_cmp_polar, n_resamples=n_resamples, seed=seed + 3)
+        def _safe_pr_1d(yt_arr: np.ndarray, yp_arr: np.ndarray) -> float:
+            if yt_arr.size < 2:
+                return 0.0
+            yt_c = yt_arr - np.mean(yt_arr)
+            yp_c = yp_arr - np.mean(yp_arr)
+            denom = float(np.sqrt(np.sum(yt_c**2) * np.sum(yp_c**2)))
+            if denom <= 1e-12:
+                return 0.0
+            return float(np.sum(yt_c * yp_c) / denom)
 
-    out["r2_size"] = _boot_pvalue_from_diffs(
-        np.mean([_vec_r2(y_size_true, yp, idx_stat) for yp in ref_size_seeds], axis=0)
-        - np.mean([_vec_r2(y_size_true, yp, idx_stat) for yp in cmp_size_seeds], axis=0)
-    )
-    out["r2_polar"] = _boot_pvalue_from_diffs(
-        np.mean([_vec_r2(y_polar_true, yp, idx_stat) for yp in ref_polar_seeds], axis=0)
-        - np.mean([_vec_r2(y_polar_true, yp, idx_stat) for yp in cmp_polar_seeds], axis=0)
-    )
-    out["pearson_r"] = _boot_pvalue_from_diffs(
-        np.mean([_vec_pearson(y_polar_true, yp, idx_stat) for yp in ref_polar_seeds], axis=0)
-        - np.mean([_vec_pearson(y_polar_true, yp, idx_stat) for yp in cmp_polar_seeds], axis=0)
-    )
+        if cluster_draws is not None:
+            msle_d, rmses_d, mae_d, rmsep_d, maep_d = [], [], [], [], []
+            r2s_d, r2p_d, pr_d, sps_d, spp_d = [], [], [], [], []
+            for b_pos, b_idx in enumerate(cluster_draws):
+                msle_d.append(
+                    float(np.mean([se[b_idx].mean() for se in se_ref_size_s]))
+                    - float(np.mean([se[b_idx].mean() for se in se_cmp_size_s]))
+                )
+                rmses_d.append(
+                    float(np.mean([math.sqrt(float(se[b_idx].mean())) for se in se_ref_size_s]))
+                    - float(np.mean([math.sqrt(float(se[b_idx].mean())) for se in se_cmp_size_s]))
+                )
+                mae_d.append(
+                    float(np.mean([ae[b_idx].mean() for ae in ae_ref_size_s]))
+                    - float(np.mean([ae[b_idx].mean() for ae in ae_cmp_size_s]))
+                )
+                rmsep_d.append(
+                    float(np.mean([math.sqrt(float(se[b_idx].mean())) for se in se_ref_polar_s]))
+                    - float(np.mean([math.sqrt(float(se[b_idx].mean())) for se in se_cmp_polar_s]))
+                )
+                maep_d.append(
+                    float(np.mean([ae[b_idx].mean() for ae in ae_ref_polar_s]))
+                    - float(np.mean([ae[b_idx].mean() for ae in ae_cmp_polar_s]))
+                )
+                if b_pos < n_stat_draws:
+                    yt_s = y_size_true[b_idx]
+                    yt_p = y_polar_true[b_idx]
+                    r2s_d.append(
+                        float(np.mean([_safe_r2_1d(yt_s, yp[b_idx]) for yp in ref_size_seeds]))
+                        - float(np.mean([_safe_r2_1d(yt_s, yp[b_idx]) for yp in cmp_size_seeds]))
+                    )
+                    r2p_d.append(
+                        float(np.mean([_safe_r2_1d(yt_p, yp[b_idx]) for yp in ref_polar_seeds]))
+                        - float(np.mean([_safe_r2_1d(yt_p, yp[b_idx]) for yp in cmp_polar_seeds]))
+                    )
+                    pr_d.append(
+                        float(np.mean([_safe_pr_1d(yt_p, yp[b_idx]) for yp in ref_polar_seeds]))
+                        - float(np.mean([_safe_pr_1d(yt_p, yp[b_idx]) for yp in cmp_polar_seeds]))
+                    )
+                    if "spearman_size" in metric_keys:
+                        sps_d.append(
+                            float(np.mean([_safe_sp(yt_s, yp[b_idx]) for yp in ref_size_seeds]))
+                            - float(np.mean([_safe_sp(yt_s, yp[b_idx]) for yp in cmp_size_seeds]))
+                        )
+                    if "spearman_polar" in metric_keys:
+                        spp_d.append(
+                            float(np.mean([_safe_sp(yt_p, yp[b_idx]) for yp in ref_polar_seeds]))
+                            - float(np.mean([_safe_sp(yt_p, yp[b_idx]) for yp in cmp_polar_seeds]))
+                        )
+            out["msle"] = _boot_pvalue_from_diffs(np.asarray(msle_d, dtype=np.float64))
+            out["rmse_size"] = _boot_pvalue_from_diffs(np.asarray(rmses_d, dtype=np.float64))
+            out["mae"] = _boot_pvalue_from_diffs(np.asarray(mae_d, dtype=np.float64))
+            out["rmse"] = _boot_pvalue_from_diffs(np.asarray(rmsep_d, dtype=np.float64))
+            out["mae_polar"] = _boot_pvalue_from_diffs(np.asarray(maep_d, dtype=np.float64))
+            out["r2_size"] = _boot_pvalue_from_diffs(np.asarray(r2s_d, dtype=np.float64))
+            out["r2_polar"] = _boot_pvalue_from_diffs(np.asarray(r2p_d, dtype=np.float64))
+            out["pearson_r"] = _boot_pvalue_from_diffs(np.asarray(pr_d, dtype=np.float64))
+            if sps_d:
+                out["spearman_size"] = _boot_pvalue_from_diffs(np.asarray(sps_d, dtype=np.float64))
+            if spp_d:
+                out["spearman_polar"] = _boot_pvalue_from_diffs(np.asarray(spp_d, dtype=np.float64))
+        else:
+            idx_fast = rng.integers(0, n_reg, size=(n_draws, n_reg))
+            idx_stat = idx_fast[:n_stat_draws]
 
-    def _safe_sp(yt_arr: np.ndarray, yp_arr: np.ndarray) -> float:
-        if np.std(yt_arr) <= 1e-12 or np.std(yp_arr) <= 1e-12:
-            return 0.0
-        val = float(spearmanr(yt_arr, yp_arr).statistic)
-        return 0.0 if math.isnan(val) else val
+            ref_msle_b = np.mean([se[idx_fast].mean(axis=1) for se in se_ref_size_s], axis=0)
+            cmp_msle_b = np.mean([se[idx_fast].mean(axis=1) for se in se_cmp_size_s], axis=0)
+            out["msle"] = _boot_pvalue_from_diffs(ref_msle_b - cmp_msle_b)
 
-    if "spearman_size" in metric_keys:
-        sp_size_diffs: list[float] = []
-        for b_idx in idx_stat:
-            yt = y_size_true[b_idx]
-            sr = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in ref_size_seeds]))
-            sc = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in cmp_size_seeds]))
-            sp_size_diffs.append(sr - sc)
-        out["spearman_size"] = _boot_pvalue_from_diffs(np.asarray(sp_size_diffs, dtype=np.float64))
+            ref_rmses_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_ref_size_s], axis=0)
+            cmp_rmses_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_cmp_size_s], axis=0)
+            out["rmse_size"] = _boot_pvalue_from_diffs(ref_rmses_b - cmp_rmses_b)
 
-    if "spearman_polar" in metric_keys:
-        sp_polar_diffs: list[float] = []
-        for b_idx in idx_stat:
-            yt = y_polar_true[b_idx]
-            sr = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in ref_polar_seeds]))
-            sc = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in cmp_polar_seeds]))
-            sp_polar_diffs.append(sr - sc)
-        out["spearman_polar"] = _boot_pvalue_from_diffs(np.asarray(sp_polar_diffs, dtype=np.float64))
+            ae_ref_size = np.mean(ae_ref_size_s, axis=0)
+            ae_cmp_size = np.mean(ae_cmp_size_s, axis=0)
+            out["mae"] = compute_paired_bootstrap_pvalue(ae_ref_size, ae_cmp_size, n_resamples=n_draws, seed=seed + 1)
+
+            ref_rmsep_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_ref_polar_s], axis=0)
+            cmp_rmsep_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_cmp_polar_s], axis=0)
+            out["rmse"] = _boot_pvalue_from_diffs(ref_rmsep_b - cmp_rmsep_b)
+
+            ae_ref_polar = np.mean(ae_ref_polar_s, axis=0)
+            ae_cmp_polar = np.mean(ae_cmp_polar_s, axis=0)
+            out["mae_polar"] = compute_paired_bootstrap_pvalue(ae_ref_polar, ae_cmp_polar, n_resamples=n_draws, seed=seed + 3)
+
+            out["r2_size"] = _boot_pvalue_from_diffs(
+                np.mean([_vec_r2(y_size_true, yp, idx_stat) for yp in ref_size_seeds], axis=0)
+                - np.mean([_vec_r2(y_size_true, yp, idx_stat) for yp in cmp_size_seeds], axis=0)
+            )
+            out["r2_polar"] = _boot_pvalue_from_diffs(
+                np.mean([_vec_r2(y_polar_true, yp, idx_stat) for yp in ref_polar_seeds], axis=0)
+                - np.mean([_vec_r2(y_polar_true, yp, idx_stat) for yp in cmp_polar_seeds], axis=0)
+            )
+            out["pearson_r"] = _boot_pvalue_from_diffs(
+                np.mean([_vec_pearson(y_polar_true, yp, idx_stat) for yp in ref_polar_seeds], axis=0)
+                - np.mean([_vec_pearson(y_polar_true, yp, idx_stat) for yp in cmp_polar_seeds], axis=0)
+            )
+
+            if "spearman_size" in metric_keys:
+                sp_size_diffs: list[float] = []
+                for b_idx in idx_stat:
+                    yt = y_size_true[b_idx]
+                    sr = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in ref_size_seeds]))
+                    sc = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in cmp_size_seeds]))
+                    sp_size_diffs.append(sr - sc)
+                out["spearman_size"] = _boot_pvalue_from_diffs(np.asarray(sp_size_diffs, dtype=np.float64))
+
+            if "spearman_polar" in metric_keys:
+                sp_polar_diffs: list[float] = []
+                for b_idx in idx_stat:
+                    yt = y_polar_true[b_idx]
+                    sr = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in ref_polar_seeds]))
+                    sc = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in cmp_polar_seeds]))
+                    sp_polar_diffs.append(sr - sc)
+                out["spearman_polar"] = _boot_pvalue_from_diffs(np.asarray(sp_polar_diffs, dtype=np.float64))
 
     ref_logits_list = [p["rumor_logits"] for p in preds_ref if p.get("rumor_logits") is not None]
     cmp_logits_list = [p["rumor_logits"] for p in preds_cmp if p.get("rumor_logits") is not None]
-    y_rumor_raw = preds_ref[0].get("y_rumor_true")
     if ref_logits_list and cmp_logits_list and y_rumor_raw is not None:
         y_rumor_arr = np.asarray(y_rumor_raw, dtype=np.int64).reshape(-1)
         valid = y_rumor_arr >= 0
         n_cls_samples = int(np.sum(valid))
         if n_cls_samples >= 2:
-            truth_v = y_rumor_arr[valid]
-            ref_probs_seeds = [
-                torch.softmax(torch.as_tensor(lg), dim=-1).numpy()[valid] for lg in ref_logits_list
-            ]
-            cmp_probs_seeds = [
-                torch.softmax(torch.as_tensor(lg), dim=-1).numpy()[valid] for lg in cmp_logits_list
-            ]
-            ref_cls_seeds = [np.argmax(pr, axis=-1) for pr in ref_probs_seeds]
-            cmp_cls_seeds = [np.argmax(pr, axis=-1) for pr in cmp_probs_seeds]
-
-            acc_ref_mean = np.mean([(pc == truth_v).astype(np.float64) for pc in ref_cls_seeds], axis=0)
-            acc_cmp_mean = np.mean([(pc == truth_v).astype(np.float64) for pc in cmp_cls_seeds], axis=0)
-            out["accuracy"] = compute_paired_bootstrap_pvalue(
-                acc_ref_mean,
-                acc_cmp_mean,
-                n_resamples=n_resamples,
-                seed=seed + 4,
-            )
-            idx_cls = rng.integers(0, n_cls_samples, size=(min(n_resamples, n_stat_resamples), n_cls_samples))
-            if "macro_f1" in metric_keys:
-                f1_diffs: list[float] = []
-                for b_idx in idx_cls:
-                    tb = truth_v[b_idx]
-                    f1_r = float(np.mean([f1_score(tb, pc[b_idx], average="macro", zero_division=0) for pc in ref_cls_seeds]))
-                    f1_c = float(np.mean([f1_score(tb, pc[b_idx], average="macro", zero_division=0) for pc in cmp_cls_seeds]))
-                    f1_diffs.append(f1_r - f1_c)
-                out["macro_f1"] = _boot_pvalue_from_diffs(np.asarray(f1_diffs, dtype=np.float64))
-            if "auc_roc" in metric_keys:
-                auc_diffs: list[float] = []
-                for b_idx in idx_cls:
-                    tb = truth_v[b_idx]
-                    ars = [_safe_auc_from_probs(tb, pr[b_idx]) for pr in ref_probs_seeds]
-                    acs = [_safe_auc_from_probs(tb, pr[b_idx]) for pr in cmp_probs_seeds]
-                    ars_v = [a for a in ars if not math.isnan(a)]
-                    acs_v = [a for a in acs if not math.isnan(a)]
-                    if ars_v and acs_v:
-                        auc_diffs.append(float(np.mean(ars_v)) - float(np.mean(acs_v)))
-                out["auc_roc"] = (
-                    _boot_pvalue_from_diffs(np.asarray(auc_diffs, dtype=np.float64))
-                    if len(auc_diffs) >= 2
+            if cluster_draws is not None and y_rumor_arr.size == n_total:
+                # Apply the same topic-cluster draws to classification metrics (filtered by valid labels)
+                ref_probs_full = [
+                    torch.softmax(torch.as_tensor(lg), dim=-1).numpy() for lg in ref_logits_list
+                ]
+                cmp_probs_full = [
+                    torch.softmax(torch.as_tensor(lg), dim=-1).numpy() for lg in cmp_logits_list
+                ]
+                ref_cls_full = [np.argmax(pr, axis=-1) for pr in ref_probs_full]
+                cmp_cls_full = [np.argmax(pr, axis=-1) for pr in cmp_probs_full]
+                acc_diffs_c: list[float] = []
+                f1_diffs_c: list[float] = []
+                auc_diffs_c: list[float] = []
+                for b_pos, b_idx in enumerate(cluster_draws):
+                    v_idx = b_idx[valid[b_idx]]
+                    if v_idx.size < 2:
+                        continue
+                    tb = y_rumor_arr[v_idx]
+                    ar = float(np.mean([(pc[v_idx] == tb).mean() for pc in ref_cls_full]))
+                    ac = float(np.mean([(pc[v_idx] == tb).mean() for pc in cmp_cls_full]))
+                    acc_diffs_c.append(ar - ac)
+                    if b_pos < n_stat_draws:
+                        if "macro_f1" in metric_keys:
+                            f1_r = float(np.mean([f1_score(tb, pc[v_idx], average="macro", zero_division=0) for pc in ref_cls_full]))
+                            f1_c = float(np.mean([f1_score(tb, pc[v_idx], average="macro", zero_division=0) for pc in cmp_cls_full]))
+                            f1_diffs_c.append(f1_r - f1_c)
+                        if "auc_roc" in metric_keys:
+                            ars = [_safe_auc_from_probs(tb, pr[v_idx]) for pr in ref_probs_full]
+                            acs = [_safe_auc_from_probs(tb, pr[v_idx]) for pr in cmp_probs_full]
+                            ars_v = [a for a in ars if not math.isnan(a)]
+                            acs_v = [a for a in acs if not math.isnan(a)]
+                            if ars_v and acs_v:
+                                auc_diffs_c.append(float(np.mean(ars_v)) - float(np.mean(acs_v)))
+                out["accuracy"] = (
+                    _boot_pvalue_from_diffs(np.asarray(acc_diffs_c, dtype=np.float64))
+                    if len(acc_diffs_c) >= 2
                     else float("nan")
                 )
+                if "macro_f1" in metric_keys:
+                    out["macro_f1"] = (
+                        _boot_pvalue_from_diffs(np.asarray(f1_diffs_c, dtype=np.float64))
+                        if len(f1_diffs_c) >= 2
+                        else float("nan")
+                    )
+                if "auc_roc" in metric_keys:
+                    out["auc_roc"] = (
+                        _boot_pvalue_from_diffs(np.asarray(auc_diffs_c, dtype=np.float64))
+                        if len(auc_diffs_c) >= 2
+                        else float("nan")
+                    )
+            else:
+                truth_v = y_rumor_arr[valid]
+                ref_probs_seeds = [
+                    torch.softmax(torch.as_tensor(lg), dim=-1).numpy()[valid] for lg in ref_logits_list
+                ]
+                cmp_probs_seeds = [
+                    torch.softmax(torch.as_tensor(lg), dim=-1).numpy()[valid] for lg in cmp_logits_list
+                ]
+                ref_cls_seeds = [np.argmax(pr, axis=-1) for pr in ref_probs_seeds]
+                cmp_cls_seeds = [np.argmax(pr, axis=-1) for pr in cmp_probs_seeds]
+
+                acc_ref_mean = np.mean([(pc == truth_v).astype(np.float64) for pc in ref_cls_seeds], axis=0)
+                acc_cmp_mean = np.mean([(pc == truth_v).astype(np.float64) for pc in cmp_cls_seeds], axis=0)
+                out["accuracy"] = compute_paired_bootstrap_pvalue(
+                    acc_ref_mean,
+                    acc_cmp_mean,
+                    n_resamples=n_draws,
+                    seed=seed + 4,
+                )
+                idx_cls = rng.integers(0, n_cls_samples, size=(n_stat_draws, n_cls_samples))
+                if "macro_f1" in metric_keys:
+                    f1_diffs: list[float] = []
+                    for b_idx in idx_cls:
+                        tb = truth_v[b_idx]
+                        f1_r = float(np.mean([f1_score(tb, pc[b_idx], average="macro", zero_division=0) for pc in ref_cls_seeds]))
+                        f1_c = float(np.mean([f1_score(tb, pc[b_idx], average="macro", zero_division=0) for pc in cmp_cls_seeds]))
+                        f1_diffs.append(f1_r - f1_c)
+                    out["macro_f1"] = _boot_pvalue_from_diffs(np.asarray(f1_diffs, dtype=np.float64))
+                if "auc_roc" in metric_keys:
+                    auc_diffs: list[float] = []
+                    for b_idx in idx_cls:
+                        tb = truth_v[b_idx]
+                        ars = [_safe_auc_from_probs(tb, pr[b_idx]) for pr in ref_probs_seeds]
+                        acs = [_safe_auc_from_probs(tb, pr[b_idx]) for pr in cmp_probs_seeds]
+                        ars_v = [a for a in ars if not math.isnan(a)]
+                        acs_v = [a for a in acs if not math.isnan(a)]
+                        if ars_v and acs_v:
+                            auc_diffs.append(float(np.mean(ars_v)) - float(np.mean(acs_v)))
+                    out["auc_roc"] = (
+                        _boot_pvalue_from_diffs(np.asarray(auc_diffs, dtype=np.float64))
+                        if len(auc_diffs) >= 2
+                        else float("nan")
+                    )
 
     for k in metric_keys:
         out.setdefault(k, float("nan"))
@@ -849,6 +1088,8 @@ def run_multi_seed_benchmark(
         "macro_f1",
         "accuracy",
         "auc_roc",
+        "construct_corr_bc",
+        "construct_corr_assort",
         "loss",
         "task_loss",
     )
@@ -895,7 +1136,7 @@ def run_multi_seed_benchmark(
         model_predictions[model_name] = pred_runs
         agg: dict[str, tuple[float, float]] = {}
         for key in metric_keys:
-            vals = np.asarray([r[key] for r in seed_runs], dtype=np.float64)
+            vals = np.asarray([r.get(key, float("nan")) for r in seed_runs], dtype=np.float64)
             vals = vals[~np.isnan(vals)]
             if vals.size == 0:
                 agg[key] = (float("nan"), float("nan"))
@@ -905,8 +1146,32 @@ def run_multi_seed_benchmark(
                 agg[key] = (mean_v, std_v)
         summary_stats[model_name] = agg
 
+    hypothesis_keys = (
+        tuple(primary_hypothesis_keys)
+        if primary_hypothesis_keys is not None
+        else (
+            ("accuracy", "macro_f1", "auc_roc")
+            if classification_only
+            else (
+                "msle",
+                "mae",
+                "r2_size",
+                "rmse",
+                "pearson_r",
+                "spearman_polar",
+                "macro_f1",
+                "accuracy",
+                "auc_roc",
+            )
+        )
+    )
+
     effective_comparator = (
-        select_best_comparator(summary_stats, reference_model=reference_model)
+        select_best_comparator(
+            summary_stats,
+            reference_model=reference_model,
+            metric_keys=hypothesis_keys,
+        )
         if comparator_model == "auto"
         else comparator_model
     )
@@ -915,8 +1180,8 @@ def run_multi_seed_benchmark(
     bootstrap_p_values: dict[str, float] = {}
     if reference_model in raw_results and effective_comparator in raw_results:
         for key in metric_keys:
-            ref_scores = [r[key] for r in raw_results[reference_model]]
-            cmp_scores = [r[key] for r in raw_results[effective_comparator]]
+            ref_scores = [r.get(key, float("nan")) for r in raw_results[reference_model]]
+            cmp_scores = [r.get(key, float("nan")) for r in raw_results[effective_comparator]]
             p_values[key] = compute_paired_ttest(ref_scores, cmp_scores)
         if compute_bootstrap:
             bootstrap_p_values = _compute_sample_level_bootstrap_pvalues(
@@ -927,21 +1192,6 @@ def run_multi_seed_benchmark(
         else:
             bootstrap_p_values = {key: float("nan") for key in metric_keys}
 
-    hypothesis_keys = (
-        tuple(primary_hypothesis_keys)
-        if primary_hypothesis_keys is not None
-        else (
-            "msle",
-            "mae",
-            "r2_size",
-            "rmse",
-            "pearson_r",
-            "spearman_polar",
-            "macro_f1",
-            "accuracy",
-            "auc_roc",
-        )
-    )
     adjusted_p_values: dict[str, float] = {}
     adjusted_bootstrap_p_values: dict[str, float] = {}
     if p_values:
@@ -967,6 +1217,7 @@ def run_multi_seed_benchmark(
         "adjusted_bootstrap_p_values": adjusted_bootstrap_p_values,
         "reference_model": reference_model,
         "comparator_model": effective_comparator,
+        "nonparametric_test_label": "Bootstrap",
         "best_seed_by_model": best_seed_by_model,
         "models": best_val_models,
     }

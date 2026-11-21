@@ -99,6 +99,42 @@ def _resolve_marker_pvalue(benchmark_result: Mapping[str, Any], key: str) -> flo
     return None
 
 
+def _is_ref_better_than_cmp(
+    summary_stats: Mapping[str, Mapping[str, tuple[float, float]]],
+    ref_model: str,
+    cmp_model: str,
+    key: str,
+    lower_is_better: bool,
+) -> bool:
+    """Return True strictly when `ref_model` improves over `cmp_model` in the better direction."""
+    ref_stat = summary_stats.get(ref_model, {}).get(key)
+    cmp_stat = summary_stats.get(cmp_model, {}).get(key)
+    if ref_stat is None or cmp_stat is None:
+        return False
+    ref_val, cmp_val = float(ref_stat[0]), float(cmp_stat[0])
+    if math.isnan(ref_val) or math.isnan(cmp_val):
+        return False
+    return (ref_val < cmp_val) if lower_is_better else (ref_val > cmp_val)
+
+
+def _sanitize_json_value(obj: Any) -> Any:
+    """Recursively replace non-finite floats (NaN/Inf) with None for strict RFC 8259 JSON."""
+    if isinstance(obj, bool) or obj is None or isinstance(obj, (int, str)):
+        return obj
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if hasattr(obj, "item") and callable(getattr(obj, "item")):
+        try:
+            return _sanitize_json_value(obj.item())
+        except Exception:
+            pass
+    if isinstance(obj, Mapping):
+        return {str(k): _sanitize_json_value(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json_value(v) for v in obj]
+    return obj
+
+
 def build_markdown_table(
     benchmark_result: Mapping[str, Any],
     metrics: Sequence[tuple[str, str, bool]] = MAIN_METRICS,
@@ -109,6 +145,7 @@ def build_markdown_table(
     summary_stats = benchmark_result["summary_stats"]
     p_values = benchmark_result.get("p_values", {})
     ref_model = benchmark_result.get("reference_model", "SBiFAGAT")
+    cmp_model = benchmark_result.get("comparator_model", "BiGCN")
     best_by_metric = _best_model_per_metric(summary_stats, metrics)
 
     headers = ["Model"] + [
@@ -124,11 +161,12 @@ def build_markdown_table(
 
     for model_name, stats in summary_stats.items():
         cells = [model_name]
-        for key, _, _ in metrics:
+        for key, _, lower_is_better in metrics:
             mean_v, std_v = stats.get(key, (float("nan"), float("nan")))
             marker = (
                 significance_marker(_resolve_marker_pvalue(benchmark_result, key), latex=False)
                 if model_name == ref_model
+                and _is_ref_better_than_cmp(summary_stats, ref_model, cmp_model, key, lower_is_better)
                 else ""
             )
             cells.append(
@@ -144,17 +182,16 @@ def build_markdown_table(
         lines.append("| " + " | ".join(cells) + " |")
 
     if p_values:
-        cmp_model = benchmark_result.get("comparator_model", "BiGCN")
         p_cells = [f"p-value ({ref_model} vs. {cmp_model})"]
         for key, _, _ in metrics:
             pv = p_values.get(key, float("nan"))
             p_cells.append("--" if math.isnan(pv) else f"{pv:.4e}")
         lines.append("| " + " | ".join(p_cells) + " |")
 
+    np_label = str(benchmark_result.get("nonparametric_test_label") or "Bootstrap")
     boot_p_values = benchmark_result.get("bootstrap_p_values", {})
     if boot_p_values:
-        cmp_model = benchmark_result.get("comparator_model", "BiGCN")
-        b_cells = [f"bootstrap p ({ref_model} vs. {cmp_model})"]
+        b_cells = [f"{np_label.lower()} p ({ref_model} vs. {cmp_model})"]
         for key, _, _ in metrics:
             bv = boot_p_values.get(key, float("nan"))
             b_cells.append("--" if math.isnan(bv) else f"{bv:.4e}")
@@ -162,7 +199,6 @@ def build_markdown_table(
 
     adj_p_values = benchmark_result.get("adjusted_p_values", {})
     if adj_p_values:
-        cmp_model = benchmark_result.get("comparator_model", "BiGCN")
         a_cells = [f"Holm-Bonf adj p ({ref_model} vs. {cmp_model})"]
         for key, _, _ in metrics:
             av = adj_p_values.get(key, float("nan"))
@@ -171,8 +207,7 @@ def build_markdown_table(
 
     adj_boot_values = benchmark_result.get("adjusted_bootstrap_p_values", {})
     if adj_boot_values:
-        cmp_model = benchmark_result.get("comparator_model", "BiGCN")
-        ab_cells = [f"Holm-Bonf bootstrap p ({ref_model} vs. {cmp_model})"]
+        ab_cells = [f"Holm-Bonf {np_label.lower()} p ({ref_model} vs. {cmp_model})"]
         for key, _, _ in metrics:
             abv = adj_boot_values.get(key, float("nan"))
             ab_cells.append("--" if math.isnan(abv) else f"{abv:.4e}")
@@ -190,11 +225,13 @@ def export_latex_table(
     metrics: Sequence[tuple[str, str, bool]] = MAIN_METRICS,
     decimals: int = 4,
 ) -> Path:
-    """Export IEEE/Springer `booktabs` LaTeX table with bold best & t-test markers."""
+    """Export IEEE/Springer `booktabs` LaTeX table with bold best & direction-aware significance markers."""
     summary_stats = benchmark_result["summary_stats"]
     p_values = benchmark_result.get("p_values", {})
     ref_model = benchmark_result.get("reference_model", "SBiFAGAT")
     cmp_model = benchmark_result.get("comparator_model", "BiGCN")
+    ref_esc = str(ref_model).replace("_", "\\_")
+    cmp_esc = str(cmp_model).replace("_", "\\_")
     best_by_metric = _best_model_per_metric(summary_stats, metrics)
 
     col_spec = "l" + "c" * len(metrics)
@@ -204,11 +241,12 @@ def export_latex_table(
     for model_name, stats in summary_stats.items():
         escaped_name = model_name.replace("_", "\\_")
         cells = [escaped_name]
-        for key, _, _ in metrics:
+        for key, _, lower_is_better in metrics:
             mean_v, std_v = stats.get(key, (float("nan"), float("nan")))
             marker = (
                 significance_marker(_resolve_marker_pvalue(benchmark_result, key), latex=True)
                 if model_name == ref_model
+                and _is_ref_better_than_cmp(summary_stats, ref_model, cmp_model, key, lower_is_better)
                 else ""
             )
             cells.append(
@@ -225,15 +263,16 @@ def export_latex_table(
 
     p_row_str = ""
     if p_values:
-        p_cells = [f"$p$-value ({ref_model} vs. {cmp_model})"]
+        p_cells = [f"$p$-value ({ref_esc} vs. {cmp_esc})"]
         for key, _, _ in metrics:
             pv = p_values.get(key, float("nan"))
             p_cells.append("--" if math.isnan(pv) else f"{pv:.2e}")
         p_row_str = "\\midrule\n" + " & ".join(p_cells) + r" \\" + "\n"
 
+    np_label = str(benchmark_result.get("nonparametric_test_label") or "Bootstrap").replace("_", "\\_")
     boot_p_values = benchmark_result.get("bootstrap_p_values", {})
     if boot_p_values:
-        b_cells = [f"Bootstrap $p$ ({ref_model} vs. {cmp_model})"]
+        b_cells = [f"{np_label} $p$ ({ref_esc} vs. {cmp_esc})"]
         for key, _, _ in metrics:
             bv = boot_p_values.get(key, float("nan"))
             b_cells.append("--" if math.isnan(bv) else f"{bv:.2e}")
@@ -241,7 +280,7 @@ def export_latex_table(
 
     adj_p_values = benchmark_result.get("adjusted_p_values", {})
     if adj_p_values:
-        a_cells = [f"Holm-Bonferroni $p$ ({ref_model} vs. {cmp_model})"]
+        a_cells = [f"Holm-Bonferroni $p$ ({ref_esc} vs. {cmp_esc})"]
         for key, _, _ in metrics:
             av = adj_p_values.get(key, float("nan"))
             a_cells.append("--" if math.isnan(av) else f"{av:.2e}")
@@ -249,17 +288,22 @@ def export_latex_table(
 
     adj_boot_values = benchmark_result.get("adjusted_bootstrap_p_values", {})
     if adj_boot_values:
-        ab_cells = [f"Holm-Bonf Bootstrap $p$ ({ref_model} vs. {cmp_model})"]
+        ab_cells = [f"Holm-Bonf {np_label} $p$ ({ref_esc} vs. {cmp_esc})"]
         for key, _, _ in metrics:
             abv = adj_boot_values.get(key, float("nan"))
             ab_cells.append("--" if math.isnan(abv) else f"{abv:.2e}")
         p_row_str = p_row_str + " & ".join(ab_cells) + r" \\" + "\n"
 
+    is_wide = len(metrics) >= 5
+    env = "table*" if is_wide else "table"
+    box_width = "\\textwidth" if is_wide else "\\columnwidth"
+
     latex = (
-        "\\begin{table}[t]\n"
+        f"\\begin{{{env}}}[t]\n"
         "\\centering\n"
         f"\\caption{{{caption}}}\n"
         f"\\label{{{label}}}\n"
+        f"\\resizebox{{{box_width}}}{{!}}{{\n"
         f"\\begin{{tabular}}{{{col_spec}}}\n"
         "\\toprule\n"
         f"{header_row}\n"
@@ -269,7 +313,8 @@ def export_latex_table(
         + p_row_str
         + "\\bottomrule\n"
         "\\end{tabular}\n"
-        "\\end{table}\n"
+        "}\n"
+        f"\\end{{{env}}}\n"
     )
 
     out_file = Path(output_path)
@@ -283,7 +328,7 @@ def serialize_benchmark_json(
     output_path: str | Path,
     extra: Mapping[str, Any] | None = None,
 ) -> Path:
-    """Persist seed-level metrics, summary stats, and p-values to JSON cleanly."""
+    """Persist seed-level metrics, summary stats, and p-values to strict RFC 8259 JSON."""
     payload: dict[str, Any] = {
         "seeds": list(benchmark_result.get("seeds", [])),
         "reference_model": benchmark_result.get("reference_model"),
@@ -316,7 +361,8 @@ def serialize_benchmark_json(
     if extra is not None:
         payload["extra"] = dict(extra)
 
+    clean_payload = _sanitize_json_value(payload)
     out_file = Path(output_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    out_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    out_file.write_text(json.dumps(clean_payload, indent=2, allow_nan=False), encoding="utf-8")
     return out_file

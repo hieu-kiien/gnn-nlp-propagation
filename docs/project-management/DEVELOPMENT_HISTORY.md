@@ -9,33 +9,37 @@
 | `71431cc` | `research: resolve round-2 scientific blockers & add SBi-FAGAT learning lab` | Loss calibration, `docs/huong_dan_nghien_cuu_de_hieu.md`, `demo_research_walkthrough.py`, `benchmark_efficiency.py`, bootstrap/Holm reporting. |
 | `5950c65` | `feat(v2): 5-class Qwen3.8-27B QLoRA teacher, 8D burst stats, auto-loop, live predictor & Kaggle T4x2 notebooks` | Profile `v2`: 5-class `Qwen/Qwen3.8-27B` QLoRA 1-pass G-Eval teacher (`[s_uv, h_uv, r_uv, c_uv]`), 8D `cascade_stats`, heteroscedastic $\beta$-NLL uncertainty (`beta_nll=0.5`), `auto_loop.py`, `predict_live_thread.py`, and dual-T4 notebooks. |
 | `f4be964` | `fix(kaggle-t4x2): harden Qwen3_5ForConditionalGeneration 4-bit loader, Student CE extraction & teacher budget` | Hardened 4-bit NF4 loading, student CE extraction, and Kaggle `T4 x 2` token budget management. |
-| `5820e71` | `feat(audit): implement scientific safeguards, profile gating, and project management suite` *(PR #1 by `thuyenevux`)* | Added salted author pseudonymization + `UserWarning`, live-predictor untrained guard + `test_live_predictor_audit.py`, `PIPELINE_VERSION=v1|v2` shell gating, `tzdata` Windows fix, `math_spec.md` cleanup, and initial `docs/project-management/`. |
-| *Reconciliation Release* | *EGM Fixes + PR #1 Reconciliation + GitHub CI & Paper Tooling* | Restored full `v2` modules + 6 EGM fixes (`F1–F6`: shared `node_backbone`, LOO `edge_source="teacher"`, finite validation checks, uniform `min_total_replies=25`), reconciled `PR #1` CLI flags/thresholds/docs, added GitHub CI + PR template, `scripts/export_dataset_stats.py`, efficiency LaTeX export, and `paper/main.tex` (`IEEEtran`). |
+| `5820e71` | `feat(audit): implement scientific safeguards, profile gating, and project management suite` *(PR #1 by `thuyenevux`)* | Added salted author pseudonymization + `UserWarning`, live-predictor untrained guard + `test_live_predictor_audit.py`, `tzdata` Windows fix, `math_spec.md` cleanup, and initial `docs/project-management/`. |
+| `090d777` | `feat(unified-2d): Steps 1–3 unified 2D SBi-FAGAT, SpanPool, KL-BCE & fair 8-model suite` | Retired `Qwen3.8-27B` QLoRA in favor of 100%-coverage Dual-Teacher (`mDeBERTa-v3-xnli` Symmetric Verbalizer + `ViHSD`/`TweetEval-Offensive`) -> reply-span-pooled 2D `DualHeadCrossEncoder`, Ancestor SpanPool, dual-channel Dir-GNN `SBiFAGAT`, `hidden_dim=64` parity, KL-calibrated BCE, and sealed machine-key zip separation. |
+| *EGM Hardening* | *Full EGM 5-Goldfish Audit Remediation (`B1–B10`, `M1–M8`)* | Fixed PHEME LOO `min_total_replies` teacher coverage (`B1`), eliminated `edge_source` split-brain (`B2`), replaced $O(N^2)$ teacher JSON checkpointing with $O(N)$ JSONL deltas + multi-GPU AMP (`B3`), added crawl cursor `.state.json` resume + salted PHEME hashing (`B4`), hardened Kaggle stage skip & UPFD fault isolation (`B5`), fixed LaTeX `_` escaping + `table*` + 6 paper figure embeds + `assemble_paper_artifacts.py` (`B6`), fixed NLI double-contradiction neutral attribution + added `audit_vn_50_trees.py` (`B7`), added direction-aware stars + exact small-sample LOO permutation + topic-cluster bootstrap (`B8`), upgraded to continuous finite-sample-unbiased `y_polar` + fixed future $K$-curve window (`B9`), and added Camp Dipole/Dir-GNN/Dual-Channel ablations + matched `BiEdgeGATv2` + `TextMLP` topology masking (`B10`). |
 
 ---
 
-## 2. Profile Evolution (`v1` MVP vs. `v2` Opt-In Scaling)
+## 2. Unified 2D Architecture Pipeline (Current Production Standard)
 
 ```mermaid
 flowchart TD
-    subgraph Profile_v1 ["Profile v1 (Default MVP: 2D Edges)"]
-        v1_nlp["Frozen NLI + Hostility Teachers<br>(mDeBERTa-v3 + ViHSD / twitter-roberta)"]
-        v1_edge["2D Edge Features<br>[s_uv, h_uv]"]
-        v1_gnn["SBiFAGAT<br>(TD + BU Stance-Guided FAConv)"]
-        v1_readout["Global Attention Readout<br>(z_root + z_att for TD & BU)"]
-        v1_out["Point Predictions<br>(y_size, y_polar, y_rumor)"]
-
-        v1_nlp --> v1_edge --> v1_gnn --> v1_readout --> v1_out
+    subgraph Stage1 ["Stage 1: Ingestion & Leakage-Free Splits"]
+        s1_data["PHEME Figshare (MD5 + Salted SHA-256)<br>Arctic Shift VN (vozforums / VietNam + .state.json)"]
+        s1_split["Canonical topic_splits.json<br>(70/15/15, min_total_replies=25)"]
+        s1_data --> s1_split
     end
 
-    subgraph Profile_v2 ["Profile v2 (Opt-In Kaggle T4 x 2: 4D + Stats + beta-NLL)"]
-        v2_nlp["Qwen/Qwen3.8-27B QLoRA 1-Pass Teacher<br>(5 Discourse Classes -> DualHeadCrossEncoder)"]
-        v2_edge["4D Edge Features<br>[s_uv, h_uv, r_uv, c_uv]"]
-        v2_burst["8D Early Cascade Stats<br>(cascade_stats)"]
-        v2_gnn["SBiFAGAT v2<br>(TD + BU Stance-Guided FAConv)"]
-        v2_out["Predictions + Calibrated beta-NLL Uncertainty<br>(size_logvar, polar_logvar, confidence)"]
+    subgraph Stage2 ["Stage 2: Offline 2D NLP Extraction (T4 x 2 FP16)"]
+        s2_teacher["Dual Open-Source Teachers (100% Eligible Coverage)<br>mDeBERTa-v3-xnli Symmetric Verbalizer + ViHSD / TweetEval"]
+        s2_student["Reply-Span-Pooled DualHeadCrossEncoder<br>(2D [s_uv, h_uv], O(N) JSONL delta cache)"]
+        s2_span["Frozen Ancestor-Conditioned SpanPool<br>(ViSoBERT / Twitter-RoBERTa -> 768-d)"]
+        s1_split --> s2_teacher --> s2_student
+        s1_split --> s2_span
+    end
 
-        v2_nlp --> v2_edge --> v2_gnn --> v2_out
-        v2_burst --> v2_out
+    subgraph Stage3 ["Stage 3: Dual-Channel Dir-GNN SBi-FAGAT (hidden_dim=64)"]
+        s3_stem["TwoStreamNodeStem (768-d Sem + 10-D Causal struct_x)"]
+        s3_gnn["TD + BU StanceGuidedFAConv<br>(Signed Polarity || Excitation + Dir-GNN Mix)"]
+        s3_read["Camp Dipole Readout (64-hop BFS) + 8-D cascade_stats"]
+        s3_out["MultiTaskHead: y_size (Huber), y_polar (KL-BCE), y_rumor (CE)"]
+        s2_span --> s3_stem
+        s2_student --> s3_gnn
+        s3_stem --> s3_gnn --> s3_read --> s3_out
     end
 ```

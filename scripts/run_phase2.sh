@@ -8,7 +8,7 @@ cd "${ROOT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_PHEME="${RUN_PHEME:-1}"
 RUN_VN="${RUN_VN:-1}"
-VN_TARGET_COUNT="${VN_TARGET_COUNT:-800}"
+VN_TARGET_COUNT="${VN_TARGET_COUNT:-1500}"
 VN_BEFORE_EPOCH="${VN_BEFORE_EPOCH:-1763164800}"
 MIN_TOTAL_REPLIES="${MIN_TOTAL_REPLIES:-25}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
@@ -49,6 +49,7 @@ if [[ "${RUN_PHEME}" -eq 1 ]]; then
         --scored-cache-json data/interim/pheme/scored_pairs.json \
         --edge-dim "${EDGE_DIM}" \
         --include-root-context \
+        --min-total-replies "${MIN_TOTAL_REPLIES}" \
         --batch-size "$((BATCH_SIZE * 2))" \
         --k-horizon 20
 fi
@@ -58,6 +59,9 @@ if [[ "${RUN_VN}" -eq 1 ]]; then
     CRAWL_ARGS=(
         --output-dir data/interim/vn
         --target-count "${VN_TARGET_COUNT}"
+        --min-comments "${MIN_TOTAL_REPLIES}"
+        --min-vi-ratio 0.65
+        --max-pages-per-sub 300
         --checkpoint-jsonl data/interim/vn/crawl_checkpoint.jsonl
         --allow-partial
     )
@@ -96,6 +100,7 @@ if [[ "${RUN_VN}" -eq 1 ]]; then
         --vihsd-dir checkpoints/visobert_vihsd \
         --edge-dim "${EDGE_DIM}" \
         --include-root-context \
+        --min-total-replies "${MIN_TOTAL_REPLIES}" \
         --batch-size "$((BATCH_SIZE * 2))" \
         --k-horizon 20
 fi

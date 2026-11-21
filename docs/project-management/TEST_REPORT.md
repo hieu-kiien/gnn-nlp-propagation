@@ -1,7 +1,7 @@
 # SBi-FAGAT: Test & Verification Report
 
 **Platform:** Windows (`win32`, CPU verification pass) + GitHub Actions Ubuntu (`Python 3.11`)  
-**Suite Scope:** 14 test modules in `tests/` (unified 2D architecture, multi-task KL-BCE optimization, zero data leakage, human audit safeguards, Kaggle bundle isolation)
+**Suite Scope:** 15 test modules in `tests/` — **114 passed, 0 failed** (unified 2D architecture, multi-task KL-BCE optimization, zero data leakage, EGM Round-1 `B1–B10`/`M1–M8` + Round-2 3-Goldfish adversarial audit remediations: detached BFS depth-30 gradient stability, Holm-Bonferroni `p < 0.01` bootstrap resolution, T4 DeBERTa AMP policy, UPFD classification-only comparator, `min_total_replies_extracted` guard, crawler fault recovery, 50-tree future-window human audit)
 
 ---
 
@@ -12,7 +12,7 @@
 | **Python** | CPython | `>=3.10` | `3.13.14` |
 | **PyTorch** | `torch` | `>=2.3.0` | `2.15.0+cpu` |
 | **PyG** | `torch-geometric` | `>=2.5.0` | `2.8.1` |
-| **Transformers** | `transformers` | `>=4.38.0` | `5.23.0` |
+| **Transformers** | `transformers` | `>=4.38.0,<5.0.0` | `5.23.0` (local) / `4.x` (Kaggle & CI) |
 | **Arrow / Tabular** | `pyarrow`, `pandas` | `>=14.0.0` / `>=2.1.0` | `25.0.1` / `3.1.1` |
 | **Scientific** | `numpy`, `scipy`, `scikit-learn` | `>=1.24.0,<3.0.0` / `>=1.11.0` / `>=1.3.0` | `2.4.6` / `1.18.1` / `1.9.1` |
 | **Test Runner** | `pytest` | `>=8.0.0` | `9.1.0` |
@@ -23,6 +23,7 @@
 
 | Test Module | Focus |
 | :--- | :--- |
+| `tests/test_egm_audit_remediation.py` | Full EGM audit regressions (`B1–B10`, `M1–M8`): `min_total_replies` LOO teacher coverage, `edge_source="auto"` Student consistency, $O(N)$ JSONL teacher delta resume, crawl `.state.json` + salted PHEME, LaTeX `_` escaping & `table*` + RFC JSON, NLI double-contradiction neutral + 50-tree VN blind audit, direction-aware stars + exact $F=4$ LOO permutation + topic-cluster bootstrap, continuous `y_polar` + fixed future $K$-window, Camp Dipole/Dir-GNN/Dual-Channel ablations + `BiEdgeGATv2` + `TextMLP` topology mask + `assemble_paper_artifacts` + UPFD fault isolation |
 | `tests/test_egm_fixes.py` | EGM hardening fixes (`F1–F6`), `node_backbone`, fair model parity, `min_total_replies=25` |
 | `tests/test_kaggle_t4x2_v2_pipeline.py` | Unified 2D discourse labels, NLI verbalizer simplex, `DualHeadCrossEncoder`, `auto_loop`, smoke runner & notebooks |
 | `tests/test_live_predictor_audit.py` | Live predictor untrained guard, `--allow-untrained`, corrupt checkpoints, `--demo-offline` |
