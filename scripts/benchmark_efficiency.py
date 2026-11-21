@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 import tracemalloc
 from pathlib import Path
@@ -18,7 +19,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.data import Batch
 
-from src.data.pyg_dataset import CascadeData, TOTAL_NODE_FEATURE_DIM
+from src.data.pyg_dataset import CascadeData, STRUCTURAL_NODE_DIM, TOTAL_NODE_FEATURE_DIM
 from src.models.baselines import (
     BiGCN,
     EdgeGATv2,
@@ -62,6 +63,7 @@ def build_profiling_batch(
         graphs.append(
             CascadeData(
                 x=x,
+                struct_x=torch.rand((num_nodes, STRUCTURAL_NODE_DIM), dtype=torch.float32),
                 edge_index=edge_index_td,
                 edge_index_td=edge_index_td,
                 edge_index_bu=edge_index_bu,
@@ -298,6 +300,7 @@ def format_efficiency_latex(
             "\\centering",
             f"\\caption{{{caption}}}",
             f"\\label{{{label}}}",
+            "\\resizebox{\\columnwidth}{!}{",
             "\\begin{tabular}{lcccc}",
             "\\toprule",
             f"Model & \\#Params & Infer (ms/cascade)$\\downarrow$ & Train Step (ms/batch)$\\downarrow$ & {mem_col}$\\downarrow$ \\\\",
@@ -305,6 +308,7 @@ def format_efficiency_latex(
             *body_lines,
             "\\bottomrule",
             "\\end{tabular}",
+            "}",
             "\\end{table}",
             "",
         ]
@@ -320,6 +324,8 @@ def _resolve_efficiency_table_label(output_table: Path) -> str:
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="Benchmark parameter count, inference/train latency, and memory across all 8 models."
     )

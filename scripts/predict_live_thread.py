@@ -172,6 +172,8 @@ def _fetch_reddit_thread(post_id: str, timeout: int = 20) -> tuple[dict[str, Any
                         "text": str(c.get("body") or c.get("text") or ""),
                         "created_utc": c.get("created_utc"),
                         "author": raw_author,
+                        "author_is_bot": isinstance(raw_author, str)
+                        and raw_author.strip().lower() == "automoderator",
                         "author_hash": hash_author_sha256(
                             str(raw_author) if raw_author is not None else None
                         ),
@@ -207,6 +209,8 @@ def _fetch_reddit_thread(post_id: str, timeout: int = 20) -> tuple[dict[str, Any
                     "text": str(d.get("body") or ""),
                     "created_utc": d.get("created_utc"),
                     "author": raw_author,
+                    "author_is_bot": isinstance(raw_author, str)
+                    and raw_author.strip().lower() == "automoderator",
                     "author_hash": hash_author_sha256(
                         str(raw_author) if raw_author is not None else None
                     ),
@@ -244,6 +248,8 @@ def _load_thread_from_json(path: Path) -> tuple[dict[str, Any], list[dict[str, A
                         "text": str(d.get("body") or ""),
                         "created_utc": d.get("created_utc"),
                         "author": raw_author,
+                        "author_is_bot": isinstance(raw_author, str)
+                        and raw_author.strip().lower() == "automoderator",
                         "author_hash": hash_author_sha256(
                             str(raw_author) if raw_author is not None else None
                         ),
@@ -284,6 +290,8 @@ def _load_thread_from_json(path: Path) -> tuple[dict[str, Any], list[dict[str, A
                     "text": str(c.get("text") or c.get("body") or ""),
                     "created_utc": float(c.get("created_utc") or (base_ts + idx * 45.0)),
                     "author": author_str,
+                    "author_is_bot": isinstance(author_str, str)
+                    and author_str.strip().lower() == "automoderator",
                     "author_hash": hash_author_sha256(author_str),
                 }
             )
@@ -598,6 +606,7 @@ def predict_live_cascade(
     return {
         "root_title": str(post.get("title") or root_row["text"][:120]),
         "k_observed": len(kept_nodes) - 1,
+        "edge_dim": int(target_edge_dim),
         "checkpoint_loaded": checkpoint_loaded,
         "early_burst_metrics": {
             "elapsed_span_norm": stats_vec[0],
@@ -628,9 +637,10 @@ def predict_live_cascade(
 
 
 def _format_report_vi(result: Mapping[str, Any]) -> str:
+    is_2d = int(result.get("edge_dim", 2)) == 2 and bool(result.get("checkpoint_loaded"))
     lines = [
         "=" * 78,
-        "BAO CAO DU BAO SOM & PHAN TICH HANH VI TRANH LUAN (SBi-FAGAT v2)",
+        "BAO CAO DU BAO SOM & PHAN TICH HANH VI TRANH LUAN (SBi-FAGAT Unified 2D)",
         "=" * 78,
     ]
     if not result["checkpoint_loaded"]:
@@ -641,14 +651,25 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
         [
             f"Bai goc      : {result['root_title']}",
             f"Cua so quan sat (V_K): {result['k_observed']} binh luan dau tien",
-            f"Trang thai GNN       : {'Da nap checkpoint huan luyen' if result['checkpoint_loaded'] else 'CHE DO KIEM THU CAU TRUC (CHUA NAP CHECKPOINT - KHONG CO GIA TRI DU BAO)'}",
+            f"Trang thai GNN       : {'Da nap checkpoint huan luyen (2D [s_uv, h_uv])' if is_2d else ('Da nap checkpoint huan luyen' if result['checkpoint_loaded'] else 'CHE DO KIEM THU CAU TRUC (CHUA NAP CHECKPOINT - KHONG CO GIA TRI DU BAO)')}",
             "",
-            "[1] PHAN LOAI 5 NHOM HANH VI TRONG 20 BINH LUAN DAU:",
+            (
+                "[1] PHAN BO LAP TRUONG & GAY GAT 2D [s_uv, h_uv] TRONG 20 BINH LUAN DAU:"
+                if is_2d
+                else "[1] PHAN LOAI 5 NHOM HANH VI TRONG 20 BINH LUAN DAU:"
+            ),
         ]
     )
-    for lbl in DISCOURSE_BEHAVIOR_LABELS:
-        cnt = result["behavior_counts"].get(lbl, 0)
-        lines.append(f"  - {BEHAVIOR_LABEL_VI.get(lbl, lbl):38s}: {cnt} binh luan")
+    if is_2d:
+        bc = result["behavior_counts"]
+        lines.append(f"  - Ung ho / dong tinh (s > 0.1)           : {bc.get('support', 0)} binh luan")
+        lines.append(f"  - Trung lap / hoi dap                    : {bc.get('neutral', 0)} binh luan")
+        lines.append(f"  - Phan bien on hoa (s < -0.1, h <= 0.6)  : {bc.get('constructive_oppose', 0)} binh luan")
+        lines.append(f"  - Xung dot / gay gat cao (h > 0.6)       : {bc.get('hostile_conflict', 0)} binh luan")
+    else:
+        for lbl in DISCOURSE_BEHAVIOR_LABELS:
+            cnt = result["behavior_counts"].get(lbl, 0)
+            lines.append(f"  - {BEHAVIOR_LABEL_VI.get(lbl, lbl):38s}: {cnt} binh luan")
 
     bm = result["early_burst_metrics"]
     sec3_header = (
@@ -676,13 +697,21 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
 
     flagged = result.get("flagged_irrational_or_hostile") or []
     lines.append("")
-    lines.append(f"[4] DIEM MAT BINH LUAN VO LY / CHONG DOI NGUY HIEM NHAT ({len(flagged)} cau):")
-    for idx, item in enumerate(flagged[:5], start=1):
-        lbl_vi = BEHAVIOR_LABEL_VI.get(item["behavior_label"], item["behavior_label"])
-        lines.append(
-            f"  {idx}. [{lbl_vi}] (s={item['s_uv']:+.2f}, gay_gat={item['h_uv']:.2f}, vo_ly={item['r_uv']:.2f})"
-        )
-        lines.append(f"     \"{item['reply_text'][:160]}\"")
+    if is_2d:
+        lines.append(f"[4] DIEM MAT BINH LUAN GAY GAT / XUNG DOT CAO ({len(flagged)} cau):")
+        for idx, item in enumerate(flagged[:5], start=1):
+            lines.append(
+                f"  {idx}. [Xung dot gay gat] (s_uv={item['s_uv']:+.2f}, h_uv={item['h_uv']:.2f})"
+            )
+            lines.append(f"     \"{item['reply_text'][:160]}\"")
+    else:
+        lines.append(f"[4] DIEM MAT BINH LUAN VO LY / CHONG DOI NGUY HIEM NHAT ({len(flagged)} cau):")
+        for idx, item in enumerate(flagged[:5], start=1):
+            lbl_vi = BEHAVIOR_LABEL_VI.get(item["behavior_label"], item["behavior_label"])
+            lines.append(
+                f"  {idx}. [{lbl_vi}] (s={item['s_uv']:+.2f}, gay_gat={item['h_uv']:.2f}, vo_ly={item['r_uv']:.2f})"
+            )
+            lines.append(f"     \"{item['reply_text'][:160]}\"")
 
     act = result["actual_post_hoc_comparison"]
     polar_note = (

@@ -3,13 +3,19 @@
 Implements the core architecture specified in `docs/math_spec.md` using
 `torch_geometric.nn.MessagePassing`:
   - Supports 2D edge attributes `e_uv = [s_uv, h_uv]` (stance polarity + hostility
-    intensity) feeding the signed frequency-adaptive gate:
-        gamma_uv = tanh(a^T [W h_u || W h_v || e_uv])
-    (and `sigmoid` variant for conflict-gate ablation).
-  - Runs independent Top-Down (propagation) and Bottom-Up (community feedback)
-    message passing with root anchoring and degree normalization.
-  - Provides `LatentConflictMLP(x_u, x_v, x_u - x_v)` for datasets without raw
-    edge texts (e.g., PyG UPFD BERT features).
+    intensity) feeding dual-channel message passing:
+      * Polarity channel (signed low/high-pass gate `gamma_uv in [-1, 1]`):
+            gamma_uv = tanh(node_score + beta_cos * cos(z_u, z_v) + a_e^T e_uv + delta_pol(phi(e_uv)))
+      * Excitatory intensity channel (`alpha_int in [0, 1]`):
+            alpha_int = sigmoid(0.8 |s_uv| + 0.8 h_uv + delta_int(phi(e_uv)))
+    (plus `sigmoid` gate-mode and single-channel ablations).
+  - Runs coupled Top-Down (propagation) and Bottom-Up (community feedback)
+    message passing with Dir-GNN cross-directional mixing, root anchoring, and
+    symmetric degree normalization.
+  - Aggregates graph-level representations via Camp Dipole + gate-moment readout
+    over root-aligned edge signals.
+  - Provides `LatentConflictMLP(x_u, x_v, x_u - x_v)` for text-free structural
+    transfer benchmarks (e.g., PyG UPFD BERT features).
   - Exposes `extract_edge_gates(data)` to inspect `|gamma_uv|` and signed `gamma_uv`
     on every edge for model interpretability and cascade heatmaps.
 """
@@ -45,6 +51,7 @@ class StanceGuidedFAConv(MessagePassing):
         eps: float = 0.5,
         gate_mode: Literal["tanh", "sigmoid"] = "tanh",
         dropout: float = 0.1,
+        use_dual_channel: bool = True,
     ) -> None:
         super().__init__(aggr="add", flow="source_to_target", node_dim=0)
         if gate_mode not in {"tanh", "sigmoid"}:
@@ -57,6 +64,7 @@ class StanceGuidedFAConv(MessagePassing):
         self.edge_dim = edge_dim
         self.eps = eps
         self.gate_mode = gate_mode
+        self.use_dual_channel = bool(use_dual_channel)
 
         self.lin = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.lin_root = nn.Linear(hidden_dim, hidden_dim, bias=True)
@@ -190,9 +198,17 @@ class StanceGuidedFAConv(MessagePassing):
         z_j: Tensor,
         edge_weights_2ch: Tensor,
     ) -> Tensor:
+        if not self.use_dual_channel:
+            return edge_weights_2ch[:, 0:1] * z_j
         m_pol = edge_weights_2ch[:, 0:1] * z_j[:, : self.pol_dim]
         m_exc = edge_weights_2ch[:, 1:2] * z_j[:, self.pol_dim :]
         return torch.cat([m_pol, m_exc], dim=-1)
+
+
+def _ste_parent_sign(u_ori: Tensor, neutral_eps: float) -> Tensor:
+    """Piecewise-linear parent sign ramp: exact +/-1 outside neutral band, smooth u/eps inside."""
+    eps_safe = max(float(neutral_eps), 1e-6)
+    return torch.clamp(u_ori / eps_safe, -1.0, 1.0)
 
 
 def _propagate_root_aligned_edge_signal(
@@ -231,12 +247,9 @@ def _propagate_root_aligned_edge_signal(
             break
         f_src = src[frontier]
         f_dst = dst[frontier]
-        u_ori = node_ori[f_src].detach()
-        p_sign = torch.where(
-            u_ori.abs() <= neutral_eps,
-            torch.ones_like(u_ori),
-            torch.where(u_ori > 0.0, torch.ones_like(u_ori), -torch.ones_like(u_ori)),
-        )
+        # Detach parent orientation so BFS acts as bounded signed routing in [-1, 1]
+        # without multiplying 1/eps Jacobians exponentially across deep chains.
+        p_sign = _ste_parent_sign(node_ori[f_src].detach(), neutral_eps)
         aligned_f = p_sign * edge_sig[frontier]
         updated = scatter(aligned_f, f_dst, dim=0, dim_size=num_nodes, reduce="mean")
         new_vis = torch.zeros((num_nodes,), dtype=torch.bool, device=device).scatter(
@@ -245,12 +258,7 @@ def _propagate_root_aligned_edge_signal(
         node_ori = torch.where(new_vis, updated, node_ori)
         visited = visited | new_vis
 
-    u_all = node_ori[src].detach()
-    p_sign_all = torch.where(
-        u_all.abs() <= neutral_eps,
-        torch.ones_like(u_all),
-        torch.where(u_all > 0.0, torch.ones_like(u_all), -torch.ones_like(u_all)),
-    )
+    p_sign_all = _ste_parent_sign(node_ori[src].detach(), neutral_eps)
     return p_sign_all * edge_sig
 
 
@@ -294,6 +302,9 @@ class SBiFAGAT(nn.Module):
         use_cascade_stats: bool = False,
         cascade_feat_dim: int = 8,
         predict_uncertainty: bool = False,
+        use_dir_mix: bool = True,
+        use_camp_dipole: bool = True,
+        use_dual_channel: bool = True,
     ) -> None:
         super().__init__()
         if readout_mode not in {"attention", "mean"}:
@@ -313,6 +324,9 @@ class SBiFAGAT(nn.Module):
         self.use_cascade_stats = bool(use_cascade_stats)
         self.cascade_feat_dim = int(cascade_feat_dim)
         self.predict_uncertainty = bool(predict_uncertainty)
+        self.use_dir_mix = bool(use_dir_mix)
+        self.use_camp_dipole = bool(use_camp_dipole)
+        self.use_dual_channel = bool(use_dual_channel)
 
         self.input_proj = TwoStreamNodeStem(
             in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout
@@ -334,6 +348,7 @@ class SBiFAGAT(nn.Module):
                     eps=eps,
                     gate_mode=gate_mode,
                     dropout=dropout,
+                    use_dual_channel=use_dual_channel,
                 )
                 for _ in range(num_layers)
             ]
@@ -347,6 +362,7 @@ class SBiFAGAT(nn.Module):
                         eps=eps,
                         gate_mode=gate_mode,
                         dropout=dropout,
+                        use_dual_channel=use_dual_channel,
                     )
                     for _ in range(num_layers)
                 ]
@@ -354,7 +370,7 @@ class SBiFAGAT(nn.Module):
             if use_bottom_up
             else None
         )
-        if use_bottom_up:
+        if use_bottom_up and use_dir_mix:
             self.dir_mix_td: nn.ModuleList | None = nn.ModuleList(
                 [nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(num_layers)]
             )
@@ -460,13 +476,7 @@ class SBiFAGAT(nn.Module):
         gamma_td_layers: list[Tensor] = []
         gamma_bu_layers: list[Tensor] = []
 
-        if (
-            self.use_bottom_up
-            and self.bu_convs is not None
-            and self.dir_mix_td is not None
-            and self.dir_mix_bu is not None
-            and self.dir_mix_scale is not None
-        ):
+        if self.use_bottom_up and self.bu_convs is not None:
             for l_idx in range(self.num_layers):
                 h_td_next, gamma_td = self.td_convs[l_idx](
                     h_td, h0, h_root_0, edge_index_td, edge_attr
@@ -476,9 +486,18 @@ class SBiFAGAT(nn.Module):
                 )
                 gamma_td_layers.append(gamma_td)
                 gamma_bu_layers.append(gamma_bu)
-                mix_scale = torch.tanh(self.dir_mix_scale[l_idx])
-                h_td = h_td_next + mix_scale * self.dir_mix_td[l_idx](h_bu_next)
-                h_bu = h_bu_next + mix_scale * self.dir_mix_bu[l_idx](h_td_next)
+                if (
+                    self.use_dir_mix
+                    and self.dir_mix_td is not None
+                    and self.dir_mix_bu is not None
+                    and self.dir_mix_scale is not None
+                ):
+                    mix_scale = torch.tanh(self.dir_mix_scale[l_idx])
+                    h_td = h_td_next + mix_scale * self.dir_mix_td[l_idx](h_bu_next)
+                    h_bu = h_bu_next + mix_scale * self.dir_mix_bu[l_idx](h_td_next)
+                else:
+                    h_td = h_td_next
+                    h_bu = h_bu_next
 
             node_emb = 0.5 * (h_td + h_bu)
             z_root = 0.5 * (h_td[root_idx] + h_bu[root_idx])
@@ -517,16 +536,16 @@ class SBiFAGAT(nn.Module):
             edge_batch = batch_vec[dst]
             h_dst = node_emb[dst]
             gamma_td_last = gamma_td_layers[-1]
-            if self.gate_mode == "tanh":
-                camp_sig = _propagate_root_aligned_edge_signal(
-                    edge_index_td,
-                    gamma_td_last,
-                    root_idx,
-                    num_nodes,
-                    neutral_eps=0.1,
-                )
-            else:
-                camp_sig = gamma_td_last
+            # Center sigmoid gates (0, 1) -> (-1, 1) and run identical root-aligned BFS so
+            # w/o Conflict Gate (Sigmoid) isolates ONLY the signed message-passing gate.
+            raw_camp_sig = gamma_td_last if self.gate_mode == "tanh" else (2.0 * gamma_td_last - 1.0)
+            camp_sig = _propagate_root_aligned_edge_signal(
+                edge_index_td,
+                raw_camp_sig,
+                root_idx,
+                num_nodes,
+                neutral_eps=0.1,
+            )
 
             w_pos = torch.sigmoid(12.0 * (camp_sig - 0.25)).unsqueeze(-1)
             w_neg = torch.sigmoid(12.0 * (-camp_sig - 0.25)).unsqueeze(-1)
@@ -555,7 +574,7 @@ class SBiFAGAT(nn.Module):
             z_dipole_polar = camp_balance * torch.sqrt(diff_camp.pow(2) + 1e-8)
             z_dipole_signed = diff_camp
 
-            g_col = gamma_td_last.unsqueeze(-1)
+            g_col = raw_camp_sig.unsqueeze(-1)
             g_sum = scatter(g_col, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
             g_sq_sum = scatter(g_col.pow(2), edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
             g_abs_sum = scatter(
@@ -571,6 +590,12 @@ class SBiFAGAT(nn.Module):
             z_dipole_polar = node_emb.new_zeros((num_graphs, self.hidden_dim))
             z_dipole_signed = node_emb.new_zeros((num_graphs, self.hidden_dim))
             g_mom = node_emb.new_zeros((num_graphs, 6))
+
+        if not self.use_camp_dipole:
+            z_disp = torch.zeros_like(z_disp)
+            z_dipole_polar = torch.zeros_like(z_dipole_polar)
+            z_dipole_signed = torch.zeros_like(z_dipole_signed)
+            g_mom = torch.zeros_like(g_mom)
 
         readout_in = torch.cat(
             [z_root, z_att, z_disp, z_dipole_polar, z_dipole_signed, g_mom], dim=-1

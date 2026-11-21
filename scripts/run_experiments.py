@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -140,11 +141,14 @@ def _export_diagnostic_figures(
             gcn_embs.append(gcn_out["node_emb"].cpu().numpy())
             sbi_embs.append(sbi_out["node_emb"].cpu().numpy())
 
-            # Map parent->child stance onto each node (root nodes stay 0.0)
-            stances = torch.zeros(batch.num_nodes, dtype=torch.float32, device=device)
-            if batch.edge_index_td.numel() > 0 and hasattr(batch, "edge_stance"):
-                dst = batch.edge_index_td[1]
-                stances[dst] = batch.edge_stance.view(-1).to(device)
+            # Prefer causal root-aligned stance orientations on V_K for UMAP coloring
+            if hasattr(batch, "early_node_root_stance") and batch.early_node_root_stance is not None:
+                stances = batch.early_node_root_stance.view(-1).to(device)
+            else:
+                stances = torch.zeros(batch.num_nodes, dtype=torch.float32, device=device)
+                if batch.edge_index_td.numel() > 0 and hasattr(batch, "edge_stance"):
+                    dst = batch.edge_index_td[1]
+                    stances[dst] = batch.edge_stance.view(-1).to(device)
             node_stances.append(stances.cpu().numpy())
 
     if gcn_embs:
@@ -217,9 +221,14 @@ def _build_persistence_summary_row(
 def attach_early_k_persistence_to_result(
     result: dict[str, Any],
     test_cascades: Sequence[Any],
+    *,
+    train_cascades: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Attach the non-learned Early-K Persistence baseline row onto a benchmark result."""
-    persist_m = compute_early_k_persistence_metrics(list(test_cascades))
+    persist_m = compute_early_k_persistence_metrics(
+        list(test_cascades),
+        train_cascades=list(train_cascades) if train_cascades is not None else None,
+    )
     result["early_k_persistence"] = persist_m
     result["summary_stats"] = {
         "Early-K Persistence": _build_persistence_summary_row(persist_m),
@@ -229,6 +238,8 @@ def attach_early_k_persistence_to_result(
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Run 5-seed benchmark for SBi-FAGAT and baselines.")
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--k-horizon", type=int, default=20)
@@ -253,6 +264,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--eval-protocol", choices=["inductive", "loo"], default="inductive"
+    )
+    parser.add_argument(
+        "--edge-source", choices=["auto", "student", "teacher"], default="auto"
     )
     parser.add_argument("--comparator-model", type=str, default="auto")
     parser.add_argument("--output-table", type=Path, default=None)
@@ -351,6 +365,7 @@ def main() -> None:
             min_total_replies=args.min_total_replies,
             polar_target_mode=args.polar_target_mode,
             label_scheme=args.label_scheme,
+            edge_source=args.edge_source,
         )
         has_rumor_labels = any(int(d.y_rumor.item()) >= 0 for d in test_ds)
         active_metrics = MAIN_METRICS if has_rumor_labels else VN_MAIN_METRICS
@@ -370,7 +385,11 @@ def main() -> None:
             primary_hypothesis_keys=active_keys,
             device=device,
         )
-        attach_early_k_persistence_to_result(result, list(test_ds))
+        attach_early_k_persistence_to_result(
+            result,
+            list(test_ds),
+            train_cascades=list(train_loader.dataset),
+        )
     else:
         nodes_tbl, edges_tbl = load_cascade_parquet(args.data_dir, validate=True)
         nlp_feats = torch.load(
@@ -411,7 +430,12 @@ def main() -> None:
                 edges_table=edges_tbl,
                 nlp_features=nlp_feats,
             )
-            persist_folds.append(compute_early_k_persistence_metrics(list(t_ds)))
+            persist_folds.append(
+                compute_early_k_persistence_metrics(
+                    list(t_ds),
+                    train_cascades=list(tr_l.dataset),
+                )
+            )
             fold_res = run_multi_seed_benchmark(
                 model_factories,
                 tr_l,
@@ -510,6 +534,9 @@ def main() -> None:
             },
             "reference_model": "SBiFAGAT",
             "comparator_model": cmp_name,
+            "nonparametric_test_label": (
+                "Exact Perm." if len(fold_raw["SBiFAGAT"]) < 6 else "Bootstrap"
+            ),
             "models": last_bundle["models"],
         }
 
@@ -545,11 +572,8 @@ def main() -> None:
 
     if "SBiFAGAT" in result.get("models", {}):
         ds_tag = args.data_dir.name.lower() if args.data_dir.name.lower() in {"pheme", "vn"} else "main"
-        ckpt_path = args.ckpt_out or (
-            out_json.with_name(f"best_sbifagat_{ds_tag}.pt")
-            if args.output_json is not None
-            else Path(f"checkpoints/best_sbifagat_{ds_tag}.pt")
-        )
+        proto_tag = "_loo" if args.eval_protocol == "loo" else ""
+        ckpt_path = args.ckpt_out or Path(f"checkpoints/best_sbifagat_{ds_tag}{proto_tag}.pt")
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {

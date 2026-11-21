@@ -19,7 +19,7 @@ Tài liệu này trình bày đánh giá thiết kế tổng quan (theo chuẩn 
 - **Phương án thay thế đã cân nhắc & bác bỏ**:
   1. *Fine-tune end-to-end Transformer + GNN cùng lúc*: Với mỗi cây có $K=20$ văn bản ($L_{\text{tok}} \le 384$), chi phí bộ nhớ $\mathcal{O}(K \cdot L_{\text{tok}}^2)$ vượt quá giới hạn 16GB VRAM khi chạy multi-seed và ablation. Tách pha NLP ra tệp `.pt` giúp giai đoạn GNN tiêu thụ $< 500\text{ MB}$ VRAM.
   2. *Sinh nhãn Teacher bằng LLM 27B QLoRA (`Qwen`)*: Bị bác bỏ vì trên Kaggle `T4 x 2`, chạy phủ 100% tập dữ liệu gây tràn VRAM logits và vượt trần thời gian 12 giờ, còn cắt mẫu `--max-teacher-pairs` làm tập Test bị gán nhãn tự chấm. Teacher kép NLI (`mDeBERTa-v3-xnli` với *Symmetric Stance Verbalizer*) + Hostility (`ViSoBERT` tinh chỉnh class-weighted trên `UIT-ViHSD` / `twitter-roberta-base-offensive`) đạt độ phủ 100% sạch và ổn định.
-  3. *Chỉ truyền cặp thô `(parent, reply)` vào NLI hoặc `[CLS]` chung đoạn cho `h_uv`*: Làm $\sim 85\%$ bình luận bị dồn về `Neutral` hoặc bị câu chửi ở `parent` lây sang `h_uv` của `reply`. Việc dùng *Symmetric 2-Hypothesis Verbalizer* trong ngân sách 384 token bảo toàn đoạn Reply và *segment-isolated mean pooling* giải quyết triệt để điểm nghẽn này.
+  3. *Chỉ truyền cặp thô `(parent, reply)` vào NLI hoặc `[CLS]` chung đoạn cho `h_uv`*: Làm $\sim 85\%$ bình luận bị dồn về `Neutral` hoặc bị câu chửi ở `parent` lây sang `h_uv` của `reply`. Việc dùng *Symmetric 2-Hypothesis Verbalizer* trong ngân sách 384 token bảo toàn đoạn Reply và *reply-span pooling* giảm thiểu đáng kể điểm nghẽn này.
 
 ### 0.4. Rủi ro, Giới hạn & Biện pháp Kiểm soát
 1. **Rò rỉ dữ liệu & Tái phân hoạch tại $K=50$**:
@@ -32,9 +32,9 @@ Tài liệu này trình bày đánh giá thiết kế tổng quan (theo chuẩn 
 
 ### 0.5. Cổng Nghiệm thu Bắt buộc
 - **Gate 0 (Contract & Split Parity)**: `pytest` xác nhận nhân quả UTC, nhất quán `topic_splits.json` ở mọi $K \in \{10, 20, 30, 50\}$ và LOO `edge_source="teacher"`.
-- **Gate 1 (ViHSD & Human Audit)**: kiểm định mù 300 cặp $(u, v)$ kèm thống kê `unadjudicated_disagreements` và `adjudication_coverage` (`compute_kappa.py`), 50 bài Test VN chấm tay, và đối chiếu **Early-K Persistence Baseline**.
-- **Gate 2 (Distillation & Anti-Cheating)**: `fallback_rate <= max_fallback_rate`, Student khớp Teacher 2D trên Val split, và `--sanity-check-shuffle` đẩy độ khớp về ngẫu nhiên.
-- **Gate 3 (Statistical Benchmark)**: 5 hạt giống $\mathcal{S} = \{42, 100, 2024, 777, 999\}$, Early Stopping theo `task_loss`, chọn checkpoint tốt nhất theo Validation trong từng mô hình, kiểm định `ttest_rel` + Sample-level Paired Bootstrap + Holm-Bonferroni đối chứng với mô hình học máy mạnh nhất (loại trừ baseline phi tham số `Early-K Persistence`).
+- **Gate 1 (ViHSD & Human Audit)**: kiểm định mù 300 cặp $(u, v)$ (phân tầng đồng thời `stance x hostility`) kèm thống kê `unadjudicated_disagreements` và `adjudication_coverage` (`compute_kappa.py`), 50 cây Test VN chấm tay (`scripts/audit_vn_50_trees.py`), và đối chiếu **Early-K Persistence Baseline**.
+- **Gate 2 (Distillation & Anti-Cheating)**: độ phủ 100% nhãn Teacher kép sạch trên toàn bộ chuỗi đủ điều kiện ($\ge 25$ phản hồi), Student khớp Teacher 2D trên Val split, và `--sanity-check-shuffle` đẩy độ khớp về ngẫu nhiên.
+- **Gate 3 (Statistical Benchmark)**: 5 hạt giống $\mathcal{S} = \{42, 100, 2024, 777, 999\}$, Early Stopping theo `task_loss`, chọn checkpoint tốt nhất theo Validation trong từng mô hình, kiểm định `ttest_rel` + Sample/Topic-Cluster Paired Bootstrap (hoặc kiểm định hoán vị dấu chính xác khi $F < 6$ trên LOO) + Holm-Bonferroni có hướng (chỉ gắn sao khi vượt trội theo chiều tốt hơn) đối chứng với mô hình học máy mạnh nhất (loại trừ baseline phi tham số `Early-K Persistence`).
 
 ---
 
@@ -61,8 +61,8 @@ Xét cây hội thoại hoàn chỉnh $\mathcal{G}_{\text{full}} = (\mathcal{V}_
 $$\mathcal{V}_K = \{r\} \cup \left\{v_1, \dots, v_{\min(K, N_{\text{total}})}\right\}, \qquad \mathcal{E}_K = \left\{(u, v) \in \mathcal{E}_{\text{full}} \mid u \in \mathcal{V}_K \land v \in \mathcal{V}_K\right\}.$$
 
 Mọi thành phần đặc trưng trong `EarlyCascadeDataset` đều tuân thủ bất biến nhân quả tại $t \le t_K$:
-1. **Nhúng nút Ancestor-Conditioned SpanPool**: Với mỗi nút phản hồi $v$ có cha trực tiếp $u$ và gốc $r$, chuỗi đầu vào `[CLS] r [SEP] u [SEP] v [SEP]` (tối đa `max_length` nằm trong giới hạn vị trí của encoder đóng băng) đi qua `uitnlp/visobert` (VN) hoặc `cardiffnlp/twitter-roberta-base` (EN), sau đó lấy trung bình ẩn tầng cuối **chỉ trên mặt nạ token thuộc $v$**. Việc điều kiện hóa theo tổ tiên nhân quả ($t_r \le t_u \le t_v \le t_K$) giải nghĩa các câu trả lời ngắn kiểu *"Hoàn toàn sai!"* mà hoàn toàn không nhìn thấy nút tương lai.
-2. **Đặc trưng cấu trúc 10 chiều `struct_x`**: Thời gian trễ chuẩn hóa log theo $T_{\text{ref}} = 7\text{ ngày}$, khoảng cách thời gian so với phản hồi liền trước, thứ tự đến trong cửa sổ $K$, độ trễ nút cha, độ sâu chuẩn hóa $\ell_v / K$, cờ nút gốc, bậc ra sớm chuẩn hóa, cờ nút lá tại $K$, tần suất bình luận của cùng tác giả trong $K$, và tỷ lệ tác giả duy nhất trả lời cha (trong `TextMLP`, các cột tô-pô `{1, 4, 6, 7}` bị khóa bằng 0 để giữ nguyên nghĩa phi cấu trúc).
+1. **Nhúng nút Ancestor-Conditioned SpanPool**: Với mỗi nút phản hồi $v$ có cha trực tiếp $u$ và gốc $r$, chuỗi đầu vào `[CLS] r [SEP] u [SEP] v [SEP]` (cắt gốc theo tỷ lệ 60% đầu + 40% cuối khi vượt ngân sách) đi qua `uitnlp/visobert` (VN) hoặc `cardiffnlp/twitter-roberta-base` (EN), sau đó lấy trung bình ẩn tầng cuối **chỉ trên mặt nạ token thuộc $v$**. Việc điều kiện hóa theo tổ tiên nhân quả ($t_r \le t_u \le t_v \le t_K$) giải nghĩa các câu trả lời ngắn kiểu *"Hoàn toàn sai!"* mà hoàn toàn không nhìn thấy nút tương lai.
+2. **Đặc trưng cấu trúc 10 chiều `struct_x`**: (0) `t_norm` — thời gian trễ chuẩn hóa log so với gốc theo $T_{\text{ref}} = 7\text{ ngày}$; (1) `dt_parent_norm` — độ trễ chuẩn hóa log so với nút cha trực tiếp; (2) `rel_phase_k` — pha đến tương đối trong $[t_0, t_K]$; (3) `rank_norm_k` — thứ tự thời gian chuẩn hóa trong $V_K$; (4) `d_norm` — độ sâu chuẩn hóa $\ell_v / K$; (5) `is_root` — cờ nút gốc; (6) `early_out_deg_norm` — bậc ra sớm chuẩn hóa trong $V_K$; (7) `is_early_leaf` — cờ nút lá sớm trong $V_K$; (8) `is_op_reentry` — cờ tác giả bài gốc quay lại bình luận; (9) `author_repeat_norm` — số lần xuất hiện trước đó của cùng tác giả trong $V_K$ (trong `TextMLP`, các cột tô-pô `{1, 4, 6, 7}` của `struct_x` và `{3, 4, 7}` của `cascade_stats` bị khóa bằng 0 để giữ nguyên nghĩa phi cấu trúc).
 
 ---
 
@@ -70,15 +70,17 @@ Mọi thành phần đặc trưng trong `EarlyCascadeDataset` đều tuân thủ
 
 ### 3.1. Teacher Kép NLI & Hostility Độ phủ 100%
 - **Chuẩn hóa văn bản xã hội (`normalize_social_text`)**: Rút gọn URL $\to$ `http` và gộp khoảng trắng cho **cả Tiếng Việt và Tiếng Anh**; ẩn `@handle` $\to$ `@user` cho Tiếng Anh (giữ nguyên `@handle` trên ngữ cảnh Việt).
-- **Symmetric NLI Stance Verbalizer (`MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7`)**: Với ngân sách `max_length = 384`, cấp phát token ưu tiên bảo toàn phần `Reply` trước khi cắt `Parent` sao cho `truncation="only_first"` không làm mất câu trả lời. Đánh giá đối xứng hai giả thuyết (`H_sup`: ủng hộ cha vs. `H_opp`: phản đối cha), tổ hợp trực giao về đơn hình 3 lớp $(p_{\text{sup}}, p_{\text{neu}}, p_{\text{opp}})$ và tính $s_{uv} = p_{\text{sup}} - p_{\text{opp}} \in [-1, 1]$ kèm nhãn `root_s_uv` đối với nút sâu (`depth >= 2`).
-- **Hostility Teacher ($h_{uv} \in [0, 1]$)**: Tinh chỉnh `uitnlp/visobert` với trọng số lớp cân bằng nghịch đảo tần suất, warmup + cosine trên `UIT-ViHSD` (Tiếng Việt) hoặc dùng `cardiffnlp/twitter-roberta-base-offensive` (Tiếng Anh).
+- **Symmetric NLI Stance Verbalizer (`MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7`)**: Với ngân sách `max_length = 384`, cấp phát token ưu tiên bảo toàn phần `Reply` trước khi cắt `Parent` sao cho `truncation="only_first"` không làm mất câu trả lời. Đánh giá đối xứng hai giả thuyết (`H_sup`: ủng hộ bình luận trước vs. `H_opp`: phản đối bình luận trước) và gán phần mâu thuẫn kép $m = \min(c_{\text{sup}}, c_{\text{opp}})$ về lớp trung lập trên đơn hình 3 lớp:
+  $$p_{\text{sup}} = \tfrac{1}{2}\left(e_{\text{sup}} + (c_{\text{opp}} - m)_+\right), \quad p_{\text{opp}} = \tfrac{1}{2}\left(e_{\text{opp}} + (c_{\text{sup}} - m)_+\right), \quad p_{\text{neu}} = \tfrac{1}{2}(n_{\text{sup}} + n_{\text{opp}}) + m,$$
+  sau đó tính $s_{uv} = p_{\text{sup}} - p_{\text{opp}} \in [-1, 1]$ kèm nhãn `root_s_uv` đối với nút sâu (`depth >= 2`). Checkpoint chấm điểm ghi delta JSONL gia tăng $\mathcal{O}(N)$ và tận dụng song song đa GPU `T4 x 2`.
+- **Hostility Teacher ($h_{uv} \in [0, 1]$)**: Tinh chỉnh `uitnlp/visobert` với trọng số lớp cân bằng căn bậc hai nghịch đảo tần suất, warmup + cosine trên `UIT-ViHSD` (Tiếng Việt) hoặc dùng `cardiffnlp/twitter-roberta-base-offensive` (Tiếng Anh).
 
-### 3.2. Chưng cất Student Cô lập Phân đoạn (`DualHeadCrossEncoder`)
-- Đầu vào `(context_u, v)` (`context_u = root[:220] | parent` khi bật `--include-root-context`).
+### 3.2. Chưng cất Student *Reply-Span Pooled* (`DualHeadCrossEncoder`)
+- Đầu vào `(context_u, v)` (`context_u = root_head_tail [SEP] parent` theo ngân sách token khi bật `--include-root-context`, bảo toàn 60% đầu + 40% cuối bài gốc và ít nhất nửa ngân sách cho `reply`).
 - Đầu lập trường gộp 5 khối tương tác quan hệ trên mặt nạ ngữ cảnh $\mathbf{h}_{\text{ctx}}$ (`context_mask == 1`) và mặt nạ phản hồi $\mathbf{h}_{\text{reply}}$ (`reply_mask == 1`) để dự đoán 3 logits `stance`:
   $$\mathbf{r}_{\text{rel}} = \left[\mathbf{h}_{\text{CLS}} \;\parallel\; \mathbf{h}_{\text{ctx}} \;\parallel\; \mathbf{h}_{\text{reply}} \;\parallel\; (\mathbf{h}_{\text{ctx}} \odot \mathbf{h}_{\text{reply}}) \;\parallel\; |\mathbf{h}_{\text{ctx}} - \mathbf{h}_{\text{reply}}|\right] \in \mathbb{R}^{5 d_{\text{PLM}}}$$
-  đi qua phép chiếu `Linear -> LayerNorm -> GELU -> Dropout`; trong khi đầu gay gắt $h_{uv}$ **chỉ đọc vector phân đoạn phản hồi cô lập** `Dropout(LayerNorm(h_reply))` để ngôn từ gay gắt ở bài cha không làm nhiễu nhãn $h_{uv}$ của bình luận con hiền hòa.
-- Tối ưu `BCEWithLogitsLoss` (cho $h_{uv}$) + KL ($T=2.0$) trên $\mathcal{T}_{\text{train}}$, tăng cường thêm cặp sâu `(root, deep_reply)` và dùng AdamW phân tầng tốc độ học (encoder vs. heads). Khi `scored_cache_json` đã phủ 100% `root_s_uv` của Teacher, `extract_features.py` dùng trực tiếp cache đó mà không chạy dư lượt Cross-Encoder sâu.
+  đi qua phép chiếu `Linear -> LayerNorm -> GELU -> Dropout`; trong khi đầu gay gắt $h_{uv}$ **chỉ đọc vector phân đoạn phản hồi (`reply-span pooling`)** `Dropout(LayerNorm(h_reply))` để giảm thiểu nhiễu ngôn từ gay gắt từ bài cha sang bình luận con hiền hòa.
+- Tối ưu $T^2 \cdot \operatorname{KL}(T=2.0) + 0.5 \cdot \operatorname{SmoothL1}(s_{uv}) + \operatorname{BCEWithLogitsLoss}(h_{uv})$ trên $\mathcal{T}_{\text{train}}$, tăng cường thêm cặp sâu `(root, deep_reply)` và dùng AdamW phân tầng tốc độ học (encoder vs. heads) hỗ trợ FP16 trên `nn.DataParallel`. Khi `scored_cache_json` đã phủ 100% các chuỗi đủ điều kiện (`--min-total-replies 25`), `extract_features.py` chỉ mã hóa các chuỗi đủ điều kiện và lưu giữ `teacher_edge_*` / `teacher_node_root_stance` sạch cho giao thức PHEME LOO.
 
 ---
 
@@ -95,15 +97,18 @@ $$\mathbf{r}_v^{(l, \delta)} = 0.5\,\mathbf{h}_v^{(l-1, \delta)} + \varepsilon \
 Sau mỗi tầng, **Dir-GNN Cross-Mixing** trộn hai hướng với hệ số học được $\tanh(\eta_l)$:
 $$\mathbf{h}^{\text{TD}} \leftarrow \mathbf{h}^{\text{TD}} + \tanh(\eta_l) \mathbf{W}_{\text{mix}}^{\text{TD}} \mathbf{h}^{\text{BU}}, \qquad \mathbf{h}^{\text{BU}} \leftarrow \mathbf{h}^{\text{BU}} + \tanh(\eta_l) \mathbf{W}_{\text{mix}}^{\text{BU}} \mathbf{h}^{\text{TD}}.$$
 
-Ở tầng Readout, ngoài $\mathbf{z}_{\text{root}}, \mathbf{z}_{\text{att}}$ và độ phân tán nút $\mathbf{z}_{\text{disp}}$, hàm `_propagate_root_aligned_edge_signal` (tối đa **64 bước BFS**) quy chiếu dấu $\gamma_{uv}$ về gốc $r$ để tính cặp cực phe $\mathbf{z}_{\text{dipole}}^{\text{polar}}, \mathbf{z}_{\text{dipole}}^{\text{signed}}$ cùng 6 mô-men cổng vô hướng, ghép nối $5d + 6$ chiều chiếu về $2d = 128$ chiều trước `MultiTaskHead`.
+Ở tầng Readout, ngoài $\mathbf{z}_{\text{root}}, \mathbf{z}_{\text{att}}$ và độ phân tán nút $\mathbf{z}_{\text{disp}}$, hàm `_propagate_root_aligned_edge_signal` (tối đa **64 bước BFS**) quy chiếu dấu cổng tầng cuối về gốc $r$ bằng hệ số định hướng cha tách gradient $p_{\text{sign}}(u) = \operatorname{clip}(\operatorname{detach}(u_{\text{ori}})/0.1, -1, 1) \in [-1, 1]$ (tránh bùng nổ Jacobian qua chuỗi sâu) để tính cặp cực phe **Camp Dipole**:
+$$w_{uv}^\pm = \sigma\!\left(12(\pm\hat{\gamma}_{uv} - 0.25)\right), \quad \boldsymbol{\mu}_\pm = \frac{\sum w_{uv}^\pm \mathbf{h}_v}{\sum w_{uv}^\pm + 1}, \quad b = 4 f_+ f_-,$$
+$$\mathbf{z}_{\text{dipole}}^{\text{polar}} = b\sqrt{(\boldsymbol{\mu}_+ - \boldsymbol{\mu}_-)^2 + 10^{-8}}, \qquad \mathbf{z}_{\text{dipole}}^{\text{signed}} = \boldsymbol{\mu}_+ - \boldsymbol{\mu}_-,$$
+cùng 6 mô-men cổng vô hướng (`g_mean, g_std, g_abs_mean, frac_pos, frac_neg, camp_balance`), ghép nối $5d + 6$ chiều chiếu về $2d = 128$ chiều trước `MultiTaskHead` (biến thể cắt bỏ *w/o Camp Dipole & Moments* khóa về `0` toàn bộ khối phân tán, lưỡng cực phe và 6 mô-men này).
 
 ---
 
 ## 5. Nhãn Mục tiêu & Tối ưu Đa nhiệm
 
-1. **Nhãn mục tiêu**:
-   $$y_{\text{size}} = \ln(1 + N_{\text{total}}), \qquad y_{\text{polar}} = \operatorname{clip}\!\left(0.5\,\sigma_{\tilde{s}}^2 + 0.5\,(4 p_+ p_-),\, 0,\, 1\right),$$
-   tính trên tương tác tương lai $t > t_K$ (`polar_target_mode="future_only"`).
+1. **Nhãn mục tiêu liên tục khử chệch cỡ mẫu trước phép kẹp `[0, 1]`**:
+   $$y_{\text{size}} = \ln(1 + N_{\text{total}}), \qquad y_{\text{polar}} = \operatorname{clip}\!\left(0.5\,\min(1, s_{\tilde{s}, \text{ddof}=1}^2) + 0.5\,\min\!\left(1, \frac{4n}{n-1} m_+ m_-\right),\, 0,\, 1\right),$$
+   trong đó $m_+ = \frac{1}{n}\sum_i \max(\tilde{s}_i, 0)$, $m_- = \frac{1}{n}\sum_i \max(-\tilde{s}_i, 0)$ tính trên $n \ge 2$ tương tác tương lai $t > t_K$ (`polar_target_mode="future_only"`, với cửa sổ đích cố định $t > K_{\max}$ trong đường cong độ nhạy $K$; hệ số $\frac{n}{n-1}$ khử đúng độ chệch cỡ mẫu của tích $m_+ m_-$ *trước* phép kẹp $\min(1, \cdot)$ dưới giả định rút mẫu i.i.d.). Hai biến kiểm chứng cấu trúc độc lập `y_bimodality` (Sarle BC) và `y_assortativity` (Signed Newman Assortativity) được gắn kèm để báo cáo tương quan `construct_corr_bc` và `construct_corr_assort`.
 2. **Hàm mất mát Đa nhiệm Chuẩn hóa Hiệu chỉnh KL**:
    - Đầu $y_{\text{polar}}$ xuất cả logit $z_{\text{polar}}$ và $\hat{y}_{\text{polar}} = \sigma(z_{\text{polar}})$.
    - Sử dụng **KL-calibrated `BCEWithLogitsLoss`** (trừ đi entropy mục tiêu $H(y_{\text{polar}})$ để giá trị cực tiểu đúng tại $\sigma(z)=y$ bằng chính xác `0.0`) cộng `SmoothL1(..., beta=0.08)`:

@@ -1,6 +1,6 @@
 # Tổng quan Tài liệu Học thuật & Xác minh Công trình Nền tảng
 
-Tài liệu này tổng hợp và xác minh thông tin xuất bản chính thức (tác giả, năm công bố, hội nghị/tạp chí, mã DOI/arXiv), công thức toán học cốt lõi và hạn chế của 8 công trình nền tảng liên quan trực tiếp đến đề tài **"Mạng nơ-ron đồ thị và xử lý ngôn ngữ tự nhiên trong mô hình hóa sự phân cực quan điểm và lan truyền thông tin trên mạng xã hội"** (kiến trúc đề xuất **SBi-FAGAT**). Mọi trích dẫn tương ứng được lưu chuẩn BibTeX tại [`paper/references.bib`](../paper/references.bib).
+Tài liệu này tổng hợp và xác minh thông tin xuất bản chính thức (tác giả, năm công bố, hội nghị/tạp chí, mã DOI/arXiv), công thức toán học cốt lõi và hạn chế của các công trình nền tảng liên quan trực tiếp đến đề tài **"Mạng nơ-ron đồ thị và xử lý ngôn ngữ tự nhiên trong mô hình hóa sự phân cực quan điểm và lan truyền thông tin trên mạng xã hội"** (kiến trúc đề xuất **SBi-FAGAT**). Mọi trích dẫn tương ứng được lưu chuẩn BibTeX tại [`paper/references.bib`](../paper/references.bib).
 
 ---
 
@@ -155,8 +155,8 @@ $$\mathcal{L}_{\text{MLM}}(\theta) = -\sum_{i \in \mathcal{M}} \ln P_\theta\left
 - **ViSoBERT (`nguyen2023visobert`)**:
   - **Tiêu đề**: *ViSoBERT: A Pre-Trained Language Model for Vietnamese Social Media Text Processing*
   - **Tác giả**: Quoc-Nam Nguyen, Thang Chau Phan, Duc-Vu Nguyen, Kiet Van Nguyen
-  - **Xuất bản**: *EMNLP 2023* (Main Conference), ACL Anthology `2023.emnlp-main.315` — DOI `10.48550/arXiv.2310.11166` | `arXiv:2310.11166`.
-  - **Vai trò trong SBi-FAGAT**: Là kiến trúc XLM-R tiền huấn luyện chuyên biệt trên ngữ liệu mạng xã hội tiếng Việt (hỗ trợ emoji, teencode, văn phong diễn đàn/Reddit với tokenizer SentencePiece), đảm nhiệm vai trò **bộ mã hóa nút đơn câu đóng băng** ($\mathbf{e}_v \in \mathbb{R}^{768}$), **bộ chấm độ gay gắt** ($h_{uv}$) khi tinh chỉnh trên `UIT-ViHSD`, và **bộ mã hóa chéo** `DualHeadCrossEncoder` nhánh tiếng Việt.
+  - **Xuất bản**: *EMNLP 2023* (Main Conference), pp. 5177–5191, ACL Anthology `2023.emnlp-main.315` — DOI `10.18653/v1/2023.emnlp-main.315` | `arXiv:2310.11166`.
+  - **Vai trò trong SBi-FAGAT**: Là kiến trúc XLM-R tiền huấn luyện chuyên biệt trên ngữ liệu mạng xã hội tiếng Việt (hỗ trợ emoji, teencode, văn phong diễn đàn/Reddit với tokenizer SentencePiece), đảm nhiệm vai trò **bộ mã hóa nút Ancestor-Conditioned SpanPool đóng băng** ($\mathbf{e}_v^{\text{Span}} \in \mathbb{R}^{768}$), **bộ chấm độ gay gắt** ($h_{uv}$) khi tinh chỉnh trên `UIT-ViHSD`, và **bộ mã hóa chéo** `DualHeadCrossEncoder` nhánh tiếng Việt.
 - **UIT-ViHSD (`luu2021vihsd`)**:
   - **Tiêu đề**: *A Large-scale Dataset for Hate Speech Detection on Vietnamese Social Media Texts*
   - **Tác giả**: Son T. Luu, Kiet Van Nguyen, Ngan Luu-Thuy Nguyen
@@ -168,7 +168,7 @@ $$\mathcal{L}_{\text{MLM}}(\theta) = -\sum_{i \in \mathcal{M}} \ln P_\theta\left
 ## 10. DeBERTaV3 & BERT-NLI / XNLI cho Suy luận Lập trường (`he2023debertav3`, `laurer2024less`)
 
 - **DeBERTaV3 (`he2023debertav3`)**: *DeBERTaV3: Improving DeBERTa using ELECTRA-Style Pre-Training with Gradient-Disentangled Embedding Sharing* — Pengcheng He, Jianfeng Gao, Weizhu Chen (*ICLR 2023*). Đưa ra cơ chế *disentangled attention* tách nội dung và vị trí tương đối cùng *ELECTRA-style Replaced Token Detection*, giúp mô hình hóa tốt quan hệ ngữ nghĩa cặp tiền đề–giả thuyết.
-- **BERT-NLI / Multilingual NLI (`laurer2024less`)**: *Less Annotating, More Classifying: Addressing the Data Scarcity Issue of Supervised Machine Learning with Deep Transfer Learning and BERT-NLI* — Moritz Laurer, Wouter van Atteveldt, Andreu Casas, Kasper Welbers (*Political Analysis*, Vol. 32, No. 1, pp. 84–100, 2024, DOI `10.1017/pan.2023.20`). Chứng minh khả năng suy luận lập trường/chủ đề ít nhãn bằng mô hình NLI đa ngữ (`mDeBERTa-v3-base-xnli-multilingual-nli-2mil7`), được dùng làm mô hình thầy tính $s_{uv} = P(\text{entailment}\mid u, v) - P(\text{contradiction}\mid u, v)$.
+- **BERT-NLI / Multilingual NLI (`laurer2024less`)**: *Less Annotating, More Classifying: Addressing the Data Scarcity Issue of Supervised Machine Learning with Deep Transfer Learning and BERT-NLI* — Moritz Laurer, Wouter van Atteveldt, Andreu Casas, Kasper Welbers (*Political Analysis*, Vol. 32, No. 1, pp. 84–100, 2024, DOI `10.1017/pan.2023.20`). Chứng minh khả năng suy luận lập trường/chủ đề ít nhãn bằng mô hình NLI đa ngữ (`mDeBERTa-v3-base-xnli-multilingual-nli-2mil7`), được dùng làm mô hình thầy theo **Symmetric 2-Hypothesis Stance Verbalizer** (đánh giá hai giả thuyết đối xứng *ủng hộ* vs. *phản đối*, gán mâu thuẫn kép $\min(c_{\text{sup}}, c_{\text{opp}})$ về *neutral*, tính $s_{uv} = p_{\text{sup}} - p_{\text{opp}}$).
 
 ---
 
@@ -184,19 +184,20 @@ $$\mathcal{L}_{\text{MLM}}(\theta) = -\sum_{i \in \mathcal{M}} \ln P_\theta\left
 
 ---
 
-## 12. Các Công trình Nâng cấp & Nền tảng Kiểm chứng cho SBi-FAGAT (`platonov2023critical`, `pfister2013good`, `li2017deepcas`)
+## 12. Các Công trình Nâng cấp & Nền tảng Kiểm chứng cho SBi-FAGAT (`platonov2023critical`, `rossi2023edge`, `pfister2013good`, `li2017deepcas`)
 
 1. **Đánh giá GNN dưới Heterophily (`platonov2023critical`)**: Oleg Platonov et al. (*ICLR 2023*, `arXiv:2302.11640`) chứng minh tầm quan trọng của tách phân hoạch nghiêm ngặt không trùng thực thể (`topic_splits.json`), tiền chuẩn hóa (Pre-Norm) và cơ chế kết nối dư khi cạnh mang tính dị biệt lập trường (*heterophily*).
-2. **DeepCas & Bimodality Coefficient (`li2017deepcas`, `pfister2013good`)**: Thành phần dự báo quy mô lan truyền theo cửa sổ sớm kế thừa bài toán từ *DeepCas* (*WWW '17*, `arXiv:1611.05373`), trong khi kiểm chứng phân đôi lập trường độc lập tham chiếu công thức *Sarle Bimodality Coefficient* của Pfister et al. (*Frontiers in Psychology 2013*, DOI `10.3389/fpsyg.2013.00700`).
+2. **Dir-GNN cho Đồ thị Có hướng Dị biệt (`rossi2023edge`)**: Emanuele Rossi, Bertrand Charpentier, Francesco Di Giovanni, Fabrizio Frasca, Stephan Günnemann (*LoG 2023*, PMLR 231, `arXiv:2305.10498`, DOI `10.48550/arXiv.2305.10498`) chứng minh việc tách biệt phép tổng hợp theo chiều đi (Top-Down) và chiều ngược (Bottom-Up) kết hợp trộn có học cải thiện mạnh hiệu năng trên đồ thị dị biệt — là cơ sở lý thuyết trực tiếp cho tầng trộn hai hướng Dir-GNN trong `SBi-FAGAT`.
+3. **DeepCas & Bimodality Coefficient (`li2017deepcas`, `pfister2013good`)**: Thành phần dự báo quy mô lan truyền theo cửa sổ sớm kế thừa bài toán từ *DeepCas* (*WWW '17*, DOI `10.1145/3038912.3052643`, `arXiv:1611.05373`), trong khi kiểm chứng phân đôi lập trường độc lập tham chiếu công thức *Sarle Bimodality Coefficient* của Pfister et al. (*Frontiers in Psychology 2013*, DOI `10.3389/fpsyg.2013.00700`).
 
 ---
 
 ## 13. Ma trận Đối sánh Tổng hợp: Khoảng trống Nghiên cứu & Đóng góp của SBi-FAGAT
 
-| Công trình / Mô hình | Lan truyền 2 chiều (Dir-GNN TD + BU) | Tín hiệu cạnh 2D $[s_{uv}, h_{uv}]$ | Bộ lọc đối xứng dấu + Kênh kích thích | Teacher NLI + Hostility $\to$ Segment-Isolated Student | Công bằng `hidden_dim=64`, 10D `struct_x`, 8D Stats | Đa nhiệm Quy mô + Phân cực (+ Tin đồn) |
+| Công trình / Mô hình | Lan truyền 2 chiều (Dir-GNN TD + BU) | Tín hiệu cạnh 2D $[s_{uv}, h_{uv}]$ | Bộ lọc đối xứng dấu + Kênh kích thích | Teacher NLI + Hostility $\to$ Reply-Span Student | Công bằng `hidden_dim=64`, 10D `struct_x`, 8D Stats | Đa nhiệm Quy mô + Phân cực (+ Tin đồn) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **GCN** (`kipf2017semisupervised`) | Không (Vô hướng) | Không | Không (Thông thấp) | Không | Có (trên benchmark) | Có (qua `MultiTaskHead`) |
-| **GATv2** (`brody2022how`) | Không | Không | Không ($\alpha_{ij} > 0$) | Có thể nhận `edge_attr` | Có | Có |
+| **GATv2 / EdgeGATv2** (`brody2022how`) | Không (hoặc BiEdgeGATv2 đối chứng) | Có (bản `EdgeGATv2` / `BiEdgeGATv2`) | Không ($\alpha_{ij} > 0$) | Nhận `edge_attr` nếu cấp ngoài | Có | Có |
 | **SGCN** (`derr2018signed`) | Không (Vô hướng) | Rời rạc $\{-1, +1\}$ | Cân bằng $B/U$ cứng | Không | Không | Không |
 | **Bi-GCN** (`bian2020rumor`) | **Có (TD + BU)** | Không | Không (Thông thấp) | Không | Có | Có |
 | **FAGCN** (`bo2021beyond`) | Không (Vô hướng) | Ngầm định $\alpha_{ij}^G$ | **Có ($\tanh$)** | Không | Có | Có |

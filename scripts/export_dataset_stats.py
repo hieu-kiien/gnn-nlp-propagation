@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -28,18 +29,22 @@ from src.data.pyg_dataset import (
 )
 from src.data.schema import load_cascade_parquet
 from src.training.metrics import evaluate_predictions
+from src.training.reporting import _sanitize_json_value
 
 
 def compute_early_k_persistence_metrics(
     test_cascades: Sequence[Any],
     *,
     lambda_polar: float = 0.5,
+    train_cascades: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate a strictly causal Early-K Persistence Baseline on test cascades.
 
     Predicts future polarization solely by evaluating the exact polarization metric
-    on the observed early tree G_K (first K chronological interactions), and predicts
-    log-size solely from the currently observed reply count ln(1 + |V_K| - 1).
+    on the observed early tree G_K (first K chronological interactions, using causal
+    root-aligned orientations on V_K). Predicts log-size via the Train-split mean
+    when `train_cascades` is provided (avoiding the constant `ln(1+K)` strawman),
+    falling back to `ln(1 + |V_K| - 1)` when invoked standalone without a train split.
     """
     if not test_cascades:
         return {
@@ -58,6 +63,12 @@ def compute_early_k_persistence_metrics(
             "mean_early_polar": float("nan"),
         }
 
+    train_mean_size: float | None = None
+    if train_cascades:
+        tr_sizes = [float(c.y_size.view(-1)[0].item()) for c in train_cascades if hasattr(c, "y_size")]
+        if tr_sizes:
+            train_mean_size = float(np.mean(tr_sizes))
+
     y_size_trues: list[float] = []
     y_size_preds: list[float] = []
     y_polar_trues: list[float] = []
@@ -67,37 +78,44 @@ def compute_early_k_persistence_metrics(
         y_size_trues.append(float(d.y_size.view(-1)[0].item()))
         y_polar_trues.append(float(d.y_polar.view(-1)[0].item()))
 
-        num_nodes = int(getattr(d, "num_nodes", int(d.x.size(0))))
-        y_size_preds.append(math.log1p(max(0, num_nodes - 1)))
+        if train_mean_size is not None:
+            y_size_preds.append(train_mean_size)
+        else:
+            num_nodes = int(getattr(d, "num_nodes", int(d.x.size(0))))
+            y_size_preds.append(math.log1p(max(0, num_nodes - 1)))
 
-        edge_index_td = getattr(d, "edge_index_td", getattr(d, "edge_index", None))
-        raw_attr = getattr(d, "edge_attr", None)
-        if raw_attr is None:
-            raw_attr = getattr(d, "edge_stance", None)
+        early_rs = getattr(d, "early_node_root_stance", None)
+        if early_rs is not None and early_rs.numel() > 1:
+            aligned = [float(v) for v in early_rs.view(-1)[1:].detach().cpu().tolist()]
+        else:
+            edge_index_td = getattr(d, "edge_index_td", getattr(d, "edge_index", None))
+            raw_attr = getattr(d, "edge_attr", None)
+            if raw_attr is None:
+                raw_attr = getattr(d, "edge_stance", None)
 
-        root_tensor = getattr(d, "root_index", None)
-        root_id = str(int(root_tensor.view(-1)[0].item())) if root_tensor is not None else "0"
+            root_tensor = getattr(d, "root_index", None)
+            root_id = str(int(root_tensor.view(-1)[0].item())) if root_tensor is not None else "0"
 
-        children_adj: dict[str, list[str]] = {}
-        stance_map: dict[tuple[str, str], float] = {}
-        if edge_index_td is not None and edge_index_td.numel() > 0:
-            num_edges = int(edge_index_td.size(1))
-            for idx in range(num_edges):
-                u_str = str(int(edge_index_td[0, idx].item()))
-                v_str = str(int(edge_index_td[1, idx].item()))
-                children_adj.setdefault(u_str, []).append(v_str)
-                if raw_attr is not None and raw_attr.numel() > 0:
-                    s_uv = float(raw_attr[idx, 0].item()) if raw_attr.dim() == 2 else float(raw_attr[idx].item())
-                else:
-                    s_uv = 0.0
-                stance_map[(u_str, v_str)] = float(min(1.0, max(-1.0, s_uv)))
+            children_adj: dict[str, list[str]] = {}
+            stance_map: dict[tuple[str, str], float] = {}
+            if edge_index_td is not None and edge_index_td.numel() > 0:
+                num_edges = int(edge_index_td.size(1))
+                for idx in range(num_edges):
+                    u_str = str(int(edge_index_td[0, idx].item()))
+                    v_str = str(int(edge_index_td[1, idx].item()))
+                    children_adj.setdefault(u_str, []).append(v_str)
+                    if raw_attr is not None and raw_attr.numel() > 0:
+                        s_uv = float(raw_attr[idx, 0].item()) if raw_attr.dim() == 2 else float(raw_attr[idx].item())
+                    else:
+                        s_uv = 0.0
+                    stance_map[(u_str, v_str)] = float(min(1.0, max(-1.0, s_uv)))
 
-        aligned = _compute_root_aligned_stances(
-            root_id=root_id,
-            children_adj=children_adj,
-            edge_lookup={},
-            stance_map=stance_map,
-        )
+            aligned = _compute_root_aligned_stances(
+                root_id=root_id,
+                children_adj=children_adj,
+                edge_lookup={},
+                stance_map=stance_map,
+            )
         y_polar_preds.append(float(_compute_full_tree_polarization(aligned, lambda_polar=lambda_polar)))
 
     metrics = evaluate_predictions(
@@ -237,6 +255,11 @@ def compute_dataset_statistics(
             y_sizes = [float(it.y_size.view(-1)[0].item()) for it in all_items]
             y_polars = [float(it.y_polar.view(-1)[0].item()) for it in all_items]
             y_bcs = [float(it.y_bimodality.view(-1)[0].item()) for it in all_items]
+            y_assorts = [
+                float(it.y_assortativity.view(-1)[0].item())
+                for it in all_items
+                if hasattr(it, "y_assortativity")
+            ]
             summary["target_stats"] = {
                 "num_cascades": len(all_items),
                 "y_size_mean": float(np.mean(y_sizes)),
@@ -244,9 +267,11 @@ def compute_dataset_statistics(
                 "y_polar_mean": float(np.mean(y_polars)),
                 "y_polar_std": float(np.std(y_polars)),
                 "y_bimodality_mean": float(np.mean(y_bcs)),
+                "y_assortativity_mean": float(np.mean(y_assorts)) if y_assorts else 0.0,
             }
         summary["early_k_persistence"] = compute_early_k_persistence_metrics(
-            list(split_datasets["test"])
+            list(split_datasets["test"]),
+            train_cascades=list(split_datasets["train"]),
         )
 
     return summary
@@ -275,9 +300,16 @@ def format_dataset_stats_latex(
         mean_rep = float(item.get("mean_replies", 0.0))
         med_dur = float(item.get("median_duration_hours", 0.0))
         persist = item.get("early_k_persistence")
-        if isinstance(persist, Mapping) and int(persist.get("num_cascades", 0)) > 0:
-            p_rmse = f"{float(persist['rmse']):.4f}"
-            p_r = f"{float(persist['pearson_r']):.4f}"
+        if (
+            isinstance(persist, Mapping)
+            and int(persist.get("num_cascades", 0) or 0) > 0
+            and persist.get("rmse") is not None
+            and persist.get("pearson_r") is not None
+        ):
+            rmse_val = float(persist["rmse"])
+            r_val = float(persist["pearson_r"])
+            p_rmse = f"{rmse_val:.4f}" if math.isfinite(rmse_val) else "--"
+            p_r = f"{r_val:.4f}" if math.isfinite(r_val) else "--"
         else:
             p_rmse = "--"
             p_r = "--"
@@ -292,6 +324,7 @@ def format_dataset_stats_latex(
             "\\centering",
             f"\\caption{{{caption}}}",
             f"\\label{{{label}}}",
+            "\\resizebox{\\textwidth}{!}{",
             "\\begin{tabular}{lcccccccc}",
             "\\toprule",
             "Dataset & Raw & Forecast ($\\ge 25$) & Topics & Train/Val/Test & Med (Mean) Replies & Med Span (h) & Persist RMSE$\\downarrow$ & Persist $r$$\\uparrow$ \\\\",
@@ -299,6 +332,7 @@ def format_dataset_stats_latex(
             *rows,
             "\\bottomrule",
             "\\end{tabular}",
+            "}",
             "\\end{table*}",
             "",
         ]
@@ -315,9 +349,16 @@ def format_dataset_stats_markdown(stats_list: Sequence[Mapping[str, Any]]) -> st
         sp = item.get("split_cascade_counts", {})
         split_str = f"{int(sp.get('train', 0))}/{int(sp.get('val', 0))}/{int(sp.get('test', 0))}"
         persist = item.get("early_k_persistence")
-        if isinstance(persist, Mapping) and int(persist.get("num_cascades", 0)) > 0:
-            p_rmse = f"{float(persist['rmse']):.4f}"
-            p_r = f"{float(persist['pearson_r']):.4f}"
+        if (
+            isinstance(persist, Mapping)
+            and int(persist.get("num_cascades", 0) or 0) > 0
+            and persist.get("rmse") is not None
+            and persist.get("pearson_r") is not None
+        ):
+            rmse_val = float(persist["rmse"])
+            r_val = float(persist["pearson_r"])
+            p_rmse = f"{rmse_val:.4f}" if math.isfinite(rmse_val) else "--"
+            p_r = f"{r_val:.4f}" if math.isfinite(r_val) else "--"
         else:
             p_rmse = "--"
             p_r = "--"
@@ -345,6 +386,8 @@ def _resolve_eda_table_label(
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="Export Table 1 Dataset EDA & Early-K Persistence Baseline."
     )
@@ -406,7 +449,12 @@ def main() -> None:
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(
-            json.dumps({"datasets": stats_list}, indent=2, ensure_ascii=False),
+            json.dumps(
+                _sanitize_json_value({"datasets": stats_list}),
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            ),
             encoding="utf-8",
         )
         print(f"Saved JSON stats -> {args.output_json}")

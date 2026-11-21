@@ -20,6 +20,7 @@ import argparse
 import gc
 import json
 import math
+import sys
 from collections import deque
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -45,6 +46,7 @@ from src.nlp.dual_edge_scorer import (
     _encode_no_specials,
     _inspect_pair_tokenizer,
     _normalize_nfc,
+    _truncate_head_tail,
     encode_cross_encoder_batch,
     load_tokenizer_safe,
     normalize_social_text,
@@ -125,7 +127,8 @@ def encode_node_embeddings(
             target_ids = _encode_no_specials(tokenizer, t_norm)
             if not p_norm and not r_norm:
                 content_budget = max(1, eff_max - 2)
-                target_keep = target_ids[:content_budget]
+                # Preserve 60% opening claim + 40% closing verdict/TL;DR on long root posts
+                target_keep = _truncate_head_tail(target_ids, content_budget, head_ratio=0.6)
                 seq = [cls_id] + target_keep + [sep_id]
                 span = (
                     [0] + [1] * len(target_keep) + [0]
@@ -145,7 +148,8 @@ def encode_node_embeddings(
                     parent_ids = _encode_no_specials(tokenizer, p_norm)
                     root_cap = min(len(root_ids), max(1, ctx_budget // 3))
                     parent_cap = min(len(parent_ids), max(0, ctx_budget - 1 - root_cap))
-                    root_keep = root_ids[: min(len(root_ids), max(0, ctx_budget - 1 - parent_cap))]
+                    root_budget = min(len(root_ids), max(0, ctx_budget - 1 - parent_cap))
+                    root_keep = _truncate_head_tail(root_ids, root_budget, head_ratio=0.6)
                     parent_keep = parent_ids[:parent_cap]
                     if root_keep and parent_keep:
                         ctx_ids = root_keep + [sep_id] + parent_keep
@@ -153,7 +157,12 @@ def encode_node_embeddings(
                         ctx_ids = root_keep or parent_keep
                 else:
                     ctx_str = p_norm or r_norm
-                    ctx_ids = _encode_no_specials(tokenizer, ctx_str)[:ctx_budget]
+                    raw_ctx_ids = _encode_no_specials(tokenizer, ctx_str)
+                    # Depth-1 replies directly to root also receive 60/40 Head+Tail root truncation
+                    if r_norm and (not p_norm or r_norm == p_norm):
+                        ctx_ids = _truncate_head_tail(raw_ctx_ids, ctx_budget, head_ratio=0.6)
+                    else:
+                        ctx_ids = raw_ctx_ids[:ctx_budget]
 
                 reply_budget = max(1, content_budget - len(ctx_ids))
                 target_keep = target_ids[:reply_budget]
@@ -258,8 +267,13 @@ def encode_edges_with_cross_encoder(
         with _cuda_autocast(enabled=use_amp):
             out = cross_encoder(**enc_dev)
         if not torch.isfinite(out["s_uv"]).all() or not torch.isfinite(out["h_uv"]).all():
-            with _cuda_autocast(enabled=False):
-                out = cross_encoder(**enc_dev)
+            prev_amp = getattr(cross_encoder, "_amp_enabled", False)
+            cross_encoder._amp_enabled = False
+            try:
+                with _cuda_autocast(enabled=False):
+                    out = cross_encoder(**enc_dev)
+            finally:
+                cross_encoder._amp_enabled = prev_amp
         all_s.append(out["s_uv"].cpu().to(dtype=torch.float32))
         all_h.append(out["h_uv"].cpu().to(dtype=torch.float32))
         all_probs.append(out["stance_probs"].cpu().to(dtype=torch.float32))
@@ -289,9 +303,8 @@ def compute_leakage_free_node_metadata(
 ) -> Tensor:
     """Compute `[N_nodes, 2]` normalized `[t_norm, depth_norm]` without future-node leakage.
 
-    For each cascade, `max_delay_k` used in temporal scaling is computed ONLY from
-    the first `k_horizon` chronological replies + root (never peeking at replies
-    beyond `K`), and clamped cleanly into `[0.0, 1.0]`.
+    Temporal scaling uses the fixed causal 7-day logarithmic horizon (`TEMPORAL_REF_SECONDS`)
+    and topological depth is normalized by `k_horizon`, clamping both cleanly into `[0.0, 1.0]`.
     """
     node_rows = nodes_table.to_pylist()
     edge_rows = edges_table.to_pylist()
@@ -306,6 +319,7 @@ def compute_leakage_free_node_metadata(
     for row in edge_rows:
         edges_by_cascade.setdefault(str(row["cascade_id"]), []).append(row)
 
+    denom_t = math.log1p(TEMPORAL_REF_SECONDS)
     for cid, c_nodes in nodes_by_cascade.items():
         c_edges = edges_by_cascade.get(cid, [])
         root_row = next(n for n in c_nodes if bool(n["is_root"]))
@@ -324,16 +338,6 @@ def compute_leakage_free_node_metadata(
                 if child not in depth_map:
                     depth_map[child] = depth_map[curr] + 1
                     q.append(child)
-
-        non_roots = [n for n in c_nodes if not bool(n["is_root"])]
-        non_roots.sort(
-            key=lambda n: (
-                n["created_at_utc"],
-                depth_map.get(str(n["node_id"]), 10**6),
-                str(n["node_id"]),
-            )
-        )
-        denom_t = math.log1p(TEMPORAL_REF_SECONDS)
 
         for n in c_nodes:
             nid = str(n["node_id"])
@@ -425,10 +429,16 @@ def extract_and_save_features(
     batch_size: int = 32,
     max_length: int = 256,
     k_horizon: int = 20,
+    min_total_replies: int = 0,
     device: torch.device | None = None,
     include_node_features_770: bool = False,
 ) -> Path:
-    """Extract frozen 768-d node embeddings and 2D/4D edge attributes (`[s, h]` or `[s, h, r, c]`)."""
+    """Extract frozen 768-d node embeddings and 2D/4D edge attributes (`[s, h]` or `[s, h, r, c]`).
+
+    When `min_total_replies > 0`, Transformer encoding and 100% Teacher coverage checks are
+    scoped to eligible forecasting cascades (`>= min_total_replies` replies), while preserving
+    the full raw `nodes.parquet`/`edges.parquet` in `output_dir` for complete EDA accounting.
+    """
     if edge_dim is not None and edge_dim not in {2, 4}:
         raise ValueError(f"edge_dim must be 2 or 4, got {edge_dim}")
     lang = "en" if dataset == "pheme" else "vi"
@@ -441,10 +451,25 @@ def extract_and_save_features(
     node_rows = nodes_tbl.to_pylist()
     edge_rows = edges_tbl.to_pylist()
 
+    reply_counts_by_cascade: dict[str, int] = {}
+    for r in node_rows:
+        cid = str(r["cascade_id"])
+        if not bool(r.get("is_root")):
+            reply_counts_by_cascade[cid] = reply_counts_by_cascade.get(cid, 0) + 1
+    if int(min_total_replies) > 0:
+        eligible_cascades = {
+            cid for cid, cnt in reply_counts_by_cascade.items() if cnt >= int(min_total_replies)
+        }
+    else:
+        eligible_cascades = {str(r["cascade_id"]) for r in node_rows}
+
     node_ids = [str(r["node_id"]) for r in node_rows]
     node_texts = [str(r["text"]) for r in node_rows]
     node_text_by_id = dict(zip(node_ids, node_texts))
     node_id_to_idx = {nid: idx for idx, nid in enumerate(node_ids)}
+    eligible_node_indices = [
+        idx for idx, r in enumerate(node_rows) if str(r["cascade_id"]) in eligible_cascades
+    ]
 
     cascade_root_id: dict[str, str] = {}
     for r in node_rows:
@@ -468,6 +493,10 @@ def extract_and_save_features(
 
     edge_ids = [str(r["edge_id"]) for r in edge_rows]
     edge_id_to_idx = {eid: idx for idx, eid in enumerate(edge_ids)}
+    eligible_edge_indices = [
+        idx for idx, r in enumerate(edge_rows) if str(r["cascade_id"]) in eligible_cascades
+    ]
+    eligible_edge_ids = [edge_ids[idx] for idx in eligible_edge_indices]
     parent_texts = [node_text_by_id[str(r["source_id"])] for r in edge_rows]
     reply_texts = [node_text_by_id[str(r["target_id"])] for r in edge_rows]
     edge_target_ids = [str(r["target_id"]) for r in edge_rows]
@@ -503,17 +532,42 @@ def extract_and_save_features(
     if active_tok is None:
         active_tok = load_tokenizer_safe(default_backbone)
 
-    node_embeddings = encode_node_embeddings(
-        node_texts,
-        encoder=active_encoder,
-        tokenizer=active_tok,
-        parent_texts=node_parent_texts,
-        root_texts=node_root_texts,
-        lang=lang,
-        batch_size=batch_size,
-        max_length=max_length,
-        device=target_device,
-    )
+    hidden_dim = int(getattr(getattr(active_encoder, "config", None), "hidden_size", 768))
+    if int(min_total_replies) > 0 and len(eligible_node_indices) < len(node_rows):
+        node_embeddings = torch.zeros((len(node_rows), hidden_dim), dtype=torch.float32)
+        if eligible_node_indices:
+            sub_emb = encode_node_embeddings(
+                [node_texts[i] for i in eligible_node_indices],
+                encoder=active_encoder,
+                tokenizer=active_tok,
+                parent_texts=(
+                    [node_parent_texts[i] for i in eligible_node_indices]
+                    if node_parent_texts is not None
+                    else None
+                ),
+                root_texts=(
+                    [node_root_texts[i] for i in eligible_node_indices]
+                    if node_root_texts is not None
+                    else None
+                ),
+                lang=lang,
+                batch_size=batch_size,
+                max_length=max_length,
+                device=target_device,
+            )
+            node_embeddings[torch.tensor(eligible_node_indices, dtype=torch.long)] = sub_emb
+    else:
+        node_embeddings = encode_node_embeddings(
+            node_texts,
+            encoder=active_encoder,
+            tokenizer=active_tok,
+            parent_texts=node_parent_texts,
+            root_texts=node_root_texts,
+            lang=lang,
+            batch_size=batch_size,
+            max_length=max_length,
+            device=target_device,
+        )
     if owns_node_encoder:
         active_encoder.cpu()
         del active_encoder
@@ -549,16 +603,16 @@ def extract_and_save_features(
             if isinstance(item, dict) and item.get("edge_id") is not None
         }
     full_teacher_coverage = bool(
-        edge_ids
+        eligible_edge_ids
         and cache_by_eid
         and all(
             eid in cache_by_eid and "s_uv" in cache_by_eid[eid] and "h_uv" in cache_by_eid[eid]
-            for eid in edge_ids
+            for eid in eligible_edge_ids
         )
     )
 
     if loaded_ckpt_model is not None:
-        # System-1 Student Cross-Encoder scores ALL edges consistently across Train/Val/Test
+        # System-1 Student Cross-Encoder scores ALL eligible edges consistently across Train/Val/Test
         ckpt_edge_dim = int(getattr(loaded_ckpt_model, "edge_dim", 2))
         if edge_dim is None:
             effective_edge_dim = ckpt_edge_dim
@@ -570,38 +624,54 @@ def extract_and_save_features(
             include_root_context or getattr(loaded_ckpt_model, "include_root_context", False)
         )
         edge_tok = loaded_ckpt_tok if loaded_ckpt_tok is not None else active_tok
-        edge_pred = encode_edges_with_cross_encoder(
-            parent_texts,
-            reply_texts,
-            cross_encoder=loaded_ckpt_model,
-            tokenizer=edge_tok,
-            root_texts=edge_root_texts,
-            include_root_context=effective_root_ctx,
-            lang=lang,
-            batch_size=batch_size,
-            max_length=max_length,
-            device=target_device,
-        )
-        s_arr = edge_pred["s_uv"]
-        h_arr = edge_pred["h_uv"]
-        pred_labels = edge_pred["pred_label"]
+        s_arr = np.zeros(len(edge_ids), dtype=np.float32)
+        h_arr = np.zeros(len(edge_ids), dtype=np.float32)
+        pred_labels = ["neutral"] * len(edge_ids)
         if effective_edge_dim == 4:
-            r_arr = edge_pred.get("r_uv", np.zeros(len(edge_ids), dtype=np.float32))
-            c_arr = edge_pred.get("c_uv", np.full(len(edge_ids), 0.5, dtype=np.float32))
-            behavior_labels = edge_pred.get("behavior_label")
+            r_arr = np.zeros(len(edge_ids), dtype=np.float32)
+            c_arr = np.full(len(edge_ids), 0.5, dtype=np.float32)
+            behavior_labels = ["neutral"] * len(edge_ids)
+
+        if eligible_edge_indices:
+            edge_pred = encode_edges_with_cross_encoder(
+                [parent_texts[i] for i in eligible_edge_indices],
+                [reply_texts[i] for i in eligible_edge_indices],
+                cross_encoder=loaded_ckpt_model,
+                tokenizer=edge_tok,
+                root_texts=[edge_root_texts[i] for i in eligible_edge_indices],
+                include_root_context=effective_root_ctx,
+                lang=lang,
+                batch_size=batch_size,
+                max_length=max_length,
+                device=target_device,
+            )
+            for pos, i in enumerate(eligible_edge_indices):
+                s_arr[i] = float(edge_pred["s_uv"][pos])
+                h_arr[i] = float(edge_pred["h_uv"][pos])
+                pred_labels[i] = str(edge_pred["pred_label"][pos])
+                if effective_edge_dim == 4:
+                    assert r_arr is not None and c_arr is not None and behavior_labels is not None
+                    if "r_uv" in edge_pred:
+                        r_arr[i] = float(edge_pred["r_uv"][pos])
+                    if "c_uv" in edge_pred:
+                        c_arr[i] = float(edge_pred["c_uv"][pos])
+                    if edge_pred.get("behavior_label") is not None:
+                        behavior_labels[i] = str(edge_pred["behavior_label"][pos])
+
         deep_idx = [
-            i for i, r in enumerate(edge_rows) if str(r["source_id"]) != edge_root_ids[i]
+            i for i in eligible_edge_indices if str(edge_rows[i]["source_id"]) != edge_root_ids[i]
         ]
-        for i in range(len(edge_ids)):
+        for i in eligible_edge_indices:
             node_root_stance[edge_target_ids[i]] = max(-1.0, min(1.0, float(s_arr[i])))
         has_full_teacher_root = bool(
             full_teacher_coverage
-            and all("root_s_uv" in cache_by_eid[eid] for eid in edge_ids)
+            and all("root_s_uv" in cache_by_eid[eid] for eid in eligible_edge_ids)
         )
-        # Only use Teacher root_s_uv when Teacher cache covers 100% of edges;
+        # Only use Teacher root_s_uv when Teacher cache covers 100% of eligible edges;
         # partial caches avoid target drift between Train/Val and Test.
         if has_full_teacher_root:
-            for idx, eid in enumerate(edge_ids):
+            for idx in eligible_edge_indices:
+                eid = edge_ids[idx]
                 node_root_stance[edge_target_ids[idx]] = max(
                     -1.0, min(1.0, float(cache_by_eid[eid]["root_s_uv"]))
                 )
@@ -625,41 +695,45 @@ def extract_and_save_features(
         cache_file = Path(scored_cache_json)
         if not cache_file.exists():
             raise FileNotFoundError(f"Scored cache JSON not found: {cache_file}")
-        missing_eids = [eid for eid in edge_ids if eid not in cache_by_eid]
+        missing_eids = [eid for eid in eligible_edge_ids if eid not in cache_by_eid]
         if missing_eids:
             raise ValueError(
-                f"scored_cache_json {cache_file} is missing {len(missing_eids)} edges "
+                f"scored_cache_json {cache_file} is missing {len(missing_eids)} eligible edges "
                 f"(first: {missing_eids[0]!r}); re-run dual_edge_scorer --score-only."
             )
         has_4d_in_cache = any(
             "r_uv" in cache_by_eid[eid] or "c_uv" in cache_by_eid[eid]
-            for eid in edge_ids
+            for eid in eligible_edge_ids
         )
         if edge_dim is None and has_4d_in_cache:
             effective_edge_dim = 4
-        elif len(edge_ids) > 0 and effective_edge_dim == 4 and not has_4d_in_cache:
+        elif len(eligible_edge_ids) > 0 and effective_edge_dim == 4 and not has_4d_in_cache:
             raise ValueError(
                 f"Requested edge_dim=4, but scored_cache_json {cache_file} lacks 4D r_uv/c_uv scores "
                 "and no 4D Cross-Encoder checkpoint was provided."
             )
 
-        s_list: list[float] = []
-        h_list: list[float] = []
-        r_list: list[float] = []
-        c_list: list[float] = []
-        pred_labels_list: list[str] = []
-        beh_labels_list: list[str] = []
-        for idx, eid in enumerate(edge_ids):
+        s_arr = np.zeros(len(edge_ids), dtype=np.float32)
+        h_arr = np.zeros(len(edge_ids), dtype=np.float32)
+        pred_labels = ["neutral"] * len(edge_ids)
+        if effective_edge_dim == 4:
+            r_arr = np.zeros(len(edge_ids), dtype=np.float32)
+            c_arr = np.full(len(edge_ids), 0.5, dtype=np.float32)
+            behavior_labels = ["neutral"] * len(edge_ids)
+
+        for idx in eligible_edge_indices:
+            eid = edge_ids[idx]
             entry = cache_by_eid[eid]
             s_val = float(entry["s_uv"])
             h_val = float(entry["h_uv"])
-            s_list.append(s_val)
-            h_list.append(h_val)
+            s_arr[idx] = s_val
+            h_arr[idx] = h_val
             if effective_edge_dim == 4:
+                assert r_arr is not None and c_arr is not None and behavior_labels is not None
                 r_val = float(entry.get("r_uv", 0.05))
                 c_val = float(entry.get("c_uv", 0.50))
-                r_list.append(r_val)
-                c_list.append(c_val)
+                r_arr[idx] = r_val
+                c_arr[idx] = c_val
                 blbl = str(entry.get("behavior_label") or "")
                 if blbl not in DISCOURSE_BEHAVIOR_LABELS:
                     if s_val > 0.15:
@@ -673,22 +747,15 @@ def extract_and_save_features(
                             blbl = "constructive_oppose"
                     else:
                         blbl = "neutral"
-                beh_labels_list.append(blbl)
+                behavior_labels[idx] = blbl
             if "pred_label" in entry and entry["pred_label"] is not None:
-                pred_labels_list.append(str(entry["pred_label"]))
+                pred_labels[idx] = str(entry["pred_label"])
             else:
                 lbl = "support" if s_val >= 0.1 else ("oppose" if s_val <= -0.1 else "neutral")
-                pred_labels_list.append(lbl)
+                pred_labels[idx] = lbl
             root_s_raw = entry.get("root_s_uv", s_val)
             root_s_clamped = max(-1.0, min(1.0, float(root_s_raw)))
             node_root_stance[edge_target_ids[idx]] = root_s_clamped
-        s_arr = s_list
-        h_arr = h_list
-        pred_labels = pred_labels_list
-        if effective_edge_dim == 4:
-            r_arr = r_list
-            c_arr = c_list
-            behavior_labels = beh_labels_list
     else:
         # Sequential teacher inference keeps peak VRAM minimal on 16GB GPUs
         if hostility_scorer is not None:
@@ -812,6 +879,7 @@ def extract_and_save_features(
         "lang": lang,
         "edge_dim": effective_edge_dim,
         "k_horizon_metadata": int(k_horizon),
+        "min_total_replies_extracted": int(min_total_replies),
         "node_backbone": default_backbone,
         "node_pooling": "ancestor_span_pool" if use_ancestor_span_pool else "standalone_mean",
         "node_embeddings": node_embeddings,
@@ -830,7 +898,7 @@ def extract_and_save_features(
         if edge_behavior_label:
             payload["edge_behavior_label"] = edge_behavior_label
     if full_teacher_coverage:
-        # Preserve isolated zero-shot Teacher edge scores only under 100% coverage
+        # Preserve isolated zero-shot Teacher edge scores over all eligible edges
         t_stance: dict[str, float] = {}
         t_hostility: dict[str, float] = {}
         t_irrat: dict[str, float] = {}
@@ -839,7 +907,8 @@ def extract_and_save_features(
         t_pred_lbl: dict[str, str] = {}
         t_beh_lbl: dict[str, str] = {}
         t_node_root_stance: dict[str, float] = {}
-        for idx, eid in enumerate(edge_ids):
+        for idx in eligible_edge_indices:
+            eid = edge_ids[idx]
             entry = cache_by_eid[eid]
             sv = float(entry["s_uv"])
             hv = float(entry["h_uv"])
@@ -862,7 +931,7 @@ def extract_and_save_features(
             payload["teacher_edge_oppose_flag"] = t_oppose
             payload["teacher_edge_pred_label"] = t_pred_lbl
             payload["teacher_node_root_stance"] = t_node_root_stance
-            if len(t_irrat) == len(edge_ids) and len(t_constr) == len(edge_ids):
+            if len(t_irrat) == len(eligible_edge_indices) and len(t_constr) == len(eligible_edge_indices):
                 payload["teacher_edge_irrationality"] = t_irrat
                 payload["teacher_edge_constructive"] = t_constr
                 if t_beh_lbl:
@@ -883,6 +952,8 @@ def extract_and_save_features(
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="Extract clean frozen NLP node embeddings & 2D/4D edge features into data/processed/."
     )
@@ -899,6 +970,12 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--k-horizon", type=int, default=20)
+    parser.add_argument(
+        "--min-total-replies",
+        type=int,
+        default=0,
+        help="Scope Transformer encoding & 100% Teacher coverage check to cascades >= N replies (0 = all).",
+    )
     parser.add_argument("--include-node-features-770", action="store_true")
     args = parser.parse_args()
 
@@ -919,6 +996,7 @@ def main() -> None:
         batch_size=args.batch_size,
         max_length=args.max_length,
         k_horizon=args.k_horizon,
+        min_total_replies=args.min_total_replies,
         include_node_features_770=args.include_node_features_770,
     )
     print(f"Saved validated offline NLP feature bank: {pt_path}")

@@ -57,12 +57,14 @@ Kiến trúc đề xuất **SBi-FAGAT** (*Stance-Guided Bidirectional Frequency-
 │   ├── export_dataset_stats.py # Xuất Bảng 1 EDA LaTeX & Early-K Persistence Baseline
 │   ├── predict_live_thread.py  # Dự báo trực tiếp từ URL/ID bài viết thật trên mạng
 │   ├── run_phase2.sh           # Pipeline Dual-Teacher NLI + Hostility -> DualHeadCrossEncoder & .pt (2D)
-│   ├── compute_kappa.py        # Tính Cohen's Kappa, Machine-vs-Gold (báo cáo tỷ lệ phủ hòa giải) & SDQC
+│   ├── compute_kappa.py        # Tính Cohen's Kappa, Machine-vs-Gold, chấm cấp cây & xuất bảng LaTeX
+│   ├── audit_vn_50_trees.py    # Xuất phiếu chấm mù 50 cây Test VN & đánh giá tương quan y_polar
+│   ├── assemble_paper_artifacts.py # Gộp bảng EDA/Efficiency từ 2 track Kaggle & kiểm tra cú pháp LaTeX
 │   ├── benchmark_efficiency.py # Đo #Params, tốc độ suy luận/huấn luyện & RAM/VRAM 8 mô hình (LaTeX/JSON)
 │   ├── demo_research_walkthrough.py # Demo minh họa cơ chế GCN vs SBi-FAGAT trên CPU (<5s)
 │   ├── run_experiments.py      # Huấn luyện công bằng 8 mô hình (`hidden_dim=64`) + Early-K Persistence qua 5 seeds
-│   ├── run_ablation.py         # Thực nghiệm cắt bỏ thành phần & quét cửa sổ K trên topic_splits.json
-│   └── run_upfd_extension.py   # Thực nghiệm mở rộng trên UPFD (GossipCop / PolitiFact)
+│   ├── run_ablation.py         # Thực nghiệm cắt bỏ thành phần (+ BiEdgeGATv2) & quét K cửa sổ tương lai cố định
+│   └── run_upfd_extension.py   # Thực nghiệm chuyển giao cấu trúc phi văn bản trên UPFD (GossipCop / PolitiFact)
 ├── src/
 │   ├── data/                   # schema.py, pheme_loader.py, arctic_shift_vn.py, pyg_dataset.py
 │   ├── nlp/                    # discourse_labels.py, dual_edge_scorer.py, extract_features.py

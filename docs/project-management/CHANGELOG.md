@@ -1,5 +1,21 @@
 # SBi-FAGAT: Changelog & Audit Modification Record
 
+## [EGM Hardening] - Full 5-Goldfish Audit Remediation (`B1–B10`, `M1–M8`)
+
+### Critical Blockers Resolved (`B1–B10`)
+- **`B1` (`extract_features.py`, `run_phase2.sh`, `kaggle_parallel_runner.py`):** Added `--min-total-replies` scoping to Transformer encoding and 100% Teacher coverage checks (`full_teacher_coverage`, `has_full_teacher_root`) so PHEME LOO `teacher_edge_stance` / `teacher_node_root_stance` populate cleanly over eligible cascades ($\ge 25$ replies) while preserving raw Parquet tables for EDA accounting.
+- **`B2` (`pyg_dataset.py`, `run_ablation.py`, `run_experiments.py`):** Removed the split-brain `edge_source="auto" and custom_topic_splits is not None -> teacher` heuristic; inductive benchmarks and ablations now consistently use Student edges (`edge_source="auto"`), while LOO explicitly enforces `edge_source="teacher"`.
+- **`B3` (`dual_edge_scorer.py`):** Replaced $O(N^2)$ full-JSON rewrites with $O(N)$ append-only score-only `.checkpoint.jsonl` delta persistence, wrapped both Teachers with `_AutoCastLogitsWrapper` + `nn.DataParallel` for dual-T4 FP16 acceleration, and moved `_cuda_autocast` inside `DualHeadCrossEncoder.forward()` for multi-GPU Student distillation.
+- **`B4` (`arctic_shift_vn.py`, `pheme_loader.py`):** Aligned VN crawl defaults (`min_comments=25`, `min_vi_ratio=0.65`, `target_count=1500`, `max_pages_per_sub=300`), added resilient per-thread error isolation and `.state.json` cursor/rejection persistence, enabled `TfidfVectorizer` stopwords, and upgraded `pheme_loader.py` to salted SHA-256 + retry download.
+- **`B5` (`kaggle_parallel_runner.py`, `requirements.txt`, `notebooks/*.ipynb`):** Pinned `datasets>=2.18.0,<4.0.0`, preserved Kaggle CUDA PyTorch during `pip install`, added stage-level skip-if-exists (`--force` to override), isolated optional UPFD execution AFTER primary bundle creation, and added persistent salt initialization to Notebook 2.
+- **`B6` (`reporting.py`, `paper/main.tex`, `paper/references.bib`, `scripts/assemble_paper_artifacts.py`):** Escaped `_` in LaTeX p-value headers (`ref_esc`/`cmp_esc`), added `table*` + `\resizebox` for IEEEtran fit, wired all 6 vector PDF figures and `tables_human_audit.tex` into `paper/main.tex`, added verified `rossi2023edge` (Dir-GNN) and fixed `li2017deepcas` DOI while removing unused v2 BibTeX entries, and added `scripts/assemble_paper_artifacts.py`.
+- **`B7` (`dual_edge_scorer.py`, `compute_kappa.py`, `scripts/audit_vn_50_trees.py`):** Fixed NLI double-contradiction neutral attribution (`double_contra = min(c_sup, c_opp)`), upgraded 2D audit export to joint `stance x hostility` stratification, added 50-tree VN blind audit export/evaluation (`scripts/audit_vn_50_trees.py`), and added `--output-table` LaTeX export to `compute_kappa.py`.
+- **`B8` (`trainer.py`, `reporting.py`, `run_ablation.py`, `run_upfd_extension.py`):** Made significance stars strictly direction-aware, added exact $2^n$ sign-flip permutation test for $n < 6$ (LOO folds), applied `(count+1)/(B+1)` bootstrap smoothing and topic-cluster bootstrap (`>= 6` topics), scoped `primary_hypothesis_keys` across ablation & UPFD, and synchronized per-seed DataLoader shuffle order.
+- **`B9` (`pyg_dataset.py`, `run_ablation.py`):** Upgraded `_compute_full_tree_polarization` to continuous finite-sample-unbiased intensity-weighted variance + balance (`ddof=1` + $\frac{n}{n-1} \cdot 4 m_+ m_-$), added `polar_future_start_k` so $K$-curve sensitivity evaluates all horizons on an identical fixed future target window.
+- **`B10` (`sbi_fagat.py`, `baselines.py`, `run_ablation.py`, `metrics.py`):** Fixed `gate_mode="sigmoid"` camp dipole centering (`2*gamma - 1`), added `use_camp_dipole`, `use_dir_mix`, `use_dual_channel` ablations plus matched `BiEdgeGATv2`, masked topology columns `[3, 4]` in `TextMLP`'s `cascade_stats`, wired `y_assortativity` & `early_node_root_stance` onto `CascadeData`, and sanitized JSON exports (`allow_nan=False`).
+
+---
+
 ## [Steps 1–3] - Unified 2D Architecture, Optimization & Leakage/Fairness Audits
 
 ### Step 1 — Core GNN Upgrade (`SBi-FAGAT` & 8-Model Parity)

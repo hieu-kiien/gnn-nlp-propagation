@@ -26,6 +26,24 @@ run_dataset_suite() {
         --min-total-replies "${MIN_TOTAL_REPLIES}" \
         --polar-target-mode "${POLAR_MODE}" \
         "${UNIFIED_FLAGS[@]}"
+    if [[ "${ds_name}" == "pheme" ]]; then
+        "${PYTHON_BIN}" -m scripts.run_experiments \
+            --data-dir "${ddir}" \
+            --eval-protocol loo \
+            --min-total-replies "${MIN_TOTAL_REPLIES}" \
+            --polar-target-mode "${POLAR_MODE}" \
+            --output-table "paper/tables_loo_${ds_name}.tex" \
+            --output-json "paper/results_loo_${ds_name}.json" \
+            --ckpt-out "checkpoints/best_sbifagat_${ds_name}_loo.pt" \
+            --skip-figures \
+            "${UNIFIED_FLAGS[@]}"
+    fi
+    if [[ "${ds_name}" == "vn" ]]; then
+        "${PYTHON_BIN}" -m scripts.audit_vn_50_trees \
+            --data-dir "${ddir}" \
+            --min-total-replies "${MIN_TOTAL_REPLIES}" \
+            --export
+    fi
     "${PYTHON_BIN}" -m scripts.run_ablation \
         --data-dir "${ddir}" \
         --min-total-replies "${MIN_TOTAL_REPLIES}" \
@@ -63,7 +81,11 @@ else
     fi
 fi
 
-echo "[3/4] Running UPFD GossipCop (BERT) 5-seed generalization benchmark..."
-"${PYTHON_BIN}" -m scripts.run_upfd_extension --upfd-root "${UPFD_ROOT}" --hidden-dim "${HIDDEN_DIM}"
+echo "[3/4] Running UPFD GossipCop (BERT) 5-seed structural transfer benchmark..."
+"${PYTHON_BIN}" -m scripts.run_upfd_extension --upfd-root "${UPFD_ROOT}" --hidden-dim "${HIDDEN_DIM}" || \
+    echo "[WARN] Optional UPFD benchmark failed (check network/GDrive mirror); continuing to paper assembly."
 
-echo "[4/4] All tests and SBi-FAGAT Phase 3 experimental pipelines completed."
+echo "[4/4] Assembling unified paper tables & validating LaTeX syntax..."
+"${PYTHON_BIN}" -m scripts.assemble_paper_artifacts --paper-dir paper
+
+echo "All tests and SBi-FAGAT Phase 3 experimental pipelines completed."

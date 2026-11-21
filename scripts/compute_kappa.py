@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import math
+import sys
 import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -479,12 +480,258 @@ def evaluate_audit_csv(
     return report
 
 
+_POLAR_GRADE_SYNONYMS: dict[str, int] = {
+    "0": 0,
+    "consensus": 0,
+    "dong_thuan": 0,
+    "1": 1,
+    "mild": 1,
+    "nhe": 1,
+    "2": 2,
+    "moderate": 2,
+    "trung_binh": 2,
+    "3": 3,
+    "strong": 3,
+    "manh": 3,
+    "4": 4,
+    "extreme": 4,
+    "rat_manh": 4,
+}
+
+
+def _parse_polar_grade(raw: Any) -> int:
+    key = str(raw or "").strip().lower()
+    if key in _POLAR_GRADE_SYNONYMS:
+        return _POLAR_GRADE_SYNONYMS[key]
+    try:
+        val = int(round(float(key)))
+        if 0 <= val <= 4:
+            return val
+    except ValueError:
+        pass
+    raise ValueError(
+        f"Unrecognized thread polarization grade {raw!r}; expected integer in 0..4."
+    )
+
+
+def evaluate_thread_level_audit_csv(
+    audit_csv: Path,
+    machine_key_csv: Path | None = None,
+    *,
+    strict_adjudication: bool = False,
+) -> dict[str, Any]:
+    """Evaluate 50-tree thread-level polarization blind human audit (0-4 Likert scale)."""
+    audit_path = Path(audit_csv)
+    if not audit_path.is_file():
+        raise FileNotFoundError(f"Thread-level audit CSV not found: {audit_path}")
+
+    g1: list[int] = []
+    g2: list[int] = []
+    gold_by_id: dict[str, float] = {}
+    matched_rows = 0
+    unadj_rows = 0
+
+    with audit_path.open("r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            cid = str(row.get("cascade_id") or "").strip()
+            sid = str(row.get("sample_id") or "").strip()
+            r1 = str(row.get("annotator_1_polar_grade") or "").strip()
+            r2 = str(row.get("annotator_2_polar_grade") or "").strip()
+            rg = str(row.get("gold_adjudicated_polar_grade") or "").strip()
+
+            v1 = _parse_polar_grade(r1) if r1 else None
+            v2 = _parse_polar_grade(r2) if r2 else None
+            vg = _parse_polar_grade(rg) if rg else None
+
+            if v1 is not None and v2 is not None:
+                g1.append(v1)
+                g2.append(v2)
+            if vg is not None or (v1 is not None and v2 is not None):
+                matched_rows += 1
+
+            resolved_gold: float | None = None
+            if vg is not None:
+                resolved_gold = float(vg)
+            elif v1 is not None and v2 is not None:
+                if abs(v1 - v2) <= 1:
+                    resolved_gold = 0.5 * float(v1 + v2)
+                else:
+                    unadj_rows += 1
+
+            if resolved_gold is not None:
+                if cid:
+                    gold_by_id[cid] = resolved_gold
+                if sid:
+                    gold_by_id[sid] = resolved_gold
+
+    if unadj_rows > 0:
+        msg = (
+            f"Detected {unadj_rows} thread-level audit rows with |annotator_1 - annotator_2| >= 2 "
+            "without gold_adjudicated_polar_grade. Adjudicate disagreements before final reporting."
+        )
+        if strict_adjudication:
+            raise ValueError(msg)
+        warnings.warn(msg, UserWarning, stacklevel=2)
+
+    if not g1 and not gold_by_id:
+        raise ValueError(
+            f"No completed thread-level annotations found in '{audit_path}'. "
+            "Fill annotator_1_polar_grade / annotator_2_polar_grade (0-4) first."
+        )
+
+    report: dict[str, Any] = {
+        "input_csv": str(audit_path),
+        "total_matched_rows": matched_rows,
+        "unadjudicated_disagreements": unadj_rows,
+    }
+    if g1:
+        labels_5 = [0, 1, 2, 3, 4]
+        unw = float(cohen_kappa_score(g1, g2, labels=labels_5))
+        if math.isnan(unw):
+            unw = 1.0 if g1 == g2 else 0.0
+        quad = float(cohen_kappa_score(g1, g2, labels=labels_5, weights="quadratic"))
+        if math.isnan(quad):
+            quad = unw
+        pr, sr = _safe_corr_pair(g1, g2)
+        report["inter_annotator"] = {
+            "num_threads": len(g1),
+            "exact_agreement": float(sum(int(a == b) for a, b in zip(g1, g2)) / len(g1)),
+            "within_one_agreement": float(sum(int(abs(a - b) <= 1) for a, b in zip(g1, g2)) / len(g1)),
+            "cohen_kappa_unweighted": unw,
+            "cohen_kappa_quadratic": quad,
+            "landis_koch_band": interpret_kappa_landis_koch(quad),
+            "pearson_r": pr,
+            "spearman_r": sr,
+            "mae_grade": float(np.mean(np.abs(np.asarray(g1, dtype=np.float64) - np.asarray(g2, dtype=np.float64)))),
+        }
+
+    if machine_key_csv is not None:
+        key_path = Path(machine_key_csv)
+        if not key_path.is_file():
+            raise FileNotFoundError(f"Thread-level machine key CSV not found: {key_path}")
+        gold_cont: list[float] = []
+        gold_int: list[int] = []
+        mach_ypolar: list[float] = []
+        mach_grade: list[int] = []
+        with key_path.open("r", encoding="utf-8-sig", newline="") as fh:
+            for row in csv.DictReader(fh):
+                cid = str(row.get("cascade_id") or "").strip()
+                sid = str(row.get("sample_id") or "").strip()
+                g_val = gold_by_id.get(cid)
+                if g_val is None:
+                    g_val = gold_by_id.get(sid)
+                if g_val is None:
+                    continue
+                yp = float(row.get("y_polar", 0.0))
+                mg = (
+                    int(round(float(row["y_polar_grade"])))
+                    if str(row.get("y_polar_grade") or "").strip()
+                    else min(4, max(0, int(round(yp * 4.0))))
+                )
+                gold_cont.append(g_val / 4.0)
+                gold_int.append(min(4, max(0, int(round(g_val)))))
+                mach_ypolar.append(yp)
+                mach_grade.append(mg)
+        if gold_cont:
+            pr_m, sr_m = _safe_corr_pair(gold_cont, mach_ypolar)
+            quad_m = float(
+                cohen_kappa_score(gold_int, mach_grade, labels=[0, 1, 2, 3, 4], weights="quadratic")
+            )
+            if math.isnan(quad_m):
+                quad_m = 1.0 if gold_int == mach_grade else 0.0
+            report["machine_vs_gold"] = {
+                "num_threads": len(gold_cont),
+                "pearson_r": pr_m,
+                "spearman_r": sr_m,
+                "cohen_kappa_quadratic": quad_m,
+                "landis_koch_band": interpret_kappa_landis_koch(quad_m),
+                "mae_norm": float(
+                    np.mean(
+                        np.abs(np.asarray(gold_cont, dtype=np.float64) - np.asarray(mach_ypolar, dtype=np.float64))
+                    )
+                ),
+            }
+    return report
+
+
+def format_human_audit_latex(
+    report: Mapping[str, Any],
+    *,
+    caption: str = (
+        "Human Reliability Audit and Silver-Label Validity: Inter-Annotator Agreement "
+        "(Cohen's $\\kappa$ / Quadratic $\\kappa_w$) and Machine-vs.-Gold Alignment."
+    ),
+    label: str = "tab:human_audit",
+) -> str:
+    """Format human audit report into an IEEEtran `booktabs` LaTeX table."""
+    rows: list[str] = []
+    mvg = report.get("machine_vs_gold") if isinstance(report.get("machine_vs_gold"), Mapping) else {}
+
+    if isinstance(report.get("stance"), Mapping):
+        st = report["stance"]
+        mg_s = mvg.get("stance") if isinstance(mvg.get("stance"), Mapping) else {}
+        f1_str = f"{float(mg_s['macro_f1']):.4f}" if "macro_f1" in mg_s else "--"
+        r_str = f"{float(mg_s['spearman_r']):.4f}" if "spearman_r" in mg_s else "--"
+        rows.append(
+            f"Pair Stance (3-cls) & {int(st['num_samples'])} & "
+            f"{float(st['cohen_kappa_unweighted']):.4f} & {float(st['cohen_kappa_quadratic']):.4f} & "
+            f"{f1_str} & {r_str} \\\\"
+        )
+    if isinstance(report.get("hostility"), Mapping):
+        ho = report["hostility"]
+        mg_h = mvg.get("hostility") if isinstance(mvg.get("hostility"), Mapping) else {}
+        f1_str = f"{float(mg_h['macro_f1']):.4f}" if "macro_f1" in mg_h else "--"
+        r_str = f"{float(mg_h['spearman_r']):.4f}" if "spearman_r" in mg_h else "--"
+        rows.append(
+            f"Pair Hostility & {int(ho['num_samples'])} & "
+            f"{float(ho['cohen_kappa_unweighted']):.4f} & {float(ho['cohen_kappa_quadratic']):.4f} & "
+            f"{f1_str} & {r_str} \\\\"
+        )
+    if isinstance(report.get("rumoureval_sdqc"), Mapping):
+        re_m = report["rumoureval_sdqc"]
+        rows.append(
+            f"RumourEval SDQC & {int(re_m['num_samples'])} & -- & -- & "
+            f"{float(re_m['macro_f1']):.4f} & {float(re_m['spearman_r']):.4f} \\\\"
+        )
+    if isinstance(report.get("inter_annotator"), Mapping):
+        ia = report["inter_annotator"]
+        r_str = f"{float(mvg['spearman_r']):.4f}" if "spearman_r" in mvg else "--"
+        rows.append(
+            f"Thread $y_{{\\text{{polar}}}}$ (0--4) & {int(ia['num_threads'])} & "
+            f"{float(ia['cohen_kappa_unweighted']):.4f} & {float(ia['cohen_kappa_quadratic']):.4f} & "
+            f"-- & {r_str} \\\\"
+        )
+
+    return "\n".join(
+        [
+            "\\begin{table}[t]",
+            "\\centering",
+            f"\\caption{{{caption}}}",
+            f"\\label{{{label}}}",
+            "\\resizebox{\\columnwidth}{!}{",
+            "\\begin{tabular}{lccccc}",
+            "\\toprule",
+            "Audit Task & $N$ & IAA $\\kappa$ & IAA $\\kappa_w$ & Mach. F1 & Mach. $\\rho$ \\\\",
+            "\\midrule",
+            *rows,
+            "\\bottomrule",
+            "\\end{tabular}",
+            "}",
+            "\\end{table}",
+            "",
+        ]
+    )
+
+
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Compute Cohen's Kappa & Machine-vs-Gold metrics.")
     parser.add_argument("--input", type=Path, default=None)
     parser.add_argument("--machine-key", type=Path, default=None)
     parser.add_argument("--rumoureval-json", type=Path, default=None)
     parser.add_argument("--output-json", type=Path, default=None)
+    parser.add_argument("--output-table", type=Path, default=None)
     parser.add_argument("--strict-adjudication", action="store_true")
     args = parser.parse_args()
 
@@ -525,6 +772,12 @@ def main() -> None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(
             json.dumps(report, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    if args.output_table is not None:
+        args.output_table.parent.mkdir(parents=True, exist_ok=True)
+        args.output_table.write_text(
+            format_human_audit_latex(report),
             encoding="utf-8",
         )
 

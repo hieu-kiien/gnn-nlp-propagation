@@ -133,6 +133,7 @@ def plot_umap_polarization(
             alpha=0.88,
             edgecolors="white",
             linewidths=0.4,
+            rasterized=True,
         )
         ax.set_title(title)
         ax.set_xlabel("UMAP-1")
@@ -140,7 +141,7 @@ def plot_umap_polarization(
         ax.grid(True, linestyle=":", alpha=0.35)
 
     cbar = fig.colorbar(scatter_handle, ax=axes, fraction=0.025, pad=0.03)
-    cbar.set_label("Node Stance Polarity ($s_{uv}$: Oppose $-1$ $\\leftrightarrow$ Support $+1$)")
+    cbar.set_label("Root-Aligned Stance ($\\tilde{s}_v$: Oppose $-1$ $\\leftrightarrow$ Support $+1$)")
 
     return _save_vector_pair(fig, Path(output_dir), stem)
 

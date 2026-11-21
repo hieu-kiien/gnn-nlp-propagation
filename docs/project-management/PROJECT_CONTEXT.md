@@ -45,10 +45,10 @@ Early-stage prediction of viral cascades and polarization is intrinsically chall
    - Rumor and non-rumor cascades ingested from Figshare article `6392078` via `src/data/pheme_loader.py` into validated `nodes.parquet` / `edges.parquet`.
    - Truly inductive topic split grouped strictly by breaking news event (`topic_id`) + LOO (`edge_source="teacher"`).
 2. **Vietnamese Social Media Dataset (Arctic Shift / Reddit VN):**
-   - Ingested from Reddit Vietnam subreddits (e.g., `r/VietNam`, `r/TroChuyenLinhTinh`) via `src/data/arctic_shift_vn.py` with `--before-epoch` cutoff.
+   - Ingested from Vietnamese Reddit subreddits (`r/vozforums`, `r/VietNam`) via `src/data/arctic_shift_vn.py` with `--before-epoch` cutoff, `--min-comments 25`, `--min-vi-ratio 0.65`, and resumable `.state.json` cursor persistence.
    - Uses a **Heuristic Temporal-Keyword / 14-day TF-IDF Grouped Inductive Split** (`cluster_vn_cascade_topics`).
 3. **UPFD Benchmark (GossipCop / PolitiFact):**
-   - External benchmark ingested via `scripts/run_upfd_extension.py` using `LatentConflictMLP`.
+   - External post-hoc text-free structural transfer benchmark ingested via `scripts/run_upfd_extension.py` using `LatentConflictMLP`.
 
 ### Five Iron Laws (`GEMINI.md`)
 - **Zero Synthetic Results:** Never report synthetic/mock numbers in experimental paper tables; synthetic tensors are strictly restricted to unit tests (`tests/`) and profiling (`scripts/benchmark_efficiency.py`).
