@@ -1,0 +1,27 @@
+\begin{table*}[t]
+\centering
+\caption{Early Cascade Size, Polarization, and Rumor Prediction at $K=20$ (INDUCTIVE, Mean $\pm$ Std). Stars indicate significance vs. TemporalStanceMLP ($^{*}p<0.05$, $^{**}p<0.01$).}
+\label{tab:main_vn}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lcccccc}
+\toprule
+Model & MSLE $\downarrow$ & MAE $\downarrow$ & $R^2_{\text{size}}$ $\uparrow$ & RMSE $\downarrow$ & Pearson $r$ $\uparrow$ & Spearman $\rho$ $\uparrow$ \\
+\midrule
+Early-K Persistence & 0.2285 $\pm$ 0.0000 & 0.3872 $\pm$ 0.0000 & -0.0232 $\pm$ 0.0000 & 0.0231 $\pm$ 0.0000 & 0.0745 $\pm$ 0.0000 & 0.1999 $\pm$ 0.0000 \\
+TextMLP & 0.1572 $\pm$ 0.0102 & 0.3034 $\pm$ 0.0101 & 0.2962 $\pm$ 0.0456 & 0.0092 $\pm$ 0.0001 & 0.3147 $\pm$ 0.0247 & 0.3224 $\pm$ 0.0127 \\
+TemporalStanceMLP & \textbf{0.1548 $\pm$ 0.0061} & 0.3054 $\pm$ 0.0061 & \textbf{0.3070 $\pm$ 0.0271} & 0.0092 $\pm$ 0.0001 & 0.3129 $\pm$ 0.0126 & 0.3132 $\pm$ 0.0227 \\
+StandardGCN & 0.1552 $\pm$ 0.0042 & \textbf{0.3016 $\pm$ 0.0060} & 0.3052 $\pm$ 0.0188 & 0.0093 $\pm$ 0.0001 & 0.2775 $\pm$ 0.0255 & 0.2916 $\pm$ 0.0131 \\
+StandardGATv2 & 0.1596 $\pm$ 0.0065 & 0.3085 $\pm$ 0.0106 & 0.2856 $\pm$ 0.0289 & 0.0092 $\pm$ 0.0001 & 0.3023 $\pm$ 0.0234 & 0.3095 $\pm$ 0.0227 \\
+EdgeGATv2 & 0.1583 $\pm$ 0.0061 & 0.3068 $\pm$ 0.0036 & 0.2911 $\pm$ 0.0273 & 0.0091 $\pm$ 0.0001 & 0.3198 $\pm$ 0.0325 & 0.3078 $\pm$ 0.0150 \\
+FAGCN & 0.1563 $\pm$ 0.0015 & 0.3078 $\pm$ 0.0019 & 0.3002 $\pm$ 0.0069 & 0.0093 $\pm$ 0.0001 & 0.2818 $\pm$ 0.0298 & 0.2997 $\pm$ 0.0175 \\
+BiGCN & 0.1642 $\pm$ 0.0142 & 0.3156 $\pm$ 0.0149 & 0.2648 $\pm$ 0.0636 & 0.0093 $\pm$ 0.0001 & 0.2927 $\pm$ 0.0115 & 0.2922 $\pm$ 0.0191 \\
+SBiFAGAT & 0.1553 $\pm$ 0.0046 & 0.3059 $\pm$ 0.0037 & 0.3048 $\pm$ 0.0204 & \textbf{0.0091 $\pm$ 0.0001} & \textbf{0.3356 $\pm$ 0.0162} & \textbf{0.3400 $\pm$ 0.0056} \\
+\midrule
+$p$-value (SBiFAGAT vs. TemporalStanceMLP) & 8.75e-01 & 8.98e-01 & 8.75e-01 & 1.10e-01 & 2.24e-02 & 3.95e-02 \\
+Bootstrap $p$ (SBiFAGAT vs. TemporalStanceMLP) & 8.90e-01 & 9.02e-01 & 8.82e-01 & 1.55e-01 & 2.28e-01 & 8.56e-02 \\
+Holm-Bonferroni $p$ (SBiFAGAT vs. TemporalStanceMLP) & 1.00e+00 & 1.00e+00 & 1.00e+00 & 4.42e-01 & 1.35e-01 & 1.97e-01 \\
+Holm-Bonf Bootstrap $p$ (SBiFAGAT vs. TemporalStanceMLP) & 1.00e+00 & 1.00e+00 & 1.00e+00 & 7.76e-01 & 9.12e-01 & 5.13e-01 \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}

@@ -1,0 +1,60 @@
+{
+  "datasets": [
+    {
+      "name": "vn",
+      "data_dir": "/kaggle/working/gnn-nlp-propagation/data/processed/vn",
+      "k_horizon": 20,
+      "min_total_replies": 25,
+      "polar_target_mode": "future_only",
+      "total_nodes": 87820,
+      "total_edges": 86320,
+      "raw_cascades": 1500,
+      "eligible_cascades": 1500,
+      "raw_topics": 1496,
+      "eligible_topics": 1496,
+      "median_replies": 44.0,
+      "mean_replies": 57.54666666666667,
+      "p90_replies": 106.0,
+      "median_duration_hours": 95.21569444444444,
+      "mean_duration_hours": 674.8884038888888,
+      "languages": {
+        "vi": 87820
+      },
+      "source_datasets": {
+        "arctic_shift_vozforums": 87788,
+        "arctic_shift_vietnam": 32
+      },
+      "rumor_label_counts": {},
+      "split_cascade_counts": {
+        "train": 1050,
+        "val": 225,
+        "test": 225
+      },
+      "topic_splits_source": "/kaggle/working/gnn-nlp-propagation/data/processed/vn/topic_splits.json",
+      "early_k_persistence": {
+        "num_cascades": 225,
+        "msle": 0.22854283580653853,
+        "mae": 0.38723919658761813,
+        "rmse_size": 0.478061539769242,
+        "r2_size": -0.023195461717307797,
+        "spearman_size": 0.0,
+        "rmse": 0.023114062401227167,
+        "mae_polar": 0.014088231321974851,
+        "r2_polar": -4.770500128333228,
+        "pearson_r": 0.07449565635902446,
+        "spearman_polar": 0.1998841129372103,
+        "mean_true_polar": 0.012169968365277681,
+        "mean_early_polar": 0.018859475983502932
+      },
+      "target_stats": {
+        "num_cascades": 1500,
+        "y_size_mean": 3.924007612546285,
+        "y_size_std": 0.4993134533679087,
+        "y_polar_mean": 0.012693507716333745,
+        "y_polar_std": 0.0098382594854216,
+        "y_bimodality_mean": 0.3605469376842181,
+        "y_assortativity_mean": 0.03890100622928003
+      }
+    }
+  ]
+}

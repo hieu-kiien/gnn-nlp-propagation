@@ -1,0 +1,14 @@
+\begin{table*}[t]
+\centering
+\caption{Exploratory dataset statistics ($K=20$, $N_{\text{reply}} \ge 25$ forecasting filter) and Early-$K$ Persistence Baseline on Test splits.}
+\label{tab:dataset_eda_vn}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lcccccccc}
+\toprule
+Dataset & Raw & Forecast ($\ge 25$) & Topics & Train/Val/Test & Med (Mean) Replies & Med Span (h) & Persist RMSE$\downarrow$ & Persist $r$$\uparrow$ \\
+\midrule
+vn & 1,500 & 1,500 & 1,496 & 1050/225/225 & 44.0 (57.5) & 95.22 & 0.0231 & 0.0745 \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}

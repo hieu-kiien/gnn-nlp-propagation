@@ -1,0 +1,27 @@
+Cascade ID: vn_1lg7ayf
+Top-5 Trigger Comments Ranked by |gamma_uv|
+========================================================================
+#1 | node_id=vn_1lg7ayf_t1_mywdzu7 (parent=vn_1lg7ayf_t3_1lg7ayf) | |gamma_uv|=0.2438 | gamma=-0.2648 | s_uv=-0.2348 | h_uv=0.5083
+    Text: Không nên. 
+
+ Gì nhiều quá cũng dễ chán
+ 
+ Gì dễ quá cũng chán
+
+ Ràng buộc quá cũng chán
+
+ Tạo không gian tiền đề để bản thân có cơ hội phát triển sự nghiệp, công việc, học hành, quan hệ. Tạo không gian để nuôi dưỡng tình cảm tâm hồn, nuôi dưỡng mối quan hệ, cảm xúc. 
+
+ Gì khan hiếm chút sẽ quý. Trừ khi ai đó muốn chơi trò tình ái.
+
+ Mà, mả mịa nó, người trong hôn nhân muốn chui ra mà người chưa lại muốn đun vào. Điên hả
+#2 | node_id=vn_1lg7ayf_t1_myydpkh (parent=vn_1lg7ayf_t1_mywa0n4) | |gamma_uv|=0.1281 | gamma=+0.1096 | s_uv=-0.0238 | h_uv=0.0024
+    Text: Ở chung để biết thói quen thì cứ ở vài ngày liền. Vài tuần liền cho biết. Mình cứ f có chỗ riêng bác ạ
+#3 | node_id=vn_1lg7ayf_t1_myvsst5 (parent=vn_1lg7ayf_t3_1lg7ayf) | |gamma_uv|=0.1062 | gamma=-0.1295 | s_uv=-0.3400 | h_uv=0.0031
+    Text: Cơ bản hôn nhân là hai người có sống chung được với nhau trọn đời hay không? Vậy là bạn tự hiểu!
+#4 | node_id=vn_1lg7ayf_t1_myy2ha5 (parent=vn_1lg7ayf_t3_1lg7ayf) | |gamma_uv|=0.1055 | gamma=+0.0841 | s_uv=+0.0143 | h_uv=0.0026
+    Text: Yêu chơi thì chẳng dại về chung. Còn về chung thì xác định yêu nghiêm túc và có thể kết hôn. Rồi cũng tùy vào việc cả 2 đi làm chưa hay còn đi học nữa. Ví dụ đi làm rồi thì việc ở chung k thường thấy đâu. Vì lúc đi làm thì tự chủ về tài chính và cũng định hình về lối sống nên nhiều người cũng ngại thay đổi hay ở chung với người yêu lắm. Trừ khi đã có ý định kết hôn mới chuyển vào ở chung. Còn sinh viên yêu thì hay ở chung, một phần vì đang yêu thì muốn gần gũi, một phần cũng tiết kiệm. Nhưng ở độ này cơ bản là thích gần nhau là chính và dù ở chung cx k có gì gọi là trải nghiệm hôn nhân vì gia đình chu cấp chứ có tự lo đâu.
+#5 | node_id=vn_1lg7ayf_t1_myydtvz (parent=vn_1lg7ayf_t1_myydpkh) | |gamma_uv|=0.0857 | gamma=+0.0893 | s_uv=-0.0815 | h_uv=0.0037
+    Text: Ở với nhau cả vài tháng cả năm mới thấy được.
+
+Vài tuần thì có như không bạn ạ.
