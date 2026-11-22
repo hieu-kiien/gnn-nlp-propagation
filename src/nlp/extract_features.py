@@ -41,6 +41,7 @@ from src.nlp.dual_edge_scorer import (
     STANCE_LABELS,
     TWITTER_ROBERTA_MODEL_NAME,
     VISOBERT_MODEL_NAME,
+    _can_use_dataparallel,
     _cuda_autocast,
     _effective_max_length,
     _encode_no_specials,
@@ -69,6 +70,20 @@ def _freeze_module(module: torch.nn.Module) -> torch.nn.Module:
     return module
 
 
+class _SpanPoolWrapper(torch.nn.Module):
+    """Thread-safe nn.DataParallel wrapper computing AMP span-pooled embeddings per GPU."""
+
+    def __init__(self, encoder: torch.nn.Module, *, use_amp: bool = False) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.use_amp = bool(use_amp)
+
+    def forward(self, input_ids: Tensor, attention_mask: Tensor, span_mask: Tensor) -> Tensor:
+        with _cuda_autocast(enabled=self.use_amp):
+            outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+            return compute_masked_mean_pooling(outputs.last_hidden_state, span_mask)
+
+
 @torch.no_grad()
 def encode_node_embeddings(
     texts: Sequence[str],
@@ -81,6 +96,7 @@ def encode_node_embeddings(
     batch_size: int = 32,
     max_length: int = 256,
     min_target_tokens: int = 96,
+    use_multi_gpu: bool = True,
     device: torch.device | None = None,
 ) -> Tensor:
     """Encode node texts into `[N, D]` float32 tensors using leakage-free Ancestor SpanPool.
@@ -103,6 +119,15 @@ def encode_node_embeddings(
     target_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _freeze_module(encoder).to(target_device)
     use_amp = target_device.type == "cuda"
+    dp_ok = _can_use_dataparallel(target_device, use_multi_gpu) and isinstance(
+        encoder, torch.nn.Module
+    )
+    num_gpus = torch.cuda.device_count() if dp_ok else 1
+    eff_batch = max(1, int(batch_size) * num_gpus)
+    pool_wrapper = _SpanPoolWrapper(encoder, use_amp=use_amp)
+    dp_model: torch.nn.Module | None = (
+        torch.nn.DataParallel(pool_wrapper) if dp_ok else None
+    )
 
     spec = _inspect_pair_tokenizer(tokenizer, encoder=encoder)
     pad_id = spec["pad_id"]
@@ -111,71 +136,80 @@ def encode_node_embeddings(
     num_specials = spec["num_specials"]
     eff_max = _effective_max_length(max_length, encoder=encoder, tokenizer=tokenizer)
 
-    chunks: list[Tensor] = []
-    for start in range(0, n, batch_size):
-        end = min(n, start + batch_size)
-        seqs: list[list[int]] = []
-        span_masks: list[list[int]] = []
+    all_seqs: list[list[int]] = []
+    all_masks: list[list[int]] = []
+    for idx in range(n):
+        t_norm = normalize_social_text(texts[idx], lang=lang)
+        p_raw = parent_texts[idx] if parent_texts is not None else None
+        r_raw = root_texts[idx] if root_texts is not None else None
+        p_norm = normalize_social_text(p_raw, lang=lang) if p_raw else ""
+        r_norm = normalize_social_text(r_raw, lang=lang) if r_raw else ""
 
-        for idx in range(start, end):
-            t_norm = normalize_social_text(texts[idx], lang=lang)
-            p_raw = parent_texts[idx] if parent_texts is not None else None
-            r_raw = root_texts[idx] if root_texts is not None else None
-            p_norm = normalize_social_text(p_raw, lang=lang) if p_raw else ""
-            r_norm = normalize_social_text(r_raw, lang=lang) if r_raw else ""
+        target_ids = _encode_no_specials(tokenizer, t_norm)
+        if not p_norm and not r_norm:
+            content_budget = max(1, eff_max - 2)
+            # Preserve 60% opening claim + 40% closing verdict/TL;DR on long root posts
+            target_keep = _truncate_head_tail(target_ids, content_budget, head_ratio=0.6)
+            seq = [cls_id] + target_keep + [sep_id]
+            span = (
+                [0] + [1] * len(target_keep) + [0]
+                if target_keep
+                else [1] * len(seq)
+            )
+        else:
+            content_budget = max(4, eff_max - num_specials)
+            guaranteed_target = min(
+                len(target_ids),
+                max(1, min(int(min_target_tokens), content_budget // 2)),
+            )
+            ctx_budget = max(0, content_budget - guaranteed_target)
 
-            target_ids = _encode_no_specials(tokenizer, t_norm)
-            if not p_norm and not r_norm:
-                content_budget = max(1, eff_max - 2)
-                # Preserve 60% opening claim + 40% closing verdict/TL;DR on long root posts
-                target_keep = _truncate_head_tail(target_ids, content_budget, head_ratio=0.6)
-                seq = [cls_id] + target_keep + [sep_id]
-                span = (
-                    [0] + [1] * len(target_keep) + [0]
-                    if target_keep
-                    else [1] * len(seq)
-                )
-            else:
-                content_budget = max(4, eff_max - num_specials)
-                guaranteed_target = min(
-                    len(target_ids),
-                    max(1, min(int(min_target_tokens), content_budget // 2)),
-                )
-                ctx_budget = max(0, content_budget - guaranteed_target)
-
-                if r_norm and p_norm and r_norm != p_norm and ctx_budget >= 3:
-                    root_ids = _encode_no_specials(tokenizer, r_norm)
-                    parent_ids = _encode_no_specials(tokenizer, p_norm)
-                    root_cap = min(len(root_ids), max(1, ctx_budget // 3))
-                    parent_cap = min(len(parent_ids), max(0, ctx_budget - 1 - root_cap))
-                    root_budget = min(len(root_ids), max(0, ctx_budget - 1 - parent_cap))
-                    root_keep = _truncate_head_tail(root_ids, root_budget, head_ratio=0.6)
-                    parent_keep = parent_ids[:parent_cap]
-                    if root_keep and parent_keep:
-                        ctx_ids = root_keep + [sep_id] + parent_keep
-                    else:
-                        ctx_ids = root_keep or parent_keep
+            if r_norm and p_norm and r_norm != p_norm and ctx_budget >= 3:
+                root_ids = _encode_no_specials(tokenizer, r_norm)
+                parent_ids = _encode_no_specials(tokenizer, p_norm)
+                root_cap = min(len(root_ids), max(1, ctx_budget // 3))
+                parent_cap = min(len(parent_ids), max(0, ctx_budget - 1 - root_cap))
+                root_budget = min(len(root_ids), max(0, ctx_budget - 1 - parent_cap))
+                root_keep = _truncate_head_tail(root_ids, root_budget, head_ratio=0.6)
+                parent_keep = parent_ids[:parent_cap]
+                if root_keep and parent_keep:
+                    ctx_ids = root_keep + [sep_id] + parent_keep
                 else:
-                    ctx_str = p_norm or r_norm
-                    raw_ctx_ids = _encode_no_specials(tokenizer, ctx_str)
-                    # Depth-1 replies directly to root also receive 60/40 Head+Tail root truncation
-                    if r_norm and (not p_norm or r_norm == p_norm):
-                        ctx_ids = _truncate_head_tail(raw_ctx_ids, ctx_budget, head_ratio=0.6)
-                    else:
-                        ctx_ids = raw_ctx_ids[:ctx_budget]
+                    ctx_ids = root_keep or parent_keep
+            else:
+                ctx_str = p_norm or r_norm
+                raw_ctx_ids = _encode_no_specials(tokenizer, ctx_str)
+                # Depth-1 replies directly to root also receive 60/40 Head+Tail root truncation
+                if r_norm and (not p_norm or r_norm == p_norm):
+                    ctx_ids = _truncate_head_tail(raw_ctx_ids, ctx_budget, head_ratio=0.6)
+                else:
+                    ctx_ids = raw_ctx_ids[:ctx_budget]
 
-                reply_budget = max(1, content_budget - len(ctx_ids))
-                target_keep = target_ids[:reply_budget]
-                mid_seps = [sep_id, sep_id] if num_specials >= 4 else [sep_id]
-                seq = [cls_id] + ctx_ids + mid_seps + target_keep + [sep_id]
-                span = (
-                    [0] * (1 + len(ctx_ids) + len(mid_seps)) + [1] * len(target_keep) + [0]
-                    if target_keep
-                    else [1] * len(seq)
-                )
+            reply_budget = max(1, content_budget - len(ctx_ids))
+            target_keep = target_ids[:reply_budget]
+            mid_seps = [sep_id, sep_id] if num_specials >= 4 else [sep_id]
+            seq = [cls_id] + ctx_ids + mid_seps + target_keep + [sep_id]
+            span = (
+                [0] * (1 + len(ctx_ids) + len(mid_seps)) + [1] * len(target_keep) + [0]
+                if target_keep
+                else [1] * len(seq)
+            )
 
-            seqs.append(seq)
-            span_masks.append(span)
+        all_seqs.append(seq)
+        all_masks.append(span)
+
+    # Sort by exact token sequence length when multiple batches exist to cut padding overhead.
+    order = (
+        sorted(range(n), key=lambda idx: len(all_seqs[idx]))
+        if n > eff_batch
+        else list(range(n))
+    )
+
+    chunks: list[Tensor] = []
+    for start in range(0, n, eff_batch):
+        idx_slice = order[start : start + eff_batch]
+        seqs = [all_seqs[idx] for idx in idx_slice]
+        span_masks = [all_masks[idx] for idx in idx_slice]
 
         batch_max_len = max(len(s) for s in seqs)
         bsz = len(seqs)
@@ -192,17 +226,28 @@ def encode_node_embeddings(
         attn_mask_dev = attention_mask.to(target_device)
         span_mask_dev = span_mask.to(target_device)
 
-        with _cuda_autocast(enabled=use_amp):
-            outputs = encoder(input_ids=input_ids_dev, attention_mask=attn_mask_dev)
-            pooled = compute_masked_mean_pooling(outputs.last_hidden_state, span_mask_dev)
+        if dp_model is not None and bsz >= num_gpus:
+            pooled = dp_model(input_ids_dev, attn_mask_dev, span_mask_dev)
+        else:
+            pooled = pool_wrapper(input_ids_dev, attn_mask_dev, span_mask_dev)
         if not torch.isfinite(pooled).all():
-            with _cuda_autocast(enabled=False):
-                outputs = encoder(input_ids=input_ids_dev, attention_mask=attn_mask_dev)
-                pooled = compute_masked_mean_pooling(outputs.last_hidden_state, span_mask_dev)
+            pool_wrapper.use_amp = False
+            if dp_model is not None and bsz >= num_gpus:
+                pooled = dp_model(input_ids_dev, attn_mask_dev, span_mask_dev)
+            else:
+                pooled = pool_wrapper(input_ids_dev, attn_mask_dev, span_mask_dev)
 
         chunks.append(pooled.cpu().to(dtype=torch.float32))
 
-    return torch.cat(chunks, dim=0)
+    ordered_out = torch.cat(chunks, dim=0)
+    if n <= eff_batch:
+        return ordered_out
+    restored = torch.empty_like(ordered_out)
+    inv_order = torch.empty((n,), dtype=torch.long)
+    for pos, orig_idx in enumerate(order):
+        inv_order[orig_idx] = pos
+    restored.copy_(ordered_out[inv_order])
+    return restored
 
 
 @torch.no_grad()
@@ -217,6 +262,7 @@ def encode_edges_with_cross_encoder(
     lang: str | None = None,
     batch_size: int = 32,
     max_length: int = 256,
+    use_multi_gpu: bool = True,
     device: torch.device | None = None,
 ) -> dict[str, Any]:
     """Run frozen segment-isolated `DualHeadCrossEncoder` inference on `(u, v)` edge text pairs."""
@@ -242,6 +288,30 @@ def encode_edges_with_cross_encoder(
     target_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _freeze_module(cross_encoder).to(target_device)
     use_amp = target_device.type == "cuda"
+    prev_amp = getattr(cross_encoder, "_amp_enabled", False)
+    cross_encoder._amp_enabled = bool(use_amp)
+
+    dp_ok = _can_use_dataparallel(target_device, use_multi_gpu) and isinstance(
+        cross_encoder, torch.nn.Module
+    )
+    num_gpus = torch.cuda.device_count() if dp_ok else 1
+    eff_batch = max(1, int(batch_size) * num_gpus)
+    dp_ce: torch.nn.Module | None = (
+        torch.nn.DataParallel(cross_encoder) if dp_ok else None
+    )
+
+    order = (
+        sorted(
+            range(n_edges),
+            key=lambda idx: (
+                len(str(parent_texts[idx] or ""))
+                + len(str(reply_texts[idx] or ""))
+                + (len(str(root_texts[idx] or "")) if root_texts is not None else 0)
+            ),
+        )
+        if n_edges > eff_batch
+        else list(range(n_edges))
+    )
 
     all_s: list[Tensor] = []
     all_h: list[Tensor] = []
@@ -250,47 +320,62 @@ def encode_edges_with_cross_encoder(
     all_probs: list[Tensor] = []
     all_b_probs: list[Tensor] = []
 
-    for start in range(0, n_edges, batch_size):
-        end = min(n_edges, start + batch_size)
-        root_slice = root_texts[start:end] if root_texts is not None else None
-        enc = encode_cross_encoder_batch(
-            parent_texts[start:end],
-            reply_texts[start:end],
-            tokenizer=tokenizer,
-            root_texts=root_slice,
-            include_root_context=include_root_context,
-            lang=eff_lang,
-            max_length=max_length,
-            encoder=cross_encoder.encoder,
-        )
-        enc_dev = {k: v.to(target_device) for k, v in enc.items()}
-        with _cuda_autocast(enabled=use_amp):
-            out = cross_encoder(**enc_dev)
-        if not torch.isfinite(out["s_uv"]).all() or not torch.isfinite(out["h_uv"]).all():
-            prev_amp = getattr(cross_encoder, "_amp_enabled", False)
-            cross_encoder._amp_enabled = False
-            try:
-                with _cuda_autocast(enabled=False):
+    try:
+        for start in range(0, n_edges, eff_batch):
+            idx_slice = order[start : start + eff_batch]
+            u_slice = [parent_texts[idx] for idx in idx_slice]
+            v_slice = [reply_texts[idx] for idx in idx_slice]
+            root_slice = [root_texts[idx] for idx in idx_slice] if root_texts is not None else None
+            enc = encode_cross_encoder_batch(
+                u_slice,
+                v_slice,
+                tokenizer=tokenizer,
+                root_texts=root_slice,
+                include_root_context=include_root_context,
+                lang=eff_lang,
+                max_length=max_length,
+                encoder=cross_encoder.encoder,
+            )
+            enc_dev = {k: v.to(target_device) for k, v in enc.items()}
+            if dp_ce is not None and len(idx_slice) >= num_gpus:
+                out = dp_ce(**enc_dev)
+            else:
+                with _cuda_autocast(enabled=bool(getattr(cross_encoder, "_amp_enabled", False))):
                     out = cross_encoder(**enc_dev)
-            finally:
-                cross_encoder._amp_enabled = prev_amp
-        all_s.append(out["s_uv"].cpu().to(dtype=torch.float32))
-        all_h.append(out["h_uv"].cpu().to(dtype=torch.float32))
-        all_probs.append(out["stance_probs"].cpu().to(dtype=torch.float32))
-        if ce_edge_dim == 4 and "r_uv" in out:
-            all_r.append(out["r_uv"].cpu().to(dtype=torch.float32))
-            all_c.append(out["c_uv"].cpu().to(dtype=torch.float32))
-            all_b_probs.append(out["behavior_probs"].cpu().to(dtype=torch.float32))
+            if not torch.isfinite(out["s_uv"]).all() or not torch.isfinite(out["h_uv"]).all():
+                cross_encoder._amp_enabled = False
+                if dp_ce is not None and len(idx_slice) >= num_gpus:
+                    out = dp_ce(**enc_dev)
+                else:
+                    with _cuda_autocast(enabled=False):
+                        out = cross_encoder(**enc_dev)
+            all_s.append(out["s_uv"].cpu().to(dtype=torch.float32))
+            all_h.append(out["h_uv"].cpu().to(dtype=torch.float32))
+            all_probs.append(out["stance_probs"].cpu().to(dtype=torch.float32))
+            if ce_edge_dim == 4 and "r_uv" in out:
+                all_r.append(out["r_uv"].cpu().to(dtype=torch.float32))
+                all_c.append(out["c_uv"].cpu().to(dtype=torch.float32))
+                all_b_probs.append(out["behavior_probs"].cpu().to(dtype=torch.float32))
+    finally:
+        cross_encoder._amp_enabled = prev_amp
 
-    s_np = torch.cat(all_s, dim=0).numpy()
-    h_np = torch.cat(all_h, dim=0).numpy()
-    probs_np = torch.cat(all_probs, dim=0).numpy()
+    def _restore_order(arr: np.ndarray) -> np.ndarray:
+        if n_edges <= eff_batch:
+            return arr
+        out_arr = np.empty_like(arr)
+        for pos, orig_idx in enumerate(order):
+            out_arr[orig_idx] = arr[pos]
+        return out_arr
+
+    s_np = _restore_order(torch.cat(all_s, dim=0).numpy())
+    h_np = _restore_order(torch.cat(all_h, dim=0).numpy())
+    probs_np = _restore_order(torch.cat(all_probs, dim=0).numpy())
     labels = [STANCE_LABELS[int(i)] for i in probs_np.argmax(axis=-1)]
     res: dict[str, Any] = {"s_uv": s_np, "h_uv": h_np, "pred_label": labels}
     if ce_edge_dim == 4 and all_r:
-        res["r_uv"] = torch.cat(all_r, dim=0).numpy()
-        res["c_uv"] = torch.cat(all_c, dim=0).numpy()
-        bp_np = torch.cat(all_b_probs, dim=0).numpy()
+        res["r_uv"] = _restore_order(torch.cat(all_r, dim=0).numpy())
+        res["c_uv"] = _restore_order(torch.cat(all_c, dim=0).numpy())
+        bp_np = _restore_order(torch.cat(all_b_probs, dim=0).numpy())
         res["behavior_label"] = [DISCOURSE_BEHAVIOR_LABELS[int(i)] for i in bp_np.argmax(axis=-1)]
     return res
 

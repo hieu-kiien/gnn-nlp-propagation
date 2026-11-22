@@ -133,8 +133,10 @@ def assemble_paper_artifacts(
         "tables_main_pheme.tex",
         "tables_loo_pheme.tex",
         "tables_ablation_pheme.tex",
+        "tables_mechanisms_pheme.tex",
         "tables_main_vn.tex",
         "tables_ablation_vn.tex",
+        "tables_mechanisms_vn.tex",
         "tables_upfd.tex",
         "tables_efficiency.tex",
     ]
@@ -142,9 +144,11 @@ def assemble_paper_artifacts(
         "figures/pheme/fig1_umap_polarization.pdf",
         "figures/pheme/fig2_early_k_curve.pdf",
         "figures/pheme/fig3_cascade_heatmap.pdf",
+        "figures/pheme/fig4_counterfactual_interventions.pdf",
         "figures/vn/fig1_umap_polarization.pdf",
         "figures/vn/fig2_early_k_curve.pdf",
         "figures/vn/fig3_cascade_heatmap.pdf",
+        "figures/vn/fig4_counterfactual_interventions.pdf",
     ]
     manifest: dict[str, Any] = {
         "paper_dir": str(pdir),

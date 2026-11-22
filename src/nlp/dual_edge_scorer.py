@@ -507,19 +507,25 @@ class HostilityTeacherScorer:
         batch_size: int = 32,
         max_length: int = 256,
     ) -> np.ndarray:
-        if not texts:
+        n_texts = len(texts)
+        if n_texts == 0:
             return np.zeros((0,), dtype=np.float32)
 
         eff_batch = max(1, int(batch_size) * max(1, int(self._num_gpus)))
         eff_max_len = _effective_max_length(max_length, encoder=self.model, tokenizer=self.tokenizer)
         id2label = getattr(getattr(self.model, "config", None), "id2label", None)
+
+        norm_texts = [normalize_social_text(t, lang=self.lang) for t in texts]
+        # Length-bucket batches to minimize padding while restoring exact input order.
+        order = (
+            sorted(range(n_texts), key=lambda idx: len(norm_texts[idx]))
+            if n_texts > eff_batch
+            else list(range(n_texts))
+        )
         scores: list[Tensor] = []
 
-        for start in range(0, len(texts), eff_batch):
-            batch = [
-                normalize_social_text(t, lang=self.lang)
-                for t in texts[start : start + eff_batch]
-            ]
+        for start in range(0, n_texts, eff_batch):
+            batch = [norm_texts[idx] for idx in order[start : start + eff_batch]]
             enc = self.tokenizer(
                 batch,
                 padding=True,
@@ -551,7 +557,13 @@ class HostilityTeacherScorer:
             h = self.hostility_from_probs(probs, lang=self.lang, id2label=id2label)
             scores.append(h.cpu())
 
-        return torch.cat(scores, dim=0).numpy().astype(np.float32)
+        ordered_np = torch.cat(scores, dim=0).numpy().astype(np.float32)
+        if n_texts <= eff_batch:
+            return ordered_np
+        out_np = np.empty_like(ordered_np)
+        for pos, orig_idx in enumerate(order):
+            out_np[orig_idx] = ordered_np[pos]
+        return out_np
 
 
 class NLIStanceTeacherScorer:
@@ -762,39 +774,45 @@ class NLIStanceTeacherScorer:
         else:
             avail_premise_tok = max(64, eff_max_len - 48)
 
-        for start in range(0, len(parent_texts), eff_batch):
-            u_raw = parent_texts[start : start + eff_batch]
-            v_raw = reply_texts[start : start + eff_batch]
-            if active_verbalizer:
-                premises = []
-                for u, v in zip(u_raw, v_raw):
-                    u_norm = normalize_social_text(u, lang=eff_lang)
-                    v_norm = normalize_social_text(v, lang=eff_lang)
-                    if has_tok_encode:
-                        u_ids = self.tokenizer.encode(u_norm, add_special_tokens=False)
-                        v_ids = self.tokenizer.encode(v_norm, add_special_tokens=False)
-                        v_reserve = min(len(v_ids), max(8, avail_premise_tok // 2))
-                        u_max_tok = max(8, avail_premise_tok - v_reserve)
-                        u_keep = u_ids[:u_max_tok]
-                        v_max_tok = max(8, avail_premise_tok - len(u_keep))
-                        v_keep = v_ids[:v_max_tok]
-                        u_trim = (
-                            self.tokenizer.decode(u_keep, skip_special_tokens=True).strip()
-                            if len(u_ids) > len(u_keep)
-                            else u_norm
-                        )
-                        v_trim = (
-                            self.tokenizer.decode(v_keep, skip_special_tokens=True).strip()
-                            if len(v_ids) > len(v_keep)
-                            else v_norm
-                        )
-                    else:
-                        u_trim = u_norm[:300]
-                        v_trim = v_norm[:500]
-                    if eff_lang == "en":
-                        premises.append(f"Parent comment: {u_trim}\nReply: {v_trim}")
-                    else:
-                        premises.append(f"Bình luận trước: {u_trim}\nPhản hồi: {v_trim}")
+        n_pairs = len(parent_texts)
+        if active_verbalizer:
+            all_premises: list[str] = []
+            for u, v in zip(parent_texts, reply_texts):
+                u_norm = normalize_social_text(u, lang=eff_lang)
+                v_norm = normalize_social_text(v, lang=eff_lang)
+                if has_tok_encode:
+                    u_ids = self.tokenizer.encode(u_norm, add_special_tokens=False)
+                    v_ids = self.tokenizer.encode(v_norm, add_special_tokens=False)
+                    v_reserve = min(len(v_ids), max(8, avail_premise_tok // 2))
+                    u_max_tok = max(8, avail_premise_tok - v_reserve)
+                    u_keep = u_ids[:u_max_tok]
+                    v_max_tok = max(8, avail_premise_tok - len(u_keep))
+                    v_keep = v_ids[:v_max_tok]
+                    u_trim = (
+                        self.tokenizer.decode(u_keep, skip_special_tokens=True).strip()
+                        if len(u_ids) > len(u_keep)
+                        else u_norm
+                    )
+                    v_trim = (
+                        self.tokenizer.decode(v_keep, skip_special_tokens=True).strip()
+                        if len(v_ids) > len(v_keep)
+                        else v_norm
+                    )
+                else:
+                    u_trim = u_norm[:300]
+                    v_trim = v_norm[:500]
+                if eff_lang == "en":
+                    all_premises.append(f"Parent comment: {u_trim}\nReply: {v_trim}")
+                else:
+                    all_premises.append(f"Bình luận trước: {u_trim}\nPhản hồi: {v_trim}")
+            order = (
+                sorted(range(n_pairs), key=lambda idx: len(all_premises[idx]))
+                if n_pairs > eff_batch
+                else list(range(n_pairs))
+            )
+            for start in range(0, n_pairs, eff_batch):
+                idx_slice = order[start : start + eff_batch]
+                premises = [all_premises[idx] for idx in idx_slice]
                 p_sup_pass = self._score_premise_hypothesis(
                     premises, [h_sup_tmpl] * len(premises), effective_max_len=eff_max_len
                 )
@@ -810,18 +828,39 @@ class NLIStanceTeacherScorer:
                 p_opp = 0.5 * (e_opp + (c_sup - double_contra).clamp_min(0.0))
                 p_neu = 0.5 * (n_sup + n_opp) + double_contra
                 canonical = torch.stack([p_sup, p_neu, p_opp], dim=-1)
-            else:
-                u_batch = [normalize_social_text(t, lang=eff_lang) for t in u_raw]
-                v_batch = [normalize_social_text(t, lang=eff_lang) for t in v_raw]
+                s = self.stance_from_canonical_probs(canonical)
+                all_probs.append(canonical.cpu())
+                all_s.append(s.cpu())
+        else:
+            u_all = [normalize_social_text(t, lang=eff_lang) for t in parent_texts]
+            v_all = [normalize_social_text(t, lang=eff_lang) for t in reply_texts]
+            order = (
+                sorted(range(n_pairs), key=lambda idx: len(u_all[idx]) + len(v_all[idx]))
+                if n_pairs > eff_batch
+                else list(range(n_pairs))
+            )
+            for start in range(0, n_pairs, eff_batch):
+                idx_slice = order[start : start + eff_batch]
+                u_batch = [u_all[idx] for idx in idx_slice]
+                v_batch = [v_all[idx] for idx in idx_slice]
                 canonical = self._score_premise_hypothesis(
                     u_batch, v_batch, effective_max_len=eff_max_len
                 )
-            s = self.stance_from_canonical_probs(canonical)
-            all_probs.append(canonical.cpu())
-            all_s.append(s.cpu())
+                s = self.stance_from_canonical_probs(canonical)
+                all_probs.append(canonical.cpu())
+                all_s.append(s.cpu())
 
-        probs_np = torch.cat(all_probs, dim=0).numpy().astype(np.float32)
-        s_np = torch.cat(all_s, dim=0).numpy().astype(np.float32)
+        probs_ordered = torch.cat(all_probs, dim=0).numpy().astype(np.float32)
+        s_ordered = torch.cat(all_s, dim=0).numpy().astype(np.float32)
+        if n_pairs <= eff_batch:
+            probs_np = probs_ordered
+            s_np = s_ordered
+        else:
+            probs_np = np.empty_like(probs_ordered)
+            s_np = np.empty_like(s_ordered)
+            for pos, orig_idx in enumerate(order):
+                probs_np[orig_idx] = probs_ordered[pos]
+                s_np[orig_idx] = s_ordered[pos]
         labels = [STANCE_LABELS[int(idx)] for idx in probs_np.argmax(axis=-1)]
         return {
             "s_uv": s_np,
@@ -1637,17 +1676,20 @@ def distill_dual_cross_encoder(
         bp_tgt = bp_tgt / bp_tgt.sum(dim=-1, keepdim=True)
         return enc, s_tgt, h_tgt, r_tgt, c_tgt, p_tgt, bp_tgt
 
+    use_pin_mem = target_device.type == "cuda"
     train_loader = DataLoader(
         _PairDistillDataset(train_data),
         batch_size=batch_size,
         shuffle=True,
         collate_fn=_collate,
+        pin_memory=use_pin_mem,
     )
     val_loader = DataLoader(
         _PairDistillDataset(val_data),
         batch_size=batch_size,
         shuffle=False,
         collate_fn=_collate,
+        pin_memory=use_pin_mem,
     )
 
     head_lr = lr * 7.5 if lr <= 3e-5 else lr
@@ -1824,6 +1866,13 @@ def distill_dual_cross_encoder(
                 best_epoch = _epoch
                 best_val_metrics = dict(last_val_metrics)
                 best_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
+            print(
+                f"[Distill:{lang}] Epoch {_epoch + 1}/{max(1, epochs)} | "
+                f"train_loss={train_losses[-1]:.4f} | val_loss={val_loss:.4f} | "
+                f"val_pearson_s={last_val_metrics['val_pearson_s']:.4f} | "
+                f"val_pearson_h={last_val_metrics['val_pearson_h']:.4f}",
+                flush=True,
+            )
     finally:
         student._amp_enabled = False
 

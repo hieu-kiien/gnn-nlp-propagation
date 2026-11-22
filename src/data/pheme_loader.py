@@ -110,24 +110,72 @@ def _resolve_figshare_file_metadata(timeout: int = 30) -> tuple[str, str]:
     return PHEME_FALLBACK_DOWNLOAD_URL, PHEME_EXPECTED_MD5
 
 
+def _has_direct_event_subdirs(directory: Path) -> bool:
+    """Return True if `directory` directly contains PHEME event subdirectories."""
+    try:
+        for child in directory.iterdir():
+            if (
+                child.is_dir()
+                and not child.name.startswith(".")
+                and child.name != "__MACOSX"
+                and ((child / "rumours").is_dir() or (child / "non-rumours").is_dir())
+            ):
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def _discover_local_pheme_source(
     raw_dir: Path,
     extra_roots: Sequence[Path] = (Path("/kaggle/input"),),
+    max_depth: int = 3,
 ) -> tuple[Path | None, Path | None]:
-    """Locate a user-provided local/Kaggle-Input PHEME archive or extracted event directory."""
+    """Locate a local/Kaggle-Input PHEME archive or extracted dir via bounded shallow BFS."""
+    skip_dirs = {
+        "__MACOSX",
+        "rumours",
+        "non-rumours",
+        "reactions",
+        "source-tweets",
+        "source-tweet",
+    }
     roots = [Path(raw_dir), *[Path(r) for r in extra_roots if Path(r).exists()]]
     for root in roots:
         if not root.exists():
             continue
-        direct = root / PHEME_ARCHIVE_FILENAME
-        if direct.is_file():
-            return direct, None
-        for cand in sorted(root.rglob(PHEME_ARCHIVE_FILENAME)):
-            if cand.is_file():
-                return cand, None
-        for cand_dir in sorted(root.rglob("all-rnr-annotated-threads")):
-            if cand_dir.is_dir() and _find_event_directories(cand_dir):
-                return None, cand_dir
+        queue: deque[tuple[Path, int]] = deque([(root, 0)])
+        seen: set[Path] = set()
+        while queue:
+            cur_dir, depth = queue.popleft()
+            resolved = cur_dir.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+
+            direct = cur_dir / PHEME_ARCHIVE_FILENAME
+            if direct.is_file():
+                return direct, None
+
+            if _has_direct_event_subdirs(cur_dir):
+                return None, cur_dir
+            if cur_dir.name.startswith("all-rnr-annotated-threads") and _find_event_directories(cur_dir):
+                return None, cur_dir
+
+            if depth >= max_depth:
+                continue
+            try:
+                children = sorted(cur_dir.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if (
+                    child.is_dir()
+                    and not child.name.startswith(".")
+                    and child.name not in skip_dirs
+                    and not child.name.endswith("-all-rnr-threads")
+                ):
+                    queue.append((child, depth + 1))
     return None, None
 
 
@@ -359,6 +407,8 @@ def parse_pheme_thread(
     tdir = Path(thread_dir)
     source_dir = tdir / "source-tweets"
     if not source_dir.is_dir():
+        source_dir = tdir / "source-tweet"
+    if not source_dir.is_dir():
         return None
 
     source_files = sorted(
@@ -494,7 +544,21 @@ def parse_pheme_thread(
 def _find_event_directories(raw_root: Path) -> list[Path]:
     root = Path(raw_root)
     nested_root = root / "all-rnr-annotated-threads"
-    search_root = nested_root if nested_root.is_dir() else root
+    if nested_root.is_dir():
+        search_root = nested_root
+    else:
+        prefixed_nested = next(
+            (
+                p
+                for p in sorted(root.iterdir())
+                if p.is_dir()
+                and not p.name.startswith(".")
+                and p.name != "__MACOSX"
+                and p.name.startswith("all-rnr-annotated-threads")
+            ),
+            None,
+        )
+        search_root = prefixed_nested if prefixed_nested is not None else root
 
     event_dirs = sorted(
         p

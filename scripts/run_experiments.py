@@ -95,6 +95,14 @@ def _build_loaders(
                 f"Missing processed dataset files in '{data_dir}': {missing}. "
                 "Run Phase 2 preprocessing first; synthetic data is prohibited in official reports."
             )
+    if nodes_table is None or edges_table is None:
+        nodes_table, edges_table = load_cascade_parquet(data_dir, validate=True)
+    if nlp_features is None:
+        nlp_features = torch.load(
+            data_dir / "nlp_features.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
 
     common = {
         "root_dir": data_dir,

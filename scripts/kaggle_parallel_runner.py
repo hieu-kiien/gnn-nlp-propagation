@@ -744,6 +744,39 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                 cwd=work_dir,
             )
 
+        mech_ckpt = work_dir / "checkpoints" / f"best_sbifagat_{ds_name}.pt"
+        mech_json = work_dir / "paper" / f"results_mechanisms_{ds_name}.json"
+        mech_tex = work_dir / "paper" / f"tables_mechanisms_{ds_name}.tex"
+        if mech_ckpt.is_file() and (force or not mech_json.is_file() or not mech_tex.is_file()):
+            try:
+                _run_cmd(
+                    [
+                        py,
+                        "-m",
+                        "scripts.analyze_mechanisms",
+                        "--data-dir",
+                        str(processed_dir),
+                        "--ckpt",
+                        str(mech_ckpt),
+                        "--k-horizon",
+                        str(args.k_horizon),
+                        "--min-total-replies",
+                        str(args.min_total_replies),
+                        "--output-json",
+                        f"paper/results_mechanisms_{ds_name}.json",
+                        "--output-table",
+                        f"paper/tables_mechanisms_{ds_name}.tex",
+                        "--figures-dir",
+                        f"paper/figures/{ds_name}",
+                    ],
+                    cwd=work_dir,
+                )
+            except Exception as exc:
+                print(
+                    f"[WARN] Optional mechanistic analysis failed ({exc}); "
+                    "primary benchmark artifacts remain preserved."
+                )
+
         if lang == "en":
             loo_json = work_dir / "paper" / f"results_loo_{ds_name}.json"
             loo_tex = work_dir / "paper" / f"tables_loo_{ds_name}.tex"

@@ -9,6 +9,7 @@ from typing import Any, Callable, Literal, Mapping, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.stats import spearmanr, ttest_rel
 from sklearn.metrics import f1_score, roc_auc_score
 from torch_geometric.loader import DataLoader
@@ -106,7 +107,7 @@ class _ModelEMA:
 
 
 def _estimate_train_target_stats(loader: DataLoader) -> dict[str, Any]:
-    """Compute target means and inverse-std loss scales strictly from `train_loader`."""
+    """Compute target means and 2:1 constant-mean baseline-normalized loss scales strictly from `train_loader`."""
     size_vals: list[np.ndarray] = []
     polar_vals: list[np.ndarray] = []
     for batch in loader:
@@ -127,22 +128,40 @@ def _estimate_train_target_stats(loader: DataLoader) -> dict[str, Any]:
     mean_polar = float(np.mean(polar_arr)) if polar_arr.size > 0 else None
     std_polar = float(np.std(polar_arr)) if polar_arr.size >= 2 else 0.0
 
-    size_scale = (
-        float(np.clip(1.0 / max(std_size, 0.25), 0.5, 4.0))
-        if size_arr.size >= 2 and std_size > 1e-6
-        else 1.0
-    )
-    polar_scale = (
-        float(np.clip(1.0 / max(std_polar, 0.12), 0.5, 4.0))
-        if polar_arr.size >= 2 and std_polar > 1e-6
-        else 1.0
-    )
+    base_size_loss = 1.0
+    base_polar_loss = 1.0
+    if size_arr.size >= 2 and std_size > 1e-6 and mean_size is not None:
+        y_s_t = torch.from_numpy(size_arr).float()
+        base_size_loss = float(F.huber_loss(torch.full_like(y_s_t, mean_size), y_s_t, delta=1.0).item())
+        size_scale = float(np.clip(1.0 / max(base_size_loss, 1e-4), 0.5, 16.0))
+    else:
+        size_scale = 1.0
+
+    if polar_arr.size >= 2 and std_polar > 1e-6 and mean_polar is not None:
+        y_p_t = torch.from_numpy(polar_arr).float().clamp(0.0, 1.0)
+        y_safe = y_p_t.clamp(1e-6, 1.0 - 1e-6)
+        target_entropy = -(y_p_t * torch.log(y_safe) + (1.0 - y_p_t) * torch.log(1.0 - y_safe))
+        p_c = min(0.99, max(1e-3, float(mean_polar)))
+        logit_c = math.log(p_c / (1.0 - p_c))
+        const_logit = torch.full_like(y_p_t, logit_c)
+        const_pred = torch.sigmoid(const_logit)
+        base_kl = (
+            F.binary_cross_entropy_with_logits(const_logit, y_p_t, reduction="none") - target_entropy
+        ).clamp_min(0.0).mean()
+        base_l1 = F.smooth_l1_loss(const_pred, y_p_t, beta=0.08)
+        base_polar_loss = float((base_kl + base_l1).item())
+        polar_scale = float(np.clip(0.5 / max(base_polar_loss, 1e-4), 0.5, 250.0))
+    else:
+        polar_scale = 1.0
+
     return {
         "count": int(min(size_arr.size, polar_arr.size)) if size_vals and polar_vals else int(size_arr.size),
         "mean_size": mean_size,
         "std_size": std_size,
         "mean_polar": mean_polar,
         "std_polar": std_polar,
+        "base_size_loss": base_size_loss,
+        "base_polar_loss": base_polar_loss,
         "size_loss_scale": size_scale,
         "polar_loss_scale": polar_scale,
     }
@@ -164,7 +183,7 @@ def _init_multitask_head_biases(model: nn.Module, stats: Mapping[str, Any]) -> N
         if mean_polar is not None and hasattr(head, "polar_head") and len(head.polar_head) > 0:
             last_polar = head.polar_head[-1]
             if getattr(last_polar, "bias", None) is not None:
-                p_clamped = min(0.95, max(0.05, float(mean_polar)))
+                p_clamped = min(0.99, max(1e-3, float(mean_polar)))
                 polar_bias = math.log(p_clamped / (1.0 - p_clamped))
                 last_polar.bias.fill_(float(polar_bias))
 

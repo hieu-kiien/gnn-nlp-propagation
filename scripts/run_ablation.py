@@ -319,7 +319,7 @@ def main() -> None:
     print("\n=== Ablation Study Results (5 Seeds, K={}) ===".format(args.k_horizon))
     print(build_markdown_table(ablation_res, active_metrics))
 
-    cmp_abl = str(ablation_res.get("comparator_model") or "BiEdgeGATv2 (Matched)").replace("_", "\\_")
+    cmp_abl = str(ablation_res.get("comparator_model") or "BiEdgeGATv2 (Matched)").replace("_", "\\_").replace("&", "\\&")
     export_latex_table(
         ablation_res,
         out_table,

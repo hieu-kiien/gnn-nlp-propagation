@@ -230,8 +230,8 @@ def export_latex_table(
     p_values = benchmark_result.get("p_values", {})
     ref_model = benchmark_result.get("reference_model", "SBiFAGAT")
     cmp_model = benchmark_result.get("comparator_model", "BiGCN")
-    ref_esc = str(ref_model).replace("_", "\\_")
-    cmp_esc = str(cmp_model).replace("_", "\\_")
+    ref_esc = str(ref_model).replace("_", "\\_").replace("&", "\\&")
+    cmp_esc = str(cmp_model).replace("_", "\\_").replace("&", "\\&")
     best_by_metric = _best_model_per_metric(summary_stats, metrics)
 
     col_spec = "l" + "c" * len(metrics)
@@ -239,7 +239,7 @@ def export_latex_table(
 
     body_rows: list[str] = []
     for model_name, stats in summary_stats.items():
-        escaped_name = model_name.replace("_", "\\_")
+        escaped_name = model_name.replace("_", "\\_").replace("&", "\\&")
         cells = [escaped_name]
         for key, _, lower_is_better in metrics:
             mean_v, std_v = stats.get(key, (float("nan"), float("nan")))

@@ -12,6 +12,7 @@ Produces three camera-ready IEEE/Springer figures in `paper/figures/`:
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -362,3 +363,100 @@ def plot_cascade_heatmap(
     txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     return pdf_path, svg_path, txt_path
+
+
+def plot_counterfactual_interventions(
+    interventions_summary: Mapping[str, Mapping[str, Any]],
+    *,
+    output_dir: str | Path = "paper/figures",
+    stem: str = "fig4_counterfactual_interventions",
+) -> tuple[Path, Path]:
+    """Generate Fig 4: Counterfactual moderation impact on predicted size & polarization."""
+    _configure_academic_rcparams()
+
+    default_order = [
+        ("cool_top3_hostility", "Cool Top-3\nHostility"),
+        ("cool_all_hostility", "Cool All\nHostility"),
+        ("neutralize_top3_conflict", "Neutralize Top-3\nConflict"),
+        ("neutralize_all_oppose", "Neutralize All\nOpposition"),
+    ]
+    ordered = [
+        (key, lbl) for key, lbl in default_order if key in interventions_summary
+    ]
+    for key in interventions_summary:
+        if all(k != key for k, _ in ordered):
+            ordered.append((key, key.replace("_", "\n")))
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.4), constrained_layout=True)
+    if not ordered:
+        for ax in axes:
+            ax.text(0.5, 0.5, "No counterfactual data", ha="center", va="center")
+        return _save_vector_pair(fig, Path(output_dir), stem)
+
+    x = np.arange(len(ordered), dtype=float)
+    bar_width = 0.36
+    cohorts = [
+        ("all_test", "All Test Cascades", "#0072B2", -0.5 * bar_width),
+        ("high_polar_q75", "High-Polarization (Q75+)", "#D55E00", 0.5 * bar_width),
+    ]
+    panels = [
+        (axes[0], "mean_delta_y_size", "ci95_delta_y_size", "Predicted Log-Size Shift ($\\Delta\\hat{y}_{\\mathrm{size}}$)", "Propagation Size Response"),
+        (axes[1], "mean_delta_y_polar", "ci95_delta_y_polar", "Predicted Polarization Shift ($\\Delta\\hat{y}_{\\mathrm{polar}}$)", "Polarization Response"),
+    ]
+
+    for ax, mean_key, ci_key, ylabel, title in panels:
+        ax.axhline(0.0, color="#333333", linestyle="--", linewidth=1.0, alpha=0.8)
+        for c_key, c_label, color, offset in cohorts:
+            means: list[float] = []
+            err_lo: list[float] = []
+            err_hi: list[float] = []
+            for int_key, _ in ordered:
+                entry = interventions_summary.get(int_key, {}).get(c_key, {})
+                mv = entry.get(mean_key)
+                m_val = 0.0 if mv is None or not math.isfinite(float(mv)) else float(mv)
+                ci = entry.get(ci_key)
+                if isinstance(ci, (list, tuple)) and len(ci) == 2 and ci[0] is not None and ci[1] is not None:
+                    lo_v = float(ci[0])
+                    hi_v = float(ci[1])
+                    if math.isfinite(lo_v) and math.isfinite(hi_v):
+                        err_lo.append(max(0.0, m_val - lo_v))
+                        err_hi.append(max(0.0, hi_v - m_val))
+                    else:
+                        err_lo.append(0.0)
+                        err_hi.append(0.0)
+                else:
+                    err_lo.append(0.0)
+                    err_hi.append(0.0)
+                means.append(m_val)
+
+            ax.bar(
+                x + offset,
+                means,
+                width=bar_width,
+                color=color,
+                alpha=0.88,
+                edgecolor="#222222",
+                linewidth=0.6,
+                yerr=[err_lo, err_hi],
+                capsize=3.5,
+                error_kw={"elinewidth": 1.1, "ecolor": "#222222"},
+                label=c_label,
+                zorder=2,
+            )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([lbl for _, lbl in ordered], fontsize=8.5)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, axis="y", linestyle=":", alpha=0.45, zorder=0)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.07),
+        ncol=2,
+        frameon=False,
+    )
+    return _save_vector_pair(fig, Path(output_dir), stem)

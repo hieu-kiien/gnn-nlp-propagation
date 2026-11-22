@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 
 from src.data.pheme_loader import (
+    _discover_local_pheme_source,
+    _find_event_directories,
     compute_hashes,
     convert_veracity_label,
     extract_pheme_archive,
@@ -265,3 +267,55 @@ def test_pheme_trees_valid_connected_acyclic_and_utc(tmp_path: Path) -> None:
     root_c1 = next(n for n in c1_nodes if n["is_root"])
     assert root_c1["user_id_hash"] == expected_root_hash
     assert root_c1["rumor_label"] == "true"
+
+
+def test_discover_local_pheme_prefixed_dir_ignores_appledouble_and_parses_singular_source_tweet(
+    tmp_path: Path,
+) -> None:
+    """Shallow BFS locates `all-rnr-annotated-threads_1`, ignores `._*`, and reads singular `source-tweet`."""
+    k_root = tmp_path / "kaggle_input"
+    ds_root = k_root / "pheme-dataset"
+    prefixed_root = ds_root / "all-rnr-annotated-threads_1"
+    ev_dir = prefixed_root / "charliehebdo-all-rnr-threads"
+    tdir = ev_dir / "rumours" / "552783238415265792"
+
+    # AppleDouble macOS metadata file at top and inside tweet folders must never break discovery/parsing
+    prefixed_root.mkdir(parents=True)
+    (ds_root / "._all-rnr-annotated-threads_1").write_bytes(b"macos_meta")
+
+    _write_tweet_json(
+        tdir / "source-tweet" / "552783238415265792.json",
+        tid="552783238415265792",
+        text="Singular source-tweet root",
+        created_at="Wed Jan 07 11:00:00 +0000 2015",
+        user_id="9001",
+    )
+    (tdir / "source-tweet" / "._552783238415265792.json").write_bytes(b"macos_meta")
+    _write_tweet_json(
+        tdir / "reactions" / "552784168849190912.json",
+        tid="552784168849190912",
+        text="Valid child reply",
+        created_at="Wed Jan 07 11:02:00 +0000 2015",
+        user_id="9002",
+        reply_to="552783238415265792",
+    )
+    (tdir / "reactions" / "._552784168849190912.json").write_bytes(b"macos_meta")
+    (tdir / "annotation.json").write_text(json.dumps({"is_rumour": "rumour", "true": "1"}), encoding="utf-8")
+    (tdir / "structure.json").write_text(
+        json.dumps({"552783238415265792": {"552784168849190912": []}}),
+        encoding="utf-8",
+    )
+
+    found_arc, found_dir = _discover_local_pheme_source(tmp_path / "empty_raw", extra_roots=(k_root,))
+    assert found_arc is None
+    assert found_dir == prefixed_root
+
+    events = _find_event_directories(ds_root)
+    assert events == [ev_dir]
+
+    out_dir = tmp_path / "out_singular"
+    nodes_path, edges_path = process_pheme_dataset(raw_root=found_dir, output_dir=out_dir)
+    assert nodes_path.is_file() and edges_path.is_file()
+    n_tbl, e_tbl = load_cascade_parquet(out_dir, validate=True)
+    assert n_tbl.num_rows == 2 and e_tbl.num_rows == 1
+

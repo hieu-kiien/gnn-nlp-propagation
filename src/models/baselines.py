@@ -179,7 +179,7 @@ class MultiTaskHead(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
         self.polar_head = nn.Sequential(
-            nn.Linear(reg_in_dim, hidden_dim),
+            nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
@@ -228,7 +228,7 @@ class MultiTaskHead(nn.Module):
             reg_emb = graph_emb
 
         y_size_pred = F.softplus(self.size_head(reg_emb)).squeeze(-1)
-        y_polar_logit = self.polar_head(reg_emb).squeeze(-1)
+        y_polar_logit = self.polar_head(graph_emb).squeeze(-1)
         y_polar_pred = torch.sigmoid(y_polar_logit)
         rumor_logits = self.rumor_head(reg_emb)
         result: dict[str, Tensor] = {
