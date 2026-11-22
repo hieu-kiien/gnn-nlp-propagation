@@ -319,3 +319,11 @@ def test_discover_local_pheme_prefixed_dir_ignores_appledouble_and_parses_singul
     n_tbl, e_tbl = load_cascade_parquet(out_dir, validate=True)
     assert n_tbl.num_rows == 2 and e_tbl.num_rows == 1
 
+    # Modern 2026 Kaggle container depth-4 mount: /kaggle/input/datasets/<owner>/<slug>/all-rnr-annotated-threads_1
+    k_v2 = tmp_path / "kaggle_input_v2"
+    v2_prefixed = k_v2 / "datasets" / "manuelcecerepalazzo" / "pheme-dataset" / "all-rnr-annotated-threads_1"
+    (v2_prefixed / "charliehebdo-all-rnr-threads" / "rumours").mkdir(parents=True)
+    v2_arc, v2_dir = _discover_local_pheme_source(tmp_path / "empty_raw_v2", extra_roots=(k_v2,))
+    assert v2_arc is None
+    assert v2_dir == v2_prefixed
+

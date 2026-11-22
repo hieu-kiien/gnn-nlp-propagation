@@ -129,7 +129,7 @@ def _has_direct_event_subdirs(directory: Path) -> bool:
 def _discover_local_pheme_source(
     raw_dir: Path,
     extra_roots: Sequence[Path] = (Path("/kaggle/input"),),
-    max_depth: int = 3,
+    max_depth: int = 6,
 ) -> tuple[Path | None, Path | None]:
     """Locate a local/Kaggle-Input PHEME archive or extracted dir via bounded shallow BFS."""
     skip_dirs = {
@@ -676,6 +676,22 @@ def main() -> None:
             max_threads=args.max_threads,
         )
     else:
+        kaggle_root = Path("/kaggle/input")
+        if discovered_archive is None and kaggle_root.exists():
+            sample_dirs: list[str] = []
+            q_dbg: deque[tuple[Path, int]] = deque([(kaggle_root, 0)])
+            while q_dbg and len(sample_dirs) < 30:
+                d_cur, d_dep = q_dbg.popleft()
+                sample_dirs.append(str(d_cur))
+                if d_dep >= 4:
+                    continue
+                try:
+                    for ch in sorted(d_cur.iterdir()):
+                        if ch.is_dir() and not ch.name.startswith("."):
+                            q_dbg.append((ch, d_dep + 1))
+                except OSError:
+                    pass
+            print(f"[PHEME] Local discovery miss; shallow /kaggle/input dirs: {sample_dirs}")
         archive_path = (
             discovered_archive
             if discovered_archive is not None
