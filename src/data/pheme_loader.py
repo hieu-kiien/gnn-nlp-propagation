@@ -19,6 +19,7 @@ import tempfile
 import time
 import unicodedata
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
@@ -398,6 +399,23 @@ def _extract_tweet_fields(tweet: Mapping[str, Any]) -> tuple[str, str, datetime,
     return tid, text, dt_utc, user_hash
 
 
+def _iter_json_files(directory: Path) -> list[Path]:
+    """List non-hidden `.json` files inside `directory` via a single `os.scandir` pass."""
+    try:
+        with os.scandir(directory) as it:
+            entries = [
+                entry
+                for entry in it
+                if not entry.name.startswith(".")
+                and entry.name.endswith(".json")
+                and entry.is_file()
+            ]
+    except OSError:
+        return []
+    entries.sort(key=lambda entry: entry.name)
+    return [Path(entry.path) for entry in entries]
+
+
 def parse_pheme_thread(
     thread_dir: Path,
     topic_id: str,
@@ -411,9 +429,7 @@ def parse_pheme_thread(
     if not source_dir.is_dir():
         return None
 
-    source_files = sorted(
-        p for p in source_dir.glob("*.json") if p.is_file() and not p.name.startswith(".")
-    )
+    source_files = _iter_json_files(source_dir)
     if not source_files:
         return None
 
@@ -442,9 +458,7 @@ def parse_pheme_thread(
 
     reactions_dir = tdir / "reactions"
     if reactions_dir.is_dir():
-        for rfile in sorted(reactions_dir.glob("*.json")):
-            if not rfile.is_file() or rfile.name.startswith("."):
-                continue
+        for rfile in _iter_json_files(reactions_dir):
             rjson = _read_json_safe(rfile)
             if not isinstance(rjson, Mapping):
                 continue
@@ -590,6 +604,7 @@ def process_pheme_dataset(
     raw_root: Path,
     output_dir: Path = Path("data/interim/pheme"),
     max_threads: int | None = None,
+    max_workers: int = 32,
 ) -> tuple[Path, Path]:
     """Parse all extracted PHEME event trees and save validated Parquet tables."""
     event_dirs = _find_event_directories(Path(raw_root))
@@ -602,36 +617,80 @@ def process_pheme_dataset(
     all_edges: list[dict[str, Any]] = []
     seen_roots: set[str] = set()
     thread_count = 0
+    eff_workers = max(1, int(max_workers))
 
-    for event_dir in event_dirs:
+    for ev_idx, event_dir in enumerate(event_dirs, start=1):
+        if max_threads is not None and thread_count >= max_threads:
+            break
+        t_ev = time.monotonic()
         topic_id = _topic_id_from_event_dir(event_dir)
+        tasks: list[tuple[Path, bool]] = []
         for sub_name, is_rumour in (("rumours", True), ("non-rumours", False)):
             sub_dir = event_dir / sub_name
             if not sub_dir.is_dir():
                 continue
-            for thread_dir in sorted(sub_dir.iterdir()):
-                if not thread_dir.is_dir() or thread_dir.name.startswith("."):
+            with os.scandir(sub_dir) as it:
+                thread_entries = sorted(
+                    (
+                        entry
+                        for entry in it
+                        if not entry.name.startswith(".") and entry.is_dir()
+                    ),
+                    key=lambda entry: entry.name,
+                )
+            for entry in thread_entries:
+                if entry.name in seen_roots:
                     continue
-                if thread_dir.name in seen_roots:
-                    continue
-                parsed = parse_pheme_thread(thread_dir, topic_id=topic_id, is_rumour=is_rumour)
+                tasks.append((Path(entry.path), is_rumour))
+
+        ev_threads = 0
+        ev_nodes = 0
+        ev_edges = 0
+        idx_cursor = 0
+        while idx_cursor < len(tasks) and (max_threads is None or thread_count < max_threads):
+            step = len(tasks) - idx_cursor if max_threads is None else max_threads - thread_count
+            chunk = tasks[idx_cursor : idx_cursor + step]
+            idx_cursor += len(chunk)
+            if eff_workers > 1 and len(chunk) > 1:
+                with ThreadPoolExecutor(max_workers=min(eff_workers, len(chunk))) as pool:
+                    parsed_chunk = list(
+                        pool.map(
+                            lambda item: parse_pheme_thread(
+                                item[0], topic_id=topic_id, is_rumour=item[1]
+                            ),
+                            chunk,
+                        )
+                    )
+            else:
+                parsed_chunk = [
+                    parse_pheme_thread(td, topic_id=topic_id, is_rumour=ir)
+                    for td, ir in chunk
+                ]
+
+            for (tdir, _), parsed in zip(chunk, parsed_chunk):
                 if parsed is None:
                     continue
                 nodes, edges = parsed
                 root_id = str(nodes[0]["node_id"]).rsplit("_", 1)[-1]
-                if root_id in seen_roots:
+                if tdir.name in seen_roots or root_id in seen_roots:
                     continue
                 seen_roots.add(root_id)
-                seen_roots.add(thread_dir.name)
+                seen_roots.add(tdir.name)
                 all_nodes.extend(nodes)
                 all_edges.extend(edges)
                 thread_count += 1
+                ev_threads += 1
+                ev_nodes += len(nodes)
+                ev_edges += len(edges)
                 if max_threads is not None and thread_count >= max_threads:
                     break
-            if max_threads is not None and thread_count >= max_threads:
-                break
-        if max_threads is not None and thread_count >= max_threads:
-            break
+
+        elapsed = time.monotonic() - t_ev
+        print(
+            f"[PHEME] Event {ev_idx}/{len(event_dirs)} ({topic_id}): "
+            f"+{ev_threads} threads ({ev_nodes} nodes, {ev_edges} edges) in {elapsed:.1f}s",
+            flush=True,
+        )
 
     nodes_table = build_nodes_table(all_nodes)
     edges_table = build_edges_table(all_edges)
@@ -645,6 +704,7 @@ def main() -> None:
     parser.add_argument("--extract-dir", type=Path, default=None)
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--max-threads", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=32)
     args = parser.parse_args()
 
     default_extract_dir = args.raw_dir / "extracted"
@@ -660,6 +720,7 @@ def main() -> None:
             raw_root=parse_root,
             output_dir=args.output_dir,
             max_threads=args.max_threads,
+            max_workers=args.workers,
         )
     elif args.skip_download or (default_extract_dir / "all-rnr-annotated-threads").exists():
         parse_root = default_extract_dir if _find_event_directories(default_extract_dir) else args.raw_dir
@@ -667,13 +728,15 @@ def main() -> None:
             raw_root=parse_root,
             output_dir=args.output_dir,
             max_threads=args.max_threads,
+            max_workers=args.workers,
         )
     elif discovered_extracted is not None:
-        print(f"Using pre-extracted PHEME directory: {discovered_extracted}")
+        print(f"Using pre-extracted PHEME directory: {discovered_extracted}", flush=True)
         nodes_path, edges_path = process_pheme_dataset(
             raw_root=discovered_extracted,
             output_dir=args.output_dir,
             max_threads=args.max_threads,
+            max_workers=args.workers,
         )
     else:
         kaggle_root = Path("/kaggle/input")
@@ -691,7 +754,7 @@ def main() -> None:
                             q_dbg.append((ch, d_dep + 1))
                 except OSError:
                     pass
-            print(f"[PHEME] Local discovery miss; shallow /kaggle/input dirs: {sample_dirs}")
+            print(f"[PHEME] Local discovery miss; shallow /kaggle/input dirs: {sample_dirs}", flush=True)
         archive_path = (
             discovered_archive
             if discovered_archive is not None
@@ -707,8 +770,9 @@ def main() -> None:
                 raw_root=parse_root,
                 output_dir=args.output_dir,
                 max_threads=args.max_threads,
+                max_workers=args.workers,
             )
-    print(f"Saved validated PHEME Parquet tables: {nodes_path}, {edges_path}")
+    print(f"Saved validated PHEME Parquet tables: {nodes_path}, {edges_path}", flush=True)
 
 
 if __name__ == "__main__":

@@ -327,3 +327,68 @@ def test_discover_local_pheme_prefixed_dir_ignores_appledouble_and_parses_singul
     assert v2_arc is None
     assert v2_dir == v2_prefixed
 
+
+def test_process_pheme_dataset_multithreaded_deterministic_parity(tmp_path: Path) -> None:
+    """ThreadPoolExecutor + os.scandir parsing must be row-for-row identical to sequential max_workers=1."""
+    raw_root = tmp_path / "pheme_raw" / "all-rnr-annotated-threads_1"
+    events_spec = [
+        ("charliehebdo-all-rnr-threads", "rumours", "source-tweets", "1001", "true"),
+        ("charliehebdo-all-rnr-threads", "non-rumours", "source-tweet", "1002", None),
+        ("ferguson-all-rnr-threads", "rumours", "source-tweet", "2001", "false"),
+        ("ferguson-all-rnr-threads", "non-rumours", "source-tweets", "2002", None),
+    ]
+    for ev_name, sub_name, src_folder, root_tid, veracity in events_spec:
+        tdir = raw_root / ev_name / sub_name / root_tid
+        is_r = sub_name == "rumours"
+        _write_tweet_json(
+            tdir / src_folder / f"{root_tid}.json",
+            tid=root_tid,
+            text=f"Source post {root_tid}",
+            created_at="Wed Jan 07 11:00:00 +0000 2015",
+            user_id="8001",
+        )
+        (tdir / src_folder / f"._{root_tid}.json").write_bytes(b"appledouble")
+        child_tid = f"{root_tid}1"
+        _write_tweet_json(
+            tdir / "reactions" / f"{child_tid}.json",
+            tid=child_tid,
+            text=f"Reply to {root_tid}",
+            created_at="Wed Jan 07 11:05:00 +0000 2015",
+            user_id="8002",
+            reply_to=root_tid,
+        )
+        (tdir / "reactions" / f"._{child_tid}.json").write_bytes(b"appledouble")
+        # AppleDouble sibling directory entry at thread level must be skipped cleanly
+        (tdir.parent / f"._{root_tid}").write_bytes(b"appledouble")
+        ann = {"is_rumour": "rumour" if is_r else "nonrumour"}
+        if veracity is not None:
+            ann["misinformation"] = "1" if veracity == "false" else "0"
+            ann["true"] = "1" if veracity == "true" else "0"
+        (tdir / "annotation.json").write_text(json.dumps(ann), encoding="utf-8")
+        (tdir / "structure.json").write_text(
+            json.dumps({root_tid: {child_tid: []}}),
+            encoding="utf-8",
+        )
+
+    out_seq = tmp_path / "out_seq"
+    out_par = tmp_path / "out_par"
+    process_pheme_dataset(raw_root=raw_root, output_dir=out_seq, max_workers=1)
+    process_pheme_dataset(raw_root=raw_root, output_dir=out_par, max_workers=8)
+    n_seq, e_seq = load_cascade_parquet(out_seq, validate=True)
+    n_par, e_par = load_cascade_parquet(out_par, validate=True)
+    assert n_seq.to_pylist() == n_par.to_pylist()
+    assert e_seq.to_pylist() == e_par.to_pylist()
+    assert n_par.num_rows == 8 and e_par.num_rows == 4
+
+    # Verify max_threads bound matches sequentially and across 8 workers
+    out_cap_seq = tmp_path / "out_cap_seq"
+    out_cap_par = tmp_path / "out_cap_par"
+    process_pheme_dataset(raw_root=raw_root, output_dir=out_cap_seq, max_threads=3, max_workers=1)
+    process_pheme_dataset(raw_root=raw_root, output_dir=out_cap_par, max_threads=3, max_workers=8)
+    nc_seq, ec_seq = load_cascade_parquet(out_cap_seq, validate=True)
+    nc_par, ec_par = load_cascade_parquet(out_cap_par, validate=True)
+    assert nc_seq.to_pylist() == nc_par.to_pylist()
+    assert ec_seq.to_pylist() == ec_par.to_pylist()
+    assert nc_par.num_rows == 6
+
+

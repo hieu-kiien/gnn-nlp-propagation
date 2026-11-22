@@ -57,9 +57,10 @@ from src.training.trainer import run_multi_seed_benchmark
 
 
 def _run_cmd(cmd: Sequence[str], *, cwd: Path) -> None:
-    print(f"[KaggleRunner] Running: {' '.join(cmd)}")
+    print(f"[KaggleRunner] Running: {' '.join(cmd)}", flush=True)
     repo_root = str(Path(__file__).resolve().parents[1])
     env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
     existing_pp = env.get("PYTHONPATH", "")
     parts = [p for p in existing_pp.split(os.pathsep) if p] if existing_pp else []
     if repo_root not in parts:
