@@ -118,13 +118,23 @@ def _tiny_roberta_config(
 
 
 def _diversify_tiny_cls_model(model: RobertaForSequenceClassification) -> None:
-    """Keep logits non-saturated and token-sensitive across distinct sequence lengths."""
+    """Keep logits centered, non-saturated, and RNG-isolated across torch/transformers builds."""
+    gen = torch.Generator(device="cpu").manual_seed(12345)
     with torch.no_grad():
         for name, param in model.named_parameters():
             if "word_embeddings.weight" in name:
-                torch.nn.init.normal_(param, std=1.0)
-            elif "value.weight" in name or "classifier.dense.weight" in name or "out_proj.weight" in name:
-                torch.nn.init.normal_(param, std=0.4)
+                param.copy_(torch.randn(param.shape, generator=gen, dtype=param.dtype))
+            elif (
+                "attention.self.value.weight" in name
+                or "attention.output.dense.weight" in name
+                or "classifier.dense.weight" in name
+            ):
+                param.copy_(torch.randn(param.shape, generator=gen, dtype=param.dtype) * 0.45)
+            elif "classifier.out_proj.weight" in name:
+                w = torch.randn(param.shape, generator=gen, dtype=param.dtype) * 0.80
+                w = w - w.mean(dim=1, keepdim=True)
+                w = w - w.mean(dim=0, keepdim=True)
+                param.copy_(w)
             elif "classifier" in name and name.endswith(".bias"):
                 torch.nn.init.zeros_(param)
 
