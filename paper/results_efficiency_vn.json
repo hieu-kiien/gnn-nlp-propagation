@@ -1,0 +1,66 @@
+[
+  {
+    "model": "TextMLP",
+    "params": 71110,
+    "infer_ms_per_cascade": 0.07871125000065149,
+    "train_ms_per_batch": 25.75840999998036,
+    "peak_mem_mb": 0.015393257141113281,
+    "mem_label": "Peak Alloc RAM (MB)"
+  },
+  {
+    "model": "TemporalStanceMLP",
+    "params": 88903,
+    "infer_ms_per_cascade": 0.17576281250057946,
+    "train_ms_per_batch": 28.45296999985294,
+    "peak_mem_mb": 0.010797500610351562,
+    "mem_label": "Peak Alloc RAM (MB)"
+  },
+  {
+    "model": "StandardGCN",
+    "params": 75398,
+    "infer_ms_per_cascade": 0.1661121874917626,
+    "train_ms_per_batch": 33.94756000016059,
+    "peak_mem_mb": 0.012730598449707031,
+    "mem_label": "Peak Alloc RAM (MB)"
+  },
+  {
+    "model": "StandardGATv2",
+    "params": 83974,
+    "infer_ms_per_cascade": 0.3057784374959738,
+    "train_ms_per_batch": 45.73788000016066,
+    "peak_mem_mb": 0.014250755310058594,
+    "mem_label": "Peak Alloc RAM (MB)"
+  },
+  {
+    "model": "EdgeGATv2",
+    "params": 84231,
+    "infer_ms_per_cascade": 0.4266890624990083,
+    "train_ms_per_batch": 73.47218000031717,
+    "peak_mem_mb": 0.014276504516601562,
+    "mem_label": "Peak Alloc RAM (MB)"
+  },
+  {
+    "model": "FAGCN",
+    "params": 67334,
+    "infer_ms_per_cascade": 0.3334312499987391,
+    "train_ms_per_batch": 55.81600999976217,
+    "peak_mem_mb": 0.014536857604980469,
+    "mem_label": "Peak Alloc RAM (MB)"
+  },
+  {
+    "model": "BiGCN",
+    "params": 116998,
+    "infer_ms_per_cascade": 0.46945312500383807,
+    "train_ms_per_batch": 80.05380999966292,
+    "peak_mem_mb": 0.01966381072998047,
+    "mem_label": "Peak Alloc RAM (MB)"
+  },
+  {
+    "model": "SBiFAGAT",
+    "params": 137086,
+    "infer_ms_per_cascade": 1.1721412500037331,
+    "train_ms_per_batch": 155.53756000008434,
+    "peak_mem_mb": 0.03209877014160156,
+    "mem_label": "Peak Alloc RAM (MB)"
+  }
+]

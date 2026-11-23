@@ -3,13 +3,19 @@
 Implements the core architecture specified in `docs/math_spec.md` using
 `torch_geometric.nn.MessagePassing`:
   - Supports 2D edge attributes `e_uv = [s_uv, h_uv]` (stance polarity + hostility
-    intensity) feeding the signed frequency-adaptive gate:
-        gamma_uv = tanh(a^T [W h_u || W h_v || e_uv])
-    (and `sigmoid` variant for conflict-gate ablation).
-  - Runs independent Top-Down (propagation) and Bottom-Up (community feedback)
-    message passing with root anchoring and degree normalization.
-  - Provides `LatentConflictMLP(x_u, x_v, x_u - x_v)` for datasets without raw
-    edge texts (e.g., PyG UPFD BERT features).
+    intensity) feeding dual-channel message passing:
+      * Polarity channel (signed low/high-pass gate `gamma_uv in [-1, 1]`):
+            gamma_uv = tanh(node_score + beta_cos * cos(z_u, z_v) + a_e^T e_uv + delta_pol(phi(e_uv)))
+      * Excitatory intensity channel (`alpha_int in [0, 1]`):
+            alpha_int = sigmoid(0.8 |s_uv| + 0.8 h_uv + delta_int(phi(e_uv)))
+    (plus `sigmoid` gate-mode and single-channel ablations).
+  - Runs coupled Top-Down (propagation) and Bottom-Up (community feedback)
+    message passing with Dir-GNN cross-directional mixing, root anchoring, and
+    symmetric degree normalization.
+  - Aggregates graph-level representations via Camp Dipole + gate-moment readout
+    over root-aligned edge signals.
+  - Provides `LatentConflictMLP(x_u, x_v, x_u - x_v)` for text-free structural
+    transfer benchmarks (e.g., PyG UPFD BERT features).
   - Exposes `extract_edge_gates(data)` to inspect `|gamma_uv|` and signed `gamma_uv`
     on every edge for model interpretability and cascade heatmaps.
 """
@@ -45,6 +51,7 @@ class StanceGuidedFAConv(MessagePassing):
         eps: float = 0.5,
         gate_mode: Literal["tanh", "sigmoid"] = "tanh",
         dropout: float = 0.1,
+        use_dual_channel: bool = True,
     ) -> None:
         super().__init__(aggr="add", flow="source_to_target", node_dim=0)
         if gate_mode not in {"tanh", "sigmoid"}:
@@ -57,11 +64,12 @@ class StanceGuidedFAConv(MessagePassing):
         self.edge_dim = edge_dim
         self.eps = eps
         self.gate_mode = gate_mode
+        self.use_dual_channel = bool(use_dual_channel)
 
         self.lin = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.lin_root = nn.Linear(hidden_dim, hidden_dim, bias=True)
         self.att = nn.Parameter(torch.empty(1, 2 * hidden_dim + edge_dim))
-        self.cos_weight = nn.Parameter(torch.tensor(0.25))
+        self.cos_weight = nn.Parameter(torch.tensor(0.10))
 
         if edge_dim >= 4:
             basis_dim = edge_dim + 2
@@ -84,7 +92,7 @@ class StanceGuidedFAConv(MessagePassing):
         nn.init.xavier_uniform_(self.lin_root.weight)
         nn.init.zeros_(self.lin_root.bias)
         node_att_dim = 2 * self.hidden_dim
-        nn.init.xavier_uniform_(self.att[:, :node_att_dim])
+        nn.init.xavier_uniform_(self.att[:, :node_att_dim], gain=0.2)
         if self.edge_dim == 4:
             with torch.no_grad():
                 self.att[:, node_att_dim:].copy_(
@@ -108,7 +116,7 @@ class StanceGuidedFAConv(MessagePassing):
             nn.init.constant_(self.att[:, node_att_dim:], edge_scale)
 
         with torch.no_grad():
-            self.cos_weight.fill_(0.25)
+            self.cos_weight.fill_(0.10)
         nn.init.xavier_uniform_(self.edge_mlp[0].weight)
         nn.init.zeros_(self.edge_mlp[0].bias)
         nn.init.normal_(self.edge_mlp[2].weight, std=0.02)
@@ -190,9 +198,17 @@ class StanceGuidedFAConv(MessagePassing):
         z_j: Tensor,
         edge_weights_2ch: Tensor,
     ) -> Tensor:
+        if not self.use_dual_channel:
+            return edge_weights_2ch[:, 0:1] * z_j
         m_pol = edge_weights_2ch[:, 0:1] * z_j[:, : self.pol_dim]
         m_exc = edge_weights_2ch[:, 1:2] * z_j[:, self.pol_dim :]
         return torch.cat([m_pol, m_exc], dim=-1)
+
+
+def _ste_parent_sign(u_ori: Tensor, neutral_eps: float) -> Tensor:
+    """Piecewise-linear parent sign ramp: exact +/-1 outside neutral band, smooth u/eps inside."""
+    eps_safe = max(float(neutral_eps), 1e-6)
+    return torch.clamp(u_ori / eps_safe, -1.0, 1.0)
 
 
 def _propagate_root_aligned_edge_signal(
@@ -231,12 +247,9 @@ def _propagate_root_aligned_edge_signal(
             break
         f_src = src[frontier]
         f_dst = dst[frontier]
-        u_ori = node_ori[f_src].detach()
-        p_sign = torch.where(
-            u_ori.abs() <= neutral_eps,
-            torch.ones_like(u_ori),
-            torch.where(u_ori > 0.0, torch.ones_like(u_ori), -torch.ones_like(u_ori)),
-        )
+        # Detach parent orientation so BFS acts as bounded signed routing in [-1, 1]
+        # without multiplying 1/eps Jacobians exponentially across deep chains.
+        p_sign = _ste_parent_sign(node_ori[f_src].detach(), neutral_eps)
         aligned_f = p_sign * edge_sig[frontier]
         updated = scatter(aligned_f, f_dst, dim=0, dim_size=num_nodes, reduce="mean")
         new_vis = torch.zeros((num_nodes,), dtype=torch.bool, device=device).scatter(
@@ -245,12 +258,7 @@ def _propagate_root_aligned_edge_signal(
         node_ori = torch.where(new_vis, updated, node_ori)
         visited = visited | new_vis
 
-    u_all = node_ori[src].detach()
-    p_sign_all = torch.where(
-        u_all.abs() <= neutral_eps,
-        torch.ones_like(u_all),
-        torch.where(u_all > 0.0, torch.ones_like(u_all), -torch.ones_like(u_all)),
-    )
+    p_sign_all = _ste_parent_sign(node_ori[src].detach(), neutral_eps)
     return p_sign_all * edge_sig
 
 
@@ -294,6 +302,10 @@ class SBiFAGAT(nn.Module):
         use_cascade_stats: bool = False,
         cascade_feat_dim: int = 8,
         predict_uncertainty: bool = False,
+        use_dir_mix: bool = True,
+        use_camp_dipole: bool = True,
+        use_dual_channel: bool = True,
+        use_polar_persistence_anchor: bool | None = None,
     ) -> None:
         super().__init__()
         if readout_mode not in {"attention", "mean"}:
@@ -313,6 +325,14 @@ class SBiFAGAT(nn.Module):
         self.use_cascade_stats = bool(use_cascade_stats)
         self.cascade_feat_dim = int(cascade_feat_dim)
         self.predict_uncertainty = bool(predict_uncertainty)
+        self.use_dir_mix = bool(use_dir_mix)
+        self.use_camp_dipole = bool(use_camp_dipole)
+        self.use_dual_channel = bool(use_dual_channel)
+        self.use_polar_persistence_anchor = (
+            bool((not self.ablate_stance) and (not self.use_latent_edge_mlp))
+            if use_polar_persistence_anchor is None
+            else bool(use_polar_persistence_anchor)
+        )
 
         self.input_proj = TwoStreamNodeStem(
             in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout
@@ -334,6 +354,7 @@ class SBiFAGAT(nn.Module):
                     eps=eps,
                     gate_mode=gate_mode,
                     dropout=dropout,
+                    use_dual_channel=use_dual_channel,
                 )
                 for _ in range(num_layers)
             ]
@@ -347,6 +368,7 @@ class SBiFAGAT(nn.Module):
                         eps=eps,
                         gate_mode=gate_mode,
                         dropout=dropout,
+                        use_dual_channel=use_dual_channel,
                     )
                     for _ in range(num_layers)
                 ]
@@ -354,7 +376,7 @@ class SBiFAGAT(nn.Module):
             if use_bottom_up
             else None
         )
-        if use_bottom_up:
+        if use_bottom_up and use_dir_mix:
             self.dir_mix_td: nn.ModuleList | None = nn.ModuleList(
                 [nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(num_layers)]
             )
@@ -362,7 +384,7 @@ class SBiFAGAT(nn.Module):
                 [nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(num_layers)]
             )
             self.dir_mix_scale: nn.Parameter | None = nn.Parameter(
-                torch.full((num_layers,), 0.25)
+                torch.full((num_layers,), 0.10)
             )
         else:
             self.dir_mix_td = None
@@ -377,12 +399,20 @@ class SBiFAGAT(nn.Module):
             if (use_bottom_up and readout_mode == "attention")
             else None
         )
-        self.readout_proj = nn.Sequential(
-            nn.Linear(5 * hidden_dim + 6, 2 * hidden_dim),
-            nn.LayerNorm(2 * hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+        if self.use_camp_dipole:
+            dip_hid = max(16, hidden_dim // 2)
+            self.dipole_proj: nn.Module | None = nn.Sequential(
+                nn.Linear(3 * hidden_dim + 6, dip_hid),
+                nn.LayerNorm(dip_hid),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(dip_hid, 2 * hidden_dim),
+            )
+            self.dipole_scale: nn.Parameter | None = nn.Parameter(torch.tensor(0.25))
+        else:
+            self.dipole_proj = None
+            self.dipole_scale = None
+        self.readout_norm = nn.LayerNorm(2 * hidden_dim)
         self.head = MultiTaskHead(
             2 * hidden_dim,
             hidden_dim,
@@ -391,6 +421,7 @@ class SBiFAGAT(nn.Module):
             cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
             predict_uncertainty=self.predict_uncertainty,
             mask_semantic_stats=bool(self.ablate_stance or self.ablate_hostility),
+            use_polar_persistence_anchor=self.use_polar_persistence_anchor,
         )
 
     def _prepare_edge_attr(
@@ -460,13 +491,7 @@ class SBiFAGAT(nn.Module):
         gamma_td_layers: list[Tensor] = []
         gamma_bu_layers: list[Tensor] = []
 
-        if (
-            self.use_bottom_up
-            and self.bu_convs is not None
-            and self.dir_mix_td is not None
-            and self.dir_mix_bu is not None
-            and self.dir_mix_scale is not None
-        ):
+        if self.use_bottom_up and self.bu_convs is not None:
             for l_idx in range(self.num_layers):
                 h_td_next, gamma_td = self.td_convs[l_idx](
                     h_td, h0, h_root_0, edge_index_td, edge_attr
@@ -476,9 +501,18 @@ class SBiFAGAT(nn.Module):
                 )
                 gamma_td_layers.append(gamma_td)
                 gamma_bu_layers.append(gamma_bu)
-                mix_scale = torch.tanh(self.dir_mix_scale[l_idx])
-                h_td = h_td_next + mix_scale * self.dir_mix_td[l_idx](h_bu_next)
-                h_bu = h_bu_next + mix_scale * self.dir_mix_bu[l_idx](h_td_next)
+                if (
+                    self.use_dir_mix
+                    and self.dir_mix_td is not None
+                    and self.dir_mix_bu is not None
+                    and self.dir_mix_scale is not None
+                ):
+                    mix_scale = torch.tanh(self.dir_mix_scale[l_idx])
+                    h_td = h_td_next + mix_scale * self.dir_mix_td[l_idx](h_bu_next)
+                    h_bu = h_bu_next + mix_scale * self.dir_mix_bu[l_idx](h_td_next)
+                else:
+                    h_td = h_td_next
+                    h_bu = h_bu_next
 
             node_emb = 0.5 * (h_td + h_bu)
             z_root = 0.5 * (h_td[root_idx] + h_bu[root_idx])
@@ -501,83 +535,100 @@ class SBiFAGAT(nn.Module):
                 else global_mean_pool(h_td, batch_vec, size=num_graphs)
             )
 
-        node_cnt = scatter(
-            x.new_ones((num_nodes, 1), dtype=node_emb.dtype),
-            batch_vec,
-            dim=0,
-            dim_size=num_graphs,
-            reduce="sum",
-        )
-        mean_h = global_mean_pool(node_emb, batch_vec, size=num_graphs)
-        var_h = global_mean_pool((node_emb - mean_h[batch_vec]).pow(2), batch_vec, size=num_graphs)
-        z_disp = torch.where(node_cnt > 1.0, torch.sqrt(var_h + 1e-6), torch.zeros_like(var_h))
+        base_emb = torch.cat([z_root, z_att], dim=-1)
+        if self.use_camp_dipole and self.dipole_proj is not None and self.dipole_scale is not None:
+            node_cnt = scatter(
+                x.new_ones((num_nodes, 1), dtype=node_emb.dtype),
+                batch_vec,
+                dim=0,
+                dim_size=num_graphs,
+                reduce="sum",
+            )
+            mean_h = global_mean_pool(node_emb, batch_vec, size=num_graphs)
+            var_h = global_mean_pool((node_emb - mean_h[batch_vec]).pow(2), batch_vec, size=num_graphs)
+            z_disp = torch.where(node_cnt > 1.0, torch.sqrt(var_h + 1e-6), torch.zeros_like(var_h))
 
-        if edge_index_td.numel() > 0:
-            dst = edge_index_td[1]
-            edge_batch = batch_vec[dst]
-            h_dst = node_emb[dst]
-            gamma_td_last = gamma_td_layers[-1]
-            if self.gate_mode == "tanh":
+            if edge_index_td.numel() > 0:
+                dst = edge_index_td[1]
+                edge_batch = batch_vec[dst]
+                h_dst = node_emb[dst]
+                gamma_td_last = gamma_td_layers[-1]
+                # Center sigmoid gates (0, 1) -> (-1, 1) and run identical root-aligned BFS so
+                # w/o Conflict Gate (Sigmoid) isolates ONLY the signed message-passing gate.
+                raw_camp_sig = gamma_td_last if self.gate_mode == "tanh" else (2.0 * gamma_td_last - 1.0)
                 camp_sig = _propagate_root_aligned_edge_signal(
                     edge_index_td,
-                    gamma_td_last,
+                    raw_camp_sig,
                     root_idx,
                     num_nodes,
                     neutral_eps=0.1,
                 )
+
+                w_pos = F.relu(camp_sig).unsqueeze(-1)
+                w_neg = F.relu(-camp_sig).unsqueeze(-1)
+                sum_pos = scatter(w_pos, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+                sum_neg = scatter(w_neg, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+                ones_e = x.new_ones((edge_index_td.size(1), 1), dtype=node_emb.dtype)
+                edge_cnt = scatter(ones_e, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+                has_edges = edge_cnt > 0.0
+
+                has_pos = sum_pos > 1e-6
+                has_neg = sum_neg > 1e-6
+                both_camps = has_pos & has_neg
+                zero_camp = node_emb.new_zeros((num_graphs, self.hidden_dim))
+                mu_pos = torch.where(
+                    has_pos,
+                    scatter(w_pos * h_dst, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+                    / sum_pos.clamp(min=1e-6),
+                    zero_camp,
+                )
+                mu_neg = torch.where(
+                    has_neg,
+                    scatter(w_neg * h_dst, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+                    / sum_neg.clamp(min=1e-6),
+                    zero_camp,
+                )
+                denom_e = edge_cnt.clamp(min=1.0)
+                frac_pos = torch.where(
+                    has_edges, (sum_pos / denom_e).clamp(0.0, 1.0), torch.zeros_like(sum_pos)
+                )
+                frac_neg = torch.where(
+                    has_edges, (sum_neg / denom_e).clamp(0.0, 1.0), torch.zeros_like(sum_neg)
+                )
+                camp_balance = torch.where(
+                    both_camps,
+                    2.0 * torch.sqrt((frac_pos * frac_neg).clamp(min=0.0, max=0.25) + 1e-8),
+                    torch.zeros_like(frac_pos),
+                )
+
+                diff_camp = torch.where(both_camps, mu_pos - mu_neg, zero_camp)
+                z_dipole_polar = camp_balance * torch.sqrt(diff_camp.pow(2) + 1e-8)
+                z_dipole_signed = diff_camp
+
+                g_col = raw_camp_sig.unsqueeze(-1)
+                g_sum = scatter(g_col, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+                g_sq_sum = scatter(g_col.pow(2), edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+                g_abs_sum = scatter(
+                    torch.sqrt(g_col.pow(2) + 1e-8), edge_batch, dim=0, dim_size=num_graphs, reduce="sum"
+                )
+                g_mean = torch.where(has_edges, g_sum / denom_e, torch.zeros_like(g_sum))
+                g_sq_mean = torch.where(has_edges, g_sq_sum / denom_e, torch.zeros_like(g_sq_sum))
+                g_abs_mean = torch.where(has_edges, g_abs_sum / denom_e, torch.zeros_like(g_abs_sum))
+                g_var = (g_sq_mean - g_mean.pow(2)).clamp(min=0.0)
+                g_std = torch.where(edge_cnt >= 2.0, torch.sqrt(g_var + 1e-8), torch.zeros_like(g_var))
+                g_mom = torch.cat([g_mean, g_std, g_abs_mean, frac_pos, frac_neg, camp_balance], dim=-1)
             else:
-                camp_sig = gamma_td_last
+                z_dipole_polar = node_emb.new_zeros((num_graphs, self.hidden_dim))
+                z_dipole_signed = node_emb.new_zeros((num_graphs, self.hidden_dim))
+                g_mom = node_emb.new_zeros((num_graphs, 6))
 
-            w_pos = torch.sigmoid(12.0 * (camp_sig - 0.25)).unsqueeze(-1)
-            w_neg = torch.sigmoid(12.0 * (-camp_sig - 0.25)).unsqueeze(-1)
-            sum_pos = scatter(w_pos, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
-            sum_neg = scatter(w_neg, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
-            ones_e = x.new_ones((edge_index_td.size(1), 1), dtype=node_emb.dtype)
-            edge_cnt = scatter(ones_e, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
-            has_edges = edge_cnt > 0.0
-
-            mu_pos = scatter(w_pos * h_dst, edge_batch, dim=0, dim_size=num_graphs, reduce="sum") / (
-                sum_pos + 1.0
-            )
-            mu_neg = scatter(w_neg * h_dst, edge_batch, dim=0, dim_size=num_graphs, reduce="sum") / (
-                sum_neg + 1.0
-            )
-            denom_e = edge_cnt.clamp(min=1.0)
-            frac_pos = torch.where(
-                has_edges, (sum_pos / denom_e).clamp(0.0, 1.0), torch.zeros_like(sum_pos)
-            )
-            frac_neg = torch.where(
-                has_edges, (sum_neg / denom_e).clamp(0.0, 1.0), torch.zeros_like(sum_neg)
-            )
-            camp_balance = 4.0 * frac_pos * frac_neg
-
-            diff_camp = mu_pos - mu_neg
-            z_dipole_polar = camp_balance * torch.sqrt(diff_camp.pow(2) + 1e-8)
-            z_dipole_signed = diff_camp
-
-            g_col = gamma_td_last.unsqueeze(-1)
-            g_sum = scatter(g_col, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
-            g_sq_sum = scatter(g_col.pow(2), edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
-            g_abs_sum = scatter(
-                torch.sqrt(g_col.pow(2) + 1e-8), edge_batch, dim=0, dim_size=num_graphs, reduce="sum"
-            )
-            g_mean = torch.where(has_edges, g_sum / denom_e, torch.zeros_like(g_sum))
-            g_sq_mean = torch.where(has_edges, g_sq_sum / denom_e, torch.zeros_like(g_sq_sum))
-            g_abs_mean = torch.where(has_edges, g_abs_sum / denom_e, torch.zeros_like(g_abs_sum))
-            g_var = (g_sq_mean - g_mean.pow(2)).clamp(min=0.0)
-            g_std = torch.where(edge_cnt >= 2.0, torch.sqrt(g_var + 1e-8), torch.zeros_like(g_var))
-            g_mom = torch.cat([g_mean, g_std, g_abs_mean, frac_pos, frac_neg, camp_balance], dim=-1)
+            dip_in = torch.cat([z_disp, z_dipole_polar, z_dipole_signed, g_mom], dim=-1)
+            graph_emb = self.readout_norm(base_emb + torch.tanh(self.dipole_scale) * self.dipole_proj(dip_in))
         else:
-            z_dipole_polar = node_emb.new_zeros((num_graphs, self.hidden_dim))
-            z_dipole_signed = node_emb.new_zeros((num_graphs, self.hidden_dim))
-            g_mom = node_emb.new_zeros((num_graphs, 6))
-
-        readout_in = torch.cat(
-            [z_root, z_att, z_disp, z_dipole_polar, z_dipole_signed, g_mom], dim=-1
-        )
-        graph_emb = self.readout_proj(readout_in)
+            graph_emb = self.readout_norm(base_emb)
         c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
-        outputs = self.head(graph_emb, node_emb, cascade_stats=c_stats)
+        early_yp = getattr(data, "early_y_polar", None) if self.use_polar_persistence_anchor else None
+        outputs = self.head(graph_emb, node_emb, cascade_stats=c_stats, early_y_polar=early_yp)
         return outputs, gamma_td_layers, gamma_bu_layers
 
     def forward(self, data: Any) -> dict[str, Tensor]:

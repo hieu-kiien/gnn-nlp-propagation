@@ -1,0 +1,24 @@
+\begin{table}[t]
+\centering
+\caption{Post-Hoc Text-Free Structural Transfer on UPFD (gossipcop, BERT 768-d) Across 5 Random Seeds. Without raw reply text, SBi-FAGAT and EdgeGATv2 use a shared learned latent edge projection $\mathbf{e}_{\text{latent}} = \mathrm{MLP}([\mathbf{x}_u \parallel \mathbf{x}_v \parallel \mathbf{x}_u - \mathbf{x}_v])$.}
+\label{tab:upfd_results}
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{lcc}
+\toprule
+Model & Accuracy $\uparrow$ & Macro-F1 $\uparrow$ \\
+\midrule
+StandardGCN & 0.9631 $\pm$ 0.0032 & 0.9631 $\pm$ 0.0032 \\
+StandardGATv2 & \textbf{0.9684 $\pm$ 0.0032} & \textbf{0.9684 $\pm$ 0.0032} \\
+EdgeGATv2 (Latent) & 0.9682 $\pm$ 0.0037 & 0.9682 $\pm$ 0.0037 \\
+FAGCN & 0.9446 $\pm$ 0.0260 & 0.9446 $\pm$ 0.0260 \\
+BiGCN & 0.9235 $\pm$ 0.0043 & 0.9235 $\pm$ 0.0043 \\
+SBiFAGAT (Latent) & 0.9486 $\pm$ 0.0077 & 0.9485 $\pm$ 0.0077 \\
+\midrule
+$p$-value (SBiFAGAT (Latent) vs. StandardGATv2) & 6.48e-03 & 6.50e-03 \\
+Bootstrap $p$ (SBiFAGAT (Latent) vs. StandardGATv2) & 4.00e-04 & 8.00e-04 \\
+Holm-Bonferroni $p$ (SBiFAGAT (Latent) vs. StandardGATv2) & 1.30e-02 & 1.30e-02 \\
+Holm-Bonf Bootstrap $p$ (SBiFAGAT (Latent) vs. StandardGATv2) & 8.00e-04 & 8.00e-04 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}

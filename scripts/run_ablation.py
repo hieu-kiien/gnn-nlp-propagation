@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import sys
 import warnings
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from src.data.pyg_dataset import (
     load_topic_splits_json,
 )
 from src.data.schema import load_cascade_parquet
-from src.models.baselines import BiGCN, StandardGCN
+from src.models.baselines import BiEdgeGATv2, BiGCN, StandardGCN
 from src.models.sbi_fagat import SBiFAGAT
 from src.training.reporting import (
     MAIN_METRICS,
@@ -44,6 +45,8 @@ def _resolve_ablation_table_label(data_dir: Path, out_table: Path) -> str:
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Run SBi-FAGAT ablation study and K-horizon curve.")
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--k-horizon", type=int, default=20)
@@ -67,7 +70,10 @@ def main() -> None:
     parser.add_argument(
         "--label-scheme", choices=["veracity4", "binary"], default="veracity4"
     )
-    parser.add_argument("--comparator-model", type=str, default="auto")
+    parser.add_argument(
+        "--edge-source", choices=["auto", "student", "teacher"], default="auto"
+    )
+    parser.add_argument("--comparator-model", type=str, default="BiEdgeGATv2 (Matched)")
     parser.add_argument("--output-table", type=Path, default=None)
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--figures-dir", type=Path, default=None)
@@ -122,6 +128,7 @@ def main() -> None:
         "polar_target_mode": args.polar_target_mode,
         "label_scheme": args.label_scheme,
         "custom_topic_splits": canonical_splits,
+        "edge_source": args.edge_source,
     }
 
     # Part 1: Component Ablation at K=20
@@ -215,6 +222,59 @@ def main() -> None:
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
         ),
+        "w/o Camp Dipole & Moments": lambda: SBiFAGAT(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
+            use_camp_dipole=False,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
+        ),
+        "w/o Dir-GNN Mixing": lambda: SBiFAGAT(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
+            use_dir_mix=False,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
+        ),
+        "w/o Dual-Channel Split": lambda: SBiFAGAT(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
+            use_dual_channel=False,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
+        ),
+        "w/o Persistence Anchor": lambda: SBiFAGAT(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
+            use_polar_persistence_anchor=False,
+        ),
+        "BiEdgeGATv2 (Matched)": lambda: BiEdgeGATv2(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            dropout=args.dropout,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
+        ),
     }
     if edge_dim == 4:
         ablation_factories["w/o Irrationality (r_uv=0)"] = lambda: SBiFAGAT(
@@ -251,6 +311,7 @@ def main() -> None:
             predict_uncertainty=use_unc,
         )
 
+    active_keys = tuple(k for k, _, _ in active_metrics)
     ablation_res = run_multi_seed_benchmark(
         ablation_factories,
         train_loader,
@@ -262,20 +323,24 @@ def main() -> None:
         patience=args.patience,
         lambda_uncertainty=lam_unc,
         reference_model="SBiFAGAT (Full)",
-        comparator_model="w/o Stance Score (s_uv=0)",
+        comparator_model=args.comparator_model,
+        primary_hypothesis_keys=active_keys,
         device=device,
     )
 
     print("\n=== Ablation Study Results (5 Seeds, K={}) ===".format(args.k_horizon))
     print(build_markdown_table(ablation_res, active_metrics))
 
+    cmp_abl = str(ablation_res.get("comparator_model") or "BiEdgeGATv2 (Matched)").replace("_", "\\_").replace("&", "\\&")
     export_latex_table(
         ablation_res,
         out_table,
         caption=(
             f"Ablation Study of SBi-FAGAT Components at $K={args.k_horizon}$ Across 5 Random Seeds. "
             "Separates stance polarity $s_{uv}$, hostility $h_{uv}$, signed $\\tanh$ gate, "
-            "Bottom-Up feedback, and Global Attention Readout."
+            "Bottom-Up feedback, Dir-GNN mixing, dual-channel split, Camp Dipole \\& Moments readout, "
+            "and Global Attention Readout against a matched BiEdgeGATv2 comparator "
+            f"(significance stars vs. {cmp_abl}, Holm-Bonferroni adjusted)."
         ),
         label=_resolve_ablation_table_label(args.data_dir, out_table),
         metrics=active_metrics,
@@ -284,26 +349,47 @@ def main() -> None:
     gc.collect()
 
     # Part 2: Early Horizon Sensitivity K in {10, 20, 30, 50} on a common cascade subset
+    # with a FIXED future polarization target window (t > K_max) across every K.
     k_horizons_sorted = sorted(args.horizons)
-    common_min_replies = max(int(args.min_total_replies), max(k_horizons_sorted) + 1)
+    active_horizons = list(k_horizons_sorted)
     k_common_kwargs = dict(common_ds_kwargs)
-    k_common_kwargs["min_total_replies"] = common_min_replies
+    common_min_replies = max(int(args.min_total_replies), max(active_horizons) + 5)
 
-    probe_splits = [
-        len(EarlyCascadeDataset(k_horizon=k_horizons_sorted[-1], split=sp, **k_common_kwargs))
-        for sp in ("train", "val", "test")
-    ]
-    used_common_filter = all(cnt >= 1 for cnt in probe_splits)
-    if not used_common_filter:
+    while len(active_horizons) >= 1:
+        cand_min = max(int(args.min_total_replies), max(active_horizons) + 5)
+        k_common_kwargs["min_total_replies"] = cand_min
+        if args.polar_target_mode == "future_only":
+            k_common_kwargs["polar_future_start_k"] = max(active_horizons)
+        try:
+            probe_splits = [
+                len(EarlyCascadeDataset(k_horizon=active_horizons[-1], split=sp, **k_common_kwargs))
+                for sp in ("train", "val", "test")
+            ]
+        except ValueError:
+            probe_splits = [0, 0, 0]
+        if all(cnt >= 1 for cnt in probe_splits):
+            common_min_replies = cand_min
+            break
+        if len(active_horizons) == 1:
+            warnings.warn(
+                f"Common K-horizon filter min_total_replies={cand_min} produced empty split "
+                f"{probe_splits}; retaining min_total_replies={args.min_total_replies} for K={active_horizons}.",
+                stacklevel=1,
+            )
+            common_min_replies = int(args.min_total_replies)
+            k_common_kwargs["min_total_replies"] = common_min_replies
+            k_common_kwargs.pop("polar_future_start_k", None)
+            break
+        dropped_k = active_horizons.pop()
         warnings.warn(
-            f"Common K-horizon filter min_total_replies={common_min_replies} produced empty split "
-            f"{probe_splits}; falling back to min_total_replies={args.min_total_replies}.",
+            f"Dropping horizon K={dropped_k} from K-curve because min_total_replies={cand_min} "
+            f"left empty split {probe_splits}; evaluating remaining horizons {active_horizons} "
+            "on an identical fixed future target window.",
             stacklevel=1,
         )
-        k_common_kwargs["min_total_replies"] = args.min_total_replies
 
     k_curve_results: dict[int, dict[str, dict[str, tuple[float, float]]]] = {}
-    for k in k_horizons_sorted:
+    for k in active_horizons:
         k_train = EarlyCascadeDataset(k_horizon=k, split="train", **k_common_kwargs)
         k_val = EarlyCascadeDataset(k_horizon=k, split="val", **k_common_kwargs)
         k_test = EarlyCascadeDataset(k_horizon=k, split="test", **k_common_kwargs)
@@ -345,6 +431,7 @@ def main() -> None:
             lambda_uncertainty=lam_unc,
             reference_model="SBiFAGAT",
             comparator_model=args.comparator_model,
+            primary_hypothesis_keys=active_keys,
             device=device,
         )
         k_curve_results[k] = k_res["summary_stats"]
@@ -358,7 +445,9 @@ def main() -> None:
         out_json,
         extra={
             "k_horizon": args.k_horizon,
-            "k_curve_common_min_replies": k_common_kwargs["min_total_replies"],
+            "k_curve_active_horizons": active_horizons,
+            "k_curve_common_min_replies": common_min_replies,
+            "k_curve_polar_future_start_k": k_common_kwargs.get("polar_future_start_k"),
             "k_curve": {
                 str(k): {
                     model_name: {

@@ -11,7 +11,7 @@ Early-stage prediction of viral cascades and polarization is intrinsically chall
 2. **Structural & Semantic Coupling:** Cascade propagation is driven both by tree topology (depth, branching, arrival order, temporal lag) and pairwise discourse dynamics (stance agreement/opposition and hostility intensity).
 3. **Multi-Task Objectives (`MultiTaskHead`):**
    - $y_{\text{size}} = \ln(1 + N_{\text{total}})$: Log-scale final cascade size regression (`F.softplus` output, Huber loss).
-   - $y_{\text{polar}} \in [0, 1]$: Silver-standard community polarization intensity over future interactions (`torch.sigmoid` output with `"y_polar_logit"`, KL-calibrated `BCEWithLogitsLoss` + Smooth-L1 loss).
+   - $y_{\text{polar}} \in [0, 1]$: Linear-amplitude silver-standard community polarization intensity over future interactions (`torch.sigmoid` output with `"y_polar_logit"`, KL-calibrated `BCEWithLogitsLoss` + Smooth-L1 $\beta=0.05$, and causal `Persistence-Residual` anchor `early_y_polar` on stance-aware architectures).
    - $y_{\text{rumor}}$: Rumor veracity classification on PHEME (`veracity4` 4-class or `binary`, class-weighted Cross-Entropy loss; masked out via `-1` when predicting Vietnamese Reddit threads without rumor labels).
 
 ---
@@ -32,9 +32,9 @@ Early-stage prediction of viral cascades and polarization is intrinsically chall
    - Computes scaled node--edge signed gates $\gamma_{uv} \in (-1, +1)$ (with `sigmoid` ablation option) and unsigned excitation gates $\alpha_{uv}^{\text{exc}} \in (0, 1)$, splitting messages evenly across Polarity and Excitation channels under symmetric degree normalization $((d_{\text{out}}(u)+1)(d_{\text{in}}(v)+1))^{-1/2}$.
    - Runs Top-Down (`edge_index_td`) and Bottom-Up (`edge_index_bu`) message passing stacks with initial residual (`eps * h_0`), root anchoring, odd-symmetric stabilization (`raw + 0.2 * tanh(raw)`), and learnable Dir-GNN TD–BU cross-mixing.
 4. **Readout, Cascade Summary, & Multi-Task Optimization (`MultiTaskHead`):**
-   - Aggregates root states, attention pooling, node dispersion, root-aligned BFS (`max_hops = 64`) camp dipoles, and 6 scalar gate moments (`5 * hidden_dim + 6 -> 2 * hidden_dim = 128`).
-   - Supports optional 8-dimensional early structural/temporal `cascade_stats` (`--use-cascade-stats`) passed symmetrically to all 8 neural models.
-   - Optimizes Huber (`y_size`), KL-calibrated `BCEWithLogitsLoss + SmoothL1` (`y_polar`), and class-weighted CE (`y_rumor`) using train-only target scaling and bias initialization, linear warmup + `ReduceLROnPlateau`, EMA (`decay = 0.985`), Early Stopping on validation `task_loss`, and validation-selected best checkpoints across 5 seeds.
+   - Aggregates root states, attention pooling, node dispersion, root-aligned BFS (`max_hops = 64`) camp dipoles with `both_camps` zero-masking and linear `camp_balance`, and 6 scalar gate moments (`5 * hidden_dim + 6 -> 2 * hidden_dim = 128`).
+   - Supports optional 8-dimensional early structural/temporal `cascade_stats` (`--use-cascade-stats`) and symmetric uncertainty prediction (`predict_uncertainty`) passed across all 8 neural models.
+   - Optimizes Huber (`y_size`), KL-calibrated `BCEWithLogitsLoss + SmoothL1(beta=0.05)` (`y_polar`), and class-weighted CE (`y_rumor`) using train-only target scaling and bias initialization, linear warmup + `ReduceLROnPlateau`, EMA (`decay = 0.985`), Early Stopping on validation `task_loss`, and Validation-only comparator selection (`val_summary_stats`) across 5 seeds.
 
 ---
 
@@ -45,10 +45,10 @@ Early-stage prediction of viral cascades and polarization is intrinsically chall
    - Rumor and non-rumor cascades ingested from Figshare article `6392078` via `src/data/pheme_loader.py` into validated `nodes.parquet` / `edges.parquet`.
    - Truly inductive topic split grouped strictly by breaking news event (`topic_id`) + LOO (`edge_source="teacher"`).
 2. **Vietnamese Social Media Dataset (Arctic Shift / Reddit VN):**
-   - Ingested from Reddit Vietnam subreddits (e.g., `r/VietNam`, `r/TroChuyenLinhTinh`) via `src/data/arctic_shift_vn.py` with `--before-epoch` cutoff.
-   - Uses a **Heuristic Temporal-Keyword / 14-day TF-IDF Grouped Inductive Split** (`cluster_vn_cascade_topics`).
+   - Ingested from Vietnamese Reddit subreddits (`r/vozforums`, `r/VietNam`) via `src/data/arctic_shift_vn.py` with `--before-epoch` cutoff, `--min-comments 25`, `--min-vi-ratio 0.65`, PII/doxxing/crypto-spam filtering & redaction, and resumable `.state.json` cursor persistence.
+   - Uses a **Heuristic Temporal-Keyword / 30-day TF-IDF Grouped Inductive Split** (`cluster_vn_cascade_topics`, cosine `>= 0.30`), cross-checked via Temporal Holdout and Embedding-Cluster Holdout (`edge_source="teacher"`).
 3. **UPFD Benchmark (GossipCop / PolitiFact):**
-   - External benchmark ingested via `scripts/run_upfd_extension.py` using `LatentConflictMLP`.
+   - External post-hoc text-free structural transfer benchmark ingested via `scripts/run_upfd_extension.py` using `LatentConflictMLP`.
 
 ### Five Iron Laws (`GEMINI.md`)
 - **Zero Synthetic Results:** Never report synthetic/mock numbers in experimental paper tables; synthetic tensors are strictly restricted to unit tests (`tests/`) and profiling (`scripts/benchmark_efficiency.py`).

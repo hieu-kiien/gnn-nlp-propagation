@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch_geometric.nn import FAConv, GATv2Conv, GCNConv, global_mean_pool
-from torch_geometric.utils import degree, dropout_edge, scatter, to_undirected
+from torch_geometric.utils import degree, dropout_edge, scatter, softmax, to_undirected
 
 
 def resolve_root_indices(data: Any, num_nodes: int) -> tuple[Tensor, Tensor]:
@@ -153,11 +153,20 @@ class MultiTaskHead(nn.Module):
         cascade_feat_dim: int = 0,
         predict_uncertainty: bool = False,
         mask_semantic_stats: bool = False,
+        mask_topology_stats: bool = False,
+        use_polar_persistence_anchor: bool = False,
     ) -> None:
         super().__init__()
         self.cascade_feat_dim = int(cascade_feat_dim)
         self.predict_uncertainty = bool(predict_uncertainty)
         self.mask_semantic_stats = bool(mask_semantic_stats)
+        self.mask_topology_stats = bool(mask_topology_stats)
+        self.use_polar_persistence_anchor = bool(use_polar_persistence_anchor)
+        self.persist_weight = (
+            nn.Parameter(torch.zeros(1)) if self.use_polar_persistence_anchor else None
+        )
+        if self.use_polar_persistence_anchor:
+            self.register_buffer("persist_ep_logit_ref", torch.zeros(1))
         if self.cascade_feat_dim > 0:
             stats_out_dim = max(16, hidden_dim // 2)
             self.cascade_proj = nn.Sequential(
@@ -177,7 +186,7 @@ class MultiTaskHead(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
         self.polar_head = nn.Sequential(
-            nn.Linear(reg_in_dim, hidden_dim),
+            nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
@@ -202,6 +211,7 @@ class MultiTaskHead(nn.Module):
         graph_emb: Tensor,
         node_emb: Tensor,
         cascade_stats: Tensor | None = None,
+        early_y_polar: Tensor | None = None,
     ) -> dict[str, Tensor]:
         if self.cascade_proj is not None:
             if cascade_stats is None:
@@ -214,15 +224,35 @@ class MultiTaskHead(nn.Module):
                     stats_t = F.pad(stats_t, (0, self.cascade_feat_dim - stats_t.size(-1)))
                 elif stats_t.size(-1) > self.cascade_feat_dim:
                     stats_t = stats_t[:, : self.cascade_feat_dim]
-            if self.mask_semantic_stats and stats_t.size(-1) >= 8:
+            if (self.mask_semantic_stats or self.mask_topology_stats) and stats_t.size(-1) >= 8:
                 stats_t = stats_t.clone()
-                stats_t[:, 7] = 0.0
+                if self.mask_semantic_stats:
+                    stats_t[:, 7] = 0.0
+                if self.mask_topology_stats:
+                    stats_t[:, 3] = 0.0
+                    stats_t[:, 4] = 0.0
             reg_emb = torch.cat([graph_emb, self.cascade_proj(stats_t)], dim=-1)
         else:
             reg_emb = graph_emb
 
         y_size_pred = F.softplus(self.size_head(reg_emb)).squeeze(-1)
-        y_polar_logit = self.polar_head(reg_emb).squeeze(-1)
+        y_polar_raw_logit = self.polar_head(graph_emb).squeeze(-1)
+        if self.persist_weight is not None and early_y_polar is not None:
+            ep = early_y_polar.float().to(device=graph_emb.device, dtype=graph_emb.dtype).view(-1)
+            if ep.size(0) == graph_emb.size(0):
+                ep_clamped = ep.clamp(0.02, 0.98)
+                ep_logit = torch.log(ep_clamped / (1.0 - ep_clamped))
+                ep_ref = getattr(self, "persist_ep_logit_ref", None)
+                if ep_ref is not None:
+                    ep_logit = ep_logit - ep_ref.to(device=ep_logit.device, dtype=ep_logit.dtype)
+                alpha_p = torch.tanh(self.persist_weight.view(1))
+                y_polar_logit = alpha_p * ep_logit + y_polar_raw_logit
+            else:
+                y_polar_logit = y_polar_raw_logit + 0.0 * self.persist_weight.sum()
+        elif self.persist_weight is not None:
+            y_polar_logit = y_polar_raw_logit + 0.0 * self.persist_weight.sum()
+        else:
+            y_polar_logit = y_polar_raw_logit
         y_polar_pred = torch.sigmoid(y_polar_logit)
         rumor_logits = self.rumor_head(reg_emb)
         result: dict[str, Tensor] = {
@@ -256,6 +286,7 @@ class TextMLP(nn.Module):
         dropout: float = 0.1,
         use_cascade_stats: bool = False,
         cascade_feat_dim: int = 8,
+        predict_uncertainty: bool = False,
     ) -> None:
         super().__init__()
         self.use_cascade_stats = bool(use_cascade_stats)
@@ -275,7 +306,9 @@ class TextMLP(nn.Module):
             num_rumor_classes,
             dropout,
             cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+            predict_uncertainty=bool(predict_uncertainty),
             mask_semantic_stats=True,
+            mask_topology_stats=True,
         )
 
     def forward(self, data: Any) -> dict[str, Tensor]:
@@ -304,11 +337,14 @@ class TemporalStanceMLP(nn.Module):
         dropout: float = 0.1,
         use_cascade_stats: bool = False,
         cascade_feat_dim: int = 8,
+        predict_uncertainty: bool = False,
+        use_polar_persistence_anchor: bool = True,
     ) -> None:
         super().__init__()
         self.edge_dim = edge_dim
         self.use_cascade_stats = bool(use_cascade_stats)
         self.cascade_feat_dim = int(cascade_feat_dim)
+        self.use_polar_persistence_anchor = bool(use_polar_persistence_anchor)
         self.stem = TwoStreamNodeStem(
             in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout, mask_topology=False
         )
@@ -330,7 +366,9 @@ class TemporalStanceMLP(nn.Module):
             num_rumor_classes,
             dropout,
             cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+            predict_uncertainty=bool(predict_uncertainty),
             mask_semantic_stats=False,
+            use_polar_persistence_anchor=self.use_polar_persistence_anchor,
         )
 
     def forward(self, data: Any) -> dict[str, Tensor]:
@@ -383,7 +421,8 @@ class TemporalStanceMLP(nn.Module):
         fused_in = torch.cat([h_root, h_pool, e_mean, e_std, e_min, e_max], dim=-1)
         graph_emb = self.fusion(fused_in)
         c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
-        return self.head(graph_emb, node_emb, cascade_stats=c_stats)
+        early_yp = getattr(data, "early_y_polar", None) if self.use_polar_persistence_anchor else None
+        return self.head(graph_emb, node_emb, cascade_stats=c_stats, early_y_polar=early_yp)
 
 
 class StandardGCN(nn.Module):
@@ -398,6 +437,7 @@ class StandardGCN(nn.Module):
         dropout: float = 0.1,
         use_cascade_stats: bool = False,
         cascade_feat_dim: int = 8,
+        predict_uncertainty: bool = False,
     ) -> None:
         super().__init__()
         self.use_cascade_stats = bool(use_cascade_stats)
@@ -418,6 +458,7 @@ class StandardGCN(nn.Module):
             num_rumor_classes,
             dropout,
             cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+            predict_uncertainty=bool(predict_uncertainty),
             mask_semantic_stats=True,
         )
 
@@ -454,6 +495,7 @@ class StandardGATv2(nn.Module):
         dropout: float = 0.1,
         use_cascade_stats: bool = False,
         cascade_feat_dim: int = 8,
+        predict_uncertainty: bool = False,
     ) -> None:
         super().__init__()
         if hidden_dim % heads != 0:
@@ -489,6 +531,7 @@ class StandardGATv2(nn.Module):
             num_rumor_classes,
             dropout,
             cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+            predict_uncertainty=bool(predict_uncertainty),
             mask_semantic_stats=True,
         )
 
@@ -558,6 +601,7 @@ class BiGCN(nn.Module):
         dropout: float = 0.1,
         use_cascade_stats: bool = False,
         cascade_feat_dim: int = 8,
+        predict_uncertainty: bool = False,
     ) -> None:
         super().__init__()
         self.use_cascade_stats = bool(use_cascade_stats)
@@ -573,6 +617,7 @@ class BiGCN(nn.Module):
             num_rumor_classes,
             dropout,
             cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+            predict_uncertainty=bool(predict_uncertainty),
             mask_semantic_stats=True,
         )
 
@@ -648,6 +693,8 @@ class EdgeGATv2(nn.Module):
         use_latent_edge_mlp: bool = False,
         use_cascade_stats: bool = False,
         cascade_feat_dim: int = 8,
+        predict_uncertainty: bool = False,
+        use_polar_persistence_anchor: bool | None = None,
     ) -> None:
         super().__init__()
         if hidden_dim % heads != 0:
@@ -658,6 +705,11 @@ class EdgeGATv2(nn.Module):
         self.use_latent_edge_mlp = use_latent_edge_mlp
         self.use_cascade_stats = bool(use_cascade_stats)
         self.cascade_feat_dim = int(cascade_feat_dim)
+        self.use_polar_persistence_anchor = (
+            bool(not use_latent_edge_mlp)
+            if use_polar_persistence_anchor is None
+            else bool(use_polar_persistence_anchor)
+        )
         self.input_proj = TwoStreamNodeStem(
             in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout
         )
@@ -692,7 +744,9 @@ class EdgeGATv2(nn.Module):
             num_rumor_classes,
             dropout,
             cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+            predict_uncertainty=bool(predict_uncertainty),
             mask_semantic_stats=False,
+            use_polar_persistence_anchor=self.use_polar_persistence_anchor,
         )
 
     def _prepare_edge_attr(self, x: Tensor, edge_index: Tensor, data: Any) -> Tensor:
@@ -735,7 +789,8 @@ class EdgeGATv2(nn.Module):
 
         graph_emb = torch.cat([h[root_idx], global_mean_pool(h, batch_vec)], dim=-1)
         c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
-        return self.head(graph_emb, h, cascade_stats=c_stats)
+        early_yp = getattr(data, "early_y_polar", None) if self.use_polar_persistence_anchor else None
+        return self.head(graph_emb, h, cascade_stats=c_stats, early_y_polar=early_yp)
 
 
 class FAGCNBaseline(nn.Module):
@@ -751,6 +806,7 @@ class FAGCNBaseline(nn.Module):
         dropout: float = 0.1,
         use_cascade_stats: bool = False,
         cascade_feat_dim: int = 8,
+        predict_uncertainty: bool = False,
     ) -> None:
         super().__init__()
         self.use_cascade_stats = bool(use_cascade_stats)
@@ -777,6 +833,7 @@ class FAGCNBaseline(nn.Module):
             num_rumor_classes,
             dropout,
             cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+            predict_uncertainty=bool(predict_uncertainty),
             mask_semantic_stats=True,
         )
 
@@ -799,3 +856,169 @@ class FAGCNBaseline(nn.Module):
         graph_emb = torch.cat([h[root_idx], global_mean_pool(h, batch_vec)], dim=-1)
         c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
         return self.head(graph_emb, h, cascade_stats=c_stats)
+
+
+class _BaselineAttentionReadout(nn.Module):
+    """Per-graph softmax attention readout used by matched bidirectional baselines."""
+
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+        self.query = nn.Linear(hidden_dim, 1, bias=False)
+
+    def forward(self, h: Tensor, batch_vec: Tensor, num_graphs: int) -> Tensor:
+        scores = self.query(torch.tanh(self.proj(h))).squeeze(-1)
+        attn = softmax(scores, batch_vec, num_nodes=num_graphs).unsqueeze(-1)
+        out = h.new_zeros((num_graphs, h.size(-1)))
+        out.index_add_(0, batch_vec, h * attn)
+        return out
+
+
+class BiEdgeGATv2(nn.Module):
+    """Matched Bidirectional Edge-Aware GATv2 comparator (TD+BU + 2D edge_attr + attention readout).
+
+    Controls for bidirectionality, edge attributes, and attention pooling so ablation
+    gains of `SBiFAGAT` are cleanly attributed to signed frequency-adaptive gating and
+    Camp Dipole readout rather than generic architecture capacity.
+    """
+
+    def __init__(
+        self,
+        in_dim: int = 770,
+        hidden_dim: int = 64,
+        num_layers: int = 2,
+        heads: int = 4,
+        edge_dim: int = 2,
+        eps: float = 0.5,
+        num_rumor_classes: int = 4,
+        dropout: float = 0.1,
+        use_latent_edge_mlp: bool = False,
+        use_cascade_stats: bool = False,
+        cascade_feat_dim: int = 8,
+        predict_uncertainty: bool = False,
+        use_polar_persistence_anchor: bool | None = None,
+    ) -> None:
+        super().__init__()
+        if hidden_dim % heads != 0:
+            raise ValueError(
+                f"hidden_dim ({hidden_dim}) must be divisible by heads ({heads})"
+            )
+        self.edge_dim = edge_dim
+        self.eps = float(eps)
+        self.use_latent_edge_mlp = use_latent_edge_mlp
+        self.use_cascade_stats = bool(use_cascade_stats)
+        self.cascade_feat_dim = int(cascade_feat_dim)
+        self.use_polar_persistence_anchor = (
+            bool(not use_latent_edge_mlp)
+            if use_polar_persistence_anchor is None
+            else bool(use_polar_persistence_anchor)
+        )
+        self.input_proj = TwoStreamNodeStem(
+            in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout
+        )
+        self.root_lin = nn.Linear(hidden_dim, hidden_dim)
+        self.latent_edge_mlp = (
+            LatentConflictMLP(
+                in_dim=in_dim, hidden_dim=hidden_dim, edge_dim=edge_dim, dropout=dropout
+            )
+            if use_latent_edge_mlp
+            else None
+        )
+        head_dim = hidden_dim // heads
+        self.td_convs = nn.ModuleList(
+            [
+                GATv2Conv(
+                    hidden_dim,
+                    head_dim,
+                    heads=heads,
+                    concat=True,
+                    edge_dim=edge_dim,
+                    dropout=dropout,
+                    add_self_loops=True,
+                    fill_value=0.0,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.bu_convs = nn.ModuleList(
+            [
+                GATv2Conv(
+                    hidden_dim,
+                    head_dim,
+                    heads=heads,
+                    concat=True,
+                    edge_dim=edge_dim,
+                    dropout=dropout,
+                    add_self_loops=True,
+                    fill_value=0.0,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.td_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+        self.bu_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+        self.td_readout = _BaselineAttentionReadout(hidden_dim)
+        self.bu_readout = _BaselineAttentionReadout(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.head = MultiTaskHead(
+            2 * hidden_dim,
+            hidden_dim,
+            num_rumor_classes,
+            dropout,
+            cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
+            predict_uncertainty=bool(predict_uncertainty),
+            mask_semantic_stats=False,
+            use_polar_persistence_anchor=self.use_polar_persistence_anchor,
+        )
+
+    def _prepare_edge_attr(self, x: Tensor, edge_index: Tensor, data: Any) -> Tensor:
+        if self.latent_edge_mlp is not None:
+            return self.latent_edge_mlp(x, edge_index)
+        raw_attr = getattr(data, "edge_attr", None)
+        if raw_attr is None:
+            raw_attr = getattr(data, "edge_stance", None)
+        if raw_attr is None:
+            return x.new_zeros((edge_index.size(1), self.edge_dim))
+        attr = raw_attr.float()
+        if attr.dim() == 1:
+            attr = attr.unsqueeze(-1)
+        if attr.size(1) < self.edge_dim:
+            attr = F.pad(attr, (0, self.edge_dim - attr.size(1)))
+        elif attr.size(1) > self.edge_dim:
+            attr = attr[:, : self.edge_dim]
+        return attr
+
+    def forward(self, data: Any) -> dict[str, Tensor]:
+        x = data.x.float()
+        root_idx, batch_vec = resolve_root_indices(data, x.size(0))
+        num_graphs = int(root_idx.size(0))
+        edge_index_td = getattr(data, "edge_index_td", data.edge_index)
+        edge_index_bu = getattr(
+            data,
+            "edge_index_bu",
+            edge_index_td[[1, 0], :] if edge_index_td.numel() > 0 else edge_index_td,
+        )
+        edge_attr = self._prepare_edge_attr(x, edge_index_td, data)
+
+        h0 = self.input_proj(x, data, root_idx)
+        root_broadcast = self.root_lin(h0[root_idx][batch_vec])
+        h_td = h0
+        h_bu = h0
+        for td_conv, bu_conv, td_norm, bu_norm in zip(
+            self.td_convs, self.bu_convs, self.td_norms, self.bu_norms
+        ):
+            td_msg = F.elu(td_conv(h_td, edge_index_td, edge_attr=edge_attr))
+            bu_msg = F.elu(bu_conv(h_bu, edge_index_bu, edge_attr=edge_attr))
+            h_td = self.dropout(td_norm(h_td + td_msg + self.eps * h0 + root_broadcast))
+            h_bu = self.dropout(bu_norm(h_bu + bu_msg + self.eps * h0 + root_broadcast))
+
+        node_emb = 0.5 * (h_td + h_bu)
+        z_root = 0.5 * (h_td[root_idx] + h_bu[root_idx])
+        z_att = 0.5 * (
+            self.td_readout(h_td, batch_vec, num_graphs)
+            + self.bu_readout(h_bu, batch_vec, num_graphs)
+        )
+        graph_emb = torch.cat([z_root, z_att], dim=-1)
+        c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
+        early_yp = getattr(data, "early_y_polar", None) if self.use_polar_persistence_anchor else None
+        return self.head(graph_emb, node_emb, cascade_stats=c_stats, early_y_polar=early_yp)

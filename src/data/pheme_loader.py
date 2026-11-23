@@ -16,14 +16,17 @@ import json
 import os
 import tarfile
 import tempfile
+import time
 import unicodedata
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import requests
 
+from src.data.arctic_shift_vn import hash_author_sha256
 from src.data.schema import (
     build_edges_table,
     build_nodes_table,
@@ -38,7 +41,9 @@ PHEME_EXPECTED_MD5 = "11530d4c0c7127fc78bbc1e46f2498f8"
 
 
 def _sha256_hex(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    """Pseudonymize PHEME user ID using salted SHA-256 (aligned with ADR-01)."""
+    hashed = hash_author_sha256(value)
+    return hashed if hashed is not None else hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _normalize_text_nfc(text: str) -> str:
@@ -78,9 +83,22 @@ def verify_archive_integrity(
     return actual_md5, actual_sha256
 
 
+FIGSHARE_HTTP_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 SBiFAGAT-Research/1.0"
+    ),
+    "Accept": "*/*",
+}
+
+
 def _resolve_figshare_file_metadata(timeout: int = 30) -> tuple[str, str]:
     try:
-        resp = requests.get(FIGSHARE_ARTICLE_API, timeout=min(timeout, 30))
+        resp = requests.get(
+            FIGSHARE_ARTICLE_API,
+            headers=FIGSHARE_HTTP_HEADERS,
+            timeout=min(timeout, 30),
+        )
         resp.raise_for_status()
         payload = resp.json()
         for entry in payload.get("files", []):
@@ -93,11 +111,80 @@ def _resolve_figshare_file_metadata(timeout: int = 30) -> tuple[str, str]:
     return PHEME_FALLBACK_DOWNLOAD_URL, PHEME_EXPECTED_MD5
 
 
+def _has_direct_event_subdirs(directory: Path) -> bool:
+    """Return True if `directory` directly contains PHEME event subdirectories."""
+    try:
+        for child in directory.iterdir():
+            if (
+                child.is_dir()
+                and not child.name.startswith(".")
+                and child.name != "__MACOSX"
+                and ((child / "rumours").is_dir() or (child / "non-rumours").is_dir())
+            ):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _discover_local_pheme_source(
+    raw_dir: Path,
+    extra_roots: Sequence[Path] = (Path("/kaggle/input"),),
+    max_depth: int = 6,
+) -> tuple[Path | None, Path | None]:
+    """Locate a local/Kaggle-Input PHEME archive or extracted dir via bounded shallow BFS."""
+    skip_dirs = {
+        "__MACOSX",
+        "rumours",
+        "non-rumours",
+        "reactions",
+        "source-tweets",
+        "source-tweet",
+    }
+    roots = [Path(raw_dir), *[Path(r) for r in extra_roots if Path(r).exists()]]
+    for root in roots:
+        if not root.exists():
+            continue
+        queue: deque[tuple[Path, int]] = deque([(root, 0)])
+        seen: set[Path] = set()
+        while queue:
+            cur_dir, depth = queue.popleft()
+            resolved = cur_dir.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+
+            direct = cur_dir / PHEME_ARCHIVE_FILENAME
+            if direct.is_file():
+                return direct, None
+
+            if _has_direct_event_subdirs(cur_dir):
+                return None, cur_dir
+            if cur_dir.name.startswith("all-rnr-annotated-threads") and _find_event_directories(cur_dir):
+                return None, cur_dir
+
+            if depth >= max_depth:
+                continue
+            try:
+                children = sorted(cur_dir.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if (
+                    child.is_dir()
+                    and not child.name.startswith(".")
+                    and child.name not in skip_dirs
+                    and not child.name.endswith("-all-rnr-threads")
+                ):
+                    queue.append((child, depth + 1))
+    return None, None
+
+
 def download_pheme_from_figshare(
     raw_dir: Path = Path("data/raw/pheme"),
     timeout: int = 120,
 ) -> Path:
-    """Download `PHEME_veracity.tar.bz2` from Figshare and verify checksums."""
+    """Download `PHEME_veracity.tar.bz2` from Figshare (or use verified local/Kaggle-Input copy)."""
     dest_dir = Path(raw_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     archive_path = dest_dir / PHEME_ARCHIVE_FILENAME
@@ -107,24 +194,48 @@ def download_pheme_from_figshare(
     if "drive.google.com" in download_url or "api.twitter.com" in download_url:
         raise RuntimeError(f"Disallowed archive URL outside Figshare: {download_url}")
 
-    if archive_path.is_file():
+    local_archive, _ = _discover_local_pheme_source(dest_dir)
+    if local_archive is not None and local_archive.is_file():
         try:
-            _, sha256_hex = verify_archive_integrity(archive_path, expected_md5=expected_md5)
-            if not sha_sidecar.exists():
+            _, sha256_hex = verify_archive_integrity(local_archive, expected_md5=expected_md5)
+            if local_archive == archive_path and not sha_sidecar.exists():
                 sha_sidecar.write_text(f"{sha256_hex}  {archive_path.name}\n", encoding="utf-8")
-            return archive_path
+            return local_archive
         except ValueError:
-            archive_path.unlink(missing_ok=True)
+            if local_archive == archive_path:
+                archive_path.unlink(missing_ok=True)
 
     part_path = dest_dir / f"{PHEME_ARCHIVE_FILENAME}.part"
-    part_path.unlink(missing_ok=True)
-
-    with requests.get(download_url, stream=True, timeout=timeout) as resp:
-        resp.raise_for_status()
-        with part_path.open("wb") as fh:
-            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    fh.write(chunk)
+    last_exc: Exception | None = None
+    with requests.Session() as session:
+        session.headers.update(FIGSHARE_HTTP_HEADERS)
+        for attempt in range(3):
+            part_path.unlink(missing_ok=True)
+            try:
+                with session.get(download_url, stream=True, timeout=timeout) as resp:
+                    resp.raise_for_status()
+                    if resp.status_code != 200:
+                        raise RuntimeError(
+                            f"Figshare returned HTTP {resp.status_code} (likely AWS WAF / anti-bot "
+                            f"challenge on {download_url}) instead of HTTP 200 archive bytes. "
+                            "Please download `PHEME_veracity.tar.bz2` manually in your browser from "
+                            "https://figshare.com/articles/dataset/PHEME_dataset_for_Rumour_Detection_and_Veracity_Classification/6392078 "
+                            "and attach it as a Kaggle Input Dataset (auto-detected under /kaggle/input) "
+                            "or place it at data/raw/pheme/PHEME_veracity.tar.bz2."
+                        )
+                    with part_path.open("wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                fh.write(chunk)
+                last_exc = None
+                break
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(2.0 * (attempt + 1))
+    if last_exc is not None:
+        part_path.unlink(missing_ok=True)
+        raise last_exc
 
     try:
         _, sha256_hex = verify_archive_integrity(part_path, expected_md5=expected_md5)
@@ -288,6 +399,23 @@ def _extract_tweet_fields(tweet: Mapping[str, Any]) -> tuple[str, str, datetime,
     return tid, text, dt_utc, user_hash
 
 
+def _iter_json_files(directory: Path) -> list[Path]:
+    """List non-hidden `.json` files inside `directory` via a single `os.scandir` pass."""
+    try:
+        with os.scandir(directory) as it:
+            entries = [
+                entry
+                for entry in it
+                if not entry.name.startswith(".")
+                and entry.name.endswith(".json")
+                and entry.is_file()
+            ]
+    except OSError:
+        return []
+    entries.sort(key=lambda entry: entry.name)
+    return [Path(entry.path) for entry in entries]
+
+
 def parse_pheme_thread(
     thread_dir: Path,
     topic_id: str,
@@ -297,11 +425,11 @@ def parse_pheme_thread(
     tdir = Path(thread_dir)
     source_dir = tdir / "source-tweets"
     if not source_dir.is_dir():
+        source_dir = tdir / "source-tweet"
+    if not source_dir.is_dir():
         return None
 
-    source_files = sorted(
-        p for p in source_dir.glob("*.json") if p.is_file() and not p.name.startswith(".")
-    )
+    source_files = _iter_json_files(source_dir)
     if not source_files:
         return None
 
@@ -330,9 +458,7 @@ def parse_pheme_thread(
 
     reactions_dir = tdir / "reactions"
     if reactions_dir.is_dir():
-        for rfile in sorted(reactions_dir.glob("*.json")):
-            if not rfile.is_file() or rfile.name.startswith("."):
-                continue
+        for rfile in _iter_json_files(reactions_dir):
             rjson = _read_json_safe(rfile)
             if not isinstance(rjson, Mapping):
                 continue
@@ -432,7 +558,21 @@ def parse_pheme_thread(
 def _find_event_directories(raw_root: Path) -> list[Path]:
     root = Path(raw_root)
     nested_root = root / "all-rnr-annotated-threads"
-    search_root = nested_root if nested_root.is_dir() else root
+    if nested_root.is_dir():
+        search_root = nested_root
+    else:
+        prefixed_nested = next(
+            (
+                p
+                for p in sorted(root.iterdir())
+                if p.is_dir()
+                and not p.name.startswith(".")
+                and p.name != "__MACOSX"
+                and p.name.startswith("all-rnr-annotated-threads")
+            ),
+            None,
+        )
+        search_root = prefixed_nested if prefixed_nested is not None else root
 
     event_dirs = sorted(
         p
@@ -464,6 +604,7 @@ def process_pheme_dataset(
     raw_root: Path,
     output_dir: Path = Path("data/interim/pheme"),
     max_threads: int | None = None,
+    max_workers: int = 32,
 ) -> tuple[Path, Path]:
     """Parse all extracted PHEME event trees and save validated Parquet tables."""
     event_dirs = _find_event_directories(Path(raw_root))
@@ -476,36 +617,80 @@ def process_pheme_dataset(
     all_edges: list[dict[str, Any]] = []
     seen_roots: set[str] = set()
     thread_count = 0
+    eff_workers = max(1, int(max_workers))
 
-    for event_dir in event_dirs:
+    for ev_idx, event_dir in enumerate(event_dirs, start=1):
+        if max_threads is not None and thread_count >= max_threads:
+            break
+        t_ev = time.monotonic()
         topic_id = _topic_id_from_event_dir(event_dir)
+        tasks: list[tuple[Path, bool]] = []
         for sub_name, is_rumour in (("rumours", True), ("non-rumours", False)):
             sub_dir = event_dir / sub_name
             if not sub_dir.is_dir():
                 continue
-            for thread_dir in sorted(sub_dir.iterdir()):
-                if not thread_dir.is_dir() or thread_dir.name.startswith("."):
+            with os.scandir(sub_dir) as it:
+                thread_entries = sorted(
+                    (
+                        entry
+                        for entry in it
+                        if not entry.name.startswith(".") and entry.is_dir()
+                    ),
+                    key=lambda entry: entry.name,
+                )
+            for entry in thread_entries:
+                if entry.name in seen_roots:
                     continue
-                if thread_dir.name in seen_roots:
-                    continue
-                parsed = parse_pheme_thread(thread_dir, topic_id=topic_id, is_rumour=is_rumour)
+                tasks.append((Path(entry.path), is_rumour))
+
+        ev_threads = 0
+        ev_nodes = 0
+        ev_edges = 0
+        idx_cursor = 0
+        while idx_cursor < len(tasks) and (max_threads is None or thread_count < max_threads):
+            step = len(tasks) - idx_cursor if max_threads is None else max_threads - thread_count
+            chunk = tasks[idx_cursor : idx_cursor + step]
+            idx_cursor += len(chunk)
+            if eff_workers > 1 and len(chunk) > 1:
+                with ThreadPoolExecutor(max_workers=min(eff_workers, len(chunk))) as pool:
+                    parsed_chunk = list(
+                        pool.map(
+                            lambda item: parse_pheme_thread(
+                                item[0], topic_id=topic_id, is_rumour=item[1]
+                            ),
+                            chunk,
+                        )
+                    )
+            else:
+                parsed_chunk = [
+                    parse_pheme_thread(td, topic_id=topic_id, is_rumour=ir)
+                    for td, ir in chunk
+                ]
+
+            for (tdir, _), parsed in zip(chunk, parsed_chunk):
                 if parsed is None:
                     continue
                 nodes, edges = parsed
                 root_id = str(nodes[0]["node_id"]).rsplit("_", 1)[-1]
-                if root_id in seen_roots:
+                if tdir.name in seen_roots or root_id in seen_roots:
                     continue
                 seen_roots.add(root_id)
-                seen_roots.add(thread_dir.name)
+                seen_roots.add(tdir.name)
                 all_nodes.extend(nodes)
                 all_edges.extend(edges)
                 thread_count += 1
+                ev_threads += 1
+                ev_nodes += len(nodes)
+                ev_edges += len(edges)
                 if max_threads is not None and thread_count >= max_threads:
                     break
-            if max_threads is not None and thread_count >= max_threads:
-                break
-        if max_threads is not None and thread_count >= max_threads:
-            break
+
+        elapsed = time.monotonic() - t_ev
+        print(
+            f"[PHEME] Event {ev_idx}/{len(event_dirs)} ({topic_id}): "
+            f"+{ev_threads} threads ({ev_nodes} nodes, {ev_edges} edges) in {elapsed:.1f}s",
+            flush=True,
+        )
 
     nodes_table = build_nodes_table(all_nodes)
     edges_table = build_edges_table(all_edges)
@@ -519,12 +704,14 @@ def main() -> None:
     parser.add_argument("--extract-dir", type=Path, default=None)
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--max-threads", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=32)
     args = parser.parse_args()
 
     default_extract_dir = args.raw_dir / "extracted"
+    discovered_archive, discovered_extracted = _discover_local_pheme_source(args.raw_dir)
     if args.extract_dir is not None:
         extract_dir = args.extract_dir
-        if not args.skip_download:
+        if not args.skip_download and not _find_event_directories(extract_dir):
             archive_path = download_pheme_from_figshare(raw_dir=args.raw_dir)
             if not (extract_dir / "all-rnr-annotated-threads").exists():
                 extract_pheme_archive(archive_path, extract_dir)
@@ -533,6 +720,7 @@ def main() -> None:
             raw_root=parse_root,
             output_dir=args.output_dir,
             max_threads=args.max_threads,
+            max_workers=args.workers,
         )
     elif args.skip_download or (default_extract_dir / "all-rnr-annotated-threads").exists():
         parse_root = default_extract_dir if _find_event_directories(default_extract_dir) else args.raw_dir
@@ -540,9 +728,40 @@ def main() -> None:
             raw_root=parse_root,
             output_dir=args.output_dir,
             max_threads=args.max_threads,
+            max_workers=args.workers,
+        )
+    elif discovered_extracted is not None:
+        print(f"Using pre-extracted PHEME directory: {discovered_extracted}", flush=True)
+        nodes_path, edges_path = process_pheme_dataset(
+            raw_root=discovered_extracted,
+            output_dir=args.output_dir,
+            max_threads=args.max_threads,
+            max_workers=args.workers,
         )
     else:
-        archive_path = download_pheme_from_figshare(raw_dir=args.raw_dir)
+        kaggle_root = Path("/kaggle/input")
+        if discovered_archive is None and kaggle_root.exists():
+            sample_dirs: list[str] = []
+            q_dbg: deque[tuple[Path, int]] = deque([(kaggle_root, 0)])
+            while q_dbg and len(sample_dirs) < 30:
+                d_cur, d_dep = q_dbg.popleft()
+                sample_dirs.append(str(d_cur))
+                if d_dep >= 4:
+                    continue
+                try:
+                    for ch in sorted(d_cur.iterdir()):
+                        if ch.is_dir() and not ch.name.startswith("."):
+                            q_dbg.append((ch, d_dep + 1))
+                except OSError:
+                    pass
+            print(f"[PHEME] Local discovery miss; shallow /kaggle/input dirs: {sample_dirs}", flush=True)
+        archive_path = (
+            discovered_archive
+            if discovered_archive is not None
+            else download_pheme_from_figshare(raw_dir=args.raw_dir)
+        )
+        if discovered_archive is not None:
+            verify_archive_integrity(discovered_archive, expected_md5=PHEME_EXPECTED_MD5)
         with tempfile.TemporaryDirectory(prefix="pheme_extract_") as tmp_dir:
             tmp_extract = Path(tmp_dir)
             extract_pheme_archive(archive_path, tmp_extract)
@@ -551,8 +770,9 @@ def main() -> None:
                 raw_root=parse_root,
                 output_dir=args.output_dir,
                 max_threads=args.max_threads,
+                max_workers=args.workers,
             )
-    print(f"Saved validated PHEME Parquet tables: {nodes_path}, {edges_path}")
+    print(f"Saved validated PHEME Parquet tables: {nodes_path}, {edges_path}", flush=True)
 
 
 if __name__ == "__main__":

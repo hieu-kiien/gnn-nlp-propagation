@@ -8,7 +8,7 @@ cd "${ROOT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_PHEME="${RUN_PHEME:-1}"
 RUN_VN="${RUN_VN:-1}"
-VN_TARGET_COUNT="${VN_TARGET_COUNT:-800}"
+VN_TARGET_COUNT="${VN_TARGET_COUNT:-1500}"
 VN_BEFORE_EPOCH="${VN_BEFORE_EPOCH:-1763164800}"
 MIN_TOTAL_REPLIES="${MIN_TOTAL_REPLIES:-25}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
@@ -17,6 +17,12 @@ EPOCHS="${EPOCHS:-3}"
 TEACHER_BACKEND="dual_nli"
 EDGE_DIM="2"
 echo ">>> Unified SBi-FAGAT 2D NLP Pipeline: teacher=${TEACHER_BACKEND}, edge_dim=${EDGE_DIM}, Ancestor SpanPool"
+
+mkdir -p data/interim
+if [[ -z "${SBIF_HASH_SALT:-}" && ! -f "data/interim/.author_hash_salt.secret" ]]; then
+    "${PYTHON_BIN}" -c "import pathlib, secrets; p = pathlib.Path('data/interim/.author_hash_salt.secret'); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(secrets.token_hex(16), encoding='utf-8')"
+    echo ">>> Initialized persistent author pseudonymization salt at data/interim/.author_hash_salt.secret"
+fi
 
 if [[ "${RUN_PHEME}" -eq 1 ]]; then
     echo "[Phase 2 - PHEME 1/3] Downloading & parsing PHEME cascades..."
@@ -28,8 +34,10 @@ if [[ "${RUN_PHEME}" -eq 1 ]]; then
         --interim-dir data/interim/pheme \
         --output-dir checkpoints/dual_ce_pheme \
         --scored-cache-json data/interim/pheme/scored_pairs.json \
-        --audit-csv data/interim/human_audit_en_300.csv \
-        --pilot-csv data/interim/pilot_calibration_en_30.csv \
+        --audit-csv data/interim/human_audit_en_120.csv \
+        --pilot-csv data/interim/pilot_calibration_en_20.csv \
+        --audit-n-samples 120 \
+        --pilot-samples 20 \
         --min-total-replies "${MIN_TOTAL_REPLIES}" \
         --teacher-backend "${TEACHER_BACKEND}" \
         --edge-dim "${EDGE_DIM}" \
@@ -49,6 +57,7 @@ if [[ "${RUN_PHEME}" -eq 1 ]]; then
         --scored-cache-json data/interim/pheme/scored_pairs.json \
         --edge-dim "${EDGE_DIM}" \
         --include-root-context \
+        --min-total-replies "${MIN_TOTAL_REPLIES}" \
         --batch-size "$((BATCH_SIZE * 2))" \
         --k-horizon 20
 fi
@@ -58,6 +67,9 @@ if [[ "${RUN_VN}" -eq 1 ]]; then
     CRAWL_ARGS=(
         --output-dir data/interim/vn
         --target-count "${VN_TARGET_COUNT}"
+        --min-comments "${MIN_TOTAL_REPLIES}"
+        --min-vi-ratio 0.65
+        --max-pages-per-sub 300
         --checkpoint-jsonl data/interim/vn/crawl_checkpoint.jsonl
         --allow-partial
     )
@@ -73,8 +85,10 @@ if [[ "${RUN_VN}" -eq 1 ]]; then
         --vihsd-dir checkpoints/visobert_vihsd \
         --output-dir checkpoints/dual_ce_vn \
         --scored-cache-json data/interim/vn/scored_pairs.json \
-        --audit-csv data/interim/human_audit_vi_300.csv \
-        --pilot-csv data/interim/pilot_calibration_vi_30.csv \
+        --audit-csv data/interim/human_audit_vi_120.csv \
+        --pilot-csv data/interim/pilot_calibration_vi_20.csv \
+        --audit-n-samples 120 \
+        --pilot-samples 20 \
         --min-total-replies "${MIN_TOTAL_REPLIES}" \
         --teacher-backend "${TEACHER_BACKEND}" \
         --edge-dim "${EDGE_DIM}" \
@@ -96,6 +110,7 @@ if [[ "${RUN_VN}" -eq 1 ]]; then
         --vihsd-dir checkpoints/visobert_vihsd \
         --edge-dim "${EDGE_DIM}" \
         --include-root-context \
+        --min-total-replies "${MIN_TOTAL_REPLIES}" \
         --batch-size "$((BATCH_SIZE * 2))" \
         --k-horizon 20
 fi

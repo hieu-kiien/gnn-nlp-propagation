@@ -64,7 +64,7 @@ def compute_multitask_loss(
             F.binary_cross_entropy_with_logits(y_polar_logit, y_p, reduction="none")
             - target_entropy
         ).clamp_min(0.0).mean()
-        loss_polar = loss_polar_kl + F.smooth_l1_loss(y_polar_pred, y_p, beta=0.08)
+        loss_polar = loss_polar_kl + F.smooth_l1_loss(y_polar_pred, y_p, beta=0.05)
     else:
         loss_polar = F.huber_loss(y_polar_pred, y_polar, delta=d_polar)
     total_loss = (
@@ -120,6 +120,7 @@ def evaluate_predictions(
     y_rumor_true: np.ndarray | None = None,
     rumor_logits: np.ndarray | None = None,
     y_bimodality_true: np.ndarray | None = None,
+    y_assortativity_true: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Compute size (MSLE/RMSE/MAE/R^2/Spearman), polarization (RMSE/MAE/R^2/Pearson/Spearman), and rumor metrics.
 
@@ -210,4 +211,8 @@ def evaluate_predictions(
         bc_arr = np.asarray(y_bimodality_true, dtype=np.float64).reshape(-1)
         if bc_arr.size >= 2 and bc_arr.size == y_polar_true.size:
             out["construct_corr_bc"] = _safe_spearman(y_polar_true, bc_arr)
+    if y_assortativity_true is not None:
+        assort_arr = np.asarray(y_assortativity_true, dtype=np.float64).reshape(-1)
+        if assort_arr.size >= 2 and assort_arr.size == y_polar_true.size:
+            out["construct_corr_assort"] = _safe_spearman(y_polar_true, assort_arr)
     return out

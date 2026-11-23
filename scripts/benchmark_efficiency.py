@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 import tracemalloc
 from pathlib import Path
@@ -18,7 +19,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.data import Batch
 
-from src.data.pyg_dataset import CascadeData, TOTAL_NODE_FEATURE_DIM
+from src.data.pyg_dataset import CascadeData, STRUCTURAL_NODE_DIM, TOTAL_NODE_FEATURE_DIM
 from src.models.baselines import (
     BiGCN,
     EdgeGATv2,
@@ -62,6 +63,7 @@ def build_profiling_batch(
         graphs.append(
             CascadeData(
                 x=x,
+                struct_x=torch.rand((num_nodes, STRUCTURAL_NODE_DIM), dtype=torch.float32),
                 edge_index=edge_index_td,
                 edge_index_td=edge_index_td,
                 edge_index_bu=edge_index_bu,
@@ -71,6 +73,7 @@ def build_profiling_batch(
                 root_index=torch.tensor([0], dtype=torch.long),
                 y_size=torch.tensor([3.2], dtype=torch.float32),
                 y_polar=torch.tensor([0.55], dtype=torch.float32),
+                early_y_polar=torch.tensor([0.5], dtype=torch.float32),
                 y_bimodality=torch.tensor([0.62], dtype=torch.float32),
                 y_rumor=torch.tensor([idx % num_classes], dtype=torch.long),
             )
@@ -199,6 +202,7 @@ def run_efficiency_benchmark(
             hidden_dim=hidden_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "TemporalStanceMLP": lambda: TemporalStanceMLP(
             in_dim=in_dim,
@@ -206,18 +210,21 @@ def run_efficiency_benchmark(
             edge_dim=edge_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "StandardGCN": lambda: StandardGCN(
             in_dim=in_dim,
             hidden_dim=hidden_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "StandardGATv2": lambda: StandardGATv2(
             in_dim=in_dim,
             hidden_dim=hidden_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "EdgeGATv2": lambda: EdgeGATv2(
             in_dim=in_dim,
@@ -225,18 +232,21 @@ def run_efficiency_benchmark(
             edge_dim=edge_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "FAGCN": lambda: FAGCNBaseline(
             in_dim=in_dim,
             hidden_dim=hidden_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "BiGCN": lambda: BiGCN(
             in_dim=in_dim,
             hidden_dim=hidden_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "SBiFAGAT": lambda: SBiFAGAT(
             in_dim=in_dim,
@@ -298,6 +308,7 @@ def format_efficiency_latex(
             "\\centering",
             f"\\caption{{{caption}}}",
             f"\\label{{{label}}}",
+            "\\resizebox{\\columnwidth}{!}{",
             "\\begin{tabular}{lcccc}",
             "\\toprule",
             f"Model & \\#Params & Infer (ms/cascade)$\\downarrow$ & Train Step (ms/batch)$\\downarrow$ & {mem_col}$\\downarrow$ \\\\",
@@ -305,6 +316,7 @@ def format_efficiency_latex(
             *body_lines,
             "\\bottomrule",
             "\\end{tabular}",
+            "}",
             "\\end{table}",
             "",
         ]
@@ -320,6 +332,8 @@ def _resolve_efficiency_table_label(output_table: Path) -> str:
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="Benchmark parameter count, inference/train latency, and memory across all 8 models."
     )

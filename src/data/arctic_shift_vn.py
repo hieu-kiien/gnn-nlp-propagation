@@ -43,6 +43,31 @@ _SPAM_DOMAIN_RE = re.compile(
     r"(?:https?://)?(?:www\.)?(?:shope\.ee|s\.shopee\.vn|bit\.ly|tinyurl\.com|t\.me)/\S*",
     re.IGNORECASE,
 )
+_CRYPTO_SPAM_RE = re.compile(r"\blmgx\b", re.IGNORECASE)
+_VN_PHONE_RE = re.compile(
+    r"(?<!\d)(?:\+?84|0)(?:3|5|7|8|9)\d(?:[\.\-\s]?\d){7,8}(?!\d)"
+)
+_BANK_ACCT_RE = re.compile(
+    r"(\b(?:stk|số\s*tài\s*khoản|so\s*tai\s*khoan|tài\s*khoản\s*ngân\s*hàng|"
+    r"vietcombank|vcb|techcombank|tcb|mb\s?bank|bidv|vietinbank|acb|tpbank|"
+    r"vpbank|agribank|sacombank|momo|zalopay)\b[^0-9\n]{0,40}?)(\b\d{8,18}\b)",
+    re.IGNORECASE,
+)
+_CCCD_RE = re.compile(
+    r"(\b(?:cccd|cmnd|căn\s*cước(?:\s*công\s*dân)?|chứng\s*minh(?:\s*nhân\s*dân)?)"
+    r"\b[^0-9\n]{0,25}?)(\b\d{9,12}\b)",
+    re.IGNORECASE,
+)
+_FB_PROFILE_RE = re.compile(
+    r"https?://(?:www\.|m\.|mbasic\.)?(?:facebook|fb)\.com/"
+    r"(?!groups/|watch/|events/|share/|photo|reel|pages/)\S+",
+    re.IGNORECASE,
+)
+_DOXXING_INTENT_RE = re.compile(
+    r"(?:truy\s+tìm|tìm\s+đối\s+tượng|tìm\s+thông\s+tin\s+người\s+nhà|"
+    r"bóc\s+phốt.{0,30}(?:sđt|stk|địa\s+chỉ|cccd)|chia\s+sẻ\s+thông\s+tin\s+cá\s+nhân)",
+    re.IGNORECASE,
+)
 _VN_DIACRITIC_RE = re.compile(
     r"[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợ"
     r"ùúủũụưừứửữựỳýỷỹỵđ"
@@ -102,8 +127,36 @@ def normalize_social_text_nfc(text: str) -> str:
     return normalize_nfc(text)
 
 
+def redact_pii_text(text: str) -> str:
+    """Redact Vietnamese phone numbers, bank accounts, national IDs, and personal FB profile URLs."""
+    cleaned = str(text or "")
+    if not cleaned:
+        return ""
+    cleaned = _FB_PROFILE_RE.sub("[REDACTED_PII]", cleaned)
+    cleaned = _BANK_ACCT_RE.sub(r"\1[REDACTED_PII]", cleaned)
+    cleaned = _CCCD_RE.sub(r"\1[REDACTED_PII]", cleaned)
+    cleaned = _VN_PHONE_RE.sub("[REDACTED_PII]", cleaned)
+    return cleaned
+
+
+def is_doxxing_post(text: str) -> bool:
+    """Return True if *text* exhibits doxxing intent alongside personal identifiers (PII)."""
+    norm = normalize_social_text_nfc(text)
+    if not norm:
+        return False
+    if not _DOXXING_INTENT_RE.search(norm):
+        return False
+    return bool(
+        _VN_PHONE_RE.search(norm)
+        or _BANK_ACCT_RE.search(norm)
+        or _CCCD_RE.search(norm)
+        or _FB_PROFILE_RE.search(norm)
+        or re.search(r"địa\s+chỉ|sinh\s+năm|sđt|stk", norm, re.IGNORECASE)
+    )
+
+
 def is_invalid_or_spam_text(text: str, author_raw: str | None = None) -> bool:
-    """Return True for empty, deleted/removed, AutoModerator, or link-spam content."""
+    """Return True for empty, deleted/removed, AutoModerator, doxxing, or link/crypto-spam content."""
     if isinstance(author_raw, str) and author_raw.strip().lower() == "automoderator":
         return True
 
@@ -111,7 +164,10 @@ def is_invalid_or_spam_text(text: str, author_raw: str | None = None) -> bool:
     if not norm or norm.lower() in {"[deleted]", "[removed]"}:
         return True
 
-    if _SPAM_DOMAIN_RE.search(norm):
+    if _SPAM_DOMAIN_RE.search(norm) or _CRYPTO_SPAM_RE.search(norm):
+        return True
+
+    if is_doxxing_post(norm):
         return True
 
     urls = _URL_RE.findall(norm)
@@ -183,7 +239,7 @@ def extract_comments_from_arctic_payload(
                     parent_raw = data.get("parent_id") or inherited_parent
                     link_raw = data.get("link_id")
                     raw_author = data.get("author")
-                    body_nfc = normalize_social_text_nfc(str(data.get("body") or ""))
+                    body_nfc = redact_pii_text(normalize_social_text_nfc(str(data.get("body") or "")))
                     created_ts = _to_float_utc(data.get("created_utc"))
                     extracted.append(
                         {
@@ -232,7 +288,7 @@ def extract_comments_from_arctic_payload(
                 ),
                 "author_is_bot": isinstance(raw_author, str)
                 and raw_author.strip().lower() == "automoderator",
-                "text": normalize_social_text_nfc(str(node.get("body") or "")),
+                "text": redact_pii_text(normalize_social_text_nfc(str(node.get("body") or ""))),
                 "created_utc": _to_float_utc(node.get("created_utc")),
             }
         )
@@ -249,7 +305,7 @@ _TOPIC_STOPWORDS: frozenset[str] = frozenset(
         "các", "của", "cho", "với", "này", "kia", "đó", "đây", "khi", "như", "nên",
         "thì", "mà", "lại", "được", "không", "chưa", "phải", "cũng", "đang", "trong",
         "ngoài", "trên", "dưới", "cùng", "những", "một", "hai", "anh", "em", "bác",
-        "các bạn", "mọi", "người", "hỏi", "tâm", "sự", "xin", "nhờ", "review",
+        "bạn", "mọi", "người", "hỏi", "tâm", "sự", "xin", "nhờ", "review",
         "chia", "sẻ", "thảo", "luận", "nghĩ", "sao", "gì", "nào", "đâu", "voz",
         "vietnam", "reddit", "the", "and", "for", "with", "that", "this", "from",
         "are", "was", "were", "what", "how", "why", "who", "you", "your", "about",
@@ -288,14 +344,14 @@ def _compute_topic_id(post: Mapping[str, Any], norm_title: str) -> str:
 def cluster_vn_cascade_topics(
     node_rows: list[dict[str, Any]],
     *,
-    time_window_days: float = 14.0,
-    sim_threshold: float = 0.55,
+    time_window_days: float = 30.0,
+    sim_threshold: float = 0.30,
 ) -> list[dict[str, Any]]:
     """Merge semantically related Vietnamese cascades within a sliding time window into shared topics.
 
-    Uses TF-IDF (1-2 gram) cosine similarity across root posts combined with a temporal
-    window (`time_window_days`) to assign a single connected-component `topic_id` across
-    near-duplicate news events, preventing cross-split leakage from minor title rewrites.
+    Uses TF-IDF (1-2 gram) cosine similarity across opening root text (`[:300]`) combined
+    with a temporal window (`time_window_days`) to assign a single connected-component
+    `topic_id` across recurring events, reducing cross-split topical overlap.
     """
     roots = [r for r in node_rows if bool(r.get("is_root"))]
     if len(roots) < 2:
@@ -304,15 +360,28 @@ def cluster_vn_cascade_topics(
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
 
-    texts = [normalize_nfc(str(r.get("text") or "")).lower() for r in roots]
+    texts = [normalize_nfc(str(r.get("text") or ""))[:300].lower() for r in roots]
     if not any(texts):
         return node_rows
 
+    eff_min_df = 2 if len(roots) >= 5 else 1
+    eff_max_df = 0.85 if len(roots) >= 5 else 1.0
     try:
-        vec = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, min_df=1)
+        stop_words = sorted({tok for tok in _TOPIC_STOPWORDS if tok})
+        vec = TfidfVectorizer(
+            ngram_range=(1, 2),
+            sublinear_tf=True,
+            min_df=eff_min_df,
+            max_df=eff_max_df,
+            stop_words=stop_words,
+        )
         mat = vec.fit_transform(texts)
     except ValueError:
-        return node_rows
+        try:
+            vec = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, min_df=1)
+            mat = vec.fit_transform(texts)
+        except ValueError:
+            return node_rows
 
     sim_mat = cosine_similarity(mat)
     timestamps: list[float] = []
@@ -378,9 +447,9 @@ def build_vn_cascade_from_thread(
     post: Mapping[str, Any],
     comments: Sequence[Mapping[str, Any]],
     *,
-    min_comments: int = 40,
+    min_comments: int = 25,
     min_depth: int = 3,
-    min_vi_ratio: float = 0.25,
+    min_vi_ratio: float = 0.65,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]] | None:
     """Validate and convert one Reddit thread into SBi-FAGAT node/edge record lists."""
     post_id = _strip_id_prefix(post.get("id") or post.get("name") or "")
@@ -405,6 +474,7 @@ def build_vn_cascade_from_thread(
         author_raw=str(raw_post_author) if raw_post_author is not None else None,
     ):
         return None
+    root_text = redact_pii_text(root_text)
 
     root_author_hash = hash_author_sha256(
         str(raw_post_author) if raw_post_author is not None else None
@@ -431,6 +501,7 @@ def build_vn_cascade_from_thread(
         c_text = normalize_social_text_nfc(str(c.get("text") or ""))
         if is_invalid_or_spam_text(c_text):
             continue
+        c_text = redact_pii_text(c_text)
         c_ts = _to_float_utc(c.get("created_utc"))
         if c_ts is None:
             continue
@@ -610,21 +681,46 @@ def _deserialize_checkpoint_record(record: Mapping[str, Any]) -> tuple[str, list
         if isinstance(ts, str):
             copied["created_at_utc"] = datetime.fromisoformat(ts)
         nodes.append(copied)
-    edges = [dict(row) for row in record.get("edges", [])]
+    edges: list[dict[str, Any]] = []
+    for row in record.get("edges", []):
+        copied_e = dict(row)
+        ts_e = copied_e.get("created_at_utc")
+        if isinstance(ts_e, str):
+            copied_e["created_at_utc"] = datetime.fromisoformat(ts_e)
+        edges.append(copied_e)
     stats = dict(record.get("stats", {}))
     return post_id, nodes, edges, stats
+
+
+def _save_crawl_state(
+    state_path: Path,
+    *,
+    cursors: Mapping[str, str | int | None],
+    exhausted: Mapping[str, bool],
+    pages_fetched: Mapping[str, int],
+    rejected_post_ids: set[str],
+) -> None:
+    payload = {
+        "cursors": dict(cursors),
+        "exhausted": {k: bool(v) for k, v in exhausted.items()},
+        "pages_fetched": {k: int(v) for k, v in pages_fetched.items()},
+        "rejected_post_ids": sorted(rejected_post_ids),
+    }
+    tmp = state_path.with_name(f"{state_path.name}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(state_path)
 
 
 def crawl_arctic_shift_discussions(
     output_dir: Path = Path("data/interim/vn"),
     *,
     subreddits: Sequence[str] = TARGET_SUBREDDITS,
-    target_count: int = 500,
-    min_comments: int = 40,
+    target_count: int = 1500,
+    min_comments: int = 25,
     min_depth: int = 3,
-    min_vi_ratio: float = 0.25,
+    min_vi_ratio: float = 0.65,
     initial_before: str | int = "7d",
-    max_pages_per_sub: int = 100,
+    max_pages_per_sub: int = 300,
     request_delay: float = 0.15,
     timeout: int = 30,
     checkpoint_jsonl: Path | None = None,
@@ -638,9 +734,15 @@ def crawl_arctic_shift_discussions(
     session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
 
     cursors: dict[str, str | int | None] = {sub: initial_before for sub in subreddits}
+    # Permanently exhausted subreddits (API genuinely returned empty/no older posts).
     exhausted: dict[str, bool] = {sub: False for sub in subreddits}
+    # In-memory transient halt flags (network error or max_pages_per_sub cap) — never persisted.
+    session_stopped: dict[str, bool] = {sub: False for sub in subreddits}
+    had_network_error = False
     pages_fetched: dict[str, int] = {sub: 0 for sub in subreddits}
     seen_post_ids: set[str] = set()
+    rejected_post_ids: set[str] = set()
+    state_path: Path | None = None
 
     all_nodes: list[dict[str, Any]] = []
     all_edges: list[dict[str, Any]] = []
@@ -649,39 +751,86 @@ def crawl_arctic_shift_discussions(
     if checkpoint_jsonl is not None:
         checkpoint_jsonl = Path(checkpoint_jsonl)
         checkpoint_jsonl.parent.mkdir(parents=True, exist_ok=True)
+        state_path = checkpoint_jsonl.with_name(f"{checkpoint_jsonl.name}.state.json")
         if checkpoint_jsonl.exists():
             with checkpoint_jsonl.open("r", encoding="utf-8") as fh:
                 for line in fh:
                     stripped = line.strip()
                     if not stripped:
                         continue
-                    pid, nodes, edges, stats = _deserialize_checkpoint_record(json.loads(stripped))
+                    try:
+                        pid, nodes, edges, stats = _deserialize_checkpoint_record(
+                            json.loads(stripped)
+                        )
+                    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                        continue
                     if pid and pid not in seen_post_ids:
                         seen_post_ids.add(pid)
                         all_nodes.extend(nodes)
                         all_edges.extend(edges)
                         collected_stats.append(stats)
+        if state_path.exists():
+            try:
+                saved_state = json.loads(state_path.read_text(encoding="utf-8"))
+                saved_cursors = saved_state.get("cursors", {})
+                saved_exhausted = saved_state.get("exhausted", {})
+                saved_pages = saved_state.get("pages_fetched", {})
+                for sub in subreddits:
+                    if sub in saved_cursors:
+                        cursors[sub] = saved_cursors[sub]
+                    if sub in saved_exhausted:
+                        exhausted[sub] = bool(saved_exhausted[sub])
+                    if sub in saved_pages:
+                        pages_fetched[sub] = int(saved_pages[sub])
+                for rpid in saved_state.get("rejected_post_ids", []):
+                    rpid_s = str(rpid).strip()
+                    if rpid_s:
+                        rejected_post_ids.add(rpid_s)
+                        seen_post_ids.add(rpid_s)
+            except (OSError, json.JSONDecodeError, ValueError):
+                pass
 
     try:
-        while len(collected_stats) < target_count and not all(exhausted.values()):
+        while len(collected_stats) < target_count and not all(
+            exhausted[s] or session_stopped[s] for s in subreddits
+        ):
             progressed = False
             for sub in subreddits:
                 if len(collected_stats) >= target_count:
                     break
-                if exhausted[sub] or pages_fetched[sub] >= max_pages_per_sub:
-                    exhausted[sub] = True
+                if exhausted[sub] or session_stopped[sub]:
+                    continue
+                if pages_fetched[sub] >= max_pages_per_sub:
+                    session_stopped[sub] = True
                     continue
 
                 params: dict[str, Any] = {"subreddit": sub, "limit": 100}
                 if cursors[sub] is not None:
                     params["before"] = cursors[sub]
 
-                payload = _request_with_retry(
-                    session,
-                    f"{ARCTIC_SHIFT_API_BASE}/posts/search",
-                    params=params,
-                    timeout=timeout,
-                )
+                try:
+                    payload = _request_with_retry(
+                        session,
+                        f"{ARCTIC_SHIFT_API_BASE}/posts/search",
+                        params=params,
+                        timeout=timeout,
+                    )
+                except RuntimeError as exc:
+                    print(
+                        f"[Warning] Transient search error on r/{sub} at cursor={cursors[sub]}: {exc}",
+                        file=sys.stderr,
+                    )
+                    had_network_error = True
+                    session_stopped[sub] = True
+                    if state_path is not None:
+                        _save_crawl_state(
+                            state_path,
+                            cursors=cursors,
+                            exhausted=exhausted,
+                            pages_fetched=pages_fetched,
+                            rejected_post_ids=rejected_post_ids,
+                        )
+                    continue
                 posts = payload.get("data") or []
                 pages_fetched[sub] += 1
                 if not posts:
@@ -704,11 +853,21 @@ def crawl_arctic_shift_discussions(
                     if not pid or pid in seen_post_ids:
                         continue
                     if int(post.get("num_comments") or 0) < min_comments:
+                        rejected_post_ids.add(pid)
+                        seen_post_ids.add(pid)
                         continue
                     seen_post_ids.add(pid)
 
                     time.sleep(request_delay)
-                    comments = fetch_comment_tree(session, pid, timeout=timeout)
+                    try:
+                        comments = fetch_comment_tree(session, pid, timeout=timeout)
+                    except Exception as exc:
+                        print(
+                            f"[Warning] Skipping post {pid} after comment-tree fetch error: {exc}",
+                            file=sys.stderr,
+                        )
+                        rejected_post_ids.add(pid)
+                        continue
                     built = build_vn_cascade_from_thread(
                         post,
                         comments,
@@ -717,6 +876,7 @@ def crawl_arctic_shift_discussions(
                         min_vi_ratio=min_vi_ratio,
                     )
                     if built is None:
+                        rejected_post_ids.add(pid)
                         continue
                     nodes, edges, stats = built
                     all_nodes.extend(nodes)
@@ -734,13 +894,24 @@ def crawl_arctic_shift_discussions(
                             }
                             for n in nodes
                         ]
+                        serial_edges = [
+                            {
+                                **e,
+                                "created_at_utc": (
+                                    e["created_at_utc"].isoformat()
+                                    if isinstance(e.get("created_at_utc"), datetime)
+                                    else e.get("created_at_utc")
+                                ),
+                            }
+                            for e in edges
+                        ]
                         with checkpoint_jsonl.open("a", encoding="utf-8") as fh:
                             fh.write(
                                 json.dumps(
                                     {
                                         "post_id": pid,
                                         "nodes": serial_nodes,
-                                        "edges": edges,
+                                        "edges": serial_edges,
                                         "stats": stats,
                                     },
                                     ensure_ascii=False,
@@ -749,12 +920,28 @@ def crawl_arctic_shift_discussions(
                                 + "\n"
                             )
 
+                if state_path is not None:
+                    _save_crawl_state(
+                        state_path,
+                        cursors=cursors,
+                        exhausted=exhausted,
+                        pages_fetched=pages_fetched,
+                        rejected_post_ids=rejected_post_ids,
+                    )
+
             if not progressed:
                 break
     finally:
         session.close()
 
+    min_usable_partial = min(30, max(1, int(target_count)))
     if len(collected_stats) < target_count:
+        if had_network_error and len(collected_stats) < min_usable_partial:
+            raise RuntimeError(
+                f"Crawl halted by transient network errors with only "
+                f"{len(collected_stats)}/{target_count} cascades (below safe partial floor "
+                f"{min_usable_partial}); refusing to overwrite Parquet so resume can retry."
+            )
         if allow_partial and len(collected_stats) > 0:
             print(
                 f"[Warning] Only collected {len(collected_stats)}/{target_count} valid cascades "
@@ -778,10 +965,10 @@ def main() -> None:
         description="Crawl Vietnamese discussion trees from Arctic Shift public REST API."
     )
     parser.add_argument("--subreddits", nargs="+", default=list(TARGET_SUBREDDITS))
-    parser.add_argument("--target-count", type=int, default=500)
-    parser.add_argument("--min-comments", type=int, default=40)
+    parser.add_argument("--target-count", type=int, default=1500)
+    parser.add_argument("--min-comments", type=int, default=25)
     parser.add_argument("--min-depth", type=int, default=3)
-    parser.add_argument("--min-vi-ratio", type=float, default=0.25)
+    parser.add_argument("--min-vi-ratio", type=float, default=0.65)
     parser.add_argument("--before", type=str, default="7d")
     parser.add_argument(
         "--before-epoch",
@@ -789,7 +976,7 @@ def main() -> None:
         default=None,
         help="Optional explicit UTC Unix epoch cursor for reproducible snapshots (overrides --before).",
     )
-    parser.add_argument("--max-pages-per-sub", type=int, default=100)
+    parser.add_argument("--max-pages-per-sub", type=int, default=300)
     parser.add_argument("--output-dir", type=Path, default=Path("data/interim/vn"))
     parser.add_argument("--checkpoint-jsonl", type=Path, default=None)
     parser.add_argument("--allow-partial", action="store_true")

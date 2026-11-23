@@ -27,13 +27,18 @@ Hệ thống AI của nhóm hoạt động theo **dây chuyền 3 tầng sạch 
 
 ### Cách A — Chia theo Track Dữ liệu (Khuyên dùng: Hai bạn chạy độc lập 100% cùng lúc)
 * **Thành viên 1** mở sổ tay [kaggle_member1_nlp_and_vn_t4x2.ipynb](../notebooks/kaggle_member1_nlp_and_vn_t4x2.ipynb), chọn `ROLE = "member1_vn"`:
-  - Thu thập **1.500 cây thảo luận Tiếng Việt** (`r/vozforums`, `r/VietNam`, `r/TroChuyenLinhTinh`).
-  - Chạy trọn gói `Dual-Teacher (mDeBERTa-v3-xnli + ViHSD) -> ViSoBERT DualHeadCrossEncoder 2D + SpanPool -> SBi-FAGAT (hidden_dim=64)` cho Tiếng Việt.
-  - Tải về `sbifagat_member1_vn_bundle.zip`.
+  - Thu thập **1.500 cây thảo luận Tiếng Việt** (`r/vozforums`, `r/VietNam` với `--min-comments 25 --min-vi-ratio 0.65 --max-pages-per-sub 300`, hỗ trợ resume con trỏ qua `.state.json`).
+  - Chạy trọn gói `Dual-Teacher (mDeBERTa-v3-xnli + ViHSD) -> ViSoBERT DualHeadCrossEncoder 2D + SpanPool -> SBi-FAGAT (hidden_dim=64)` cho Tiếng Việt, tự xuất phiếu chấm mù 300 cặp & 50 cây Test (`audit_vn_50_trees.py`).
+  - Tải về `sbifagat_member1_vn_bundle.zip` và `sbifagat_member1_vn_sealed_machine_keys.zip`.
 * **Thành viên 2** mở sổ tay [kaggle_member2_gnn_and_en_t4x2.ipynb](../notebooks/kaggle_member2_gnn_and_en_t4x2.ipynb), chọn `ROLE = "member2_en"`:
   - Tải bộ chuẩn quốc tế **PHEME** (có kiểm tra MD5).
   - Chạy trọn gói `Dual-Teacher -> Twitter-RoBERTa DualHeadCrossEncoder 2D + SpanPool -> SBi-FAGAT (Inductive + LOO + Ablation + EDA + Efficiency)` cho Tiếng Anh (có thể bật `--run-upfd`).
-  - Tải về `sbifagat_member2_en_bundle.zip`.
+  - Tải về `sbifagat_member2_en_bundle.zip` và `sbifagat_member2_en_sealed_machine_keys.zip`.
+* **Gộp kết quả 2 track sau khi tải cả 2 gói về máy cục bộ:** Giải nén `paper/` từ cả hai gói vào chung thư mục `paper/` rồi chạy:
+  ```bash
+  python -m scripts.assemble_paper_artifacts --paper-dir paper
+  ```
+  Lệnh này gộp bảng EDA (`tables_dataset_eda.tex`), bảng hiệu năng (`tables_efficiency.tex`), bảng kiểm định con người (`tables_human_audit.tex` nếu đã có JSON báo cáo), kiểm tra sạch lỗi `_` LaTeX và xuất báo cáo tồn kho `paper/assembly_manifest.json`.
 
 ### Cách B — Chia mỗi người chuyên trách một loại Mô hình (NLP vs GNN)
 * **Thành viên 1 (Chuyên NLP):** Đổi `ROLE = "model_nlp_only"` trong sổ tay 1 để train Teacher/Student 2D và xuất `data/processed/{vn,pheme}/nlp_features.pt`.

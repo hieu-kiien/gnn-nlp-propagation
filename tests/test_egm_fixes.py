@@ -200,6 +200,7 @@ def test_extract_features_uses_independent_node_encoder_not_student(tmp_path: Pa
         batch_size=8,
         max_length=32,
         k_horizon=20,
+        device=torch.device("cpu"),
     )
     payload = torch.load(pt_path, map_location="cpu", weights_only=False)
     assert "node_features_770" not in payload

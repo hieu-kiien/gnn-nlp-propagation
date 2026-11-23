@@ -172,6 +172,8 @@ def _fetch_reddit_thread(post_id: str, timeout: int = 20) -> tuple[dict[str, Any
                         "text": str(c.get("body") or c.get("text") or ""),
                         "created_utc": c.get("created_utc"),
                         "author": raw_author,
+                        "author_is_bot": isinstance(raw_author, str)
+                        and raw_author.strip().lower() == "automoderator",
                         "author_hash": hash_author_sha256(
                             str(raw_author) if raw_author is not None else None
                         ),
@@ -207,6 +209,8 @@ def _fetch_reddit_thread(post_id: str, timeout: int = 20) -> tuple[dict[str, Any
                     "text": str(d.get("body") or ""),
                     "created_utc": d.get("created_utc"),
                     "author": raw_author,
+                    "author_is_bot": isinstance(raw_author, str)
+                    and raw_author.strip().lower() == "automoderator",
                     "author_hash": hash_author_sha256(
                         str(raw_author) if raw_author is not None else None
                     ),
@@ -244,6 +248,8 @@ def _load_thread_from_json(path: Path) -> tuple[dict[str, Any], list[dict[str, A
                         "text": str(d.get("body") or ""),
                         "created_utc": d.get("created_utc"),
                         "author": raw_author,
+                        "author_is_bot": isinstance(raw_author, str)
+                        and raw_author.strip().lower() == "automoderator",
                         "author_hash": hash_author_sha256(
                             str(raw_author) if raw_author is not None else None
                         ),
@@ -284,6 +290,8 @@ def _load_thread_from_json(path: Path) -> tuple[dict[str, Any], list[dict[str, A
                     "text": str(c.get("text") or c.get("body") or ""),
                     "created_utc": float(c.get("created_utc") or (base_ts + idx * 45.0)),
                     "author": author_str,
+                    "author_is_bot": isinstance(author_str, str)
+                    and author_str.strip().lower() == "automoderator",
                     "author_hash": hash_author_sha256(author_str),
                 }
             )
@@ -506,6 +514,24 @@ def predict_live_cascade(
         k_horizon=k_horizon,
     )
 
+    early_children_adj: dict[str, list[str]] = {}
+    early_edge_lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    early_stance_map: dict[str, float] = {}
+    for d_e in kept_edge_details:
+        pu = str(d_e["parent_id"])
+        cv = str(d_e["node_id"])
+        eid_e = str(d_e["edge_id"])
+        early_children_adj.setdefault(pu, []).append(cv)
+        early_edge_lookup[(pu, cv)] = {"edge_id": eid_e}
+        early_stance_map[eid_e] = float(d_e["s_uv"])
+    early_aligned = _compute_root_aligned_stances(
+        root_id=root_id,
+        children_adj=early_children_adj,
+        edge_lookup=early_edge_lookup,
+        stance_map=early_stance_map,
+    )
+    early_y_polar_val = _compute_full_tree_polarization(early_aligned) if early_aligned else 0.0
+
     data = CascadeData(
         x=x,
         struct_x=struct_x,
@@ -514,6 +540,7 @@ def predict_live_cascade(
         edge_index_bu=edge_index_bu,
         edge_attr=edge_attr,
         edge_stance=edge_attr[:, 0:1] if edge_attr.numel() > 0 else torch.empty((0, 1)),
+        early_y_polar=torch.tensor([early_y_polar_val], dtype=torch.float32),
         cascade_stats=cascade_stats,
         root_index=torch.tensor([0], dtype=torch.long),
         edge_pairs=kept_pairs,
@@ -531,7 +558,13 @@ def predict_live_cascade(
         if not isinstance(payload, Mapping) or "model_state_dict" not in payload:
             raise ValueError(f"Checkpoint GNN tại '{gnn_path}' thiếu trường 'model_state_dict'.")
         cfg = payload.get("config", {})
+        state_dict = payload["model_state_dict"]
         target_edge_dim = int(cfg.get("edge_dim", 2))
+        has_persist = (
+            bool(cfg["use_polar_persistence_anchor"])
+            if "use_polar_persistence_anchor" in cfg
+            else ("head.persist_weight" in state_dict)
+        )
         gnn_model = SBiFAGAT(
             in_dim=int(payload.get("in_dim", TOTAL_NODE_FEATURE_DIM)),
             hidden_dim=int(cfg.get("hidden_dim", 64)),
@@ -541,8 +574,9 @@ def predict_live_cascade(
             dropout=float(cfg.get("dropout", 0.1)),
             use_cascade_stats=bool(cfg.get("use_cascade_stats", True)),
             predict_uncertainty=bool(cfg.get("predict_uncertainty", False)),
+            use_polar_persistence_anchor=has_persist,
         )
-        gnn_model.load_state_dict(payload["model_state_dict"])
+        gnn_model.load_state_dict(state_dict, strict=True)
         checkpoint_loaded = True
     else:
         is_demo_post = bool(is_demo or str(post.get("id", "")).startswith("demo_"))
@@ -598,6 +632,7 @@ def predict_live_cascade(
     return {
         "root_title": str(post.get("title") or root_row["text"][:120]),
         "k_observed": len(kept_nodes) - 1,
+        "edge_dim": int(target_edge_dim),
         "checkpoint_loaded": checkpoint_loaded,
         "early_burst_metrics": {
             "elapsed_span_norm": stats_vec[0],
@@ -628,9 +663,10 @@ def predict_live_cascade(
 
 
 def _format_report_vi(result: Mapping[str, Any]) -> str:
+    is_2d = int(result.get("edge_dim", 2)) == 2 and bool(result.get("checkpoint_loaded"))
     lines = [
         "=" * 78,
-        "BAO CAO DU BAO SOM & PHAN TICH HANH VI TRANH LUAN (SBi-FAGAT v2)",
+        "BAO CAO DU BAO SOM & PHAN TICH HANH VI TRANH LUAN (SBi-FAGAT Unified 2D)",
         "=" * 78,
     ]
     if not result["checkpoint_loaded"]:
@@ -641,14 +677,25 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
         [
             f"Bai goc      : {result['root_title']}",
             f"Cua so quan sat (V_K): {result['k_observed']} binh luan dau tien",
-            f"Trang thai GNN       : {'Da nap checkpoint huan luyen' if result['checkpoint_loaded'] else 'CHE DO KIEM THU CAU TRUC (CHUA NAP CHECKPOINT - KHONG CO GIA TRI DU BAO)'}",
+            f"Trang thai GNN       : {'Da nap checkpoint huan luyen (2D [s_uv, h_uv])' if is_2d else ('Da nap checkpoint huan luyen' if result['checkpoint_loaded'] else 'CHE DO KIEM THU CAU TRUC (CHUA NAP CHECKPOINT - KHONG CO GIA TRI DU BAO)')}",
             "",
-            "[1] PHAN LOAI 5 NHOM HANH VI TRONG 20 BINH LUAN DAU:",
+            (
+                "[1] PHAN BO LAP TRUONG & GAY GAT 2D [s_uv, h_uv] TRONG 20 BINH LUAN DAU:"
+                if is_2d
+                else "[1] PHAN LOAI 5 NHOM HANH VI TRONG 20 BINH LUAN DAU:"
+            ),
         ]
     )
-    for lbl in DISCOURSE_BEHAVIOR_LABELS:
-        cnt = result["behavior_counts"].get(lbl, 0)
-        lines.append(f"  - {BEHAVIOR_LABEL_VI.get(lbl, lbl):38s}: {cnt} binh luan")
+    if is_2d:
+        bc = result["behavior_counts"]
+        lines.append(f"  - Ung ho / dong tinh (s > 0.1)           : {bc.get('support', 0)} binh luan")
+        lines.append(f"  - Trung lap / hoi dap                    : {bc.get('neutral', 0)} binh luan")
+        lines.append(f"  - Phan bien on hoa (s < -0.1, h <= 0.6)  : {bc.get('constructive_oppose', 0)} binh luan")
+        lines.append(f"  - Xung dot / gay gat cao (h > 0.6)       : {bc.get('hostile_conflict', 0)} binh luan")
+    else:
+        for lbl in DISCOURSE_BEHAVIOR_LABELS:
+            cnt = result["behavior_counts"].get(lbl, 0)
+            lines.append(f"  - {BEHAVIOR_LABEL_VI.get(lbl, lbl):38s}: {cnt} binh luan")
 
     bm = result["early_burst_metrics"]
     sec3_header = (
@@ -676,13 +723,21 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
 
     flagged = result.get("flagged_irrational_or_hostile") or []
     lines.append("")
-    lines.append(f"[4] DIEM MAT BINH LUAN VO LY / CHONG DOI NGUY HIEM NHAT ({len(flagged)} cau):")
-    for idx, item in enumerate(flagged[:5], start=1):
-        lbl_vi = BEHAVIOR_LABEL_VI.get(item["behavior_label"], item["behavior_label"])
-        lines.append(
-            f"  {idx}. [{lbl_vi}] (s={item['s_uv']:+.2f}, gay_gat={item['h_uv']:.2f}, vo_ly={item['r_uv']:.2f})"
-        )
-        lines.append(f"     \"{item['reply_text'][:160]}\"")
+    if is_2d:
+        lines.append(f"[4] DIEM MAT BINH LUAN GAY GAT / XUNG DOT CAO ({len(flagged)} cau):")
+        for idx, item in enumerate(flagged[:5], start=1):
+            lines.append(
+                f"  {idx}. [Xung dot gay gat] (s_uv={item['s_uv']:+.2f}, h_uv={item['h_uv']:.2f})"
+            )
+            lines.append(f"     \"{item['reply_text'][:160]}\"")
+    else:
+        lines.append(f"[4] DIEM MAT BINH LUAN VO LY / CHONG DOI NGUY HIEM NHAT ({len(flagged)} cau):")
+        for idx, item in enumerate(flagged[:5], start=1):
+            lbl_vi = BEHAVIOR_LABEL_VI.get(item["behavior_label"], item["behavior_label"])
+            lines.append(
+                f"  {idx}. [{lbl_vi}] (s={item['s_uv']:+.2f}, gay_gat={item['h_uv']:.2f}, vo_ly={item['r_uv']:.2f})"
+            )
+            lines.append(f"     \"{item['reply_text'][:160]}\"")
 
     act = result["actual_post_hoc_comparison"]
     polar_note = (

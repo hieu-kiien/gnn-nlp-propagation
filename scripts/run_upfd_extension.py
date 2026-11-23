@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import torch
@@ -10,7 +11,7 @@ from torch_geometric.datasets import UPFD
 from torch_geometric.loader import DataLoader
 
 from src.data.pyg_dataset import UPFDAdapterTransform
-from src.models.baselines import BiGCN, EdgeGATv2, StandardGATv2, StandardGCN
+from src.models.baselines import BiGCN, EdgeGATv2, FAGCNBaseline, StandardGATv2, StandardGCN
 from src.models.sbi_fagat import SBiFAGAT
 from src.training.reporting import (
     UPFD_METRICS,
@@ -23,7 +24,9 @@ from src.utils.seed import OFFICIAL_SEEDS
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run 5-seed UPFD BERT/SpaCy/Profile/Content generalization benchmark.")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    parser = argparse.ArgumentParser(description="Run 5-seed UPFD post-hoc text-free structural transfer benchmark.")
     parser.add_argument("--upfd-root", type=Path, default=Path("data/raw/upfd"))
     parser.add_argument("--dataset-name", type=str, default="gossipcop", choices=["gossipcop", "politifact"])
     parser.add_argument(
@@ -62,6 +65,7 @@ def main() -> None:
             num_rumor_classes=2,
             use_latent_edge_mlp=True,
         ),
+        "FAGCN": lambda: FAGCNBaseline(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=2),
         "BiGCN": lambda: BiGCN(in_dim=in_dim, hidden_dim=h_dim, num_rumor_classes=2),
         "SBiFAGAT (Latent)": lambda: SBiFAGAT(
             in_dim=in_dim,
@@ -83,22 +87,29 @@ def main() -> None:
         patience=args.patience,
         classification_only=True,
         reference_model="SBiFAGAT (Latent)",
-        comparator_model="BiGCN",
+        comparator_model="auto",
+        primary_hypothesis_keys=("accuracy", "macro_f1"),
         device=device,
     )
 
-    print(f"\n=== UPFD ({args.dataset_name}, {args.feature}) Generalization Results (5 Seeds) ===")
+    print(f"\n=== UPFD ({args.dataset_name}, {args.feature}) Structural Transfer Results (5 Seeds) ===")
     print(build_markdown_table(result, UPFD_METRICS))
 
+    tbl_label = (
+        "tab:upfd_results"
+        if args.dataset_name == "gossipcop"
+        else f"tab:upfd_{args.dataset_name}"
+    )
     export_latex_table(
         result,
         args.output_table,
         caption=(
-            f"Generalization Benchmark on UPFD ({args.dataset_name}, {args.feature.upper()} {in_dim}-d) Across 5 Random Seeds. "
-            "SBi-FAGAT infers latent edge conflict vectors $\\mathbf{e}_{\\text{latent}} = "
+            f"Post-Hoc Text-Free Structural Transfer on UPFD ({args.dataset_name}, {args.feature.upper()} {in_dim}-d) "
+            "Across 5 Random Seeds. Without raw reply text, SBi-FAGAT and EdgeGATv2 use a shared learned latent edge "
+            "projection $\\mathbf{e}_{\\text{latent}} = "
             "\\mathrm{MLP}([\\mathbf{x}_u \\parallel \\mathbf{x}_v \\parallel \\mathbf{x}_u - \\mathbf{x}_v])$."
         ),
-        label="tab:upfd_results",
+        label=tbl_label,
         metrics=UPFD_METRICS,
     )
     serialize_benchmark_json(

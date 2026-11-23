@@ -166,20 +166,15 @@ def run_walkthrough() -> None:
     gcn = StandardGCN(in_dim=TOTAL_NODE_FEATURE_DIM, hidden_dim=64, num_rumor_classes=4)
     fagat = SBiFAGAT(in_dim=TOTAL_NODE_FEATURE_DIM, hidden_dim=64, edge_dim=2, num_rumor_classes=4)
 
-    # Calibrate edge-sign intuition alongside polarization loss so gates clearly mirror (s_uv, h_uv)
+    # Train both StandardGCN and SBiFAGAT on the exact same pure polarization loss (zero extra supervision)
     contrast_batch = Batch.from_data_list([split_g, agree_g])
-    for name, model in (("StandardGCN", gcn), ("SBiFAGAT", fagat)):
+    for _name, model in (("StandardGCN", gcn), ("SBiFAGAT", fagat)):
         opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
         model.train()
         for _ in range(25):
             opt.zero_grad()
             out = model(contrast_batch)
             loss = F.mse_loss(out["y_polar_pred"], contrast_batch.y_polar)
-            if name == "SBiFAGAT":
-                # Auxiliary camp separation alignment for demonstration clarity
-                g_out = fagat.extract_edge_gates(split_g)
-                s_sign = torch.sign(split_g.edge_attr[:, 0])
-                loss = loss + 0.25 * F.mse_loss(g_out["gamma_td"], 0.85 * s_sign)
             loss.backward()
             opt.step()
         model.eval()

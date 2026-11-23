@@ -336,6 +336,183 @@ def compute_canonical_topic_splits(
     return out
 
 
+def _to_unix_seconds(value: Any) -> float:
+    """Convert datetime, numeric epoch, or ISO timestamp to float UTC seconds."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(float(value)) else 0.0
+    if hasattr(value, "timestamp"):
+        return float(value.timestamp())
+    from datetime import datetime, timezone
+
+    raw = str(value).strip()
+    if not raw:
+        return 0.0
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return float(dt.timestamp())
+
+
+def _extract_topic_and_timestamp(item: Any) -> tuple[str, float]:
+    if isinstance(item, Mapping):
+        topic_id = str(item["topic_id"])
+        raw_ts = item.get("root_ts", item.get("created_at_utc", item.get("timestamp", 0.0)))
+    else:
+        topic_id = str(getattr(item, "topic_id"))
+        raw_ts = getattr(item, "root_ts", getattr(item, "created_at_utc", 0.0))
+    return topic_id, _to_unix_seconds(raw_ts)
+
+
+def _extract_topic_and_embedding(item: Any) -> tuple[str, np.ndarray | None]:
+    if isinstance(item, Mapping):
+        topic_id = str(item["topic_id"])
+        raw_emb = item.get("root_emb", item.get("x"))
+    else:
+        topic_id = str(getattr(item, "topic_id"))
+        raw_emb = getattr(item, "root_emb", None)
+        if raw_emb is None and hasattr(item, "x"):
+            x_t = getattr(item, "x")
+            root_i = getattr(item, "root_index", 0)
+            r_idx = int(root_i.view(-1)[0].item()) if isinstance(root_i, torch.Tensor) else int(root_i)
+            raw_emb = x_t[r_idx, :NLP_NODE_DIM]
+    if raw_emb is None:
+        return topic_id, None
+    arr = raw_emb.detach().cpu().numpy() if isinstance(raw_emb, torch.Tensor) else np.asarray(raw_emb)
+    arr = arr.astype(np.float64).reshape(-1)
+    if arr.size > NLP_NODE_DIM:
+        arr = arr[:NLP_NODE_DIM]
+    norm = float(np.linalg.norm(arr))
+    if norm > 1e-12:
+        arr = arr / norm
+    return topic_id, arr
+
+
+def compute_temporal_topic_splits(
+    items: Sequence[Any] | pa.Table,
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+) -> dict[str, set[str]]:
+    """Topic-disjoint chronological Train/Val/Test split ordered by earliest topic timestamp."""
+    if not math.isclose(train_ratio + val_ratio + test_ratio, 1.0, abs_tol=1e-6):
+        raise ValueError("train_ratio + val_ratio + test_ratio must sum to 1.0")
+    records = (
+        [r for r in items.to_pylist() if bool(r.get("is_root", True))]
+        if isinstance(items, pa.Table)
+        else list(items)
+    )
+    topic_to_indices: dict[str, list[int]] = {}
+    topic_min_ts: dict[str, float] = {}
+    for idx, item in enumerate(records):
+        tid, ts = _extract_topic_and_timestamp(item)
+        topic_to_indices.setdefault(tid, []).append(idx)
+        if tid not in topic_min_ts or ts < topic_min_ts[tid]:
+            topic_min_ts[tid] = ts
+
+    ordered_topics = sorted(topic_to_indices.keys(), key=lambda t: (topic_min_ts[t], t))
+    if len(ordered_topics) < 3:
+        raise ValueError(
+            f"Need at least 3 distinct topic_ids for temporal Train/Val/Test split, got {len(ordered_topics)}"
+        )
+    tr_t, va_t, te_t = _partition_topics_greedy(
+        ordered_topics,
+        topic_to_indices,
+        len(records),
+        train_ratio,
+        val_ratio,
+    )
+    out = {"train": set(tr_t), "val": set(va_t), "test": set(te_t)}
+    assert out["train"].isdisjoint(out["val"])
+    assert out["train"].isdisjoint(out["test"])
+    assert out["val"].isdisjoint(out["test"])
+    return out
+
+
+def compute_embedding_cluster_splits(
+    items: Sequence[Any],
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42,
+    n_clusters: int | None = None,
+) -> dict[str, set[str]]:
+    """Domain-shift split grouping semantically similar topics into atomic macro-clusters."""
+    if not math.isclose(train_ratio + val_ratio + test_ratio, 1.0, abs_tol=1e-6):
+        raise ValueError("train_ratio + val_ratio + test_ratio must sum to 1.0")
+    records = list(items)
+    topic_to_indices: dict[str, list[int]] = {}
+    topic_embs: dict[str, list[np.ndarray]] = {}
+    for idx, item in enumerate(records):
+        tid, emb = _extract_topic_and_embedding(item)
+        topic_to_indices.setdefault(tid, []).append(idx)
+        if emb is not None:
+            topic_embs.setdefault(tid, []).append(emb)
+
+    topics = sorted(topic_to_indices.keys())
+    if len(topics) < 3:
+        raise ValueError(
+            f"Need at least 3 distinct topic_ids for cluster Train/Val/Test split, got {len(topics)}"
+        )
+
+    valid_vecs = [np.mean(topic_embs[t], axis=0) for t in topics if t in topic_embs and topic_embs[t]]
+    if len(valid_vecs) == len(topics) and len(topics) >= 4:
+        mat = np.vstack(valid_vecs)
+        norms = np.linalg.norm(mat, axis=1, keepdims=True).clip(min=1e-12)
+        mat = mat / norms
+        k = int(n_clusters) if n_clusters is not None else max(3, min(len(topics), int(round(math.sqrt(len(topics))))))
+        k = max(3, min(len(topics), k))
+        from sklearn.cluster import KMeans
+
+        labels = KMeans(n_clusters=k, random_state=int(seed), n_init=10).fit_predict(mat)
+        cluster_to_topics: dict[str, list[str]] = {}
+        cluster_to_indices: dict[str, list[int]] = {}
+        for tid, cid in zip(topics, labels.tolist()):
+            ckey = f"cluster_{cid}"
+            cluster_to_topics.setdefault(ckey, []).append(tid)
+            cluster_to_indices.setdefault(ckey, []).extend(topic_to_indices[tid])
+
+        if len(cluster_to_topics) >= 3:
+            rng = random.Random(int(seed))
+            ordered_clusters = list(cluster_to_topics.keys())
+            rng.shuffle(ordered_clusters)
+            tr_c, va_c, te_c = _partition_topics_greedy(
+                ordered_clusters,
+                cluster_to_indices,
+                len(records),
+                train_ratio,
+                val_ratio,
+            )
+            out = {
+                "train": {t for c in tr_c for t in cluster_to_topics[c]},
+                "val": {t for c in va_c for t in cluster_to_topics[c]},
+                "test": {t for c in te_c for t in cluster_to_topics[c]},
+            }
+            assert out["train"].isdisjoint(out["val"])
+            assert out["train"].isdisjoint(out["test"])
+            assert out["val"].isdisjoint(out["test"])
+            return out
+
+    rng = random.Random(int(seed))
+    ordered_topics = list(topics)
+    rng.shuffle(ordered_topics)
+    tr_t, va_t, te_t = _partition_topics_greedy(
+        ordered_topics,
+        topic_to_indices,
+        len(records),
+        train_ratio,
+        val_ratio,
+    )
+    out = {"train": set(tr_t), "val": set(va_t), "test": set(te_t)}
+    assert out["train"].isdisjoint(out["val"])
+    assert out["train"].isdisjoint(out["test"])
+    assert out["val"].isdisjoint(out["test"])
+    return out
+
+
 def save_topic_splits_json(
     splits: Mapping[str, Iterable[str]],
     path: Path,
@@ -432,7 +609,7 @@ def _lookup_edge_oppose_flag(
     return stance_val < -0.1
 
 
-def _compute_root_aligned_stances(
+def _compute_root_aligned_stances_and_orientations(
     root_id: str,
     children_adj: Mapping[str, Sequence[str]],
     edge_lookup: Mapping[tuple[str, str], Mapping[str, Any]],
@@ -441,22 +618,28 @@ def _compute_root_aligned_stances(
     root_stance_map: Mapping[Any, Any] | None = None,
     excluded_pairs: set[tuple[str, str]] | None = None,
     neutral_eps: float = 0.1,
-) -> list[float]:
+) -> tuple[list[float], dict[str, float]]:
     """Propagate local parent-child stances into root-aligned orientations via BFS.
 
     When direct `(root, reply)` NLI stance scores (`root_stance_map`) are provided,
     they are used directly for any reply `v` present in `root_stance_map`, eliminating
     multi-hop sign-product drift on deep replies while falling back to signed parent
-    propagation (`parent_sign * s_uv`) when `root_stance_map` is absent.
+    propagation (`parent_sign * s_uv`) when `root_stance_map` is absent. Neutral
+    parents (`|u_ori| <= neutral_eps`) smoothly attenuate propagation via
+    `u_ori / neutral_eps` instead of forcing `+1.0`.
     """
     node_orientations: dict[str, float] = {root_id: 1.0}
     aligned_stances: list[float] = []
     queue: deque[str] = deque([root_id])
+    eps_safe = max(float(neutral_eps), 1e-6)
 
     while queue:
         u = queue.popleft()
         u_ori = node_orientations.get(u, 1.0)
-        parent_sign = 1.0 if abs(u_ori) <= neutral_eps else (1.0 if u_ori > 0.0 else -1.0)
+        if abs(u_ori) <= eps_safe:
+            parent_sign = u_ori / eps_safe
+        else:
+            parent_sign = 1.0 if u_ori > 0.0 else -1.0
         for v in children_adj.get(u, []):
             edge_row = edge_lookup.get((u, v))
             eid = str(edge_row["edge_id"]) if edge_row is not None else f"{u}->{v}"
@@ -471,6 +654,29 @@ def _compute_root_aligned_stances(
             if excluded_pairs is None or (u, v) not in excluded_pairs:
                 aligned_stances.append(aligned)
 
+    return aligned_stances, node_orientations
+
+
+def _compute_root_aligned_stances(
+    root_id: str,
+    children_adj: Mapping[str, Sequence[str]],
+    edge_lookup: Mapping[tuple[str, str], Mapping[str, Any]],
+    stance_map: Mapping[Any, Any] | None,
+    *,
+    root_stance_map: Mapping[Any, Any] | None = None,
+    excluded_pairs: set[tuple[str, str]] | None = None,
+    neutral_eps: float = 0.1,
+) -> list[float]:
+    """Return list of root-aligned stances along non-excluded edges."""
+    aligned_stances, _ = _compute_root_aligned_stances_and_orientations(
+        root_id=root_id,
+        children_adj=children_adj,
+        edge_lookup=edge_lookup,
+        stance_map=stance_map,
+        root_stance_map=root_stance_map,
+        excluded_pairs=excluded_pairs,
+        neutral_eps=neutral_eps,
+    )
     return aligned_stances
 
 
@@ -534,23 +740,31 @@ def _compute_full_tree_polarization(
     lambda_polar: float = 0.5,
     neutral_eps: float = 0.1,
 ) -> float:
-    """Compute symmetric bipolar full-tree polarization target y_polar in [0, 1].
+    """Compute continuous, finite-sample-unbiased symmetric bipolar polarization y_polar in [0, 1].
 
-    Combines normalized population variance sigma_s^2 (Popoviciu upper bound 1.0 on [-1, 1])
-    with symmetric bipolar camp balance `4 * p_+ * p_-`, where p_+ = P(s > eps) and
-    p_- = P(s < -eps). Unanimous support or unanimous opposition both yield 0.0, while an
-    equal 50/50 split (+1 vs -1) attains the maximum 1.0.
+    Combines finite-sample-unbiased stance variance `min(1, s^2_{ddof=1})` with
+    continuous intensity-weighted bipolar balance
+    `min(1, (n / (n - 1)) * 4 * mean(max(s, 0)) * mean(max(-s, 0)))`.
+    Because `max(s_i, 0) * max(-s_i, 0) = 0` identically, the `n / (n - 1)` factor
+    removes finite-sample covariance bias for both terms, eliminating cascade-size
+    length bias while suppressing near-neutral noise (e.g. |s| ~ 0.11). Unanimous
+    support or unanimous opposition both yield 0.0, while an equal 50/50 extreme
+    split (+1 vs -1) attains the maximum 1.0.
     """
-    del oppose_flags  # Retained in signature for backward compatibility
-    if len(stances) == 0:
+    del oppose_flags, neutral_eps  # Retained in signature for backward compatibility
+    n = len(stances)
+    if n < 2:
         return 0.0
     arr = np.asarray(stances, dtype=np.float64)
     arr = np.clip(arr, -1.0, 1.0)
-    var_s = float(np.var(arr, ddof=0))
-    pro_frac = float(np.mean(arr > neutral_eps))
-    con_frac = float(np.mean(arr < -neutral_eps))
-    bipolar_balance = 4.0 * pro_frac * con_frac
-    y_polar = lambda_polar * var_s + (1.0 - lambda_polar) * bipolar_balance
+    corr = float(n) / float(n - 1)
+    var_s = min(1.0, float(np.var(arr, ddof=1)))
+    std_s = math.sqrt(max(0.0, var_s))
+    m_pos = float(np.mean(np.maximum(arr, 0.0)))
+    m_neg = float(np.mean(np.maximum(-arr, 0.0)))
+    # Linear dipole amplitude matched in scale to std_s (avoids quadratic collapse).
+    bipolar_balance = min(1.0, 2.0 * math.sqrt(max(0.0, corr * m_pos * m_neg)))
+    y_polar = lambda_polar * std_s + (1.0 - lambda_polar) * bipolar_balance
     return float(min(1.0, max(0.0, y_polar)))
 
 
@@ -780,6 +994,7 @@ class EarlyCascadeDataset(Dataset):
         nlp_features: Mapping[str, Any] | None = None,
         min_total_replies: int = 0,
         polar_target_mode: Literal["full", "future_only"] = "full",
+        polar_future_start_k: int | None = None,
         label_scheme: Literal["veracity4", "binary"] = "veracity4",
         custom_topic_splits: Mapping[str, set[str]] | None = None,
         edge_source: Literal["auto", "student", "teacher"] = "auto",
@@ -791,6 +1006,8 @@ class EarlyCascadeDataset(Dataset):
             raise ValueError(f"Unsupported split {split!r}")
         if polar_target_mode not in {"full", "future_only"}:
             raise ValueError(f"Unsupported polar_target_mode {polar_target_mode!r}")
+        if polar_future_start_k is not None and int(polar_future_start_k) < 1:
+            raise ValueError(f"polar_future_start_k must be >= 1, got {polar_future_start_k}")
         if label_scheme not in {"veracity4", "binary"}:
             raise ValueError(f"Unsupported label_scheme {label_scheme!r}")
         if edge_source not in {"auto", "student", "teacher"}:
@@ -803,6 +1020,9 @@ class EarlyCascadeDataset(Dataset):
         self.lambda_polar = float(lambda_polar)
         self.min_total_replies = int(min_total_replies)
         self.polar_target_mode = polar_target_mode
+        self.polar_future_start_k = (
+            int(polar_future_start_k) if polar_future_start_k is not None else None
+        )
         self.label_scheme = label_scheme
         self.edge_source = edge_source
 
@@ -820,19 +1040,29 @@ class EarlyCascadeDataset(Dataset):
                 )
             nlp_features = torch.load(feat_path, map_location="cpu", weights_only=False)
 
+        extracted_min = int(nlp_features.get("min_total_replies_extracted", 0) or 0)
+        if extracted_min > 0 and self.min_total_replies < extracted_min:
+            raise ValueError(
+                f"EarlyCascadeDataset requested min_total_replies={self.min_total_replies}, "
+                f"but nlp_features.pt only extracted embeddings/edges for cascades with "
+                f"min_total_replies_extracted={extracted_min}. Pass min_total_replies>={extracted_min} "
+                "to prevent loading zero-vector unextracted cascades."
+            )
+
         has_teacher_edges = (
             "teacher_edge_stance" in nlp_features or "teacher_edge_attr" in nlp_features
         )
         if self.edge_source == "teacher" and not has_teacher_edges:
             raise ValueError(
-                "edge_source='teacher' requires 100% Teacher edge coverage in nlp_features.pt "
-                "(run dual_edge_scorer without --max-teacher-pairs or use legacy_nli --score-only)."
+                "edge_source='teacher' requires 100% Teacher edge coverage over eligible cascades "
+                "in nlp_features.pt (run dual_edge_scorer without --max-teacher-pairs and "
+                "extract_features with matching --min-total-replies)."
             )
         self._use_teacher_edges = bool(
             self.edge_source == "teacher"
             or (
                 self.edge_source == "auto"
-                and custom_topic_splits is not None
+                and "edge_stance" not in nlp_features
                 and has_teacher_edges
             )
         )
@@ -1008,13 +1238,30 @@ class EarlyCascadeDataset(Dataset):
                 for n in kept_nodes[1:]
                 if str(n["parent_id"]) in kept_id_to_idx
             }
-            aligned_stances = _compute_root_aligned_stances(
-                root_id=root_id,
-                children_adj=children_adj,
-                edge_lookup=edge_lookup,
-                stance_map=target_stance_map,
-                root_stance_map=root_stance_map,
-                excluded_pairs=kept_pair_set if self.polar_target_mode == "future_only" else None,
+            if self.polar_target_mode == "future_only":
+                if self.polar_future_start_k is not None:
+                    cutoff_k = max(self.k_horizon, int(self.polar_future_start_k))
+                    excl_nodes = [root_row] + non_root_nodes[:cutoff_k]
+                    excl_ids = {str(n["node_id"]) for n in excl_nodes}
+                    excluded_pair_set: set[tuple[str, str]] | None = {
+                        (str(n["parent_id"]), str(n["node_id"]))
+                        for n in excl_nodes[1:]
+                        if str(n["parent_id"]) in excl_ids
+                    }
+                else:
+                    excluded_pair_set = kept_pair_set
+            else:
+                excluded_pair_set = None
+
+            aligned_stances, target_node_orientations = (
+                _compute_root_aligned_stances_and_orientations(
+                    root_id=root_id,
+                    children_adj=children_adj,
+                    edge_lookup=edge_lookup,
+                    stance_map=target_stance_map,
+                    root_stance_map=root_stance_map,
+                    excluded_pairs=excluded_pair_set,
+                )
             )
             y_polar_val = _compute_full_tree_polarization(
                 aligned_stances,
@@ -1022,15 +1269,22 @@ class EarlyCascadeDataset(Dataset):
             )
             y_bimodality_val = compute_bimodality_coefficient(aligned_stances)
 
+            target_edge_pairs: list[tuple[str, str]] = []
             target_toxicity_scores: list[float] = []
             for e in c_edges:
                 pair = (str(e["source_id"]), str(e["target_id"]))
-                if self.polar_target_mode == "future_only" and pair in kept_pair_set:
+                if excluded_pair_set is not None and pair in excluded_pair_set:
                     continue
+                target_edge_pairs.append(pair)
                 eid_t = str(e["edge_id"])
                 h_t = max(0.0, min(1.0, _lookup_edge_scalar(target_hostility_map, eid_t, pair[0], pair[1], 0.0)))
                 r_t = max(0.0, min(1.0, _lookup_edge_scalar(target_irr_map, eid_t, pair[0], pair[1], 0.0)))
                 target_toxicity_scores.append(0.6 * h_t + 0.4 * r_t)
+            y_assortativity_val = compute_signed_assortativity(
+                target_edge_pairs,
+                target_node_orientations,
+                root_id=root_id,
+            )
             mean_tox = float(np.mean(target_toxicity_scores)) if target_toxicity_scores else 0.0
             y_toxic_polar_val = float(min(1.0, max(0.0, 0.5 * y_polar_val + 0.5 * mean_tox)))
 
@@ -1128,6 +1382,28 @@ class EarlyCascadeDataset(Dataset):
                 k_horizon=self.k_horizon,
             )
 
+            # Causal root-aligned orientations strictly on V_K using input stance_map only
+            kept_children_adj: dict[str, list[str]] = {nid: [] for nid in kept_ids}
+            for src_id, dst_id in kept_edge_pairs:
+                kept_children_adj.setdefault(src_id, []).append(dst_id)
+            _, early_orientations = _compute_root_aligned_stances_and_orientations(
+                root_id=root_id,
+                children_adj=kept_children_adj,
+                edge_lookup=edge_lookup,
+                stance_map=stance_map,
+                root_stance_map=None,
+            )
+            early_node_root_stance = torch.tensor(
+                [float(early_orientations.get(nid, 0.0)) for nid in kept_ids],
+                dtype=torch.float32,
+            )
+            early_reply_stances = [
+                float(early_orientations.get(nid, 0.0))
+                for nid in kept_ids
+                if nid != root_id
+            ]
+            early_y_polar_val = _compute_full_tree_polarization(early_reply_stances)
+
             data = CascadeData(
                 x=x,
                 struct_x=struct_x,
@@ -1136,12 +1412,16 @@ class EarlyCascadeDataset(Dataset):
                 edge_index_bu=edge_index_bu,
                 edge_attr=edge_attr,
                 edge_stance=edge_stance,
+                early_node_root_stance=early_node_root_stance,
                 cascade_stats=cascade_stats,
                 root_index=torch.tensor([0], dtype=torch.long),
                 y_size=torch.tensor([y_size_val], dtype=torch.float32),
                 y_polar=torch.tensor([y_polar_val], dtype=torch.float32),
+                early_y_polar=torch.tensor([early_y_polar_val], dtype=torch.float32),
+                root_ts=_to_unix_seconds(root_ts),
                 y_toxic_polar=torch.tensor([y_toxic_polar_val], dtype=torch.float32),
                 y_bimodality=torch.tensor([y_bimodality_val], dtype=torch.float32),
+                y_assortativity=torch.tensor([y_assortativity_val], dtype=torch.float32),
                 y_rumor=torch.tensor([y_rumor_val], dtype=torch.long),
                 cascade_id=cid,
                 topic_id=topic_id,
@@ -1203,6 +1483,7 @@ class UPFDAdapterTransform:
             y_polar=y_polar,
             y_toxic_polar=torch.tensor([0.0], dtype=torch.float32),
             y_bimodality=torch.tensor([0.0], dtype=torch.float32),
+            y_assortativity=torch.tensor([0.0], dtype=torch.float32),
             y_rumor=y_cls,
             y=y_cls,
         )
