@@ -1,7 +1,7 @@
 # SBi-FAGAT: Test & Verification Report
 
 **Platform:** Windows (`win32`, CPU verification pass) + GitHub Actions Ubuntu (`Python 3.11`)  
-**Suite Scope:** 17 test modules in `tests/` — **124 passed, 0 failed** (unified 2D architecture, multi-task KL-BCE optimization, zero data leakage, EGM Round-1 `B1–B10`/`M1–M8` + Round-2 3-Goldfish adversarial audit remediations: detached BFS depth-30 gradient stability, Holm-Bonferroni `p < 0.01` bootstrap resolution, T4 DeBERTa AMP policy, UPFD classification-only comparator, `min_total_replies_extracted` guard, crawler fault recovery, 50-tree future-window human audit, lossless NLP length-bucketing/mechanisms, and strict-blind local audit UI)
+**Suite Scope:** 18 test modules in `tests/` — **128 passed, 0 failed** (`563.27s`, zero skipped — covering unified 2D architecture, multi-task KL-BCE optimization, zero data leakage, EGM Round-1/Round-2 remediations, and **v3 EGM Overhaul**: PII/doxxing/spam filtering, linear `y_polar`, ReZero `tanh(w_p)` centered Persistence-Residual anchor, masked single-camp Camp Dipole, Smooth-L1 `beta=0.05` + validation-only comparator selection, `temporal`/`embedding_cluster` splits with `edge_source="teacher"`, binary `clean`/`uncivil` Gate 1 audit, `--lock-role` UI isolation, and non-overwriting multi-corpus LaTeX assembly)
 
 ---
 
@@ -39,14 +39,15 @@
 | `tests/test_schema.py` | `NodeRecord`/`EdgeRecord` Pydantic contracts, UTC enforcement, cycle/leakage rejection |
 | `tests/test_sota_v2_upgrades.py` | LOO `edge_source="teacher"`, EDA/Persistence & Efficiency LaTeX, CLI aliases, fair runner config |
 | `tests/test_step3_training_and_audit_fixes.py` | KL-BCE zero min & tail gradient, EMA/best-val seed selection, `EarlyStopping` NaN/Inf guard, sealed key bundles, canonical split locks, dynamic LaTeX labels, NLI reply preservation |
+| `tests/test_v3_egm_overhaul.py` | v3 EGM overhaul: PII/doxxing/LMGX spam redaction, linear `y_polar`, `early_y_polar` & chronological/embedding splits, ReZero `tanh(w_p)` centered Persistence anchor + `persist_ep_logit_ref` + consistent mechanism perturbation clone, `predict_uncertainty` parity & validation-only comparator selection, binary `clean`/`uncivil` Gate 1 (`ROC-AUC`/`PR-AUC`), `--lock-role` 403 UI isolation, Kendall $\tau_b$/AUROC $@\ge 2$ thread audit, multi-corpus LaTeX merge |
 | `tests/test_vn_tree.py` | Arctic Shift VN tree builder & salted SHA-256 pseudonymization |
 
 ---
 
 ## 3. Offline CLI & Smoke Verification (`exit code 0`)
 
-1. `python -m scripts.demo_research_walkthrough` — Exited `0` (CPU walkthrough comparing `StandardGCN` vs. `SBiFAGAT`).
-2. `python -m scripts.predict_live_thread --demo-offline` — Exited `0` (verified live safety guard + offline diagnostics).
-3. `python -m scripts.benchmark_efficiency` — Exited `0` (`hidden_dim=64`, `SBiFAGAT = 163,836` params; with `--use-cascade-stats`: `170,332` params).
-4. `python -m scripts.kaggle_parallel_runner --role member1_vn --smoke-test` — Exited `0` (builds `sbifagat_member1_vn_bundle.zip` excluding `*_machine_key.csv` AND `sbifagat_member1_vn_sealed_machine_keys.zip` preserving the blind answer key).
-5. `python -m scripts.kaggle_parallel_runner --role member2_en --smoke-test` — Exited `0`.
+1. `python -u -m scripts.demo_research_walkthrough` — Exited `0` (CPU walkthrough comparing `StandardGCN` vs. `SBiFAGAT`).
+2. `python -u -m scripts.predict_live_thread --demo-offline` — Exited `0` (verified live safety guard + offline diagnostics).
+3. `python -u -m scripts.benchmark_efficiency --use-cascade-stats --hidden-dim 64 --edge-dim 2` — Exited `0` (`SBiFAGAT = 137,086` params, `1.1843 ms/cascade`, `155.79 ms/batch`, `0.03 MB` peak alloc RAM on CPU).
+4. `python -u -m scripts.kaggle_parallel_runner --role member1_vn --smoke-test` — Exited `0` (verified temp-isolated 2D VN distillation + sealed machine-key separation).
+5. `python -u -m scripts.kaggle_parallel_runner --role member2_en --smoke-test` — Exited `0` (verified temp-isolated 2D EN distillation + LOO/UPFD path).

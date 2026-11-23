@@ -336,6 +336,183 @@ def compute_canonical_topic_splits(
     return out
 
 
+def _to_unix_seconds(value: Any) -> float:
+    """Convert datetime, numeric epoch, or ISO timestamp to float UTC seconds."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(float(value)) else 0.0
+    if hasattr(value, "timestamp"):
+        return float(value.timestamp())
+    from datetime import datetime, timezone
+
+    raw = str(value).strip()
+    if not raw:
+        return 0.0
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return float(dt.timestamp())
+
+
+def _extract_topic_and_timestamp(item: Any) -> tuple[str, float]:
+    if isinstance(item, Mapping):
+        topic_id = str(item["topic_id"])
+        raw_ts = item.get("root_ts", item.get("created_at_utc", item.get("timestamp", 0.0)))
+    else:
+        topic_id = str(getattr(item, "topic_id"))
+        raw_ts = getattr(item, "root_ts", getattr(item, "created_at_utc", 0.0))
+    return topic_id, _to_unix_seconds(raw_ts)
+
+
+def _extract_topic_and_embedding(item: Any) -> tuple[str, np.ndarray | None]:
+    if isinstance(item, Mapping):
+        topic_id = str(item["topic_id"])
+        raw_emb = item.get("root_emb", item.get("x"))
+    else:
+        topic_id = str(getattr(item, "topic_id"))
+        raw_emb = getattr(item, "root_emb", None)
+        if raw_emb is None and hasattr(item, "x"):
+            x_t = getattr(item, "x")
+            root_i = getattr(item, "root_index", 0)
+            r_idx = int(root_i.view(-1)[0].item()) if isinstance(root_i, torch.Tensor) else int(root_i)
+            raw_emb = x_t[r_idx, :NLP_NODE_DIM]
+    if raw_emb is None:
+        return topic_id, None
+    arr = raw_emb.detach().cpu().numpy() if isinstance(raw_emb, torch.Tensor) else np.asarray(raw_emb)
+    arr = arr.astype(np.float64).reshape(-1)
+    if arr.size > NLP_NODE_DIM:
+        arr = arr[:NLP_NODE_DIM]
+    norm = float(np.linalg.norm(arr))
+    if norm > 1e-12:
+        arr = arr / norm
+    return topic_id, arr
+
+
+def compute_temporal_topic_splits(
+    items: Sequence[Any] | pa.Table,
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+) -> dict[str, set[str]]:
+    """Topic-disjoint chronological Train/Val/Test split ordered by earliest topic timestamp."""
+    if not math.isclose(train_ratio + val_ratio + test_ratio, 1.0, abs_tol=1e-6):
+        raise ValueError("train_ratio + val_ratio + test_ratio must sum to 1.0")
+    records = (
+        [r for r in items.to_pylist() if bool(r.get("is_root", True))]
+        if isinstance(items, pa.Table)
+        else list(items)
+    )
+    topic_to_indices: dict[str, list[int]] = {}
+    topic_min_ts: dict[str, float] = {}
+    for idx, item in enumerate(records):
+        tid, ts = _extract_topic_and_timestamp(item)
+        topic_to_indices.setdefault(tid, []).append(idx)
+        if tid not in topic_min_ts or ts < topic_min_ts[tid]:
+            topic_min_ts[tid] = ts
+
+    ordered_topics = sorted(topic_to_indices.keys(), key=lambda t: (topic_min_ts[t], t))
+    if len(ordered_topics) < 3:
+        raise ValueError(
+            f"Need at least 3 distinct topic_ids for temporal Train/Val/Test split, got {len(ordered_topics)}"
+        )
+    tr_t, va_t, te_t = _partition_topics_greedy(
+        ordered_topics,
+        topic_to_indices,
+        len(records),
+        train_ratio,
+        val_ratio,
+    )
+    out = {"train": set(tr_t), "val": set(va_t), "test": set(te_t)}
+    assert out["train"].isdisjoint(out["val"])
+    assert out["train"].isdisjoint(out["test"])
+    assert out["val"].isdisjoint(out["test"])
+    return out
+
+
+def compute_embedding_cluster_splits(
+    items: Sequence[Any],
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42,
+    n_clusters: int | None = None,
+) -> dict[str, set[str]]:
+    """Domain-shift split grouping semantically similar topics into atomic macro-clusters."""
+    if not math.isclose(train_ratio + val_ratio + test_ratio, 1.0, abs_tol=1e-6):
+        raise ValueError("train_ratio + val_ratio + test_ratio must sum to 1.0")
+    records = list(items)
+    topic_to_indices: dict[str, list[int]] = {}
+    topic_embs: dict[str, list[np.ndarray]] = {}
+    for idx, item in enumerate(records):
+        tid, emb = _extract_topic_and_embedding(item)
+        topic_to_indices.setdefault(tid, []).append(idx)
+        if emb is not None:
+            topic_embs.setdefault(tid, []).append(emb)
+
+    topics = sorted(topic_to_indices.keys())
+    if len(topics) < 3:
+        raise ValueError(
+            f"Need at least 3 distinct topic_ids for cluster Train/Val/Test split, got {len(topics)}"
+        )
+
+    valid_vecs = [np.mean(topic_embs[t], axis=0) for t in topics if t in topic_embs and topic_embs[t]]
+    if len(valid_vecs) == len(topics) and len(topics) >= 4:
+        mat = np.vstack(valid_vecs)
+        norms = np.linalg.norm(mat, axis=1, keepdims=True).clip(min=1e-12)
+        mat = mat / norms
+        k = int(n_clusters) if n_clusters is not None else max(3, min(len(topics), int(round(math.sqrt(len(topics))))))
+        k = max(3, min(len(topics), k))
+        from sklearn.cluster import KMeans
+
+        labels = KMeans(n_clusters=k, random_state=int(seed), n_init=10).fit_predict(mat)
+        cluster_to_topics: dict[str, list[str]] = {}
+        cluster_to_indices: dict[str, list[int]] = {}
+        for tid, cid in zip(topics, labels.tolist()):
+            ckey = f"cluster_{cid}"
+            cluster_to_topics.setdefault(ckey, []).append(tid)
+            cluster_to_indices.setdefault(ckey, []).extend(topic_to_indices[tid])
+
+        if len(cluster_to_topics) >= 3:
+            rng = random.Random(int(seed))
+            ordered_clusters = list(cluster_to_topics.keys())
+            rng.shuffle(ordered_clusters)
+            tr_c, va_c, te_c = _partition_topics_greedy(
+                ordered_clusters,
+                cluster_to_indices,
+                len(records),
+                train_ratio,
+                val_ratio,
+            )
+            out = {
+                "train": {t for c in tr_c for t in cluster_to_topics[c]},
+                "val": {t for c in va_c for t in cluster_to_topics[c]},
+                "test": {t for c in te_c for t in cluster_to_topics[c]},
+            }
+            assert out["train"].isdisjoint(out["val"])
+            assert out["train"].isdisjoint(out["test"])
+            assert out["val"].isdisjoint(out["test"])
+            return out
+
+    rng = random.Random(int(seed))
+    ordered_topics = list(topics)
+    rng.shuffle(ordered_topics)
+    tr_t, va_t, te_t = _partition_topics_greedy(
+        ordered_topics,
+        topic_to_indices,
+        len(records),
+        train_ratio,
+        val_ratio,
+    )
+    out = {"train": set(tr_t), "val": set(va_t), "test": set(te_t)}
+    assert out["train"].isdisjoint(out["val"])
+    assert out["train"].isdisjoint(out["test"])
+    assert out["val"].isdisjoint(out["test"])
+    return out
+
+
 def save_topic_splits_json(
     splits: Mapping[str, Iterable[str]],
     path: Path,
@@ -582,10 +759,12 @@ def _compute_full_tree_polarization(
     arr = np.clip(arr, -1.0, 1.0)
     corr = float(n) / float(n - 1)
     var_s = min(1.0, float(np.var(arr, ddof=1)))
+    std_s = math.sqrt(max(0.0, var_s))
     m_pos = float(np.mean(np.maximum(arr, 0.0)))
     m_neg = float(np.mean(np.maximum(-arr, 0.0)))
-    bipolar_balance = min(1.0, corr * 4.0 * m_pos * m_neg)
-    y_polar = lambda_polar * var_s + (1.0 - lambda_polar) * bipolar_balance
+    # Linear dipole amplitude matched in scale to std_s (avoids quadratic collapse).
+    bipolar_balance = min(1.0, 2.0 * math.sqrt(max(0.0, corr * m_pos * m_neg)))
+    y_polar = lambda_polar * std_s + (1.0 - lambda_polar) * bipolar_balance
     return float(min(1.0, max(0.0, y_polar)))
 
 
@@ -1218,6 +1397,12 @@ class EarlyCascadeDataset(Dataset):
                 [float(early_orientations.get(nid, 0.0)) for nid in kept_ids],
                 dtype=torch.float32,
             )
+            early_reply_stances = [
+                float(early_orientations.get(nid, 0.0))
+                for nid in kept_ids
+                if nid != root_id
+            ]
+            early_y_polar_val = _compute_full_tree_polarization(early_reply_stances)
 
             data = CascadeData(
                 x=x,
@@ -1232,6 +1417,8 @@ class EarlyCascadeDataset(Dataset):
                 root_index=torch.tensor([0], dtype=torch.long),
                 y_size=torch.tensor([y_size_val], dtype=torch.float32),
                 y_polar=torch.tensor([y_polar_val], dtype=torch.float32),
+                early_y_polar=torch.tensor([early_y_polar_val], dtype=torch.float32),
+                root_ts=_to_unix_seconds(root_ts),
                 y_toxic_polar=torch.tensor([y_toxic_polar_val], dtype=torch.float32),
                 y_bimodality=torch.tensor([y_bimodality_val], dtype=torch.float32),
                 y_assortativity=torch.tensor([y_assortativity_val], dtype=torch.float32),

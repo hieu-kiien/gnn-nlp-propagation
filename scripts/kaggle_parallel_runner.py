@@ -511,13 +511,20 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
     work_dir = Path(args.work_dir or ".").resolve()
     py = sys.executable
 
+    salt_file = work_dir / "data" / "interim" / ".author_hash_salt.secret"
+    if not os.environ.get("SBIF_HASH_SALT") and not salt_file.is_file():
+        import secrets
+
+        salt_file.parent.mkdir(parents=True, exist_ok=True)
+        salt_file.write_text(secrets.token_hex(16), encoding="utf-8")
+
     interim_dir = work_dir / "data" / "interim" / ds_name
     processed_dir = Path(args.processed_dir) if args.processed_dir else (work_dir / "data" / "processed" / ds_name)
     scored_cache = interim_dir / "scored_pairs.json"
     ce_ckpt = work_dir / "checkpoints" / f"dual_ce_{ds_name}"
     vihsd_dir = work_dir / "checkpoints" / "visobert_vihsd"
-    audit_csv = work_dir / "data" / "interim" / f"human_audit_{lang}_300.csv"
-    pilot_csv = work_dir / "data" / "interim" / f"pilot_calibration_{lang}_30.csv"
+    audit_csv = work_dir / "data" / "interim" / f"human_audit_{lang}_120.csv"
+    pilot_csv = work_dir / "data" / "interim" / f"pilot_calibration_{lang}_20.csv"
     student_backbone = VISOBERT_MODEL_NAME if lang == "vi" else TWITTER_ROBERTA_MODEL_NAME
 
     run_nlp = args.role in {"member1_vn", "member2_en", "model_nlp_only"}
@@ -589,6 +596,10 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                 str(audit_csv),
                 "--pilot-csv",
                 str(pilot_csv),
+                "--audit-n-samples",
+                "120",
+                "--pilot-samples",
+                "20",
                 "--teacher-backend",
                 "dual_nli",
                 "--min-total-replies",
@@ -810,8 +821,8 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                         "(ensure dual_edge_scorer scored 100% of PHEME edges before extract_features)."
                     )
         else:
-            # Export 50-tree blind thread-level human audit on VN Test cascades if data exists
-            vn_tree_audit = work_dir / "data" / "interim" / "human_audit_vn_50_trees.csv"
+            # Export 30-tree blind thread-level human audit on VN Test cascades if data exists
+            vn_tree_audit = work_dir / "data" / "interim" / "human_audit_vn_30_trees.csv"
             if (processed_dir / "nlp_features.pt").exists() and (processed_dir / "nodes.parquet").exists():
                 if force or not vn_tree_audit.exists():
                     try:
@@ -824,6 +835,8 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                                 str(processed_dir),
                                 "--audit-csv",
                                 str(vn_tree_audit),
+                                "--n-samples",
+                                "30",
                                 "--k-horizon",
                                 str(args.k_horizon),
                                 "--min-total-replies",
@@ -833,7 +846,27 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                             cwd=work_dir,
                         )
                     except Exception as exc:
-                        print(f"[WARN] Could not export 50-tree VN blind audit CSV: {exc}")
+                        print(f"[WARN] Could not export 30-tree VN blind audit CSV: {exc}")
+
+            # Temporal holdout check with isolated teacher edges (zero Student leakage)
+            temp_json = work_dir / "paper" / f"results_temporal_{ds_name}.json"
+            temp_tex = work_dir / "paper" / f"tables_temporal_{ds_name}.tex"
+            if force or not temp_json.is_file() or not temp_tex.is_file():
+                _run_cmd(
+                    exp_base_cmd
+                    + [
+                        "--split-mode",
+                        "temporal",
+                        "--edge-source",
+                        "teacher",
+                        "--output-table",
+                        f"paper/tables_temporal_{ds_name}.tex",
+                        "--output-json",
+                        f"paper/results_temporal_{ds_name}.json",
+                        "--skip-figures",
+                    ],
+                    cwd=work_dir,
+                )
 
         # Full component & K-horizon ablations
         abl_json = work_dir / "paper" / f"results_ablation_{ds_name}.json"

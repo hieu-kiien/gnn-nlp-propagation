@@ -13,6 +13,7 @@ MAIN_METRICS: tuple[tuple[str, str, bool], ...] = (
     ("mae", "MAE $\\downarrow$", True),
     ("r2_size", "$R^2_{\\text{size}}$ $\\uparrow$", False),
     ("rmse", "RMSE $\\downarrow$", True),
+    ("r2_polar", "$R^2_{\\text{polar}}$ $\\uparrow$", False),
     ("pearson_r", "Pearson $r$ $\\uparrow$", False),
     ("spearman_polar", "Spearman $\\rho$ $\\uparrow$", False),
     ("macro_f1", "Macro-F1 $\\uparrow$", False),
@@ -24,6 +25,7 @@ VN_MAIN_METRICS: tuple[tuple[str, str, bool], ...] = (
     ("mae", "MAE $\\downarrow$", True),
     ("r2_size", "$R^2_{\\text{size}}$ $\\uparrow$", False),
     ("rmse", "RMSE $\\downarrow$", True),
+    ("r2_polar", "$R^2_{\\text{polar}}$ $\\uparrow$", False),
     ("pearson_r", "Pearson $r$ $\\uparrow$", False),
     ("spearman_polar", "Spearman $\\rho$ $\\uparrow$", False),
 )

@@ -34,6 +34,8 @@ from src.data.pyg_dataset import (
     DEFAULT_FORECAST_MIN_REPLIES,
     EarlyCascadeDataset,
     TOTAL_NODE_FEATURE_DIM,
+    _compute_full_tree_polarization,
+    _compute_root_aligned_stances_and_orientations,
 )
 from src.models.sbi_fagat import SBiFAGAT
 from src.training.reporting import _sanitize_json_value
@@ -56,8 +58,14 @@ def load_sbifagat_checkpoint(
     """Reconstruct and load a trained `SBiFAGAT` checkpoint with `strict=True`."""
     payload = torch.load(Path(ckpt_path), map_location="cpu", weights_only=False)
     cfg = dict(payload.get("config") or {})
+    state_dict = payload["model_state_dict"]
     in_dim = int(payload.get("in_dim", TOTAL_NODE_FEATURE_DIM))
     num_cls = int(payload.get("num_rumor_classes", 4))
+    has_persist = (
+        bool(cfg["use_polar_persistence_anchor"])
+        if "use_polar_persistence_anchor" in cfg
+        else ("head.persist_weight" in state_dict)
+    )
     model = SBiFAGAT(
         in_dim=in_dim,
         hidden_dim=int(cfg.get("hidden_dim", 64)),
@@ -67,8 +75,9 @@ def load_sbifagat_checkpoint(
         dropout=float(cfg.get("dropout", 0.1)),
         use_cascade_stats=bool(cfg.get("use_cascade_stats", True)),
         predict_uncertainty=bool(cfg.get("predict_uncertainty", False)),
+        use_polar_persistence_anchor=has_persist,
     )
-    model.load_state_dict(payload["model_state_dict"], strict=True)
+    model.load_state_dict(state_dict, strict=True)
     target_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(target_device)
     model.eval()
@@ -176,10 +185,59 @@ def _clone_cascade_with_edge_attr(data: Any, new_edge_attr: torch.Tensor) -> Any
             one_sided = 0.0
         stats_new[..., 7] = one_sided
         d_new.cascade_stats = stats_new
+
+    raw_early = getattr(data, "early_y_polar", None)
+    edge_index_td = getattr(data, "edge_index_td", getattr(data, "edge_index", None))
+    if isinstance(raw_early, torch.Tensor) and edge_index_td is not None:
+        num_nodes = int(
+            getattr(
+                data,
+                "num_nodes",
+                int(data.x.size(0)) if getattr(data, "x", None) is not None else 0,
+            )
+        )
+        root_t = getattr(data, "root_index", None)
+        root_idx = (
+            int(root_t.view(-1)[0].item())
+            if root_t is not None and root_t.numel() > 0
+            else 0
+        )
+        children_adj: dict[str, list[str]] = {}
+        edge_lookup: dict[tuple[str, str], dict[str, str]] = {}
+        stance_map: dict[str, float] = {}
+        n_edges = int(edge_index_td.size(1)) if edge_index_td.dim() == 2 else 0
+        if n_edges > 0 and new_edge_attr.size(0) >= n_edges and new_edge_attr.size(1) >= 1:
+            src_arr = edge_index_td[0].detach().cpu().numpy().astype(np.int64)
+            dst_arr = edge_index_td[1].detach().cpu().numpy().astype(np.int64)
+            for idx_e, (u, v) in enumerate(zip(src_arr.tolist(), dst_arr.tolist())):
+                u_s, v_s = str(u), str(v)
+                children_adj.setdefault(u_s, []).append(v_s)
+                eid = f"{u}->{v}"
+                edge_lookup[(u_s, v_s)] = {"edge_id": eid}
+                stance_map[eid] = float(new_edge_attr[idx_e, 0].item())
+        _, early_ori = _compute_root_aligned_stances_and_orientations(
+            root_id=str(root_idx),
+            children_adj=children_adj,
+            edge_lookup=edge_lookup,
+            stance_map=stance_map,
+            root_stance_map=None,
+        )
+        early_stances = [
+            float(early_ori.get(str(nid), 0.0))
+            for nid in range(num_nodes)
+            if nid != root_idx
+        ]
+        new_ep_val = _compute_full_tree_polarization(early_stances)
+        d_new.early_y_polar = torch.full_like(raw_early, float(new_ep_val))
     return d_new
 
 
-def _summarize_cohort(records: Sequence[Mapping[str, float]], *, seed: int) -> dict[str, Any]:
+def _summarize_cohort(
+    records: Sequence[Mapping[str, float]],
+    *,
+    seed: int,
+    polar_sd: float = 0.0,
+) -> dict[str, Any]:
     if not records:
         return {
             "num_cascades": 0,
@@ -189,6 +247,7 @@ def _summarize_cohort(records: Sequence[Mapping[str, float]], *, seed: int) -> d
             "ci95_pct_reply_change": [float("nan"), float("nan")],
             "mean_delta_y_polar": float("nan"),
             "ci95_delta_y_polar": [float("nan"), float("nan")],
+            "mean_delta_polar_sd_pct": float("nan"),
         }
     d_sizes = [r["delta_y_size"] for r in records]
     pct_replies = [r["pct_reply_change"] for r in records]
@@ -196,6 +255,11 @@ def _summarize_cohort(records: Sequence[Mapping[str, float]], *, seed: int) -> d
     m_size, ci_size = _bootstrap_mean_ci(d_sizes, seed=seed)
     m_pct, ci_pct = _bootstrap_mean_ci(pct_replies, seed=seed + 1)
     m_pol, ci_pol = _bootstrap_mean_ci(d_polars, seed=seed + 2)
+    sd_pct = (
+        100.0 * m_pol / polar_sd
+        if math.isfinite(m_pol) and math.isfinite(polar_sd) and polar_sd > 1e-8
+        else float("nan")
+    )
     return {
         "num_cascades": int(len(records)),
         "mean_delta_y_size": m_size,
@@ -204,6 +268,7 @@ def _summarize_cohort(records: Sequence[Mapping[str, float]], *, seed: int) -> d
         "ci95_pct_reply_change": ci_pct,
         "mean_delta_y_polar": m_pol,
         "ci95_delta_y_polar": ci_pol,
+        "mean_delta_polar_sd_pct": sd_pct,
     }
 
 
@@ -421,20 +486,24 @@ def run_mechanism_analysis(
         "non_top3_mean_abs_gamma": float(np.mean(non_trig_gamma)) if non_trig_gamma else float("nan"),
     }
 
-    q75_polar = float(np.quantile(np.asarray(y_polars, dtype=np.float64), 0.75))
+    polar_arr = np.asarray(y_polars, dtype=np.float64)
+    obs_polar_sd = float(np.std(polar_arr, ddof=1)) if polar_arr.size >= 2 else 0.0
+    q75_polar = float(np.quantile(polar_arr, 0.75))
     interventions: dict[str, Any] = {}
     for offset, int_key in enumerate(intervention_keys):
         recs = per_cascade_cf[int_key]
         high_recs = [r for r in recs if r["y_polar_obs"] >= q75_polar]
         interventions[int_key] = {
             "label": INTERVENTION_LABELS[int_key],
-            "all_test": _summarize_cohort(recs, seed=seed + offset * 10),
-            "high_polar_q75": _summarize_cohort(high_recs, seed=seed + 100 + offset * 10),
+            "all_test": _summarize_cohort(recs, seed=seed + offset * 10, polar_sd=obs_polar_sd),
+            "high_polar_q75": _summarize_cohort(high_recs, seed=seed + 100 + offset * 10, polar_sd=obs_polar_sd),
         }
 
     report: dict[str, Any] = {
         "dataset": dataset_name,
+        "analysis_scope": "observational_edge_feature_sensitivity",
         "num_test_cascades": int(len(cascades)),
+        "observed_y_polar_sd": obs_polar_sd,
         "q75_observed_y_polar": q75_polar,
         "empirical_coupling": correlations,
         "discourse_regimes": regimes,
@@ -469,8 +538,8 @@ def format_mechanisms_latex(
     """Format Counterfactual Moderation Stress Test results as a valid IEEEtran booktabs table."""
     ds = str(report.get("dataset") or "dataset").upper().replace("_", "\\_")
     cap = caption or (
-        f"Counterfactual Moderation Stress Test on {ds} Test Cascades "
-        "(Mean Shift with 95\\% Paired Bootstrap CI)."
+        f"Observational Edge-Feature Sensitivity Analysis on {ds} Test Cascades "
+        "(Non-Causal Input Perturbation Mean Shift with 95\\% Paired Bootstrap CI)."
     )
     interventions = report.get("interventions", {})
     rows: list[str] = []
@@ -494,7 +563,7 @@ def format_mechanisms_latex(
         f"\\label{{{label}}}",
         r"\begin{tabular}{lcccc}",
         r"\toprule",
-        r"Counterfactual Intervention & All Test $\Delta \hat{y}_{\mathrm{size}}$ & All Test $\Delta \hat{y}_{\mathrm{polar}}$ & Q75+ $\Delta \hat{y}_{\mathrm{size}}$ & Q75+ $\Delta \hat{y}_{\mathrm{polar}}$ \\",
+        r"Edge-Feature Perturbation & All Test $\Delta \hat{y}_{\mathrm{size}}$ & All Test $\Delta \hat{y}_{\mathrm{polar}}$ & Q75+ $\Delta \hat{y}_{\mathrm{size}}$ & Q75+ $\Delta \hat{y}_{\mathrm{polar}}$ \\",
         r"\midrule",
         *rows,
         r"\bottomrule",

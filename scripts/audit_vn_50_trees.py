@@ -1,13 +1,13 @@
-"""Thread-level 50-tree blind human audit exporter & evaluator for VN Test cascades.
+"""Thread-level 30-tree blind human audit exporter & evaluator for VN Test cascades.
 
 Validates the silver-standard thread polarization label `y_polar` against independent
 human expert grading (0 = Consensus, 1 = Mild disagreement, 2 = Moderate split,
 3 = Strong polarization, 4 = Extreme bipolar conflict) strictly on held-out Test trees.
 
 Exports:
-  - Strictly blind CSV (`data/interim/human_audit_vn_50_trees.csv`): hides `y_polar`,
+  - Strictly blind CSV (`data/interim/human_audit_vn_30_trees.csv`): hides `y_polar`,
     `y_bimodality`, and `y_assortativity`.
-  - Sealed machine key CSV (`data/interim/human_audit_vn_50_trees_machine_key.csv`):
+  - Sealed machine key CSV (`data/interim/human_audit_vn_30_trees_machine_key.csv`):
     automatically excluded from primary bundles and sealed separately.
 """
 
@@ -16,8 +16,10 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import random
 import sys
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -29,19 +31,26 @@ from src.data.pyg_dataset import DEFAULT_FORECAST_MIN_REPLIES, EarlyCascadeDatas
 from src.data.schema import load_cascade_parquet
 
 
+def _is_visible_reply(row: dict[str, Any]) -> bool:
+    txt = str(row.get("text") or "").strip()
+    if not txt or txt in {"[deleted]", "[removed]"}:
+        return False
+    return "[REDACTED" not in txt
+
+
 def export_vn_50_tree_audit(
     data_dir: Path = Path("data/processed/vn"),
     *,
-    output_csv: Path = Path("data/interim/human_audit_vn_50_trees.csv"),
+    output_csv: Path = Path("data/interim/human_audit_vn_30_trees.csv"),
     machine_key_csv: Path | None = None,
-    n_samples: int = 50,
+    n_samples: int = 30,
     k_horizon: int = 20,
     min_total_replies: int = DEFAULT_FORECAST_MIN_REPLIES,
     polar_target_mode: str = "future_only",
     max_reply_snippets: int = 12,
     seed: int = 42,
 ) -> tuple[Path, Path]:
-    """Export stratified 50-tree blind audit CSV from the held-out Test split."""
+    """Export stratified 30-tree blind audit CSV from the held-out Test split."""
     test_ds = EarlyCascadeDataset(
         root_dir=data_dir,
         k_horizon=k_horizon,
@@ -109,10 +118,15 @@ def export_vn_50_tree_audit(
         "num_target_replies",
         "root_text",
         "sample_replies",
+        "sample_replies_json",
         "annotator_1_polar_grade",
         "annotator_2_polar_grade",
         "gold_adjudicated_polar_grade",
-        "notes",
+        "annotator_1_uncertain",
+        "annotator_2_uncertain",
+        "annotator_1_notes",
+        "annotator_2_notes",
+        "gold_notes",
     ]
     key_fields = [
         "sample_id",
@@ -120,9 +134,22 @@ def export_vn_50_tree_audit(
         "topic_id",
         "y_polar",
         "y_polar_grade",
+        "y_polar_quintile_grade",
+        "y_polar_linear_grade",
         "y_bimodality",
         "y_assortativity",
     ]
+
+    # Compute dynamic 5-quintile grades over the selected sample without leaking into blind CSV
+    sel_order = sorted(
+        range(len(selected)),
+        key=lambda i: float(selected[i].y_polar.view(-1)[0].item()),
+    )
+    sel_quintiles = [0] * len(selected)
+    if selected:
+        n_q = min(5, len(selected))
+        for rank, orig_i in enumerate(sel_order):
+            sel_quintiles[orig_i] = min(4, int(rank * n_q / len(selected))) if n_q > 1 else 0
 
     with (
         out_path.open("w", encoding="utf-8-sig", newline="") as f_blind,
@@ -134,6 +161,7 @@ def export_vn_50_tree_audit(
         w_key.writeheader()
 
         for idx, item in enumerate(selected, start=1):
+            q_grade = sel_quintiles[idx - 1]
             sid = f"tree_{idx:03d}"
             cid = str(item.cascade_id)
             tid = str(item.topic_id)
@@ -142,8 +170,29 @@ def export_vn_50_tree_audit(
             root_row = next((r for r in c_rows if bool(r.get("is_root"))), c_rows[0] if c_rows else None)
             root_nid = str(root_row["node_id"]) if root_row is not None else ""
             root_txt = str(root_row["text"]) if root_row is not None else ""
+
+            children_adj: dict[str, list[str]] = {}
+            for r in c_rows:
+                if not bool(r.get("is_root")):
+                    pid_s = str(r.get("parent_id") or root_nid)
+                    children_adj.setdefault(pid_s, []).append(str(r["node_id"]))
+            depth_map: dict[str, int] = {root_nid: 0} if root_nid else {}
+            bfs = deque([root_nid] if root_nid else [])
+            while bfs:
+                cur = bfs.popleft()
+                for ch in children_adj.get(cur, ()):
+                    if ch not in depth_map:
+                        depth_map[ch] = depth_map[cur] + 1
+                        bfs.append(ch)
+
             replies = [r for r in c_rows if not bool(r.get("is_root"))]
-            replies.sort(key=lambda r: (r["created_at_utc"], str(r["node_id"])))
+            replies.sort(
+                key=lambda r: (
+                    r["created_at_utc"],
+                    depth_map.get(str(r["node_id"]), 999),
+                    str(r["node_id"]),
+                )
+            )
 
             # Align sampled human-inspection replies strictly with the y_polar target window
             if polar_target_mode == "future_only" and len(replies) > k_horizon:
@@ -153,30 +202,48 @@ def export_vn_50_tree_audit(
                 target_replies = replies
                 window_desc = f"full_tree (replies #1..#{len(replies)})"
 
-            if len(target_replies) <= max_reply_snippets:
-                chosen_replies = target_replies
+            visible_targets = [r for r in target_replies if _is_visible_reply(r)]
+            pool_replies = visible_targets if visible_targets else target_replies
+
+            if len(pool_replies) <= max_reply_snippets:
+                chosen_replies = pool_replies
             else:
-                step = (len(target_replies) - 1) / float(max(1, max_reply_snippets - 1))
+                step = (len(pool_replies) - 1) / float(max(1, max_reply_snippets - 1))
                 chosen_replies = [
-                    target_replies[int(round(i * step))] for i in range(max_reply_snippets)
+                    pool_replies[int(round(i * step))] for i in range(max_reply_snippets)
                 ]
 
             formatted_snippets: list[str] = []
+            structured_snippets: list[dict[str, Any]] = []
             for pos, r in enumerate(chosen_replies, start=1):
+                nid_s = str(r["node_id"])
+                depth_v = int(depth_map.get(nid_s, 1))
                 pid_raw = r.get("parent_id")
                 pid_s = str(pid_raw) if pid_raw is not None else ""
                 if not pid_s or pid_s == root_nid:
+                    target_kind = "root"
+                    parent_snip = ""
                     parent_tag = "-> Root"
                 else:
+                    target_kind = "parent"
                     p_row = by_nid.get(pid_s)
-                    p_txt = (
+                    parent_snip = (
                         str(p_row["text"]).replace("\n", " ").strip()[:80]
                         if p_row is not None
                         else pid_s
                     )
-                    parent_tag = f"-> Parent(\"{p_txt}\")"
+                    parent_tag = f"-> Parent(\"{parent_snip}\")"
                 rep_txt = str(r["text"]).replace("\n", " ").strip()[:200]
                 formatted_snippets.append(f"[#{pos} {parent_tag}] {rep_txt}")
+                structured_snippets.append(
+                    {
+                        "pos": pos,
+                        "depth": depth_v,
+                        "target_kind": target_kind,
+                        "parent_snippet": parent_snip,
+                        "text": rep_txt,
+                    }
+                )
             snippet_str = " || ".join(formatted_snippets)
 
             w_blind.writerow(
@@ -189,10 +256,15 @@ def export_vn_50_tree_audit(
                     "num_target_replies": len(target_replies),
                     "root_text": root_txt[:600],
                     "sample_replies": snippet_str,
+                    "sample_replies_json": json.dumps(structured_snippets, ensure_ascii=False),
                     "annotator_1_polar_grade": "",
                     "annotator_2_polar_grade": "",
                     "gold_adjudicated_polar_grade": "",
-                    "notes": "",
+                    "annotator_1_uncertain": "",
+                    "annotator_2_uncertain": "",
+                    "annotator_1_notes": "",
+                    "annotator_2_notes": "",
+                    "gold_notes": "",
                 }
             )
             yp = float(item.y_polar.view(-1)[0].item())
@@ -204,7 +276,9 @@ def export_vn_50_tree_audit(
                     "cascade_id": cid,
                     "topic_id": tid,
                     "y_polar": f"{yp:.6f}",
-                    "y_polar_grade": min(4, max(0, int(round(yp * 4.0)))),
+                    "y_polar_grade": q_grade,
+                    "y_polar_quintile_grade": q_grade,
+                    "y_polar_linear_grade": min(4, max(0, int(math.floor(yp * 4.0 + 0.5)))),
                     "y_bimodality": f"{ybc:.6f}",
                     "y_assortativity": f"{yas:.6f}",
                 }
@@ -217,12 +291,12 @@ def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
-        description="Export/evaluate 50-tree blind human audit on VN Test cascades."
+        description="Export/evaluate 30-tree blind human audit on VN Test cascades."
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed/vn"))
-    parser.add_argument("--audit-csv", type=Path, default=Path("data/interim/human_audit_vn_50_trees.csv"))
+    parser.add_argument("--audit-csv", type=Path, default=Path("data/interim/human_audit_vn_30_trees.csv"))
     parser.add_argument("--machine-key-csv", type=Path, default=None)
-    parser.add_argument("--n-samples", type=int, default=50)
+    parser.add_argument("--n-samples", type=int, default=30)
     parser.add_argument("--k-horizon", type=int, default=20)
     parser.add_argument("--min-total-replies", type=int, default=DEFAULT_FORECAST_MIN_REPLIES)
     parser.add_argument("--polar-target-mode", choices=["future_only", "full"], default="future_only")
@@ -250,7 +324,7 @@ def main() -> None:
             polar_target_mode=args.polar_target_mode,
             seed=args.seed,
         )
-        print(f"Exported blind 50-tree VN audit CSV: {out_csv} (sealed key: {out_key})")
+        print(f"Exported blind {args.n_samples}-tree VN audit CSV: {out_csv} (sealed key: {out_key})")
 
     if args.evaluate:
         report = evaluate_thread_level_audit_csv(
@@ -267,7 +341,7 @@ def main() -> None:
             args.output_table.write_text(
                 format_human_audit_latex(
                     report,
-                    caption="Thread-Level Polarization Human Audit on 50 Held-Out VN Test Cascades (0--4 Likert Scale).",
+                    caption="Thread-Level Polarization Human Audit on Held-Out VN Test Cascades (0--4 Likert Scale).",
                     label="tab:human_audit_vn_trees",
                 ),
                 encoding="utf-8",

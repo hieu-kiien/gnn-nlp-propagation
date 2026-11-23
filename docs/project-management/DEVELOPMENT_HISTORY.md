@@ -16,6 +16,7 @@
 | `338651b` | `results(vn): official 5-seed VN benchmark & mechanism artifacts` | Integrated Track 1 Vietnamese 5-seed benchmarks, ablations, `analyze_mechanisms.py` counterfactual results, efficiency stats, and VN vector figures. |
 | `11637ed` | `perf(pheme): parallelized GCS-FUSE parsing & unbuffered logs` | Sped up Kaggle PHEME directory parsing with `os.scandir` + `ThreadPoolExecutor` and unbuffered progress logging. |
 | `5332750` | `feat(paper,ui): Track 2 PHEME+UPFD artifacts & local blind audit UI` | Integrated Track 2 PHEME + UPFD results/figures, assembled unified tables (`0` missing), added `scripts/human_audit_ui.py` + `tests/test_human_audit_ui.py`, and synced `PROJECT_STATUS.md` / `TEST_REPORT.md`. |
+| `fix/egm-audit-hardening` *(v3)* | *EGM v3 Overhaul: ReZero Anchor, Binary Gate 1 & Colab GPU Offload* | Scrubbed PII/spam in VN Parquets; linearized `y_polar`; fixed single-camp Camp Dipole; switched Persistence-Residual anchor to ReZero `tanh(w_p)` centered around train logit; added validation-only comparator selection, `r2_polar`, `beta=0.05`, and `--split-mode temporal`; streamlined blind Gate 1 to `20/120/30` binary `clean`/`uncivil` with `--lock-role` UI & multi-corpus `assemble_paper_artifacts.py`; executed v3 canonical VN + sensitivity + EDA + efficiency (`18` test modules) and added `notebooks/colab_gpu_v3_gnn_benchmarks.ipynb` + Notebook 2 Tier 2A ($K=10, N \ge 15$). |
 
 ---
 

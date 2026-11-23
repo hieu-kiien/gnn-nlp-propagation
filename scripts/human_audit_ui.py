@@ -27,7 +27,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 VALID_PAIR_STANCE: frozenset[str] = frozenset({"", "support", "neutral", "oppose"})
-VALID_PAIR_HOSTILITY: frozenset[str] = frozenset({"", "clean", "offensive", "hate"})
+VALID_PAIR_HOSTILITY: frozenset[str] = frozenset({"", "clean", "uncivil", "offensive", "hate"})
 VALID_TREE_GRADE: frozenset[str] = frozenset({"", "0", "1", "2", "3", "4"})
 VALID_ROLES: frozenset[str] = frozenset({"annotator_1", "annotator_2", "gold"})
 
@@ -45,17 +45,45 @@ class DatasetSpec:
 
 ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
     DatasetSpec(
+        filename="pilot_calibration_vi_20.csv",
+        mode="pair",
+        title="1. Pilot hiệu chuẩn VN (20 cặp Test)",
+        subtitle="Chấm thử 20 cặp tiếng Việt (10 clean / 10 uncivil) để 2 người thống nhất chuẩn trước khi chấm 120 cặp.",
+        kappa_command="python -m scripts.compute_kappa --input data/interim/pilot_calibration_vi_20.csv",
+    ),
+    DatasetSpec(
+        filename="human_audit_vi_120.csv",
+        mode="pair",
+        title="2. Kiểm định chính VN (120 cặp Test)",
+        subtitle="Chấm mù độc lập Thái độ (stance) + Khiếm nhã/Công kích nhị phân (clean vs. uncivil) trên tập Test VN.",
+        kappa_command=(
+            "python -m scripts.compute_kappa --input data/interim/human_audit_vi_120.csv "
+            "--strict-adjudication --output-json paper/results_human_audit_vi.json"
+        ),
+    ),
+    DatasetSpec(
+        filename="human_audit_vn_30_trees.csv",
+        mode="tree",
+        title="3. Phân cực cấp cây VN (30 cây Test)",
+        subtitle="Chấm mức độ phân cực toàn cửa sổ tương lai theo thang Likert 0–4 trên 30 cây Test phân tầng.",
+        kappa_command=(
+            "python -m scripts.audit_vn_50_trees --evaluate --strict-adjudication "
+            "--audit-csv data/interim/human_audit_vn_30_trees.csv "
+            "--output-json paper/results_human_audit_vn_30_trees.json"
+        ),
+    ),
+    DatasetSpec(
         filename="pilot_calibration_vi_30.csv",
         mode="pair",
-        title="1. Pilot hiệu chuẩn VN (30 cặp)",
-        subtitle="Chấm thử 30 cặp tiếng Việt để hai người thống nhất tiêu chuẩn trước khi chấm 300 cặp.",
+        title="[Di sản] Pilot VN cũ (30 cặp)",
+        subtitle="Bộ pilot cũ 30 cặp (giữ tương thích kiểm thử cũ).",
         kappa_command="python -m scripts.compute_kappa --input data/interim/pilot_calibration_vi_30.csv",
     ),
     DatasetSpec(
         filename="human_audit_vi_300.csv",
         mode="pair",
-        title="2. Kiểm định chính VN (300 cặp)",
-        subtitle="Chấm mù độc lập Thái độ (stance) + Công kích (hostility) cho dữ liệu tiếng Việt.",
+        title="[Di sản] Kiểm định VN cũ (300 cặp)",
+        subtitle="Bộ kiểm định cũ 300 cặp (giữ tương thích kiểm thử cũ).",
         kappa_command=(
             "python -m scripts.compute_kappa --input data/interim/human_audit_vi_300.csv "
             "--strict-adjudication --output-json paper/results_human_audit_vi.json"
@@ -64,8 +92,8 @@ ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
     DatasetSpec(
         filename="human_audit_vn_50_trees.csv",
         mode="tree",
-        title="3. Phân cực cấp cây VN (50 cây Test)",
-        subtitle="Chấm mức độ phân cực toàn cửa sổ thảo luận theo thang Likert 0–4.",
+        title="[Di sản] Phân cực cây VN cũ (50 cây)",
+        subtitle="Bộ kiểm định cũ 50 cây (giữ tương thích kiểm thử cũ).",
         kappa_command=(
             "python -m scripts.audit_vn_50_trees --evaluate --strict-adjudication "
             "--audit-csv data/interim/human_audit_vn_50_trees.csv "
@@ -75,15 +103,15 @@ ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
     DatasetSpec(
         filename="pilot_calibration_en_30.csv",
         mode="pair",
-        title="4. Pilot hiệu chuẩn EN PHEME (30 cặp)",
-        subtitle="Tuỳ chọn: 30 cặp tiếng Anh PHEME để hiệu chuẩn thang chấm quốc tế.",
+        title="Tuỳ chọn: Pilot EN PHEME (30 cặp)",
+        subtitle="Tuỳ chọn: 30 cặp tiếng Anh PHEME (EN pair validation sử dụng RumourEval SDQC làm chuẩn chính).",
         kappa_command="python -m scripts.compute_kappa --input data/interim/pilot_calibration_en_30.csv",
     ),
     DatasetSpec(
         filename="human_audit_en_300.csv",
         mode="pair",
-        title="5. Kiểm định EN PHEME (300 cặp)",
-        subtitle="Tuỳ chọn: 300 cặp tiếng Anh PHEME để báo cáo độ đồng thuận song ngữ.",
+        title="Tuỳ chọn: Kiểm định EN PHEME (300 cặp)",
+        subtitle="Tuỳ chọn: 300 cặp tiếng Anh PHEME.",
         kappa_command=(
             "python -m scripts.compute_kappa --input data/interim/human_audit_en_300.csv "
             "--strict-adjudication --output-json paper/results_human_audit_en.json"
@@ -156,6 +184,25 @@ def _tree_disagreement(row: dict[str, str]) -> tuple[bool, bool]:
     return diff >= 1, diff >= 2
 
 
+def _has_isolated_notes_cols(row: dict[str, str]) -> bool:
+    return any(k in row for k in ("annotator_1_notes", "annotator_2_notes", "gold_notes"))
+
+
+def _read_role_notes(row: dict[str, str], role: str) -> str:
+    if _has_isolated_notes_cols(row):
+        col = "gold_notes" if role == "gold" else f"{role}_notes"
+        return str(row.get(col) or "")
+    # Legacy fallback: only expose legacy `notes` to annotator_1/gold, never leak to annotator_2
+    if role in {"annotator_1", "gold"}:
+        return str(row.get("notes") or "")
+    return ""
+
+
+def _read_role_uncertain(row: dict[str, str], role: str) -> bool:
+    col = "gold_uncertain" if role == "gold" else f"{role}_uncertain"
+    return str(row.get(col) or "").strip().lower() in {"1", "true", "yes"}
+
+
 def _sanitize_row_for_role(row: dict[str, str], spec: DatasetSpec, role: str) -> dict[str, Any]:
     """Return a strictly blinded row dictionary for the requested *role*."""
     if spec.mode == "pair":
@@ -164,9 +211,11 @@ def _sanitize_row_for_role(row: dict[str, str], spec: DatasetSpec, role: str) ->
             "cascade_id": str(row.get("cascade_id") or ""),
             "edge_id": str(row.get("edge_id") or ""),
             "root_text": str(row.get("root_text") or ""),
+            "grandparent_text": str(row.get("grandparent_text") or ""),
             "parent_text": str(row.get("parent_text") or ""),
             "reply_text": str(row.get("reply_text") or ""),
-            "notes": str(row.get("notes") or ""),
+            "notes": _read_role_notes(row, role),
+            "uncertain": _read_role_uncertain(row, role),
         }
         if role == "annotator_1":
             base["stance"] = str(row.get("annotator_1_stance") or "").strip()
@@ -184,6 +233,8 @@ def _sanitize_row_for_role(row: dict[str, str], spec: DatasetSpec, role: str) ->
             base["annotator_2_stance"] = str(row.get("annotator_2_stance") or "").strip()
             base["annotator_1_hostility"] = str(row.get("annotator_1_hostility") or "").strip()
             base["annotator_2_hostility"] = str(row.get("annotator_2_hostility") or "").strip()
+            base["annotator_1_uncertain"] = _read_role_uncertain(row, "annotator_1")
+            base["annotator_2_uncertain"] = _read_role_uncertain(row, "annotator_2")
             base["disagreement"] = disagree
             base["hard_disagreement"] = disagree
             base["is_done"] = bool(base["stance"] and base["hostility"]) or (
@@ -193,7 +244,7 @@ def _sanitize_row_for_role(row: dict[str, str], spec: DatasetSpec, role: str) ->
             )
         return base
 
-    # Thread-level 50-tree mode
+    # Thread-level mode
     base = {
         "sample_id": str(row.get("sample_id") or ""),
         "cascade_id": str(row.get("cascade_id") or ""),
@@ -203,7 +254,9 @@ def _sanitize_row_for_role(row: dict[str, str], spec: DatasetSpec, role: str) ->
         "num_target_replies": str(row.get("num_target_replies") or ""),
         "root_text": str(row.get("root_text") or ""),
         "sample_replies": str(row.get("sample_replies") or ""),
-        "notes": str(row.get("notes") or ""),
+        "sample_replies_json": str(row.get("sample_replies_json") or ""),
+        "notes": _read_role_notes(row, role),
+        "uncertain": _read_role_uncertain(row, role),
     }
     if role == "annotator_1":
         val = str(row.get("annotator_1_polar_grade") or "").strip()
@@ -221,6 +274,8 @@ def _sanitize_row_for_role(row: dict[str, str], spec: DatasetSpec, role: str) ->
         base["polar_grade"] = val
         base["annotator_1_polar_grade"] = a1
         base["annotator_2_polar_grade"] = a2
+        base["annotator_1_uncertain"] = _read_role_uncertain(row, "annotator_1")
+        base["annotator_2_uncertain"] = _read_role_uncertain(row, "annotator_2")
         base["disagreement"] = disagree
         base["hard_disagreement"] = hard
         base["is_done"] = bool(val) or (bool(a1) and bool(a2) and not disagree)
@@ -230,9 +285,18 @@ def _sanitize_row_for_role(row: dict[str, str], spec: DatasetSpec, role: str) ->
 class AuditStore:
     """Thread-safe atomic CSV store enforcing blind read/write access."""
 
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, *, locked_role: str | None = None) -> None:
         self.data_dir = Path(data_dir)
+        self.locked_role = validate_role(locked_role) if locked_role is not None else None
         self._lock = threading.Lock()
+
+    def _assert_role_allowed(self, role: str) -> str:
+        clean = validate_role(role)
+        if self.locked_role is not None and clean != self.locked_role:
+            raise ForbiddenDatasetError(
+                f"Server is locked to role {self.locked_role!r}; access as {clean!r} is forbidden."
+            )
+        return clean
 
     def _read_csv(self, csv_path: Path) -> tuple[list[str], list[dict[str, str]]]:
         with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -310,8 +374,9 @@ class AuditStore:
             "hard_disagreements_count": hard_disagreements,
         }
 
-    def list_datasets(self) -> list[dict[str, Any]]:
-        """List allowlisted datasets with availability and progress counts."""
+    def list_datasets(self, role: str = "annotator_1") -> list[dict[str, Any]]:
+        """List allowlisted datasets with availability and role-specific progress counts."""
+        active_role = self.locked_role or validate_role(role)
         out: list[dict[str, Any]] = []
         with self._lock:
             for spec in ALLOWLISTED_SPECS:
@@ -327,19 +392,27 @@ class AuditStore:
                     "done_a1": 0,
                     "done_a2": 0,
                     "done_gold": 0,
+                    "done_for_role": 0,
                     "disagreements_count": 0,
                     "hard_disagreements_count": 0,
                 }
                 if csv_path.is_file():
                     _, rows = self._read_csv(csv_path)
-                    entry.update(self._summarize_rows(rows, spec))
+                    summ = self._summarize_rows(rows, spec)
+                    entry.update(summ)
+                    if active_role == "annotator_1":
+                        entry["done_for_role"] = summ["done_a1"]
+                    elif active_role == "annotator_2":
+                        entry["done_for_role"] = summ["done_a2"]
+                    else:
+                        entry["done_for_role"] = summ["done_gold"]
                 out.append(entry)
         return out
 
     def get_dataset(self, filename: str, role: str) -> dict[str, Any]:
         """Load *filename* with strict role-based blinding."""
         spec = validate_dataset_filename(filename)
-        clean_role = validate_role(role)
+        clean_role = self._assert_role_allowed(role)
         csv_path = self.data_dir / spec.filename
         if not csv_path.is_file():
             raise FileNotFoundError(f"Dataset file not found: {csv_path}")
@@ -363,6 +436,7 @@ class AuditStore:
             "subtitle": spec.subtitle,
             "kappa_command": spec.kappa_command,
             "role": clean_role,
+            "locked_role": self.locked_role,
             "summary": {**summary, "done_for_role": done_for_role},
             "rows": sanitized,
         }
@@ -372,13 +446,15 @@ class AuditStore:
         if not isinstance(payload, dict):
             raise ValidationError("Request body must be a JSON object.")
         spec = validate_dataset_filename(str(payload.get("file") or ""))
-        clean_role = validate_role(str(payload.get("role") or ""))
+        clean_role = self._assert_role_allowed(str(payload.get("role") or ""))
         sample_id = str(payload.get("sample_id") or "").strip()
         if not sample_id:
             raise ValidationError("Missing sample_id.")
 
         notes_present = "notes" in payload
         notes_val = str(payload.get("notes") or "") if notes_present else None
+        uncertain_present = "uncertain" in payload
+        uncertain_val = "1" if bool(payload.get("uncertain")) else ""
 
         if spec.mode == "pair":
             stance = str(payload.get("stance") or "").strip().lower()
@@ -428,9 +504,20 @@ class AuditStore:
                     fieldnames.append(k)
                 target_row[k] = v
             if notes_present:
-                if "notes" not in fieldnames:
-                    fieldnames.append("notes")
-                target_row["notes"] = notes_val or ""
+                if any(c in fieldnames for c in ("annotator_1_notes", "annotator_2_notes", "gold_notes")):
+                    n_col = "gold_notes" if clean_role == "gold" else f"{clean_role}_notes"
+                elif clean_role == "annotator_1":
+                    n_col = "notes"
+                else:
+                    n_col = f"{clean_role}_notes"
+                if n_col not in fieldnames:
+                    fieldnames.append(n_col)
+                target_row[n_col] = notes_val or ""
+            if uncertain_present:
+                u_col = "gold_uncertain" if clean_role == "gold" else f"{clean_role}_uncertain"
+                if u_col not in fieldnames:
+                    fieldnames.append(u_col)
+                target_row[u_col] = uncertain_val
 
             self._write_csv_atomic(csv_path, fieldnames, rows)
             summary = self._summarize_rows(rows, spec)
@@ -1312,13 +1399,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div id="decision-controls"></div>
 
       <div class="notes-row">
-        <label class="field-label" for="notes-input">Ghi chú nhanh (tuỳ chọn):</label>
+        <label class="field-label" for="notes-input">Ghi chú (chỉ lưu riêng cho vai trò hiện tại):</label>
         <input
           type="text"
           id="notes-input"
           class="notes-input"
           placeholder="Nhập lý do nếu câu khó/mơ hồ (nhấn Enter sau khi gõ xong tiếng Việt để lưu)..."
         >
+        <label class="checkbox-label" style="white-space:nowrap;">
+          <input type="checkbox" id="uncertain-checkbox">
+          <span>Câu khó / chưa chắc</span>
+        </label>
       </div>
 
       <div class="nav-bar">
@@ -1378,22 +1469,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <table class="guide-table">
         <thead>
           <tr>
-            <th>Nhóm 2: Công kích (Hostility)</th>
-            <th>Ý nghĩa &amp; Ví dụ nhanh</th>
+            <th>Nhóm 2: Khiếm nhã / Công kích (Reply Incivility — 2 mức)</th>
+            <th>Cây quyết định &amp; Slang mạng VN</th>
           </tr>
         </thead>
         <tbody>
           <tr>
             <td><strong>[Q] Bình thường (clean)</strong></td>
-            <td>Ngôn từ lịch sự hoặc khẩu ngữ mạng thông thường, không mạt sát hay mỉa mai nặng.</td>
+            <td>Khẩu ngữ mạng thông thường, tranh luận gay gắt nhưng nhắm vào <em>luận điểm/sự việc</em>, hoặc chửi thề cảm thán bạn bè không xúc phạm người đối thoại (<em>"vãi", "vl thật", "chuyện hài vcl"</em>).</td>
           </tr>
           <tr>
-            <td><strong>[W] Thô lỗ / Mỉa mai (offensive)</strong></td>
-            <td>Có từ chửi thề nhẹ ("vãi", "đm"), mỉa mai cay nghiệt, cà khịa người viết hoặc đám đông.</td>
-          </tr>
-          <tr>
-            <td><strong>[E] Chửi rủa / Thù ghét (hate)</strong></td>
-            <td>Xúc phạm nhân phẩm nặng ("óc chó", "rác rưởi"), kỳ thị vùng miền/giới tính, hoặc công kích ác ý trực diện.</td>
+            <td><strong>[W] Xúc phạm / Công kích (uncivil)</strong></td>
+            <td>Mạt sát, xúc phạm nhân phẩm cá nhân (<em>"ngu", "óc chó", "rác rưởi", "đồ súc vật"</em>), mỉa mai ác ý nhắm vào người viết/nhóm người, kỳ thị vùng miền/giới tính hoặc đe dọa.</td>
           </tr>
         </tbody>
       </table>
@@ -1401,7 +1488,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <table class="guide-table">
         <thead>
           <tr>
-            <th>Thang 50 cây Test (0–4)</th>
+            <th>Thang 30 cây Test (0–4)</th>
             <th>Cách chấm mức độ phân cực toàn đoạn thảo luận</th>
           </tr>
         </thead>
@@ -1414,7 +1501,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </table>
 
       <p style="margin:0;color:var(--muted);">
-        <strong>Phím tắt bàn phím:</strong> Cặp: <code>1 / 2 / 3</code> chọn Thái độ, <code>Q / W / E</code> chọn Công kích. Cây: <code>0–4</code> chọn mức. Chuyển câu: <code>←</code> / <code>→</code>.
+        <strong>Phím tắt bàn phím:</strong> Cặp: <code>1 / 2 / 3</code> chọn Thái độ, <code>Q / W</code> chọn Công kích (nhị phân). Cây: <code>0–4</code> chọn mức. Chuyển câu: <code>←</code> / <code>→</code>.
       </p>
     </div>
     <div class="dialog-foot">
@@ -1427,8 +1514,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <script>
     const state = {
       datasets: [],
-      filename: "pilot_calibration_vi_30.csv",
+      filename: "pilot_calibration_vi_20.csv",
       role: "annotator_1",
+      lockedRole: null,
       mode: "pair",
       rows: [],
       filteredIndices: [],
@@ -1436,6 +1524,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       cursor: 0,
       summary: {},
       saving: false,
+      saveQueue: Promise.resolve(),
     };
 
     const datasetSelect = document.getElementById("dataset-select");
@@ -1455,6 +1544,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const badgeRowDone = document.getElementById("badge-row-done");
     const badgeSameRoot = document.getElementById("badge-same-root");
     const notesInput = document.getElementById("notes-input");
+    const uncertainCheckbox = document.getElementById("uncertain-checkbox");
     const autoAdvanceCheckbox = document.getElementById("auto-advance-checkbox");
     const kappaCmdBox = document.getElementById("kappa-cmd-box");
     const filterAllBtn = document.getElementById("filter-all");
@@ -1506,9 +1596,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function updateProgressBar() {
       const total = Number(state.summary.total || 0);
-      const done = Number(state.summary.done_for_role || 0);
-      const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-      progressText.textContent = `${done} / ${total} (${pct}%)`;
+      const disCount = Number(state.summary.disagreements_count || 0);
+      const isGoldDis = state.role === "gold" && disCount > 0;
+      const denom = isGoldDis ? disCount : total;
+      const doneRaw = Number(state.summary.done_for_role || 0);
+      const done = isGoldDis ? Math.min(doneRaw, denom) : doneRaw;
+      const pct = denom > 0 ? Math.min(100, Math.round((done / denom) * 100)) : 0;
+      progressText.textContent = isGoldDis
+        ? `Chốt Gold: ${done} / ${denom} câu lệch (${pct}%)`
+        : `${done} / ${total} (${pct}%)`;
       progressFill.style.width = `${pct}%`;
 
       const visTotal = state.filteredIndices.length;
@@ -1516,14 +1612,35 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       if (state.role === "gold") {
         disagreeBadge.hidden = false;
-        disagreeBadge.textContent = `Lệch 2 người: ${state.summary.disagreements_count || 0}`;
+        disagreeBadge.textContent = `Lệch 2 người: ${disCount}`;
       } else {
         disagreeBadge.hidden = true;
       }
     }
 
-    function renderTreeReplies(rawReplies) {
-      const parts = String(rawReplies || "")
+    function renderTreeReplies(row) {
+      if (row && row.sample_replies_json) {
+        try {
+          const parsed = JSON.parse(row.sample_replies_json);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            return parsed.map(item => {
+              const kind = item.target_kind === "root" ? "root" : "parent";
+              const depthLbl = item.depth ? `Tầng ${item.depth}` : "";
+              const targetLbl = kind === "root"
+                ? `-> Bài gốc`
+                : `-> Cha ("${item.parent_snippet || ""}")`;
+              const tag = `#${item.pos || ""} ${depthLbl} ${targetLbl}`.trim();
+              return `
+                <div class="tree-reply-item" data-target-kind="${kind}">
+                  <span class="tree-reply-tag tabular">${escapeHtml(tag)}</span>
+                  <div>${escapeHtml(item.text || "")}</div>
+                </div>
+              `;
+            }).join("");
+          }
+        } catch (_e) { /* fall back to delimited parser */ }
+      }
+      const parts = String((row && row.sample_replies) || "")
         .split(/\s*\|\|\s*/)
         .map(s => s.trim())
         .filter(Boolean);
@@ -1531,9 +1648,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         return `<div class="empty-state">Không có bình luận mẫu trong cửa sổ này.</div>`;
       }
       return parts.map(part => {
-        const m = part.match(/^(\[[^\]]+\])\s*(.*)$/s);
-        const tag = m ? m[1] : "[Bình luận]";
-        const body = m ? m[2] : part;
+        const tagEnd = part.indexOf("] ");
+        const hasTag = part.startsWith("[") && tagEnd > 0;
+        const tag = hasTag ? part.slice(0, tagEnd + 1) : "[Bình luận]";
+        const body = hasTag ? part.slice(tagEnd + 2) : part;
         const kind = tag.includes("-> Root") ? "root" : "parent";
         return `
           <div class="tree-reply-item" data-target-kind="${kind}">
@@ -1564,19 +1682,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
         decisionControls.innerHTML = "";
         notesInput.value = "";
         notesInput.disabled = true;
+        uncertainCheckbox.checked = false;
+        uncertainCheckbox.disabled = true;
         return;
       }
 
       notesInput.disabled = false;
+      uncertainCheckbox.disabled = false;
       badgeSampleId.textContent = row.sample_id;
       badgeCascadeId.textContent = row.cascade_id;
       badgeRowDone.hidden = !row.is_done;
       notesInput.value = row.notes || "";
+      uncertainCheckbox.checked = Boolean(row.uncertain);
 
       if (state.mode === "pair") {
         const rootTrim = String(row.root_text || "").trim();
+        const grandTrim = String(row.grandparent_text || "").trim();
         const parentTrim = String(row.parent_text || "").trim();
         const isSameRoot = rootTrim && rootTrim === parentTrim;
+        const hasDistinctGrand = grandTrim && grandTrim !== parentTrim && grandTrim !== rootTrim;
         badgeSameRoot.hidden = !isSameRoot;
 
         stageContent.innerHTML = `
@@ -1589,6 +1713,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <div class="text-body">${escapeHtml(row.root_text)}</div>
             </details>
           `}
+          ${hasDistinctGrand ? `
+            <details class="context-details" open>
+              <summary>
+                <span>Bình luận ông/bà (ngữ cảnh trước Bình luận cha)</span>
+                <span class="tabular">${grandTrim.length} ký tự</span>
+              </summary>
+              <div class="text-body">${escapeHtml(row.grandparent_text)}</div>
+            </details>
+          ` : ""}
           <div class="card-box">
             <div class="card-box-title">
               <span>${isSameRoot ? "Bài đăng gốc (= Bình luận cha được trả lời trực tiếp)" : "Bình luận cha đang được trả lời"}</span>
@@ -1619,7 +1752,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
 
         const curS = row.stance || "";
-        const curH = row.hostility || "";
+        const curH = (row.hostility === "offensive" || row.hostility === "hate") ? "uncivil" : (row.hostility || "");
         decisionControls.innerHTML = `
           <div class="choice-group" role="group" aria-label="1. Thái độ đối với bình luận cha">
             <div class="choice-heading">
@@ -1642,23 +1775,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </div>
           </div>
 
-          <div class="choice-group" role="group" aria-label="2. Mức độ công kích ngôn từ">
+          <div class="choice-group" role="group" aria-label="2. Mức độ khiếm nhã công kích">
             <div class="choice-heading">
-              <h2>2. Mức độ công kích (hostility)</h2>
-              <span class="choice-hint">Đánh giá riêng lời lẽ của bình luận cần chấm</span>
+              <h2>2. Khiếm nhã / Công kích (incivility)</h2>
+              <span class="choice-hint">Chửi thề cảm thán/khẩu ngữ không mạt sát ai => Bình thường · Xúc phạm/mỉa mai ác ý => Công kích</span>
             </div>
-            <div class="choice-grid-3">
+            <div class="choice-grid-3" style="grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));">
               <button type="button" class="choice-btn" data-kind="hostility" data-value="clean" data-tone="slate" aria-pressed="${curH === "clean"}">
                 <span class="choice-top"><span>Bình thường (clean)</span><span class="keycap tabular">Q</span></span>
-                <span class="choice-desc">Lịch sự hoặc khẩu ngữ thông thường, không xúc phạm</span>
+                <span class="choice-desc">Lịch sự hoặc khẩu ngữ/chửi thề cảm thán, không xúc phạm ai</span>
               </button>
-              <button type="button" class="choice-btn" data-kind="hostility" data-value="offensive" data-tone="amber" aria-pressed="${curH === "offensive"}">
-                <span class="choice-top"><span>Thô lỗ / Mỉa mai (offensive)</span><span class="keycap tabular">W</span></span>
-                <span class="choice-desc">Cà khịa, chửi thề nhẹ hoặc mỉa mai cay nghiệt</span>
-              </button>
-              <button type="button" class="choice-btn" data-kind="hostility" data-value="hate" data-tone="red" aria-pressed="${curH === "hate"}">
-                <span class="choice-top"><span>Chửi rủa / Thù ghét (hate)</span><span class="keycap tabular">E</span></span>
-                <span class="choice-desc">Mạt sát nhân phẩm nặng, kỳ thị hoặc đe dọa</span>
+              <button type="button" class="choice-btn" data-kind="hostility" data-value="uncivil" data-tone="red" aria-pressed="${curH === "uncivil"}">
+                <span class="choice-top"><span>Xúc phạm / Công kích (uncivil)</span><span class="keycap tabular">W</span></span>
+                <span class="choice-desc">Mạt sát cá nhân, mỉa mai cay nghiệt, kỳ thị hoặc đe dọa</span>
               </button>
             </div>
           </div>
@@ -1678,7 +1807,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <h2>Các bình luận tiêu biểu trong cửa sổ tương lai</h2>
               <span class="choice-hint">Viền cam = trả lời bình luận cha · Viền xám = trả lời bài gốc</span>
             </div>
-            <div class="tree-replies-list">${renderTreeReplies(row.sample_replies)}</div>
+            <div class="tree-replies-list">${renderTreeReplies(row)}</div>
           </div>
         `;
 
@@ -1729,51 +1858,68 @@ HTML_PAGE = r"""<!DOCTYPE html>
       btnNext.disabled = state.cursor >= state.filteredIndices.length - 1;
     }
 
-    async function persistRow(row, maybeAutoAdvance) {
-      setSaveStatus("saving", "Đang lưu...");
-      state.saving = true;
+    function persistRow(row, maybeAutoAdvance) {
+      const targetFile = state.filename;
+      const targetRole = state.role;
+      const targetSampleId = row.sample_id;
+      const targetMode = state.mode;
+      row.notes = notesInput.value;
+      row.uncertain = Boolean(uncertainCheckbox.checked);
+
       const body = {
-        file: state.filename,
-        role: state.role,
-        sample_id: row.sample_id,
-        notes: notesInput.value,
+        file: targetFile,
+        role: targetRole,
+        sample_id: targetSampleId,
+        notes: row.notes,
+        uncertain: row.uncertain,
       };
-      if (state.mode === "pair") {
+      if (targetMode === "pair") {
         body.stance = row.stance || "";
         body.hostility = row.hostility || "";
       } else {
         body.polar_grade = row.polar_grade || "";
       }
 
-      try {
-        const res = await fetch("/api/save", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const data = await res.json();
-        if (!res.ok || !data.ok) {
-          throw new Error(data.error || `HTTP ${res.status}`);
-        }
-        const origIdx = state.filteredIndices[state.cursor];
-        state.rows[origIdx] = data.row;
-        state.summary = data.summary;
-        setSaveStatus("saved", "Đã lưu CSV");
-
-        const becameDone = Boolean(data.row.is_done);
-        if (maybeAutoAdvance && becameDone && autoAdvanceCheckbox.checked) {
-          if (state.filterMode === "pending") {
-            computeFilteredIndices();
-          } else if (state.cursor < state.filteredIndices.length - 1) {
-            state.cursor += 1;
+      setSaveStatus("saving", "Đang lưu...");
+      state.saving = true;
+      state.saveQueue = state.saveQueue.then(async () => {
+        try {
+          const res = await fetch("/api/save", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) {
+            throw new Error(data.error || `HTTP ${res.status}`);
           }
+          if (state.filename !== targetFile || state.role !== targetRole) {
+            return;
+          }
+          const origIdx = state.rows.findIndex(r => r.sample_id === targetSampleId);
+          if (origIdx >= 0) {
+            state.rows[origIdx] = data.row;
+          }
+          state.summary = data.summary;
+          setSaveStatus("saved", "Đã lưu CSV");
+
+          const becameDone = Boolean(data.row.is_done);
+          if (maybeAutoAdvance && becameDone && autoAdvanceCheckbox.checked) {
+            if (state.filterMode === "pending") {
+              computeFilteredIndices();
+            } else if (state.cursor < state.filteredIndices.length - 1) {
+              state.cursor += 1;
+            }
+          }
+          renderCurrentSample();
+          loadDatasetList(true);
+        } catch (err) {
+          setSaveStatus("error", `Lỗi lưu: ${err.message}`);
+        } finally {
+          state.saving = false;
         }
-        renderCurrentSample();
-      } catch (err) {
-        setSaveStatus("error", `Lỗi lưu: ${err.message}`);
-      } finally {
-        state.saving = false;
-      }
+      });
+      return state.saveQueue;
     }
 
     function handleDecisionClick(kind, value) {
@@ -1804,23 +1950,33 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
     }
 
-    async function loadDatasetList() {
-      const res = await fetch("/api/datasets");
+    async function loadDatasetList(preserveOnly = false) {
+      const roleParam = encodeURIComponent(state.role);
+      const res = await fetch(`/api/datasets?role=${roleParam}`);
       const data = await res.json();
       state.datasets = data.datasets || [];
+      if (data.locked_role) {
+        state.lockedRole = data.locked_role;
+        state.role = data.locked_role;
+        roleSelect.value = data.locked_role;
+        roleSelect.disabled = true;
+      }
       datasetSelect.innerHTML = "";
       for (const ds of state.datasets) {
         const opt = document.createElement("option");
         opt.value = ds.filename;
+        const doneN = Number(ds.done_for_role ?? ds.done_a1 ?? 0);
         opt.textContent = ds.exists
-          ? `${ds.title} (${ds.done_a1}/${ds.total})`
+          ? `${ds.title} (${doneN}/${ds.total})`
           : `${ds.title} [Chưa có tệp]`;
         opt.disabled = !ds.exists;
         datasetSelect.appendChild(opt);
       }
-      const firstAvail = state.datasets.find(d => d.exists);
-      if (firstAvail && (!datasetSelect.value || !state.datasets.some(d => d.filename === state.filename && d.exists))) {
-        state.filename = firstAvail.filename;
+      if (!preserveOnly) {
+        const firstAvail = state.datasets.find(d => d.exists);
+        if (firstAvail && (!state.filename || !state.datasets.some(d => d.filename === state.filename && d.exists))) {
+          state.filename = firstAvail.filename;
+        }
       }
       datasetSelect.value = state.filename;
     }
@@ -1834,6 +1990,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         setSaveStatus("error", data.error || `HTTP ${res.status}`);
         stageContent.innerHTML = `<div class="empty-state">${escapeHtml(data.error || "Không tải được dữ liệu.")}</div>`;
         return;
+      }
+      if (data.locked_role) {
+        state.lockedRole = data.locked_role;
+        state.role = data.locked_role;
+        roleSelect.value = data.locked_role;
+        roleSelect.disabled = true;
       }
       state.mode = data.mode;
       state.rows = data.rows || [];
@@ -1864,7 +2026,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
 
     roleSelect.addEventListener("change", () => {
-      state.role = roleSelect.value;
+      const nextRole = roleSelect.value;
+      if (nextRole === "gold" && state.role !== "gold" && !state.lockedRole) {
+        const ok = window.confirm(
+          "CẢNH BÁO CHỐT GOLD: Chế độ Gold sẽ hiển thị nhãn của cả Người 1 và Người 2. Chỉ chuyển sang chế độ này sau khi hai người đã chấm mù xong. Tiếp tục?"
+        );
+        if (!ok) {
+          roleSelect.value = state.role;
+          return;
+        }
+      }
+      state.role = nextRole;
+      loadDatasetList(true);
       loadCurrentDataset();
     });
 
@@ -1913,6 +2086,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const row = currentRow();
       if (row) persistRow(row, false);
     });
+    uncertainCheckbox.addEventListener("change", () => {
+      const row = currentRow();
+      if (row) persistRow(row, false);
+    });
 
     document.addEventListener("keydown", (event) => {
       if (guideDialog.open) return;
@@ -1926,8 +2103,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         else if (k === "2") handleDecisionClick("stance", "neutral");
         else if (k === "3") handleDecisionClick("stance", "oppose");
         else if (k === "q") handleDecisionClick("hostility", "clean");
-        else if (k === "w") handleDecisionClick("hostility", "offensive");
-        else if (k === "e") handleDecisionClick("hostility", "hate");
+        else if (k === "w") handleDecisionClick("hostility", "uncivil");
       } else {
         if (["0", "1", "2", "3", "4"].includes(k)) {
           handleDecisionClick("polar_grade", k);
@@ -2006,7 +2182,16 @@ def make_handler(store: AuditStore):
                 self._send_html(HTTPStatus.OK, HTML_PAGE)
                 return
             if parsed.path == "/api/datasets":
-                self._send_json(HTTPStatus.OK, {"datasets": store.list_datasets()})
+                qs = parse_qs(parsed.query)
+                req_role = (qs.get("role") or [store.locked_role or "annotator_1"])[0]
+                try:
+                    datasets = store.list_datasets(role=req_role)
+                except ValidationError:
+                    datasets = store.list_datasets()
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"datasets": datasets, "locked_role": store.locked_role},
+                )
                 return
             if parsed.path == "/api/dataset":
                 qs = parse_qs(parsed.query)
@@ -2056,11 +2241,12 @@ def create_server(
     *,
     host: str = "127.0.0.1",
     port: int = 8765,
+    locked_role: str | None = None,
 ) -> ThreadingHTTPServer:
     """Create a local-only HTTP server for the Gate 1 Human Audit Studio."""
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError(f"Refusing non-local bind host {host!r}; use 127.0.0.1.")
-    store = AuditStore(Path(data_dir))
+    store = AuditStore(Path(data_dir), locked_role=locked_role)
     handler_cls = make_handler(store)
     return ThreadingHTTPServer((host, int(port)), handler_cls)
 
@@ -2070,10 +2256,16 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1", help="Local host to bind (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8765, help="Port to listen on (default: 8765)")
     parser.add_argument("--data-dir", type=Path, default=Path("data/interim"), help="Directory containing blind CSVs")
+    parser.add_argument(
+        "--lock-role",
+        choices=["annotator_1", "annotator_2", "gold"],
+        default=None,
+        help="Optional server-side role lock to enforce strict single-annotator blinding.",
+    )
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open browser tab")
     args = parser.parse_args()
 
-    server = create_server(args.data_dir, host=args.host, port=args.port)
+    server = create_server(args.data_dir, host=args.host, port=args.port, locked_role=args.lock_role)
     actual_port = server.server_address[1]
     url = f"http://{args.host}:{actual_port}/"
     print(f"[HumanAuditUI] Running at {url} (data_dir={args.data_dir})", flush=True)

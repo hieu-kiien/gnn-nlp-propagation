@@ -16,6 +16,8 @@ from src.data.pyg_dataset import (
     DEFAULT_FORECAST_MIN_REPLIES,
     EarlyCascadeDataset,
     TOTAL_NODE_FEATURE_DIM,
+    compute_embedding_cluster_splits,
+    compute_temporal_topic_splits,
     leave_one_event_out_splits,
 )
 from src.data.schema import load_cascade_parquet
@@ -52,16 +54,32 @@ def _resolve_output_paths(
     output_table: Path | None,
     output_json: Path | None,
     figures_dir: Path | None,
+    *,
+    split_mode: str = "canonical",
 ) -> tuple[Path, Path, Path]:
     ds_name = data_dir.name.lower() if data_dir.name.lower() in {"pheme", "vn"} else ""
     suffix = f"_{ds_name}" if ds_name else ""
-    tbl = output_table or Path(f"paper/tables_main{suffix}.tex")
-    jsn = output_json or Path(f"paper/results_main{suffix}.json")
-    figs = figures_dir or (Path("paper/figures") / ds_name if ds_name else Path("paper/figures"))
+    prefix = (
+        "temporal"
+        if split_mode == "temporal"
+        else ("cluster" if split_mode == "embedding_cluster" else "main")
+    )
+    tbl = output_table or Path(f"paper/tables_{prefix}{suffix}.tex")
+    jsn = output_json or Path(f"paper/results_{prefix}{suffix}.json")
+    if split_mode != "canonical" and figures_dir is None:
+        figs = Path("paper/figures") / (f"{ds_name}_{prefix}" if ds_name else prefix)
+    else:
+        figs = figures_dir or (Path("paper/figures") / ds_name if ds_name else Path("paper/figures"))
     return tbl, jsn, figs
 
 
-def _resolve_main_table_label(data_dir: Path, eval_protocol: str, out_table: Path) -> str:
+def _resolve_main_table_label(
+    data_dir: Path,
+    eval_protocol: str,
+    out_table: Path,
+    *,
+    split_mode: str = "canonical",
+) -> str:
     ds_tag = data_dir.name.lower() if data_dir.name.lower() in {"pheme", "vn"} else ""
     if not ds_tag:
         stem = out_table.stem.lower()
@@ -69,7 +87,14 @@ def _resolve_main_table_label(data_dir: Path, eval_protocol: str, out_table: Pat
             ds_tag = "pheme"
         elif "vn" in stem:
             ds_tag = "vn"
-    prefix = "loo" if str(eval_protocol).lower() == "loo" else "main"
+    if str(eval_protocol).lower() == "loo":
+        prefix = "loo"
+    elif split_mode == "temporal":
+        prefix = "temporal"
+    elif split_mode == "embedding_cluster":
+        prefix = "cluster"
+    else:
+        prefix = "main"
     return f"tab:{prefix}_{ds_tag}" if ds_tag else f"tab:{prefix}_results"
 
 
@@ -274,6 +299,12 @@ def main() -> None:
         "--eval-protocol", choices=["inductive", "loo"], default="inductive"
     )
     parser.add_argument(
+        "--split-mode",
+        choices=["canonical", "temporal", "embedding_cluster"],
+        default="canonical",
+        help="Holdout split strategy under inductive eval; non-canonical splits force teacher edges.",
+    )
+    parser.add_argument(
         "--edge-source", choices=["auto", "student", "teacher"], default="auto"
     )
     parser.add_argument("--comparator-model", type=str, default="auto")
@@ -285,7 +316,14 @@ def main() -> None:
     args = parser.parse_args()
 
     out_table, out_json, fig_dir = _resolve_output_paths(
-        args.data_dir, args.output_table, args.output_json, args.figures_dir
+        args.data_dir,
+        args.output_table,
+        args.output_json,
+        args.figures_dir,
+        split_mode=args.split_mode,
+    )
+    effective_edge_source = (
+        "teacher" if args.split_mode != "canonical" else args.edge_source
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -307,6 +345,7 @@ def main() -> None:
             num_rumor_classes=num_cls,
             dropout=args.dropout,
             use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
         "TemporalStanceMLP": lambda: TemporalStanceMLP(
             in_dim=in_dim,
@@ -315,6 +354,7 @@ def main() -> None:
             num_rumor_classes=num_cls,
             dropout=args.dropout,
             use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
         "StandardGCN": lambda: StandardGCN(
             in_dim=in_dim,
@@ -322,6 +362,7 @@ def main() -> None:
             num_rumor_classes=num_cls,
             dropout=args.dropout,
             use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
         "StandardGATv2": lambda: StandardGATv2(
             in_dim=in_dim,
@@ -329,6 +370,7 @@ def main() -> None:
             num_rumor_classes=num_cls,
             dropout=args.dropout,
             use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
         "EdgeGATv2": lambda: EdgeGATv2(
             in_dim=in_dim,
@@ -337,6 +379,7 @@ def main() -> None:
             num_rumor_classes=num_cls,
             dropout=args.dropout,
             use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
         "FAGCN": lambda: FAGCNBaseline(
             in_dim=in_dim,
@@ -345,6 +388,7 @@ def main() -> None:
             eps=args.eps,
             dropout=args.dropout,
             use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
         "BiGCN": lambda: BiGCN(
             in_dim=in_dim,
@@ -352,6 +396,7 @@ def main() -> None:
             num_rumor_classes=num_cls,
             dropout=args.dropout,
             use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
         "SBiFAGAT": lambda: SBiFAGAT(
             in_dim=in_dim,
@@ -366,15 +411,53 @@ def main() -> None:
     }
 
     if args.eval_protocol == "inductive":
-        test_ds, train_loader, val_loader, test_loader = _build_loaders(
-            args.data_dir,
-            args.k_horizon,
-            args.batch_size,
-            min_total_replies=args.min_total_replies,
-            polar_target_mode=args.polar_target_mode,
-            label_scheme=args.label_scheme,
-            edge_source=args.edge_source,
-        )
+        custom_splits: dict[str, set[str]] | None = None
+        if args.split_mode != "canonical":
+            nodes_tbl, edges_tbl = load_cascade_parquet(args.data_dir, validate=True)
+            nlp_feats = torch.load(
+                args.data_dir / "nlp_features.pt", map_location="cpu", weights_only=False
+            )
+            all_ds = EarlyCascadeDataset(
+                root_dir=args.data_dir,
+                k_horizon=args.k_horizon,
+                split="all",
+                nodes_table=nodes_tbl,
+                edges_table=edges_tbl,
+                nlp_features=nlp_feats,
+                min_total_replies=args.min_total_replies,
+                polar_target_mode=args.polar_target_mode,
+                label_scheme=args.label_scheme,
+                edge_source=effective_edge_source,
+            )
+            if args.split_mode == "temporal":
+                custom_splits = compute_temporal_topic_splits(all_ds._all_cascades)
+            else:
+                custom_splits = compute_embedding_cluster_splits(
+                    all_ds._all_cascades, seed=OFFICIAL_SEEDS[0]
+                )
+            test_ds, train_loader, val_loader, test_loader = _build_loaders(
+                args.data_dir,
+                args.k_horizon,
+                args.batch_size,
+                min_total_replies=args.min_total_replies,
+                polar_target_mode=args.polar_target_mode,
+                label_scheme=args.label_scheme,
+                custom_topic_splits=custom_splits,
+                edge_source=effective_edge_source,
+                nodes_table=nodes_tbl,
+                edges_table=edges_tbl,
+                nlp_features=nlp_feats,
+            )
+        else:
+            test_ds, train_loader, val_loader, test_loader = _build_loaders(
+                args.data_dir,
+                args.k_horizon,
+                args.batch_size,
+                min_total_replies=args.min_total_replies,
+                polar_target_mode=args.polar_target_mode,
+                label_scheme=args.label_scheme,
+                edge_source=effective_edge_source,
+            )
         has_rumor_labels = any(int(d.y_rumor.item()) >= 0 for d in test_ds)
         active_metrics = MAIN_METRICS if has_rumor_labels else VN_MAIN_METRICS
         active_keys = tuple(k for k, _, _ in active_metrics)
@@ -552,13 +635,25 @@ def main() -> None:
     print(build_markdown_table(result, active_metrics))
 
     cmp_caption = str(result.get("comparator_model") or "BiGCN").replace("_", "\\_")
-    table_label = _resolve_main_table_label(args.data_dir, args.eval_protocol, out_table)
+    table_label = _resolve_main_table_label(
+        args.data_dir, args.eval_protocol, out_table, split_mode=args.split_mode
+    )
+    proto_label = (
+        args.split_mode.replace("_", "-").upper()
+        if args.eval_protocol == "inductive" and args.split_mode != "canonical"
+        else args.eval_protocol.upper()
+    )
+    task_desc = (
+        "Early Cascade Size, Polarization, and Rumor Prediction"
+        if has_rumor_labels
+        else "Early Cascade Size and Future Polarization Forecasting"
+    )
     export_latex_table(
         result,
         out_table,
         caption=(
-            f"Early Cascade Size, Polarization, and Rumor Prediction at $K={args.k_horizon}$ "
-            f"({args.eval_protocol.upper()}, Mean $\\pm$ Std). Stars indicate significance "
+            f"{task_desc} at $K={args.k_horizon}$ "
+            f"({proto_label}, Mean $\\pm$ Std). Stars indicate significance "
             f"vs. {cmp_caption} ($^{{*}}p<0.05$, $^{{**}}p<0.01$)."
         ),
         label=table_label,
@@ -570,6 +665,8 @@ def main() -> None:
         extra={
             "k_horizon": args.k_horizon,
             "eval_protocol": args.eval_protocol,
+            "split_mode": args.split_mode,
+            "edge_source": effective_edge_source,
             "polar_target_mode": args.polar_target_mode,
             "min_total_replies": args.min_total_replies,
             "label_scheme": args.label_scheme,
@@ -578,7 +675,9 @@ def main() -> None:
         },
     )
 
-    if "SBiFAGAT" in result.get("models", {}):
+    if "SBiFAGAT" in result.get("models", {}) and (
+        args.split_mode == "canonical" or args.ckpt_out is not None
+    ):
         ds_tag = args.data_dir.name.lower() if args.data_dir.name.lower() in {"pheme", "vn"} else "main"
         proto_tag = "_loo" if args.eval_protocol == "loo" else ""
         ckpt_path = args.ckpt_out or Path(f"checkpoints/best_sbifagat_{ds_tag}{proto_tag}.pt")
@@ -592,6 +691,9 @@ def main() -> None:
                     "dropout": args.dropout,
                     "use_cascade_stats": use_stats,
                     "predict_uncertainty": use_unc,
+                    "use_polar_persistence_anchor": bool(
+                        getattr(result["models"]["SBiFAGAT"], "use_polar_persistence_anchor", False)
+                    ),
                 },
                 "model_state_dict": result["models"]["SBiFAGAT"].state_dict(),
                 "in_dim": in_dim,

@@ -64,7 +64,7 @@ def compute_multitask_loss(
             F.binary_cross_entropy_with_logits(y_polar_logit, y_p, reduction="none")
             - target_entropy
         ).clamp_min(0.0).mean()
-        loss_polar = loss_polar_kl + F.smooth_l1_loss(y_polar_pred, y_p, beta=0.08)
+        loss_polar = loss_polar_kl + F.smooth_l1_loss(y_polar_pred, y_p, beta=0.05)
     else:
         loss_polar = F.huber_loss(y_polar_pred, y_polar, delta=d_polar)
     total_loss = (

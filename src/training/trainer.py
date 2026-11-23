@@ -110,23 +110,35 @@ def _estimate_train_target_stats(loader: DataLoader) -> dict[str, Any]:
     """Compute target means and 2:1 constant-mean baseline-normalized loss scales strictly from `train_loader`."""
     size_vals: list[np.ndarray] = []
     polar_vals: list[np.ndarray] = []
+    early_polar_vals: list[np.ndarray] = []
     for batch in loader:
         ys = getattr(batch, "y_size", None)
         yp = getattr(batch, "y_polar", None)
+        ep = getattr(batch, "early_y_polar", None)
         if ys is not None:
             size_vals.append(ys.view(-1).detach().cpu().numpy())
         if yp is not None:
             polar_vals.append(yp.view(-1).detach().cpu().numpy())
+        if ep is not None:
+            early_polar_vals.append(ep.view(-1).detach().cpu().numpy())
 
     size_arr = np.concatenate(size_vals) if size_vals else np.array([], dtype=np.float64)
     polar_arr = np.concatenate(polar_vals) if polar_vals else np.array([], dtype=np.float64)
+    ep_arr = np.concatenate(early_polar_vals) if early_polar_vals else np.array([], dtype=np.float64)
     size_arr = size_arr[np.isfinite(size_arr)] if size_arr.size > 0 else size_arr
     polar_arr = polar_arr[np.isfinite(polar_arr)] if polar_arr.size > 0 else polar_arr
+    ep_arr = ep_arr[np.isfinite(ep_arr)] if ep_arr.size > 0 else ep_arr
 
     mean_size = float(np.mean(size_arr)) if size_arr.size > 0 else None
     std_size = float(np.std(size_arr)) if size_arr.size >= 2 else 0.0
     mean_polar = float(np.mean(polar_arr)) if polar_arr.size > 0 else None
     std_polar = float(np.std(polar_arr)) if polar_arr.size >= 2 else 0.0
+    mean_early_polar = float(np.mean(ep_arr)) if ep_arr.size > 0 else None
+    if ep_arr.size > 0:
+        ep_c = np.clip(ep_arr, 0.02, 0.98)
+        mean_early_polar_logit = float(np.mean(np.log(ep_c / (1.0 - ep_c))))
+    else:
+        mean_early_polar_logit = None
 
     base_size_loss = 1.0
     base_polar_loss = 1.0
@@ -148,7 +160,7 @@ def _estimate_train_target_stats(loader: DataLoader) -> dict[str, Any]:
         base_kl = (
             F.binary_cross_entropy_with_logits(const_logit, y_p_t, reduction="none") - target_entropy
         ).clamp_min(0.0).mean()
-        base_l1 = F.smooth_l1_loss(const_pred, y_p_t, beta=0.08)
+        base_l1 = F.smooth_l1_loss(const_pred, y_p_t, beta=0.05)
         base_polar_loss = float((base_kl + base_l1).item())
         polar_scale = float(np.clip(0.5 / max(base_polar_loss, 1e-4), 0.5, 250.0))
     else:
@@ -160,6 +172,8 @@ def _estimate_train_target_stats(loader: DataLoader) -> dict[str, Any]:
         "std_size": std_size,
         "mean_polar": mean_polar,
         "std_polar": std_polar,
+        "mean_early_polar": mean_early_polar,
+        "mean_early_polar_logit": mean_early_polar_logit,
         "base_size_loss": base_size_loss,
         "base_polar_loss": base_polar_loss,
         "size_loss_scale": size_scale,
@@ -180,12 +194,16 @@ def _init_multitask_head_biases(model: nn.Module, stats: Mapping[str, Any]) -> N
                 size_bias = math.log(math.expm1(max(0.1, float(mean_size))))
                 last_size.bias.fill_(float(size_bias))
         mean_polar = stats.get("mean_polar")
+        mean_early_polar_logit = stats.get("mean_early_polar_logit")
         if mean_polar is not None and hasattr(head, "polar_head") and len(head.polar_head) > 0:
             last_polar = head.polar_head[-1]
             if getattr(last_polar, "bias", None) is not None:
                 p_clamped = min(0.99, max(1e-3, float(mean_polar)))
                 polar_bias = math.log(p_clamped / (1.0 - p_clamped))
                 last_polar.bias.fill_(float(polar_bias))
+        ep_ref = getattr(head, "persist_ep_logit_ref", None)
+        if ep_ref is not None and mean_early_polar_logit is not None:
+            ep_ref.fill_(float(mean_early_polar_logit))
 
 
 def _estimate_balanced_class_weights(
@@ -511,6 +529,20 @@ def train_and_evaluate_single_seed(
             break
 
     early_stopper.restore_best(model)
+    val_metrics = evaluate_loader(
+        model,
+        val_loader,
+        target_device,
+        alpha_size=alpha_size,
+        alpha_polar=alpha_polar,
+        alpha_rumor=alpha_rumor,
+        size_loss_scale=s_scale,
+        polar_loss_scale=p_scale,
+        lambda_uncertainty=lambda_uncertainty,
+        class_weights=class_weights,
+        classification_only=classification_only,
+        return_predictions=False,
+    )
     test_metrics = evaluate_loader(
         model,
         test_loader,
@@ -525,6 +557,7 @@ def train_and_evaluate_single_seed(
         classification_only=classification_only,
         return_predictions=return_predictions,
     )
+    test_metrics["_val_metrics"] = val_metrics
     test_metrics["val_task_loss"] = (
         float(early_stopper.best_score)
         if early_stopper.best_score is not None
@@ -1088,6 +1121,7 @@ def run_multi_seed_benchmark(
     """Run all models over the official 5 random seeds and compute paired t-tests & bootstrap p-values."""
     raw_results: dict[str, list[dict[str, float]]] = {}
     summary_stats: dict[str, dict[str, tuple[float, float]]] = {}
+    val_summary_stats: dict[str, dict[str, tuple[float, float]]] = {}
     best_val_models: dict[str, nn.Module] = {}
     best_val_scores: dict[str, float] = {}
     best_seed_by_model: dict[str, int] = {}
@@ -1115,6 +1149,7 @@ def run_multi_seed_benchmark(
 
     for model_name, factory in model_factories.items():
         seed_runs: list[dict[str, float]] = []
+        val_seed_runs: list[dict[str, float]] = []
         pred_runs: list[dict[str, Any]] = []
         for seed in seeds:
             model, test_metrics = train_and_evaluate_single_seed(
@@ -1139,6 +1174,9 @@ def run_multi_seed_benchmark(
             preds_blob = test_metrics.pop("_predictions", None)
             if preds_blob is not None:
                 pred_runs.append(preds_blob)
+            val_blob = test_metrics.pop("_val_metrics", None)
+            if isinstance(val_blob, Mapping):
+                val_seed_runs.append({str(k): float(v) for k, v in val_blob.items() if isinstance(v, (int, float))})
             seed_runs.append(test_metrics)
 
             val_score = float(test_metrics.get("val_task_loss", float("nan")))
@@ -1154,6 +1192,7 @@ def run_multi_seed_benchmark(
         raw_results[model_name] = seed_runs
         model_predictions[model_name] = pred_runs
         agg: dict[str, tuple[float, float]] = {}
+        val_agg: dict[str, tuple[float, float]] = {}
         for key in metric_keys:
             vals = np.asarray([r.get(key, float("nan")) for r in seed_runs], dtype=np.float64)
             vals = vals[~np.isnan(vals)]
@@ -1163,7 +1202,19 @@ def run_multi_seed_benchmark(
                 mean_v = float(np.mean(vals))
                 std_v = float(np.std(vals, ddof=1)) if vals.size >= 2 else 0.0
                 agg[key] = (mean_v, std_v)
+
+            if val_seed_runs:
+                v_vals = np.asarray([r.get(key, float("nan")) for r in val_seed_runs], dtype=np.float64)
+                v_vals = v_vals[~np.isnan(v_vals)]
+                if v_vals.size == 0:
+                    val_agg[key] = (float("nan"), float("nan"))
+                else:
+                    v_mean = float(np.mean(v_vals))
+                    v_std = float(np.std(v_vals, ddof=1)) if v_vals.size >= 2 else 0.0
+                    val_agg[key] = (v_mean, v_std)
         summary_stats[model_name] = agg
+        if val_agg:
+            val_summary_stats[model_name] = val_agg
 
     hypothesis_keys = (
         tuple(primary_hypothesis_keys)
@@ -1176,6 +1227,7 @@ def run_multi_seed_benchmark(
                 "mae",
                 "r2_size",
                 "rmse",
+                "r2_polar",
                 "pearson_r",
                 "spearman_polar",
                 "macro_f1",
@@ -1185,9 +1237,10 @@ def run_multi_seed_benchmark(
         )
     )
 
+    comparator_pool = val_summary_stats if len(val_summary_stats) == len(summary_stats) else summary_stats
     effective_comparator = (
         select_best_comparator(
-            summary_stats,
+            comparator_pool,
             reference_model=reference_model,
             metric_keys=hypothesis_keys,
         )
@@ -1230,6 +1283,7 @@ def run_multi_seed_benchmark(
         "seeds": list(seeds),
         "raw_results": raw_results,
         "summary_stats": summary_stats,
+        "val_summary_stats": val_summary_stats,
         "p_values": p_values,
         "adjusted_p_values": adjusted_p_values,
         "bootstrap_p_values": bootstrap_p_values,

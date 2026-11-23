@@ -84,6 +84,11 @@ def compute_early_k_persistence_metrics(
             num_nodes = int(getattr(d, "num_nodes", int(d.x.size(0))))
             y_size_preds.append(math.log1p(max(0, num_nodes - 1)))
 
+        early_yp_attr = getattr(d, "early_y_polar", None)
+        if early_yp_attr is not None and early_yp_attr.numel() >= 1:
+            y_polar_preds.append(float(early_yp_attr.view(-1)[0].item()))
+            continue
+
         early_rs = getattr(d, "early_node_root_stance", None)
         if early_rs is not None and early_rs.numel() > 1:
             aligned = [float(v) for v in early_rs.view(-1)[1:].detach().cpu().tolist()]
@@ -163,28 +168,35 @@ def compute_dataset_statistics(
         langs[str(row["lang"])] += 1
         sources[str(row["source_dataset"])] += 1
 
-    reply_counts: list[int] = []
-    duration_hours: list[float] = []
+    raw_reply_counts: list[int] = []
+    raw_duration_hours: list[float] = []
+    eligible_reply_counts: list[int] = []
+    eligible_duration_hours: list[float] = []
     topic_ids_raw: set[str] = set()
     topic_ids_eligible: set[str] = set()
     rumor_counts: Counter[str] = Counter()
+    eligible_rumor_counts: Counter[str] = Counter()
 
     for cid, rows in nodes_by_cid.items():
         n_replies = max(0, len(rows) - 1)
-        reply_counts.append(n_replies)
+        raw_reply_counts.append(n_replies)
         ts_list = [r["created_at_utc"] for r in rows]
         span_h = max(0.0, (max(ts_list) - min(ts_list)).total_seconds() / 3600.0)
-        duration_hours.append(span_h)
+        raw_duration_hours.append(span_h)
 
         roots = [r for r in rows if bool(r["is_root"])]
         root_row = roots[0] if roots else rows[0]
         tid = str(root_row["topic_id"])
         topic_ids_raw.add(tid)
-        if n_replies >= int(min_total_replies):
-            topic_ids_eligible.add(tid)
         rlab = root_row.get("rumor_label")
         if rlab is not None:
             rumor_counts[str(rlab)] += 1
+        if n_replies >= int(min_total_replies):
+            topic_ids_eligible.add(tid)
+            eligible_reply_counts.append(n_replies)
+            eligible_duration_hours.append(span_h)
+            if rlab is not None:
+                eligible_rumor_counts[str(rlab)] += 1
 
     eligible_cids = {
         cid for cid, rows in nodes_by_cid.items() if max(0, len(rows) - 1) >= int(min_total_replies)
@@ -208,8 +220,12 @@ def compute_dataset_statistics(
                 split_cascade_counts[sp] += 1
                 break
 
-    arr_replies = np.asarray(reply_counts, dtype=np.float64)
-    arr_dur = np.asarray(duration_hours, dtype=np.float64)
+    arr_raw_replies = np.asarray(raw_reply_counts, dtype=np.float64)
+    arr_raw_dur = np.asarray(raw_duration_hours, dtype=np.float64)
+    active_replies = eligible_reply_counts if eligible_reply_counts else raw_reply_counts
+    active_dur = eligible_duration_hours if eligible_duration_hours else raw_duration_hours
+    arr_replies = np.asarray(active_replies, dtype=np.float64)
+    arr_dur = np.asarray(active_dur, dtype=np.float64)
 
     summary: dict[str, Any] = {
         "name": name or root.name,
@@ -228,9 +244,13 @@ def compute_dataset_statistics(
         "p90_replies": float(np.percentile(arr_replies, 90)) if arr_replies.size > 0 else 0.0,
         "median_duration_hours": float(np.median(arr_dur)) if arr_dur.size > 0 else 0.0,
         "mean_duration_hours": float(np.mean(arr_dur)) if arr_dur.size > 0 else 0.0,
+        "raw_median_replies": float(np.median(arr_raw_replies)) if arr_raw_replies.size > 0 else 0.0,
+        "raw_mean_replies": float(np.mean(arr_raw_replies)) if arr_raw_replies.size > 0 else 0.0,
+        "raw_median_duration_hours": float(np.median(arr_raw_dur)) if arr_raw_dur.size > 0 else 0.0,
         "languages": dict(langs),
         "source_datasets": dict(sources),
-        "rumor_label_counts": dict(rumor_counts),
+        "rumor_label_counts": dict(eligible_rumor_counts if eligible_rumor_counts else rumor_counts),
+        "raw_rumor_label_counts": dict(rumor_counts),
         "split_cascade_counts": split_cascade_counts,
         "topic_splits_source": str(splits_path) if splits_path.exists() else "computed_canonical",
         "early_k_persistence": None,

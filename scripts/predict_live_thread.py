@@ -514,6 +514,24 @@ def predict_live_cascade(
         k_horizon=k_horizon,
     )
 
+    early_children_adj: dict[str, list[str]] = {}
+    early_edge_lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    early_stance_map: dict[str, float] = {}
+    for d_e in kept_edge_details:
+        pu = str(d_e["parent_id"])
+        cv = str(d_e["node_id"])
+        eid_e = str(d_e["edge_id"])
+        early_children_adj.setdefault(pu, []).append(cv)
+        early_edge_lookup[(pu, cv)] = {"edge_id": eid_e}
+        early_stance_map[eid_e] = float(d_e["s_uv"])
+    early_aligned = _compute_root_aligned_stances(
+        root_id=root_id,
+        children_adj=early_children_adj,
+        edge_lookup=early_edge_lookup,
+        stance_map=early_stance_map,
+    )
+    early_y_polar_val = _compute_full_tree_polarization(early_aligned) if early_aligned else 0.0
+
     data = CascadeData(
         x=x,
         struct_x=struct_x,
@@ -522,6 +540,7 @@ def predict_live_cascade(
         edge_index_bu=edge_index_bu,
         edge_attr=edge_attr,
         edge_stance=edge_attr[:, 0:1] if edge_attr.numel() > 0 else torch.empty((0, 1)),
+        early_y_polar=torch.tensor([early_y_polar_val], dtype=torch.float32),
         cascade_stats=cascade_stats,
         root_index=torch.tensor([0], dtype=torch.long),
         edge_pairs=kept_pairs,
@@ -539,7 +558,13 @@ def predict_live_cascade(
         if not isinstance(payload, Mapping) or "model_state_dict" not in payload:
             raise ValueError(f"Checkpoint GNN tại '{gnn_path}' thiếu trường 'model_state_dict'.")
         cfg = payload.get("config", {})
+        state_dict = payload["model_state_dict"]
         target_edge_dim = int(cfg.get("edge_dim", 2))
+        has_persist = (
+            bool(cfg["use_polar_persistence_anchor"])
+            if "use_polar_persistence_anchor" in cfg
+            else ("head.persist_weight" in state_dict)
+        )
         gnn_model = SBiFAGAT(
             in_dim=int(payload.get("in_dim", TOTAL_NODE_FEATURE_DIM)),
             hidden_dim=int(cfg.get("hidden_dim", 64)),
@@ -549,8 +574,9 @@ def predict_live_cascade(
             dropout=float(cfg.get("dropout", 0.1)),
             use_cascade_stats=bool(cfg.get("use_cascade_stats", True)),
             predict_uncertainty=bool(cfg.get("predict_uncertainty", False)),
+            use_polar_persistence_anchor=has_persist,
         )
-        gnn_model.load_state_dict(payload["model_state_dict"])
+        gnn_model.load_state_dict(state_dict, strict=True)
         checkpoint_loaded = True
     else:
         is_demo_post = bool(is_demo or str(post.get("id", "")).startswith("demo_"))

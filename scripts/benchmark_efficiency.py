@@ -73,6 +73,7 @@ def build_profiling_batch(
                 root_index=torch.tensor([0], dtype=torch.long),
                 y_size=torch.tensor([3.2], dtype=torch.float32),
                 y_polar=torch.tensor([0.55], dtype=torch.float32),
+                early_y_polar=torch.tensor([0.5], dtype=torch.float32),
                 y_bimodality=torch.tensor([0.62], dtype=torch.float32),
                 y_rumor=torch.tensor([idx % num_classes], dtype=torch.long),
             )
@@ -201,6 +202,7 @@ def run_efficiency_benchmark(
             hidden_dim=hidden_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "TemporalStanceMLP": lambda: TemporalStanceMLP(
             in_dim=in_dim,
@@ -208,18 +210,21 @@ def run_efficiency_benchmark(
             edge_dim=edge_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "StandardGCN": lambda: StandardGCN(
             in_dim=in_dim,
             hidden_dim=hidden_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "StandardGATv2": lambda: StandardGATv2(
             in_dim=in_dim,
             hidden_dim=hidden_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "EdgeGATv2": lambda: EdgeGATv2(
             in_dim=in_dim,
@@ -227,18 +232,21 @@ def run_efficiency_benchmark(
             edge_dim=edge_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "FAGCN": lambda: FAGCNBaseline(
             in_dim=in_dim,
             hidden_dim=hidden_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "BiGCN": lambda: BiGCN(
             in_dim=in_dim,
             hidden_dim=hidden_dim,
             num_rumor_classes=num_classes,
             use_cascade_stats=use_cascade_stats,
+            predict_uncertainty=predict_uncertainty,
         ),
         "SBiFAGAT": lambda: SBiFAGAT(
             in_dim=in_dim,

@@ -759,8 +759,8 @@ class NLIStanceTeacherScorer:
             h_opp_tmpl = "The reply disagrees with, criticizes, or opposes the parent comment."
             tpl_prefix = "Parent comment: \nReply: "
         else:
-            h_sup_tmpl = "Phản hồi đồng ý hoặc ủng hộ bình luận trước."
-            h_opp_tmpl = "Phản hồi phản đối, chỉ trích hoặc không đồng ý với bình luận trước."
+            h_sup_tmpl = "Phản hồi này đồng ý, ủng hộ hoặc xác nhận bình luận trước."
+            h_opp_tmpl = "Phản hồi này phản đối, bác bỏ hoặc chỉ trích bình luận trước."
             tpl_prefix = "Bình luận trước: \nPhản hồi: "
 
         has_tok_encode = hasattr(self.tokenizer, "encode") and hasattr(self.tokenizer, "decode")
@@ -785,7 +785,7 @@ class NLIStanceTeacherScorer:
                     v_ids = self.tokenizer.encode(v_norm, add_special_tokens=False)
                     v_reserve = min(len(v_ids), max(8, avail_premise_tok // 2))
                     u_max_tok = max(8, avail_premise_tok - v_reserve)
-                    u_keep = u_ids[:u_max_tok]
+                    u_keep = _truncate_head_tail(u_ids, u_max_tok, head_ratio=0.6)
                     v_max_tok = max(8, avail_premise_tok - len(u_keep))
                     v_keep = v_ids[:v_max_tok]
                     u_trim = (
@@ -903,82 +903,175 @@ def _infer_behavior_stratum(pair: Mapping[str, Any]) -> str:
     return "constructive_oppose"
 
 
+_MD_LINK_ONLY_RE = re.compile(r"\[([^\]]*)\]\((https?://[^)]+)\)", re.IGNORECASE)
+
+
+def _is_unrateable_audit_pair(item: Mapping[str, Any], *, min_words: int = 3) -> tuple[bool, bool]:
+    """Return `(hard_unrateable, short_reply)` flags for audit pool hygiene."""
+    from src.data.arctic_shift_vn import is_invalid_or_spam_text
+
+    root_txt = str(item.get("root_text") or "")
+    parent_txt = str(item.get("parent_text") or "")
+    reply_txt = str(item.get("reply_text") or "").strip()
+    if "[REDACTED" in root_txt or "[REDACTED" in parent_txt or "[REDACTED" in reply_txt:
+        return True, True
+    if not reply_txt or is_invalid_or_spam_text(reply_txt) or is_invalid_or_spam_text(parent_txt):
+        return True, True
+    stripped = _MD_LINK_ONLY_RE.sub(" ", reply_txt)
+    stripped = _EN_URL_RE.sub(" ", stripped).strip()
+    alnum = re.sub(r"[^\w]", "", stripped, flags=re.UNICODE)
+    if len(alnum) < 2:
+        return True, True
+    word_count = len([w for w in stripped.split() if re.search(r"[^\W_]", w, flags=re.UNICODE)])
+    return False, (word_count < int(min_words))
+
+
+def _take_balanced_from_subbuckets(
+    hostile_list: Sequence[dict[str, Any]],
+    clean_list: Sequence[dict[str, Any]],
+    *,
+    h_start: int,
+    c_start: int,
+    quota: int,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Sample up to *quota* items balanced 50/50 between hostile/uncivil and clean sub-buckets."""
+    avail_h = max(0, len(hostile_list) - h_start)
+    avail_c = max(0, len(clean_list) - c_start)
+    if quota <= 0 or (avail_h == 0 and avail_c == 0):
+        return [], h_start, c_start
+
+    want_h = quota // 2
+    want_c = quota - want_h
+    take_h = min(avail_h, want_h)
+    take_c = min(avail_c, want_c)
+    rem = quota - (take_h + take_c)
+    if rem > 0:
+        extra_h = min(rem, avail_h - take_h)
+        take_h += extra_h
+        rem -= extra_h
+    if rem > 0:
+        extra_c = min(rem, avail_c - take_c)
+        take_c += extra_c
+    chosen = list(hostile_list[h_start : h_start + take_h]) + list(
+        clean_list[c_start : c_start + take_c]
+    )
+    return chosen, h_start + take_h, c_start + take_c
+
+
 def export_stratified_human_audit_csv(
     scored_pairs: Sequence[Mapping[str, Any]],
-    output_csv: Path = Path("data/interim/human_audit_300.csv"),
+    output_csv: Path = Path("data/interim/human_audit_vi_120.csv"),
     *,
     machine_key_csv: Path | None = None,
     pilot_csv: Path | None = None,
-    pilot_samples: int = 30,
-    n_samples: int = 300,
+    pilot_machine_key_csv: Path | None = None,
+    pilot_samples: int = 20,
+    n_samples: int = 120,
+    hostile_threshold: float = 0.5,
+    test_cascade_ids: set[str] | Sequence[str] | None = None,
+    exclude_unrateable: bool = True,
     seed: int = 42,
 ) -> Path:
     """Export balanced stratified blind pairs to CSV (strictly hiding machine predictions)."""
     if not scored_pairs:
         raise ValueError("Cannot export human audit CSV from empty scored_pairs")
 
-    has_behavior = any(p.get("behavior_label") in DISCOURSE_BEHAVIOR_LABELS for p in scored_pairs)
+    pool = [dict(p) for p in scored_pairs]
+    if test_cascade_ids is not None:
+        allowed_cids = {str(c) for c in test_cascade_ids}
+        test_only = [p for p in pool if str(p.get("cascade_id") or "") in allowed_cids]
+        if test_only:
+            pool = test_only
+
+    if exclude_unrateable:
+        non_redacted = [p for p in pool if not _is_unrateable_audit_pair(p)[0]]
+        if non_redacted:
+            pool = non_redacted
+        rateable = [p for p in pool if not _is_unrateable_audit_pair(p)[1]]
+        need_total = min(len(pool), int(n_samples) + (int(pilot_samples) if pilot_csv is not None else 0))
+        if len(rateable) >= max(1, need_total):
+            pool = rateable
+
+    has_behavior = any(p.get("behavior_label") in DISCOURSE_BEHAVIOR_LABELS for p in pool)
     strata_order = DISCOURSE_BEHAVIOR_LABELS if has_behavior else STANCE_LABELS
 
     rng = random.Random(seed)
     buckets: dict[str, list[dict[str, Any]]] = {lbl: [] for lbl in strata_order}
-    for item in scored_pairs:
+    hostile_sub: dict[str, list[dict[str, Any]]] = {lbl: [] for lbl in strata_order}
+    clean_sub: dict[str, list[dict[str, Any]]] = {lbl: [] for lbl in strata_order}
+    h_offsets: dict[str, int] = {lbl: 0 for lbl in strata_order}
+    c_offsets: dict[str, int] = {lbl: 0 for lbl in strata_order}
+    pop_joint_counts: dict[tuple[str, bool], int] = {}
+
+    for item in pool:
         row_copy = dict(item)
         stance_stratum = _infer_stance_stratum(item)
         row_copy["_stance_stratum"] = stance_stratum
         stratum = _infer_behavior_stratum(item) if has_behavior else stance_stratum
         row_copy["_stratum"] = stratum
+        is_uncivil = float(row_copy.get("h_uv", 0.0)) >= float(hostile_threshold)
+        row_copy["_is_uncivil"] = is_uncivil
+        pop_joint_counts[(stratum, is_uncivil)] = pop_joint_counts.get((stratum, is_uncivil), 0) + 1
         buckets[stratum].append(row_copy)
+        if is_uncivil:
+            hostile_sub[stratum].append(row_copy)
+        else:
+            clean_sub[stratum].append(row_copy)
 
     for lbl in strata_order:
         rng.shuffle(buckets[lbl])
+        rng.shuffle(hostile_sub[lbl])
+        rng.shuffle(clean_sub[lbl])
 
-    target_total = min(n_samples, len(scored_pairs))
+    target_total = min(int(n_samples), len(pool))
     selected: list[dict[str, Any]] = []
     base_quota = target_total // len(strata_order)
     offsets: dict[str, int] = {lbl: 0 for lbl in strata_order}
 
     if not has_behavior:
-        # Joint stance x hostility stratification (hostile >= 0.4) preserving balanced stance quotas
-        ordered_buckets: dict[str, list[dict[str, Any]]] = {}
         for lbl in strata_order:
-            hostile_items = [r for r in buckets[lbl] if float(r.get("h_uv", 0.0)) >= 0.4]
-            clean_items = [r for r in buckets[lbl] if float(r.get("h_uv", 0.0)) < 0.4]
-            target_h = min(len(hostile_items), max(1, base_quota // 2)) if hostile_items else 0
-            target_c = min(len(clean_items), max(0, base_quota - target_h))
-            rem_need = max(0, base_quota - (target_h + target_c))
-            if rem_need > 0:
-                extra_h = min(rem_need, len(hostile_items) - target_h)
-                target_h += extra_h
-                rem_need -= extra_h
-                extra_c = min(rem_need, len(clean_items) - target_c)
-                target_c += extra_c
-            ordered_buckets[lbl] = (
-                hostile_items[:target_h]
-                + clean_items[:target_c]
-                + hostile_items[target_h:]
-                + clean_items[target_c:]
+            picked, nh, nc = _take_balanced_from_subbuckets(
+                hostile_sub[lbl], clean_sub[lbl], h_start=0, c_start=0, quota=base_quota
             )
-        buckets = ordered_buckets
+            selected.extend(picked)
+            h_offsets[lbl] = nh
+            c_offsets[lbl] = nc
 
-    for lbl in strata_order:
-        take = min(base_quota, len(buckets[lbl]))
-        selected.extend(buckets[lbl][:take])
-        offsets[lbl] = take
-
-    # Redistribute remaining slots across non-exhausted strata in round-robin order
-    while len(selected) < target_total:
-        added_any = False
-        for lbl in strata_order:
-            if len(selected) >= target_total:
+        # Round-robin fill remainder while preserving balanced uncivil/clean where possible
+        while len(selected) < target_total:
+            added_any = False
+            for lbl in strata_order:
+                if len(selected) >= target_total:
+                    break
+                want_h_next = h_offsets[lbl] < len(hostile_sub[lbl])
+                want_c_next = c_offsets[lbl] < len(clean_sub[lbl])
+                if want_h_next and (not want_c_next or (len(selected) % 2 == 0)):
+                    selected.append(hostile_sub[lbl][h_offsets[lbl]])
+                    h_offsets[lbl] += 1
+                    added_any = True
+                elif want_c_next:
+                    selected.append(clean_sub[lbl][c_offsets[lbl]])
+                    c_offsets[lbl] += 1
+                    added_any = True
+            if not added_any:
                 break
-            idx = offsets[lbl]
-            if idx < len(buckets[lbl]):
-                selected.append(buckets[lbl][idx])
-                offsets[lbl] += 1
-                added_any = True
-        if not added_any:
-            break
+    else:
+        for lbl in strata_order:
+            take = min(base_quota, len(buckets[lbl]))
+            selected.extend(buckets[lbl][:take])
+            offsets[lbl] = take
+        while len(selected) < target_total:
+            added_any = False
+            for lbl in strata_order:
+                if len(selected) >= target_total:
+                    break
+                idx = offsets[lbl]
+                if idx < len(buckets[lbl]):
+                    selected.append(buckets[lbl][idx])
+                    offsets[lbl] += 1
+                    added_any = True
+            if not added_any:
+                break
 
     rng.shuffle(selected)
 
@@ -989,13 +1082,18 @@ def export_stratified_human_audit_csv(
         "cascade_id",
         "edge_id",
         "root_text",
+        "grandparent_text",
         "parent_text",
         "reply_text",
         "annotator_1_stance",
         "annotator_2_stance",
         "annotator_1_hostility",
         "annotator_2_hostility",
-        "notes",
+        "annotator_1_uncertain",
+        "annotator_2_uncertain",
+        "annotator_1_notes",
+        "annotator_2_notes",
+        "gold_notes",
         "gold_adjudicated_stance",
         "gold_adjudicated_hostility",
     ]
@@ -1015,13 +1113,18 @@ def export_stratified_human_audit_csv(
                     "cascade_id": str(row.get("cascade_id") or ""),
                     "edge_id": str(row.get("edge_id") or ""),
                     "root_text": str(row.get("root_text") or row.get("parent_text") or ""),
+                    "grandparent_text": str(row.get("grandparent_text") or ""),
                     "parent_text": str(row.get("parent_text") or ""),
                     "reply_text": str(row.get("reply_text") or ""),
                     "annotator_1_stance": "",
                     "annotator_2_stance": "",
                     "annotator_1_hostility": "",
                     "annotator_2_hostility": "",
-                    "notes": "",
+                    "annotator_1_uncertain": "",
+                    "annotator_2_uncertain": "",
+                    "annotator_1_notes": "",
+                    "annotator_2_notes": "",
+                    "gold_notes": "",
                     "gold_adjudicated_stance": "",
                     "gold_adjudicated_hostility": "",
                 }
@@ -1031,29 +1134,10 @@ def export_stratified_human_audit_csv(
                     payload_row["gold_adjudicated_behavior"] = ""
                 writer.writerow(payload_row)
 
-    _write_blind_csv(out_path, selected, prefix="audit")
-
-    if pilot_csv is not None and pilot_samples > 0:
-        pilot_selected: list[dict[str, Any]] = []
-        while len(pilot_selected) < pilot_samples:
-            added_pilot = False
-            for lbl in strata_order:
-                if len(pilot_selected) >= pilot_samples:
-                    break
-                idx = offsets[lbl]
-                if idx < len(buckets[lbl]):
-                    pilot_selected.append(buckets[lbl][idx])
-                    offsets[lbl] += 1
-                    added_pilot = True
-            if not added_pilot:
-                break
-        if pilot_selected:
-            rng.shuffle(pilot_selected)
-            _write_blind_csv(Path(pilot_csv), pilot_selected, prefix="pilot")
-
-    if machine_key_csv is not None:
-        key_path = Path(machine_key_csv)
-        key_path.parent.mkdir(parents=True, exist_ok=True)
+    def _write_key_csv(
+        key_dest: Path, rows_to_write: Sequence[Mapping[str, Any]], prefix: str
+    ) -> None:
+        key_dest.parent.mkdir(parents=True, exist_ok=True)
         key_fields = [
             "sample_id",
             "cascade_id",
@@ -1061,26 +1145,98 @@ def export_stratified_human_audit_csv(
             "machine_stance_label",
             "s_uv",
             "h_uv",
+            "sampling_weight",
         ]
         if has_behavior:
             key_fields.extend(["machine_behavior_label", "r_uv", "c_uv"])
-        with key_path.open("w", encoding="utf-8-sig", newline="") as fh:
+
+        sel_counts: dict[tuple[str, bool], int] = {}
+        for r in rows_to_write:
+            k = (str(r["_stratum"]), bool(r["_is_uncivil"]))
+            sel_counts[k] = sel_counts.get(k, 0) + 1
+        n_pool = max(1, len(pool))
+        n_sel = max(1, len(rows_to_write))
+
+        with key_dest.open("w", encoding="utf-8-sig", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=key_fields)
             writer.writeheader()
-            for idx, row in enumerate(selected):
+            for idx, row in enumerate(rows_to_write):
+                jk = (str(row["_stratum"]), bool(row["_is_uncivil"]))
+                pop_share = pop_joint_counts.get(jk, 0) / float(n_pool)
+                sel_share = sel_counts.get(jk, 1) / float(n_sel)
+                sw = (pop_share / sel_share) if sel_share > 0 else 1.0
                 k_row = {
-                    "sample_id": f"audit_{idx + 1:03d}",
+                    "sample_id": f"{prefix}_{idx + 1:03d}",
                     "cascade_id": str(row.get("cascade_id") or ""),
                     "edge_id": str(row.get("edge_id") or ""),
                     "machine_stance_label": row["_stance_stratum"],
                     "s_uv": f"{float(row.get('s_uv', 0.0)):.6f}",
                     "h_uv": f"{float(row.get('h_uv', 0.0)):.6f}",
+                    "sampling_weight": f"{sw:.6f}",
                 }
                 if has_behavior:
                     k_row["machine_behavior_label"] = row["_stratum"]
                     k_row["r_uv"] = f"{float(row.get('r_uv', 0.0)):.6f}"
                     k_row["c_uv"] = f"{float(row.get('c_uv', 0.5)):.6f}"
                 writer.writerow(k_row)
+
+    _write_blind_csv(out_path, selected, prefix="audit")
+
+    pilot_selected: list[dict[str, Any]] = []
+    if pilot_csv is not None and pilot_samples > 0:
+        pilot_target = min(int(pilot_samples), max(0, len(pool) - len(selected)))
+        if not has_behavior:
+            pilot_base = pilot_target // len(strata_order)
+            for lbl in strata_order:
+                picked_p, nh, nc = _take_balanced_from_subbuckets(
+                    hostile_sub[lbl],
+                    clean_sub[lbl],
+                    h_start=h_offsets[lbl],
+                    c_start=c_offsets[lbl],
+                    quota=pilot_base,
+                )
+                pilot_selected.extend(picked_p)
+                h_offsets[lbl] = nh
+                c_offsets[lbl] = nc
+            while len(pilot_selected) < pilot_target:
+                added_pilot = False
+                for lbl in strata_order:
+                    if len(pilot_selected) >= pilot_target:
+                        break
+                    want_h = h_offsets[lbl] < len(hostile_sub[lbl])
+                    want_c = c_offsets[lbl] < len(clean_sub[lbl])
+                    if want_h and (not want_c or (len(pilot_selected) % 2 == 0)):
+                        pilot_selected.append(hostile_sub[lbl][h_offsets[lbl]])
+                        h_offsets[lbl] += 1
+                        added_pilot = True
+                    elif want_c:
+                        pilot_selected.append(clean_sub[lbl][c_offsets[lbl]])
+                        c_offsets[lbl] += 1
+                        added_pilot = True
+                if not added_pilot:
+                    break
+        else:
+            while len(pilot_selected) < pilot_target:
+                added_pilot = False
+                for lbl in strata_order:
+                    if len(pilot_selected) >= pilot_target:
+                        break
+                    idx = offsets[lbl]
+                    if idx < len(buckets[lbl]):
+                        pilot_selected.append(buckets[lbl][idx])
+                        offsets[lbl] += 1
+                        added_pilot = True
+                if not added_pilot:
+                    break
+
+        if pilot_selected:
+            rng.shuffle(pilot_selected)
+            _write_blind_csv(Path(pilot_csv), pilot_selected, prefix="pilot")
+            if pilot_machine_key_csv is not None:
+                _write_key_csv(Path(pilot_machine_key_csv), pilot_selected, prefix="pilot")
+
+    if machine_key_csv is not None:
+        _write_key_csv(Path(machine_key_csv), selected, prefix="audit")
 
     return out_path
 
@@ -1924,6 +2080,10 @@ def extract_parent_reply_pairs_from_parquet(
 
     node_text_by_id = {str(row["node_id"]): str(row["text"]) for row in node_rows}
     node_topic_by_id = {str(row["node_id"]): str(row["topic_id"]) for row in node_rows}
+    parent_of_node = {
+        str(row["node_id"]): (str(row["parent_id"]) if row.get("parent_id") is not None else "")
+        for row in node_rows
+    }
     cascade_root_id: dict[str, str] = {}
     for row in node_rows:
         if bool(row.get("is_root")):
@@ -1937,6 +2097,8 @@ def extract_parent_reply_pairs_from_parquet(
         src = str(edge["source_id"])
         tgt = str(edge["target_id"])
         root_id = cascade_root_id.get(cid, src)
+        gp_id = parent_of_node.get(src, "")
+        gp_text = node_text_by_id.get(gp_id, "") if gp_id and gp_id != src else ""
         pairs.append(
             {
                 "edge_id": str(edge["edge_id"]),
@@ -1946,6 +2108,7 @@ def extract_parent_reply_pairs_from_parquet(
                 "parent_id": src,
                 "target_id": tgt,
                 "root_text": node_text_by_id.get(root_id, node_text_by_id[src]),
+                "grandparent_text": gp_text,
                 "parent_text": node_text_by_id[src],
                 "reply_text": node_text_by_id[tgt],
             }
@@ -2269,14 +2432,21 @@ def main() -> None:
     parser.add_argument("--checkpoint-every", type=int, default=250)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--audit-n-samples", type=int, default=120)
+    parser.add_argument("--pilot-samples", type=int, default=20)
     args = parser.parse_args()
 
     out_dir = args.output_dir or Path(
         f"checkpoints/dual_ce_{args.lang}{'_sanity_shuffle' if args.sanity_check_shuffle else ''}"
     )
-    audit_csv = args.audit_csv or Path(f"data/interim/human_audit_{args.lang}_300.csv")
+    audit_csv = args.audit_csv or Path(f"data/interim/human_audit_{args.lang}_120.csv")
     machine_key_csv = args.machine_key_csv or audit_csv.with_name(
         f"{audit_csv.stem}_machine_key.csv"
+    )
+    pilot_key_csv = (
+        args.pilot_csv.with_name(f"{args.pilot_csv.stem}_machine_key.csv")
+        if args.pilot_csv is not None
+        else None
     )
     splits_path = args.topic_splits_json or (args.interim_dir / "topic_splits.json")
 
@@ -2336,14 +2506,26 @@ def main() -> None:
                 )
 
         if args.export_audit:
-            if args.skip_if_exists and audit_csv.exists() and machine_key_csv.exists():
+            pilot_ready = args.pilot_csv is None or args.pilot_csv.exists()
+            if args.skip_if_exists and audit_csv.exists() and machine_key_csv.exists() and pilot_ready:
                 print(f"[SKIP] Blind human audit CSV already exists: {audit_csv}")
             else:
+                test_topics = {str(t) for t in canonical_splits.get("test", ())}
+                test_cids = {
+                    str(r["cascade_id"])
+                    for r in nodes_tbl.to_pylist()
+                    if str(r.get("topic_id") or "") in test_topics
+                }
                 csv_path = export_stratified_human_audit_csv(
                     scored,
                     output_csv=audit_csv,
                     machine_key_csv=machine_key_csv,
                     pilot_csv=args.pilot_csv,
+                    pilot_machine_key_csv=pilot_key_csv,
+                    pilot_samples=args.pilot_samples,
+                    n_samples=args.audit_n_samples,
+                    test_cascade_ids=test_cids or None,
+                    seed=args.split_seed,
                 )
                 print(f"Exported blind stratified human audit CSV: {csv_path} (key: {machine_key_csv})")
 

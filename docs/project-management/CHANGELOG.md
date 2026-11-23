@@ -1,5 +1,17 @@
 # SBi-FAGAT: Changelog & Audit Modification Record
 
+## [v3.0 — EGM Full Mathematical, Audit & Cloud-GPU Overhaul] - `fix/egm-audit-hardening`
+
+- **PII, Doxxing & Spam Hygiene (`arctic_shift_vn.py`, `dual_edge_scorer.py`):** Scrubbed `112` crypto/spam rows across local `data/{interim,processed}/vn/nodes.parquet` while preserving cascade IDs/edges, and blocked `[deleted]`/spam/PII/redacted strings from blind audit exports.
+- **v3 Mathematical & Modeling Fixes (`pyg_dataset.py`, `baselines.py`, `sbi_fagat.py`, `metrics.py`, `trainer.py`, `reporting.py`):**
+  - Linearized `_compute_full_tree_polarization` and attached causal `early_y_polar` + `root_ts` to `CascadeData`, alongside chronological `compute_temporal_topic_splits` & `compute_embedding_cluster_splits` (both enforcing `edge_source="teacher"` in `run_experiments.py`).
+  - Replaced raw Persistence-Residual scaling with ReZero zero-initialized `tanh(persist_weight)` over train-centered `[0.02, 0.98]` clamped `early_y_polar` logits (`persist_ep_logit_ref`) symmetrically across stance-aware models (`TemporalStanceMLP`, `EdgeGATv2`, `BiEdgeGATv2`, `SBiFAGAT`); fixed `predict_uncertainty` parity across all 8 models; zeroed single-camp Camp Dipole (`both_camps`); tightened Smooth-L1 `beta=0.05`; moved `comparator_model="auto"` strictly to Validation `val_summary_stats`; added `r2_polar` to primary tables/hypothesis keys.
+- **Streamlined Gate 1 `20/120/30` Binary Audit & UI (`compute_kappa.py`, `audit_vn_50_trees.py`, `human_audit_ui.py`):**
+  - Standardized hostility annotation to binary `clean` vs. `uncivil` (with `ROC-AUC`/`PR-AUC`/`weighted_macro_f1`, always-on `--strict-adjudication`, Kendall $\tau_b$, AUROC $@\ge 2$, dynamic `y_polar_quintile_grade`).
+  - Added `--lock-role` HTTP `403` enforcement, per-role isolated notes/`uncertain` fields, `grandparent_text`, queued race-free UI `saveQueue`, JSON reply rendering, `[Q]/[W]` hotkeys, VN rubric, `gold` confirmation & `disagreements_count`.
+  - Exported clean Test-only disjoint VN blind packages (`20` pilot [`6` uncivil / `14` clean], `120` pairs [`47` / `73`], `30` trees [`6 x 5` grades]) with machine keys sealed in `data/interim/sbifagat_member1_vn_sealed_machine_keys.zip`.
+- **Verified v3 VN Canonical + Cloud GPU Offload (`notebooks/colab_gpu_v3_gnn_benchmarks.ipynb`):** Executed v3 VN EDA, CPU efficiency profiler, canonical 5-seed VN benchmark (`SBiFAGAT RMSE=0.0370±0.0003, R^2_polar=0.0742±0.0157`), observational sensitivity analysis (`analyze_mechanisms.py` with consistent `early_y_polar` recomputation), and `assemble_paper_artifacts.py` (multi-corpus non-overwriting audit merge, `latex_underscore_issues={}`); added `notebooks/colab_gpu_v3_gnn_benchmarks.ipynb` (plus updated Notebook 2 Tier 2A `--k-horizon 10 --min-total-replies 15`) to run remaining heavy multi-seed benchmarks on Google Colab / Kaggle GPU without taxing local CPU.
+
 ## [Track 1 & Track 2 Results + Blind Audit UI] - `2575295`..`5332750`
 
 - **Model, Loss & Ingestion Hardening (`2575295`, `3215ede`, `11637ed`):** Added CleanRes Camp Dipole readout, decoupled `polar_head`, balanced 2:1 multi-task loss, shallow depth-6 `/kaggle/input` PHEME auto-discovery, and parallelized GCS-FUSE thread parsing (`os.scandir` + `ThreadPoolExecutor`).

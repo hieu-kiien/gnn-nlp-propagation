@@ -86,34 +86,34 @@ def assemble_paper_artifacts(
                 generated.append(str(eff_tex))
                 break
 
-    # 2b. Merge pair-level & 50-tree thread-level human audit JSON reports into unified `tables_human_audit.tex`
-    audit_report_merged: dict[str, Any] = {}
-    audit_mvg_merged: dict[str, Any] = {}
-    for candidate_name in (
-        "results_human_audit_pairs.json",
-        "results_human_audit_vi.json",
-        "results_human_audit_en.json",
-        "results_human_audit_vn_50_trees.json",
-    ):
+    # 2b. Merge pair-level & thread-level human audit JSON reports without overwriting VI vs EN
+    corpus_candidates = (
+        ("results_human_audit_pairs.json", ""),
+        ("results_human_audit_vi.json", "VN"),
+        ("results_human_audit_en.json", "EN"),
+        ("results_rumoureval_sdqc.json", ""),
+        ("results_human_audit_vn_30_trees.json", "VN"),
+        ("results_human_audit_vn_50_trees.json", "VN"),
+    )
+    corpus_reports: list[dict[str, Any]] = []
+    seen_tree = False
+    for candidate_name, corpus_prefix in corpus_candidates:
+        if "trees" in candidate_name:
+            if seen_tree:
+                continue
         cand_path = pdir / candidate_name
         if not cand_path.is_file():
             continue
         blob = json.loads(cand_path.read_text(encoding="utf-8"))
         if not isinstance(blob, dict):
             continue
-        for key in ("stance", "hostility", "rumoureval_sdqc", "inter_annotator"):
-            if key in blob and isinstance(blob[key], dict):
-                audit_report_merged[key] = blob[key]
-        mvg_blob = blob.get("machine_vs_gold")
-        if isinstance(mvg_blob, dict):
-            for mk, mv in mvg_blob.items():
-                audit_mvg_merged[mk] = mv
-    if audit_report_merged:
-        if audit_mvg_merged:
-            audit_report_merged["machine_vs_gold"] = audit_mvg_merged
+        if "trees" in candidate_name:
+            seen_tree = True
+        corpus_reports.append({"prefix": corpus_prefix, "report": blob})
+    if corpus_reports:
         audit_tex = pdir / "tables_human_audit.tex"
         audit_tex.write_text(
-            format_human_audit_latex(audit_report_merged, label="tab:human_audit"),
+            format_human_audit_latex({"corpora": corpus_reports}, label="tab:human_audit"),
             encoding="utf-8",
         )
         generated.append(str(audit_tex))
@@ -135,6 +135,7 @@ def assemble_paper_artifacts(
         "tables_ablation_pheme.tex",
         "tables_mechanisms_pheme.tex",
         "tables_main_vn.tex",
+        "tables_temporal_vn.tex",
         "tables_ablation_vn.tex",
         "tables_mechanisms_vn.tex",
         "tables_upfd.tex",

@@ -73,7 +73,7 @@ def main() -> None:
     parser.add_argument(
         "--edge-source", choices=["auto", "student", "teacher"], default="auto"
     )
-    parser.add_argument("--comparator-model", type=str, default="auto")
+    parser.add_argument("--comparator-model", type=str, default="BiEdgeGATv2 (Matched)")
     parser.add_argument("--output-table", type=Path, default=None)
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--figures-dir", type=Path, default=None)
@@ -255,6 +255,17 @@ def main() -> None:
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
         ),
+        "w/o Persistence Anchor": lambda: SBiFAGAT(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
+            use_polar_persistence_anchor=False,
+        ),
         "BiEdgeGATv2 (Matched)": lambda: BiEdgeGATv2(
             in_dim=in_dim,
             hidden_dim=h_dim,
@@ -262,6 +273,7 @@ def main() -> None:
             num_rumor_classes=num_cls,
             dropout=args.dropout,
             use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
         ),
     }
     if edge_dim == 4:

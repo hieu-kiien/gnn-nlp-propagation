@@ -18,6 +18,12 @@ TEACHER_BACKEND="dual_nli"
 EDGE_DIM="2"
 echo ">>> Unified SBi-FAGAT 2D NLP Pipeline: teacher=${TEACHER_BACKEND}, edge_dim=${EDGE_DIM}, Ancestor SpanPool"
 
+mkdir -p data/interim
+if [[ -z "${SBIF_HASH_SALT:-}" && ! -f "data/interim/.author_hash_salt.secret" ]]; then
+    "${PYTHON_BIN}" -c "import pathlib, secrets; p = pathlib.Path('data/interim/.author_hash_salt.secret'); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(secrets.token_hex(16), encoding='utf-8')"
+    echo ">>> Initialized persistent author pseudonymization salt at data/interim/.author_hash_salt.secret"
+fi
+
 if [[ "${RUN_PHEME}" -eq 1 ]]; then
     echo "[Phase 2 - PHEME 1/3] Downloading & parsing PHEME cascades..."
     "${PYTHON_BIN}" -m src.data.pheme_loader --output-dir data/interim/pheme
@@ -28,8 +34,10 @@ if [[ "${RUN_PHEME}" -eq 1 ]]; then
         --interim-dir data/interim/pheme \
         --output-dir checkpoints/dual_ce_pheme \
         --scored-cache-json data/interim/pheme/scored_pairs.json \
-        --audit-csv data/interim/human_audit_en_300.csv \
-        --pilot-csv data/interim/pilot_calibration_en_30.csv \
+        --audit-csv data/interim/human_audit_en_120.csv \
+        --pilot-csv data/interim/pilot_calibration_en_20.csv \
+        --audit-n-samples 120 \
+        --pilot-samples 20 \
         --min-total-replies "${MIN_TOTAL_REPLIES}" \
         --teacher-backend "${TEACHER_BACKEND}" \
         --edge-dim "${EDGE_DIM}" \
@@ -77,8 +85,10 @@ if [[ "${RUN_VN}" -eq 1 ]]; then
         --vihsd-dir checkpoints/visobert_vihsd \
         --output-dir checkpoints/dual_ce_vn \
         --scored-cache-json data/interim/vn/scored_pairs.json \
-        --audit-csv data/interim/human_audit_vi_300.csv \
-        --pilot-csv data/interim/pilot_calibration_vi_30.csv \
+        --audit-csv data/interim/human_audit_vi_120.csv \
+        --pilot-csv data/interim/pilot_calibration_vi_20.csv \
+        --audit-n-samples 120 \
+        --pilot-samples 20 \
         --min-total-replies "${MIN_TOTAL_REPLIES}" \
         --teacher-backend "${TEACHER_BACKEND}" \
         --edge-dim "${EDGE_DIM}" \

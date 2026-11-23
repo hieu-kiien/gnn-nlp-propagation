@@ -43,6 +43,31 @@ _SPAM_DOMAIN_RE = re.compile(
     r"(?:https?://)?(?:www\.)?(?:shope\.ee|s\.shopee\.vn|bit\.ly|tinyurl\.com|t\.me)/\S*",
     re.IGNORECASE,
 )
+_CRYPTO_SPAM_RE = re.compile(r"\blmgx\b", re.IGNORECASE)
+_VN_PHONE_RE = re.compile(
+    r"(?<!\d)(?:\+?84|0)(?:3|5|7|8|9)\d(?:[\.\-\s]?\d){7,8}(?!\d)"
+)
+_BANK_ACCT_RE = re.compile(
+    r"(\b(?:stk|số\s*tài\s*khoản|so\s*tai\s*khoan|tài\s*khoản\s*ngân\s*hàng|"
+    r"vietcombank|vcb|techcombank|tcb|mb\s?bank|bidv|vietinbank|acb|tpbank|"
+    r"vpbank|agribank|sacombank|momo|zalopay)\b[^0-9\n]{0,40}?)(\b\d{8,18}\b)",
+    re.IGNORECASE,
+)
+_CCCD_RE = re.compile(
+    r"(\b(?:cccd|cmnd|căn\s*cước(?:\s*công\s*dân)?|chứng\s*minh(?:\s*nhân\s*dân)?)"
+    r"\b[^0-9\n]{0,25}?)(\b\d{9,12}\b)",
+    re.IGNORECASE,
+)
+_FB_PROFILE_RE = re.compile(
+    r"https?://(?:www\.|m\.|mbasic\.)?(?:facebook|fb)\.com/"
+    r"(?!groups/|watch/|events/|share/|photo|reel|pages/)\S+",
+    re.IGNORECASE,
+)
+_DOXXING_INTENT_RE = re.compile(
+    r"(?:truy\s+tìm|tìm\s+đối\s+tượng|tìm\s+thông\s+tin\s+người\s+nhà|"
+    r"bóc\s+phốt.{0,30}(?:sđt|stk|địa\s+chỉ|cccd)|chia\s+sẻ\s+thông\s+tin\s+cá\s+nhân)",
+    re.IGNORECASE,
+)
 _VN_DIACRITIC_RE = re.compile(
     r"[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợ"
     r"ùúủũụưừứửữựỳýỷỹỵđ"
@@ -102,8 +127,36 @@ def normalize_social_text_nfc(text: str) -> str:
     return normalize_nfc(text)
 
 
+def redact_pii_text(text: str) -> str:
+    """Redact Vietnamese phone numbers, bank accounts, national IDs, and personal FB profile URLs."""
+    cleaned = str(text or "")
+    if not cleaned:
+        return ""
+    cleaned = _FB_PROFILE_RE.sub("[REDACTED_PII]", cleaned)
+    cleaned = _BANK_ACCT_RE.sub(r"\1[REDACTED_PII]", cleaned)
+    cleaned = _CCCD_RE.sub(r"\1[REDACTED_PII]", cleaned)
+    cleaned = _VN_PHONE_RE.sub("[REDACTED_PII]", cleaned)
+    return cleaned
+
+
+def is_doxxing_post(text: str) -> bool:
+    """Return True if *text* exhibits doxxing intent alongside personal identifiers (PII)."""
+    norm = normalize_social_text_nfc(text)
+    if not norm:
+        return False
+    if not _DOXXING_INTENT_RE.search(norm):
+        return False
+    return bool(
+        _VN_PHONE_RE.search(norm)
+        or _BANK_ACCT_RE.search(norm)
+        or _CCCD_RE.search(norm)
+        or _FB_PROFILE_RE.search(norm)
+        or re.search(r"địa\s+chỉ|sinh\s+năm|sđt|stk", norm, re.IGNORECASE)
+    )
+
+
 def is_invalid_or_spam_text(text: str, author_raw: str | None = None) -> bool:
-    """Return True for empty, deleted/removed, AutoModerator, or link-spam content."""
+    """Return True for empty, deleted/removed, AutoModerator, doxxing, or link/crypto-spam content."""
     if isinstance(author_raw, str) and author_raw.strip().lower() == "automoderator":
         return True
 
@@ -111,7 +164,10 @@ def is_invalid_or_spam_text(text: str, author_raw: str | None = None) -> bool:
     if not norm or norm.lower() in {"[deleted]", "[removed]"}:
         return True
 
-    if _SPAM_DOMAIN_RE.search(norm):
+    if _SPAM_DOMAIN_RE.search(norm) or _CRYPTO_SPAM_RE.search(norm):
+        return True
+
+    if is_doxxing_post(norm):
         return True
 
     urls = _URL_RE.findall(norm)
@@ -183,7 +239,7 @@ def extract_comments_from_arctic_payload(
                     parent_raw = data.get("parent_id") or inherited_parent
                     link_raw = data.get("link_id")
                     raw_author = data.get("author")
-                    body_nfc = normalize_social_text_nfc(str(data.get("body") or ""))
+                    body_nfc = redact_pii_text(normalize_social_text_nfc(str(data.get("body") or "")))
                     created_ts = _to_float_utc(data.get("created_utc"))
                     extracted.append(
                         {
@@ -232,7 +288,7 @@ def extract_comments_from_arctic_payload(
                 ),
                 "author_is_bot": isinstance(raw_author, str)
                 and raw_author.strip().lower() == "automoderator",
-                "text": normalize_social_text_nfc(str(node.get("body") or "")),
+                "text": redact_pii_text(normalize_social_text_nfc(str(node.get("body") or ""))),
                 "created_utc": _to_float_utc(node.get("created_utc")),
             }
         )
@@ -249,7 +305,7 @@ _TOPIC_STOPWORDS: frozenset[str] = frozenset(
         "các", "của", "cho", "với", "này", "kia", "đó", "đây", "khi", "như", "nên",
         "thì", "mà", "lại", "được", "không", "chưa", "phải", "cũng", "đang", "trong",
         "ngoài", "trên", "dưới", "cùng", "những", "một", "hai", "anh", "em", "bác",
-        "các bạn", "mọi", "người", "hỏi", "tâm", "sự", "xin", "nhờ", "review",
+        "bạn", "mọi", "người", "hỏi", "tâm", "sự", "xin", "nhờ", "review",
         "chia", "sẻ", "thảo", "luận", "nghĩ", "sao", "gì", "nào", "đâu", "voz",
         "vietnam", "reddit", "the", "and", "for", "with", "that", "this", "from",
         "are", "was", "were", "what", "how", "why", "who", "you", "your", "about",
@@ -288,14 +344,14 @@ def _compute_topic_id(post: Mapping[str, Any], norm_title: str) -> str:
 def cluster_vn_cascade_topics(
     node_rows: list[dict[str, Any]],
     *,
-    time_window_days: float = 14.0,
-    sim_threshold: float = 0.55,
+    time_window_days: float = 30.0,
+    sim_threshold: float = 0.30,
 ) -> list[dict[str, Any]]:
     """Merge semantically related Vietnamese cascades within a sliding time window into shared topics.
 
-    Uses TF-IDF (1-2 gram) cosine similarity across root posts combined with a temporal
-    window (`time_window_days`) to assign a single connected-component `topic_id` across
-    near-duplicate news events, preventing cross-split leakage from minor title rewrites.
+    Uses TF-IDF (1-2 gram) cosine similarity across opening root text (`[:300]`) combined
+    with a temporal window (`time_window_days`) to assign a single connected-component
+    `topic_id` across recurring events, reducing cross-split topical overlap.
     """
     roots = [r for r in node_rows if bool(r.get("is_root"))]
     if len(roots) < 2:
@@ -304,16 +360,19 @@ def cluster_vn_cascade_topics(
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
 
-    texts = [normalize_nfc(str(r.get("text") or "")).lower() for r in roots]
+    texts = [normalize_nfc(str(r.get("text") or ""))[:300].lower() for r in roots]
     if not any(texts):
         return node_rows
 
+    eff_min_df = 2 if len(roots) >= 5 else 1
+    eff_max_df = 0.85 if len(roots) >= 5 else 1.0
     try:
-        stop_words = sorted({tok for phrase in _TOPIC_STOPWORDS for tok in phrase.split() if tok})
+        stop_words = sorted({tok for tok in _TOPIC_STOPWORDS if tok})
         vec = TfidfVectorizer(
             ngram_range=(1, 2),
             sublinear_tf=True,
-            min_df=1,
+            min_df=eff_min_df,
+            max_df=eff_max_df,
             stop_words=stop_words,
         )
         mat = vec.fit_transform(texts)
@@ -415,6 +474,7 @@ def build_vn_cascade_from_thread(
         author_raw=str(raw_post_author) if raw_post_author is not None else None,
     ):
         return None
+    root_text = redact_pii_text(root_text)
 
     root_author_hash = hash_author_sha256(
         str(raw_post_author) if raw_post_author is not None else None
@@ -441,6 +501,7 @@ def build_vn_cascade_from_thread(
         c_text = normalize_social_text_nfc(str(c.get("text") or ""))
         if is_invalid_or_spam_text(c_text):
             continue
+        c_text = redact_pii_text(c_text)
         c_ts = _to_float_utc(c.get("created_utc"))
         if c_ts is None:
             continue

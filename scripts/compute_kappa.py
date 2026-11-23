@@ -1,9 +1,9 @@
-"""Compute inter-annotator agreement (Cohen's Kappa) on `human_audit_300.csv`.
+"""Compute inter-annotator agreement (Cohen's Kappa) & Machine-vs-Gold validity metrics.
 
-Supports stance annotations (`support` / `neutral` / `oppose`, or `1` / `0` / `-1`)
-and optional hostility annotations (`clean` / `offensive` / `hate`, or `0` / `1` / `2`),
-reporting unweighted and quadratic-weighted Cohen's Kappa, raw agreement rate,
-confusion matrices, and Landis & Koch reliability bands.
+Supports stance annotations (`support` / `neutral` / `oppose`, or `1` / `0` / `-1`),
+binary reply incivility (`clean` / `uncivil`, accepting legacy `offensive`/`hate`/`hostile`),
+5-class discourse behavior labels, RumourEval SDQC external benchmark validation, and
+thread-level polarization Likert grading (`0..4`).
 """
 
 from __future__ import annotations
@@ -18,8 +18,15 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-from scipy.stats import pearsonr, spearmanr
-from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix, f1_score
+from scipy.stats import kendalltau, pearsonr, spearmanr
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    cohen_kappa_score,
+    confusion_matrix,
+    f1_score,
+    roc_auc_score,
+)
 
 from src.nlp.discourse_labels import DISCOURSE_BEHAVIOR_LABELS, _LABEL_SYNONYMS
 
@@ -41,14 +48,16 @@ _HOSTILITY_SYNONYMS: dict[str, str] = {
     "clean": "clean",
     "non-offensive": "clean",
     "0": "clean",
-    "offensive": "offensive",
-    "1": "offensive",
-    "hate": "hate",
-    "2": "hate",
+    "uncivil": "uncivil",
+    "hostile": "uncivil",
+    "offensive": "uncivil",
+    "1": "uncivil",
+    "hate": "uncivil",
+    "2": "uncivil",
 }
 
 STANCE_ORDER: tuple[str, ...] = ("support", "neutral", "oppose")
-HOSTILITY_ORDER: tuple[str, ...] = ("clean", "offensive", "hate")
+HOSTILITY_ORDER: tuple[str, ...] = ("clean", "uncivil")
 
 _SDQC_TO_STANCE: dict[str, str] = {
     "support": "support",
@@ -66,7 +75,7 @@ _SDQC_TO_STANCE: dict[str, str] = {
 }
 
 _STANCE_TO_NUM: dict[str, float] = {"oppose": -1.0, "neutral": 0.0, "support": 1.0}
-_HOSTILITY_TO_NUM: dict[str, float] = {"clean": 0.0, "offensive": 0.5, "hate": 1.0}
+_HOSTILITY_TO_NUM: dict[str, float] = {"clean": 0.0, "uncivil": 1.0}
 
 
 def interpret_kappa_landis_koch(kappa: float) -> str:
@@ -175,6 +184,8 @@ def evaluate_machine_vs_human(
     host_pred_bin: list[str] = []
     host_gold_num: list[float] = []
     host_pred_h: list[float] = []
+    stance_weights: list[float] = []
+    host_weights: list[float] = []
 
     behavior_gold: list[str] = []
     behavior_pred: list[str] = []
@@ -216,8 +227,13 @@ def evaluate_machine_vs_human(
                 stance_pred.append(p_lbl)
                 stance_gold_num.append(_STANCE_TO_NUM[g_lbl])
                 stance_pred_s.append(s_uv)
+                try:
+                    sw = float(row.get("sampling_weight") or key_row.get("sampling_weight") or 1.0)
+                    stance_weights.append(sw if math.isfinite(sw) and sw > 0.0 else 1.0)
+                except ValueError:
+                    stance_weights.append(1.0)
 
-            # Hostility gold: adjudicated column or unanimous dual-annotator consensus
+            # Incivility / hostility gold: adjudicated column or unanimous dual-annotator consensus
             raw_gh = str(row.get("gold_adjudicated_hostility") or "").strip()
             h1 = str(row.get("annotator_1_hostility") or "").strip()
             h2 = str(row.get("annotator_2_hostility") or "").strip()
@@ -233,10 +249,15 @@ def evaluate_machine_vs_human(
             if raw_gh:
                 gh_lbl = _normalize_label(raw_gh, _HOSTILITY_SYNONYMS, "hostility")
                 h_uv = float(key_row.get("h_uv", 0.0))
-                host_gold_bin.append("clean" if gh_lbl == "clean" else "hostile")
-                host_pred_bin.append("hostile" if h_uv >= 0.5 else "clean")
+                host_gold_bin.append("clean" if gh_lbl == "clean" else "uncivil")
+                host_pred_bin.append("uncivil" if h_uv >= 0.5 else "clean")
                 host_gold_num.append(_HOSTILITY_TO_NUM[gh_lbl])
                 host_pred_h.append(h_uv)
+                try:
+                    hw = float(row.get("sampling_weight") or key_row.get("sampling_weight") or 1.0)
+                    host_weights.append(hw if math.isfinite(hw) and hw > 0.0 else 1.0)
+                except ValueError:
+                    host_weights.append(1.0)
 
             # 5-class behavior gold vs machine behavior label
             raw_gb = str(row.get("gold_adjudicated_behavior") or "").strip().lower()
@@ -287,6 +308,7 @@ def evaluate_machine_vs_human(
         if math.isnan(kappa):
             kappa = 1.0 if stance_gold == stance_pred else 0.0
         pr, sr = _safe_corr_pair(stance_gold_num, stance_pred_s)
+        sw_arr = np.asarray(stance_weights, dtype=np.float64) if len(stance_weights) == len(stance_gold) else None
         result["stance"] = {
             "num_samples": len(stance_gold),
             "total_matched_rows": matched_counts["stance"],
@@ -296,6 +318,17 @@ def evaluate_machine_vs_human(
                 f1_score(stance_gold, stance_pred, labels=list(STANCE_ORDER), average="macro", zero_division=0)
             ),
             "accuracy": float(accuracy_score(stance_gold, stance_pred)),
+            "weighted_macro_f1": float(
+                f1_score(
+                    stance_gold,
+                    stance_pred,
+                    labels=list(STANCE_ORDER),
+                    average="macro",
+                    sample_weight=sw_arr,
+                    zero_division=0,
+                )
+            ),
+            "weighted_accuracy": float(accuracy_score(stance_gold, stance_pred, sample_weight=sw_arr)),
             "cohen_kappa_unweighted": kappa,
             "pearson_r": pr,
             "spearman_r": sr,
@@ -304,19 +337,46 @@ def evaluate_machine_vs_human(
             ).tolist(),
         }
     if host_gold_bin:
-        h_kappa = float(cohen_kappa_score(host_gold_bin, host_pred_bin, labels=["clean", "hostile"]))
+        h_labels = list(HOSTILITY_ORDER)
+        h_kappa = float(cohen_kappa_score(host_gold_bin, host_pred_bin, labels=h_labels))
         if math.isnan(h_kappa):
             h_kappa = 1.0 if host_gold_bin == host_pred_bin else 0.0
         pr_h, sr_h = _safe_corr_pair(host_gold_num, host_pred_h)
+        hw_arr = np.asarray(host_weights, dtype=np.float64) if len(host_weights) == len(host_gold_bin) else None
+        y_bin_true = np.asarray([1 if lbl == "uncivil" else 0 for lbl in host_gold_bin], dtype=np.int64)
+        y_bin_score = np.asarray(host_pred_h, dtype=np.float64)
+        roc_auc_v = (
+            float(roc_auc_score(y_bin_true, y_bin_score, sample_weight=hw_arr))
+            if np.unique(y_bin_true).size >= 2
+            else float("nan")
+        )
+        pr_auc_v = (
+            float(average_precision_score(y_bin_true, y_bin_score, sample_weight=hw_arr))
+            if int(y_bin_true.sum()) >= 1
+            else float("nan")
+        )
         result["hostility"] = {
             "num_samples": len(host_gold_bin),
             "total_matched_rows": matched_counts["hostility"],
             "unadjudicated_disagreements": unadj_counts["hostility"],
             "adjudication_coverage": float(len(host_gold_bin) / max(1, matched_counts["hostility"])),
             "macro_f1": float(
-                f1_score(host_gold_bin, host_pred_bin, labels=["clean", "hostile"], average="macro", zero_division=0)
+                f1_score(host_gold_bin, host_pred_bin, labels=h_labels, average="macro", zero_division=0)
             ),
             "accuracy": float(accuracy_score(host_gold_bin, host_pred_bin)),
+            "weighted_macro_f1": float(
+                f1_score(
+                    host_gold_bin,
+                    host_pred_bin,
+                    labels=h_labels,
+                    average="macro",
+                    sample_weight=hw_arr,
+                    zero_division=0,
+                )
+            ),
+            "weighted_accuracy": float(accuracy_score(host_gold_bin, host_pred_bin, sample_weight=hw_arr)),
+            "roc_auc": roc_auc_v if math.isfinite(roc_auc_v) else None,
+            "pr_auc": pr_auc_v if math.isfinite(pr_auc_v) else None,
             "cohen_kappa_unweighted": h_kappa,
             "pearson_r": pr_h,
             "spearman_r": sr_h,
@@ -436,29 +496,58 @@ def evaluate_audit_csv(
     behavior_1: list[str] = []
     behavior_2: list[str] = []
     behavior_order = list(DISCOURSE_BEHAVIOR_LABELS)
+    unadj_iaa = {"stance": 0, "hostility": 0, "behavior_5class": 0}
 
     with path.open("r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
             s1 = str(row.get("annotator_1_stance") or "").strip()
             s2 = str(row.get("annotator_2_stance") or "").strip()
+            gs = str(row.get("gold_adjudicated_stance") or "").strip()
             if s1 and s2:
-                stance_1.append(_normalize_label(s1, _STANCE_SYNONYMS, "stance"))
-                stance_2.append(_normalize_label(s2, _STANCE_SYNONYMS, "stance"))
+                ns1 = _normalize_label(s1, _STANCE_SYNONYMS, "stance")
+                ns2 = _normalize_label(s2, _STANCE_SYNONYMS, "stance")
+                stance_1.append(ns1)
+                stance_2.append(ns2)
+                if ns1 != ns2 and not gs:
+                    unadj_iaa["stance"] += 1
 
             h1 = str(row.get("annotator_1_hostility") or "").strip()
             h2 = str(row.get("annotator_2_hostility") or "").strip()
+            gh = str(row.get("gold_adjudicated_hostility") or "").strip()
             if h1 and h2:
-                hostility_1.append(_normalize_label(h1, _HOSTILITY_SYNONYMS, "hostility"))
-                hostility_2.append(_normalize_label(h2, _HOSTILITY_SYNONYMS, "hostility"))
+                nh1 = _normalize_label(h1, _HOSTILITY_SYNONYMS, "hostility")
+                nh2 = _normalize_label(h2, _HOSTILITY_SYNONYMS, "hostility")
+                hostility_1.append(nh1)
+                hostility_2.append(nh2)
+                if nh1 != nh2 and not gh:
+                    unadj_iaa["hostility"] += 1
 
             b1 = _LABEL_SYNONYMS.get(str(row.get("annotator_1_behavior") or "").strip().lower())
             b2 = _LABEL_SYNONYMS.get(str(row.get("annotator_2_behavior") or "").strip().lower())
+            gb = str(row.get("gold_adjudicated_behavior") or "").strip().lower()
             if b1 is not None and b2 is not None:
                 behavior_1.append(b1)
                 behavior_2.append(b2)
+                if b1 != b2 and gb not in _LABEL_SYNONYMS:
+                    unadj_iaa["behavior_5class"] += 1
 
-    report: dict[str, Any] = {"input_csv": str(path)}
+    total_unadj_iaa = sum(unadj_iaa.values())
+    if total_unadj_iaa > 0:
+        msg = (
+            f"Detected {total_unadj_iaa} dual-annotator disagreement rows without gold_adjudicated_* labels "
+            f"(stance={unadj_iaa['stance']}, hostility={unadj_iaa['hostility']}, "
+            f"behavior_5class={unadj_iaa['behavior_5class']}). Adjudicate ties before final reporting."
+        )
+        if strict_adjudication:
+            raise ValueError(msg)
+        if machine_key_csv is None:
+            warnings.warn(msg, UserWarning, stacklevel=2)
+
+    report: dict[str, Any] = {
+        "input_csv": str(path),
+        "unadjudicated_disagreements": unadj_iaa,
+    }
     if stance_1:
         report["stance"] = _compute_pair_agreement(stance_1, stance_2, STANCE_ORDER)
     if hostility_1:
@@ -613,6 +702,7 @@ def evaluate_thread_level_audit_csv(
         gold_int: list[int] = []
         mach_ypolar: list[float] = []
         mach_grade: list[int] = []
+        matched_key_rows: list[tuple[float, dict[str, str]]] = []
         with key_path.open("r", encoding="utf-8-sig", newline="") as fh:
             for row in csv.DictReader(fh):
                 cid = str(row.get("cascade_id") or "").strip()
@@ -622,18 +712,50 @@ def evaluate_thread_level_audit_csv(
                     g_val = gold_by_id.get(sid)
                 if g_val is None:
                     continue
-                yp = float(row.get("y_polar", 0.0))
-                mg = (
-                    int(round(float(row["y_polar_grade"])))
-                    if str(row.get("y_polar_grade") or "").strip()
-                    else min(4, max(0, int(round(yp * 4.0))))
-                )
-                gold_cont.append(g_val / 4.0)
-                gold_int.append(min(4, max(0, int(round(g_val)))))
-                mach_ypolar.append(yp)
-                mach_grade.append(mg)
+                matched_key_rows.append((g_val, row))
+
+        n_m = len(matched_key_rows)
+        quintile_grades: list[int] = []
+        if n_m > 0:
+            order = sorted(
+                range(n_m),
+                key=lambda i: float(matched_key_rows[i][1].get("y_polar", 0.0)),
+            )
+            quintile_grades = [0] * n_m
+            n_q = min(5, n_m)
+            for rank, orig_i in enumerate(order):
+                quintile_grades[orig_i] = min(4, int(rank * n_q / n_m)) if n_q > 1 else 0
+
+        for i, (g_val, row) in enumerate(matched_key_rows):
+            yp = float(row.get("y_polar", 0.0))
+            raw_q = str(row.get("y_polar_quintile_grade") or "").strip()
+            raw_g = str(row.get("y_polar_grade") or "").strip()
+            if raw_q:
+                mg = min(4, max(0, int(math.floor(float(raw_q) + 0.5))))
+            elif raw_g:
+                mg = min(4, max(0, int(math.floor(float(raw_g) + 0.5))))
+            elif n_m >= 5:
+                mg = quintile_grades[i]
+            else:
+                mg = min(4, max(0, int(math.floor(yp * 4.0 + 0.5))))
+            gold_cont.append(g_val / 4.0)
+            gold_int.append(min(4, max(0, int(math.floor(g_val + 0.5)))))
+            mach_ypolar.append(yp)
+            mach_grade.append(mg)
+
         if gold_cont:
             pr_m, sr_m = _safe_corr_pair(gold_cont, mach_ypolar)
+            if len(gold_cont) >= 2 and np.std(gold_cont) > 1e-12 and np.std(mach_ypolar) > 1e-12:
+                kt = float(kendalltau(gold_cont, mach_ypolar, variant="b").statistic)
+                tau_b = 0.0 if math.isnan(kt) else kt
+            else:
+                tau_b = 0.0
+            gold_ge2 = np.asarray([1 if g >= 2 else 0 for g in gold_int], dtype=np.int64)
+            roc_auc_ge2: float | None = (
+                float(roc_auc_score(gold_ge2, np.asarray(mach_ypolar, dtype=np.float64)))
+                if np.unique(gold_ge2).size >= 2
+                else None
+            )
             quad_m = float(
                 cohen_kappa_score(gold_int, mach_grade, labels=[0, 1, 2, 3, 4], weights="quadratic")
             )
@@ -643,6 +765,8 @@ def evaluate_thread_level_audit_csv(
                 "num_threads": len(gold_cont),
                 "pearson_r": pr_m,
                 "spearman_r": sr_m,
+                "kendall_tau_b": tau_b,
+                "roc_auc_ge2": roc_auc_ge2,
                 "cohen_kappa_quadratic": quad_m,
                 "landis_koch_band": interpret_kappa_landis_koch(quad_m),
                 "mae_norm": float(
@@ -654,17 +778,8 @@ def evaluate_thread_level_audit_csv(
     return report
 
 
-def format_human_audit_latex(
-    report: Mapping[str, Any],
-    *,
-    caption: str = (
-        "Human Reliability Audit and Silver-Label Validity: Inter-Annotator Agreement "
-        "(Cohen's $\\kappa$ / Quadratic $\\kappa_w$) and Machine-vs.-Gold Alignment."
-    ),
-    label: str = "tab:human_audit",
-) -> str:
-    """Format human audit report into an IEEEtran `booktabs` LaTeX table."""
-    rows: list[str] = []
+def _append_human_audit_rows(rows: list[str], report: Mapping[str, Any], *, prefix: str = "") -> None:
+    p = f"{prefix} " if prefix else ""
     mvg = report.get("machine_vs_gold") if isinstance(report.get("machine_vs_gold"), Mapping) else {}
 
     if isinstance(report.get("stance"), Mapping):
@@ -673,7 +788,7 @@ def format_human_audit_latex(
         f1_str = f"{float(mg_s['macro_f1']):.4f}" if "macro_f1" in mg_s else "--"
         r_str = f"{float(mg_s['spearman_r']):.4f}" if "spearman_r" in mg_s else "--"
         rows.append(
-            f"Pair Stance (3-cls) & {int(st['num_samples'])} & "
+            f"{p}Pair Stance (3-cls) & {int(st['num_samples'])} & "
             f"{float(st['cohen_kappa_unweighted']):.4f} & {float(st['cohen_kappa_quadratic']):.4f} & "
             f"{f1_str} & {r_str} \\\\"
         )
@@ -683,7 +798,7 @@ def format_human_audit_latex(
         f1_str = f"{float(mg_h['macro_f1']):.4f}" if "macro_f1" in mg_h else "--"
         r_str = f"{float(mg_h['spearman_r']):.4f}" if "spearman_r" in mg_h else "--"
         rows.append(
-            f"Pair Hostility & {int(ho['num_samples'])} & "
+            f"{p}Pair Incivility (2-cls) & {int(ho['num_samples'])} & "
             f"{float(ho['cohen_kappa_unweighted']):.4f} & {float(ho['cohen_kappa_quadratic']):.4f} & "
             f"{f1_str} & {r_str} \\\\"
         )
@@ -697,10 +812,34 @@ def format_human_audit_latex(
         ia = report["inter_annotator"]
         r_str = f"{float(mvg['spearman_r']):.4f}" if "spearman_r" in mvg else "--"
         rows.append(
-            f"Thread $y_{{\\text{{polar}}}}$ (0--4) & {int(ia['num_threads'])} & "
+            f"{p}Thread $y_{{\\text{{polar}}}}$ (0--4) & {int(ia['num_threads'])} & "
             f"{float(ia['cohen_kappa_unweighted']):.4f} & {float(ia['cohen_kappa_quadratic']):.4f} & "
             f"-- & {r_str} \\\\"
         )
+
+
+def format_human_audit_latex(
+    report: Mapping[str, Any],
+    *,
+    caption: str = (
+        "Human Reliability Audit and Silver-Label Validity: Inter-Annotator Agreement "
+        "(Cohen's $\\kappa$ / Quadratic $\\kappa_w$) and Machine-vs.-Gold Alignment."
+    ),
+    label: str = "tab:human_audit",
+) -> str:
+    """Format single or multi-corpus human audit report into an IEEEtran `booktabs` LaTeX table."""
+    rows: list[str] = []
+    corpora = report.get("corpora")
+    if isinstance(corpora, Sequence) and not isinstance(corpora, (str, bytes)):
+        for entry in corpora:
+            if isinstance(entry, Mapping) and isinstance(entry.get("report"), Mapping):
+                _append_human_audit_rows(
+                    rows,
+                    entry["report"],
+                    prefix=str(entry.get("prefix") or ""),
+                )
+    else:
+        _append_human_audit_rows(rows, report)
 
     return "\n".join(
         [
@@ -738,6 +877,7 @@ def main() -> None:
     resolved_input = args.input
     if resolved_input is None:
         for candidate in (
+            Path("data/interim/human_audit_vi_120.csv"),
             Path("data/interim/human_audit_vi_300.csv"),
             Path("data/interim/human_audit_en_300.csv"),
             Path("data/interim/human_audit_300.csv"),

@@ -305,6 +305,7 @@ class SBiFAGAT(nn.Module):
         use_dir_mix: bool = True,
         use_camp_dipole: bool = True,
         use_dual_channel: bool = True,
+        use_polar_persistence_anchor: bool | None = None,
     ) -> None:
         super().__init__()
         if readout_mode not in {"attention", "mean"}:
@@ -327,6 +328,11 @@ class SBiFAGAT(nn.Module):
         self.use_dir_mix = bool(use_dir_mix)
         self.use_camp_dipole = bool(use_camp_dipole)
         self.use_dual_channel = bool(use_dual_channel)
+        self.use_polar_persistence_anchor = (
+            bool((not self.ablate_stance) and (not self.use_latent_edge_mlp))
+            if use_polar_persistence_anchor is None
+            else bool(use_polar_persistence_anchor)
+        )
 
         self.input_proj = TwoStreamNodeStem(
             in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout
@@ -415,6 +421,7 @@ class SBiFAGAT(nn.Module):
             cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
             predict_uncertainty=self.predict_uncertainty,
             mask_semantic_stats=bool(self.ablate_stance or self.ablate_hostility),
+            use_polar_persistence_anchor=self.use_polar_persistence_anchor,
         )
 
     def _prepare_edge_attr(
@@ -565,11 +572,21 @@ class SBiFAGAT(nn.Module):
                 edge_cnt = scatter(ones_e, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
                 has_edges = edge_cnt > 0.0
 
-                mu_pos = scatter(w_pos * h_dst, edge_batch, dim=0, dim_size=num_graphs, reduce="sum") / (
-                    sum_pos + 1.0
+                has_pos = sum_pos > 1e-6
+                has_neg = sum_neg > 1e-6
+                both_camps = has_pos & has_neg
+                zero_camp = node_emb.new_zeros((num_graphs, self.hidden_dim))
+                mu_pos = torch.where(
+                    has_pos,
+                    scatter(w_pos * h_dst, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+                    / sum_pos.clamp(min=1e-6),
+                    zero_camp,
                 )
-                mu_neg = scatter(w_neg * h_dst, edge_batch, dim=0, dim_size=num_graphs, reduce="sum") / (
-                    sum_neg + 1.0
+                mu_neg = torch.where(
+                    has_neg,
+                    scatter(w_neg * h_dst, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+                    / sum_neg.clamp(min=1e-6),
+                    zero_camp,
                 )
                 denom_e = edge_cnt.clamp(min=1.0)
                 frac_pos = torch.where(
@@ -578,9 +595,13 @@ class SBiFAGAT(nn.Module):
                 frac_neg = torch.where(
                     has_edges, (sum_neg / denom_e).clamp(0.0, 1.0), torch.zeros_like(sum_neg)
                 )
-                camp_balance = 4.0 * frac_pos * frac_neg
+                camp_balance = torch.where(
+                    both_camps,
+                    2.0 * torch.sqrt((frac_pos * frac_neg).clamp(min=0.0, max=0.25) + 1e-8),
+                    torch.zeros_like(frac_pos),
+                )
 
-                diff_camp = mu_pos - mu_neg
+                diff_camp = torch.where(both_camps, mu_pos - mu_neg, zero_camp)
                 z_dipole_polar = camp_balance * torch.sqrt(diff_camp.pow(2) + 1e-8)
                 z_dipole_signed = diff_camp
 
@@ -606,7 +627,8 @@ class SBiFAGAT(nn.Module):
         else:
             graph_emb = self.readout_norm(base_emb)
         c_stats = getattr(data, "cascade_stats", None) if self.use_cascade_stats else None
-        outputs = self.head(graph_emb, node_emb, cascade_stats=c_stats)
+        early_yp = getattr(data, "early_y_polar", None) if self.use_polar_persistence_anchor else None
+        outputs = self.head(graph_emb, node_emb, cascade_stats=c_stats, early_y_polar=early_yp)
         return outputs, gamma_td_layers, gamma_bu_layers
 
     def forward(self, data: Any) -> dict[str, Tensor]:
