@@ -11,14 +11,13 @@
     "tables_ablation_pheme.tex",
     "tables_mechanisms_pheme.tex",
     "tables_main_vn.tex",
+    "tables_temporal_vn.tex",
     "tables_ablation_vn.tex",
     "tables_mechanisms_vn.tex",
     "tables_upfd.tex",
     "tables_efficiency.tex"
   ],
-  "missing_tables": [
-    "tables_temporal_vn.tex"
-  ],
+  "missing_tables": [],
   "present_figures": [
     "figures/pheme/fig1_umap_polarization.pdf",
     "figures/pheme/fig2_early_k_curve.pdf",

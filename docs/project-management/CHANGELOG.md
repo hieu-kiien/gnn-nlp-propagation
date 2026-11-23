@@ -1,5 +1,13 @@
 # SBi-FAGAT: Changelog & Audit Modification Record
 
+## [v3.1 — Kaggle Version #5 VN Temporal Holdout, v3 ReZero Ablation & Notebook Guard] - `results/kaggle-v5-vn-v3-temporal-ablation`
+
+- **Kaggle Version #5 Track 1 VN Completion (`scriptVersionId=373122344`, `1h 32m 24s`, `0%` local CPU):**
+  - Executed `scripts.run_experiments --split-mode temporal --edge-source teacher` (`225` Test cascades): `Early-K Persistence` collapses under chronological shift ($R^2_{\text{polar}} = -5.4386$, RMSE $= 0.0874$), whereas all learned architectures generalize positively ($R^2_{\text{polar}} \in [0.0481, 0.0815]$); `SBiFAGAT` leads Spearman polarization rank correlation ($\rho = 0.3058 \pm 0.0187$, RMSE $= 0.0334 \pm 0.0009$, $r = 0.3338 \pm 0.0319$), validation-selected `TemporalStanceMLP` reaches RMSE $= 0.0330 \pm 0.0004$ ($R^2_{\text{polar}} = 0.0815 \pm 0.0198$, $r = 0.3377 \pm 0.0112$, Holm--Bonferroni $p_{\text{adj}} = 1.00$), and `FAGCN` leads size regression (MSLE $= 0.1881 \pm 0.0129$, $R^2_{\text{size}} = 0.2586 \pm 0.0509$).
+  - Executed refreshed 5-seed v3 ReZero `scripts.run_ablation` (`tables_ablation_vn.tex`, `results_ablation_vn.json`, `figures/vn/fig2_early_k_curve.{pdf,svg}`): `SBiFAGAT (Full)` achieves MSLE $= 0.1580 \pm 0.0070$, $R^2_{\text{size}} = 0.2925 \pm 0.0315$, RMSE $= 0.0369 \pm 0.0003$, $R^2_{\text{polar}} = 0.0777 \pm 0.0141$, $r = 0.2939 \pm 0.0223$, $\rho = 0.2335 \pm 0.0180$, comparable to matched `BiEdgeGATv2 (Matched)` ($R^2_{\text{polar}} = 0.0789 \pm 0.0172$, $p_{\text{adj}} = 1.00$); removing Camp Dipole \& Moments drops $R^2_{\text{polar}}$ to $0.0503 \pm 0.0208$ and removing the signed Conflict Gate drops it to $0.0527 \pm 0.0258$.
+  - Integrated all 6 Kaggle artifacts into `paper/`, re-ran `scripts.assemble_paper_artifacts --paper-dir paper` (`missing_tables=[]`, `missing_figures=[]`, `latex_underscore_issues={}`), and updated `paper/main.tex` (~93% overall completion; 100% Track 1 VN automated deliverables).
+- **Notebook Tier 2A Guard (`notebooks/colab_gpu_v3_gnn_benchmarks.ipynb`):** Hardened Cell 5 (`colab-v3-pheme-tier2a`) to check `_meta.min_total_replies_extracted` in `data/processed/pheme/nlp_features.pt` before launching Tier 2A (`min_total_replies=15`), cleanly skipping if the attached bundle reflects legacy Cohort B (`min_total_replies_extracted=25`) so Cell 6 (`sbifagat_v3_gpu_results.zip`) still completes.
+
 ## [v3.0 — EGM Full Mathematical, Audit & Cloud-GPU Overhaul] - `fix/egm-audit-hardening`
 
 - **PII, Doxxing & Spam Hygiene (`arctic_shift_vn.py`, `dual_edge_scorer.py`):** Scrubbed `112` crypto/spam rows across local `data/{interim,processed}/vn/nodes.parquet` while preserving cascade IDs/edges, and blocked `[deleted]`/spam/PII/redacted strings from blind audit exports.
