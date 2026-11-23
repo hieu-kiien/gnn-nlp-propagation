@@ -1,0 +1,64 @@
+{
+  "datasets": [
+    {
+      "name": "pheme",
+      "data_dir": "/kaggle/working/gnn-nlp-propagation/data/processed/pheme",
+      "k_horizon": 20,
+      "min_total_replies": 25,
+      "polar_target_mode": "future_only",
+      "total_nodes": 101342,
+      "total_edges": 94917,
+      "raw_cascades": 6425,
+      "eligible_cascades": 874,
+      "raw_topics": 9,
+      "eligible_topics": 6,
+      "median_replies": 11.0,
+      "mean_replies": 14.77307392996109,
+      "p90_replies": 29.0,
+      "median_duration_hours": 2.5258333333333334,
+      "mean_duration_hours": 14.559228231733679,
+      "languages": {
+        "en": 101342
+      },
+      "source_datasets": {
+        "pheme": 101342
+      },
+      "rumor_label_counts": {
+        "true": 1067,
+        "unverified": 697,
+        "false": 638,
+        "non-rumor": 4023
+      },
+      "split_cascade_counts": {
+        "train": 570,
+        "val": 228,
+        "test": 76
+      },
+      "topic_splits_source": "/kaggle/working/gnn-nlp-propagation/data/processed/pheme/topic_splits.json",
+      "early_k_persistence": {
+        "num_cascades": 76,
+        "msle": 0.11856515787352262,
+        "mae": 0.29678974548975623,
+        "rmse_size": 0.34433291720880044,
+        "r2_size": -0.21355686954457198,
+        "spearman_size": 0.0,
+        "rmse": 0.016148877678187845,
+        "mae_polar": 0.00901686754612222,
+        "r2_polar": -0.6705198807459676,
+        "pearson_r": 0.2953750468879383,
+        "spearman_polar": 0.4240874914559125,
+        "mean_true_polar": 0.011745353411912985,
+        "mean_early_polar": 0.007444128398311019
+      },
+      "target_stats": {
+        "num_cascades": 874,
+        "y_size_mean": 3.7291885281591175,
+        "y_size_std": 0.44998947075767326,
+        "y_polar_mean": 0.010416323695879639,
+        "y_polar_std": 0.014017848736424346,
+        "y_bimodality_mean": 0.4411871431425248,
+        "y_assortativity_mean": -0.026355478160587583
+      }
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 # SBi-FAGAT: Test & Verification Report
 
 **Platform:** Windows (`win32`, CPU verification pass) + GitHub Actions Ubuntu (`Python 3.11`)  
-**Suite Scope:** 15 test modules in `tests/` — **114 passed, 0 failed** (unified 2D architecture, multi-task KL-BCE optimization, zero data leakage, EGM Round-1 `B1–B10`/`M1–M8` + Round-2 3-Goldfish adversarial audit remediations: detached BFS depth-30 gradient stability, Holm-Bonferroni `p < 0.01` bootstrap resolution, T4 DeBERTa AMP policy, UPFD classification-only comparator, `min_total_replies_extracted` guard, crawler fault recovery, 50-tree future-window human audit)
+**Suite Scope:** 17 test modules in `tests/` — **124 passed, 0 failed** (unified 2D architecture, multi-task KL-BCE optimization, zero data leakage, EGM Round-1 `B1–B10`/`M1–M8` + Round-2 3-Goldfish adversarial audit remediations: detached BFS depth-30 gradient stability, Holm-Bonferroni `p < 0.01` bootstrap resolution, T4 DeBERTa AMP policy, UPFD classification-only comparator, `min_total_replies_extracted` guard, crawler fault recovery, 50-tree future-window human audit, lossless NLP length-bucketing/mechanisms, and strict-blind local audit UI)
 
 ---
 
@@ -25,8 +25,10 @@
 | :--- | :--- |
 | `tests/test_egm_audit_remediation.py` | Full EGM audit regressions (`B1–B10`, `M1–M8`): `min_total_replies` LOO teacher coverage, `edge_source="auto"` Student consistency, $O(N)$ JSONL teacher delta resume, crawl `.state.json` + salted PHEME, LaTeX `_` escaping & `table*` + RFC JSON, NLI double-contradiction neutral + 50-tree VN blind audit, direction-aware stars + exact $F=4$ LOO permutation + topic-cluster bootstrap, continuous `y_polar` + fixed future $K$-window, Camp Dipole/Dir-GNN/Dual-Channel ablations + `BiEdgeGATv2` + `TextMLP` topology mask + `assemble_paper_artifacts` + UPFD fault isolation |
 | `tests/test_egm_fixes.py` | EGM hardening fixes (`F1–F6`), `node_backbone`, fair model parity, `min_total_replies=25` |
+| `tests/test_human_audit_ui.py` | Localhost blind audit Web UI: `127.0.0.1` binding, `403` 5-CSV allowlist, role blinding, atomic UTF-8 BOM saves + `.bak`, `compute_kappa`/`audit_vn_50_trees` strict-adjudication compatibility, native `<dialog>` & IME-safe UI invariants |
 | `tests/test_kaggle_t4x2_v2_pipeline.py` | Unified 2D discourse labels, NLI verbalizer simplex, `DualHeadCrossEncoder`, `auto_loop`, smoke runner & notebooks |
 | `tests/test_live_predictor_audit.py` | Live predictor untrained guard, `--allow-untrained`, corrupt checkpoints, `--demo-offline` |
+| `tests/test_mechanisms_and_optimizations.py` | Lossless NLP length-bucketing/DP wrappers, mechanistic counterfactual edge/hop/polarity interventions, LaTeX & underscore validation |
 | `tests/test_nlp_and_features.py` | Dual teachers, *Ancestor-Conditioned SpanPool*, finite `.pt` bank extraction |
 | `tests/test_no_leakage.py` | Strict $K=20$ truncation, `future_only` $y_{\text{polar}}$, zero post-$t_K$ leakage |
 | `tests/test_overfit_20.py` | Step 1 20-cascade overfit, 50/50 dipole cancellation, `TwoStreamNodeStem` topology mask, fair `hidden_dim=64` |
