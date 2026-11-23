@@ -181,6 +181,10 @@ This manuscript template strictly forbids pre-filled or synthetic metric numbers
   \input{tables_upfd}
 }{}
 
+\IfFileExists{tables_upfd_politifact.tex}{
+  \input{tables_upfd_politifact}
+}{}
+
 \IfFileExists{tables_human_audit.tex}{
   \input{tables_human_audit}
 }{}
@@ -273,7 +277,7 @@ For qualitative interpretability, \texttt{extract\_edge\_gates} ranks edges by g
 }{}
 
 \subsection{Mechanistic Coupling and Counterfactual Moderation Analysis}
-To move beyond black-box accuracy and examine how early affective hostility and ideological disagreement shape downstream propagation, \texttt{scripts/analyze\_mechanisms.py} conducts empirical regime stratification (low conflict, civil disagreement, hostile conflict), trigger-edge depth profiling ($d=1$ vs.\ $d \ge 2$), and non-mutating counterfactual interventions on trained test checkpoints. Generated LaTeX summaries and paired bootstrap shift plots populate automatically below once GPU runs complete.
+To move beyond black-box accuracy and examine how early affective hostility and ideological disagreement shape downstream propagation, \texttt{scripts/analyze\_mechanisms.py} conducts empirical regime stratification (low conflict, civil disagreement, hostile conflict), trigger-edge depth profiling ($d=1$ vs.\ $d \ge 2$), and non-mutating counterfactual interventions on trained test checkpoints. Generated LaTeX summaries and paired bootstrap shift plots are included below.
 
 \IfFileExists{tables_mechanisms_pheme.tex}{
   \input{tables_mechanisms_pheme}

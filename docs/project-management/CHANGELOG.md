@@ -1,5 +1,11 @@
 # SBi-FAGAT: Changelog & Audit Modification Record
 
+## [Track 1 & Track 2 Results + Blind Audit UI] - `2575295`..`5332750`
+
+- **Model, Loss & Ingestion Hardening (`2575295`, `3215ede`, `11637ed`):** Added CleanRes Camp Dipole readout, decoupled `polar_head`, balanced 2:1 multi-task loss, shallow depth-6 `/kaggle/input` PHEME auto-discovery, and parallelized GCS-FUSE thread parsing (`os.scandir` + `ThreadPoolExecutor`).
+- **Track 1 VN & Track 2 PHEME+UPFD Empirical Artifacts (`338651b`, `5332750`):** Executed both Kaggle `T4 x 2` tracks across `[42, 100, 2024, 777, 999]`, exported unified EDA, efficiency, 5-seed main/LOO/ablation/mechanisms & UPFD (GossipCop + PolitiFact) LaTeX/JSON artifacts plus 8 vector figures (`pheme` + `vn`), verified via `scripts/assemble_paper_artifacts.py` (`0` missing tables/figures, `0` unescaped `_`).
+- **Strict-Blind Gate 1 Web Studio (`5332750`):** Added localhost-only Vietnamese Web UI (`scripts/human_audit_ui.py`) with 5-CSV allowlist (`403` guard on sealed machine keys), dual-annotator blinding, atomic `utf-8-sig` saves + `.bak`, native `<dialog closedby="any">`, IME-safe Enter handling, and `tests/test_human_audit_ui.py` (`17` test modules / `124` passing tests).
+
 ## [EGM Hardening] - Full 5-Goldfish Audit Remediation (`B1–B10`, `M1–M8`)
 
 ### Critical Blockers Resolved (`B1–B10`)

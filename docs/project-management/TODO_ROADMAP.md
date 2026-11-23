@@ -4,8 +4,8 @@
 | :--- | :--- | :--- | :--- | :--- |
 | **P0** | Scientific Integrity & Architecture Upgrade | Steps 1–3 complete: Dual-channel Dir-GNN `SBiFAGAT`, 10D `struct_x`, `SpanPool`, Symmetric NLI + Hostility 2D teachers, segment-isolated CE, KL-calibrated BCE + EMA + best-val seed selection, fair 8-model parity (`hidden_dim=64`), canonical split locks | `SBIF-27`, `SBIF-28`, `SBIF-47` | **Done** |
 | **P1** | Repo Governance & Publication Tooling | GitHub CI (`pytest`), PR template, Branch Ruleset, `export_dataset_stats.py`, efficiency LaTeX, unified `paper/main.tex` | `SBIF-42`, `SBIF-47` | **Done** |
-| **P2** | Real Data Ingestion & Offline NLP (Step 4) | Ingest PHEME + Arctic Shift VN, blind 300-pair + 50-tree VN audit (`compute_kappa.py --strict-adjudication`), extract 2D `.pt` features & canonical splits on Kaggle `T4 x 2` | `SBIF-14..26`, `SBIF-48`, `SBIF-49` | **Active (Needs GPU)** |
-| **P3** | 5-Seed Benchmarks, Ablations & Camera-Ready Paper (Step 4) | Train 8 models across `[42, 100, 2024, 777, 999]` (`hidden_dim=64`), LOO PHEME, $K$ ablation, `Early-K Persistence`, UPFD, figures & compile `paper/main.tex` | `SBIF-30..46`, `SBIF-50` | **Planned (Step 4)** |
+| **P2** | Real Data Ingestion, Offline NLP & Human Audit | PHEME + Arctic Shift VN ingestion, offline 2D NLP `.pt` & canonical splits **Done** (`member1_vn` + `member2_en`). **Remaining:** Gate 1 blind human audit (`pilot` 30 pairs, `300` pairs, `50` VN Test trees via `scripts/human_audit_ui.py` -> `compute_kappa.py` & `audit_vn_50_trees.py`) | `SBIF-14..26`, `SBIF-48`, `SBIF-49` | **Active (Human Audit)** |
+| **P3** | 5-Seed Benchmarks, Ablations & Camera-Ready Paper | 8-model 5-seed benchmarks, LOO PHEME, $K$ ablation, mechanisms, UPFD (GossipCop & PolitiFact), EDA, efficiency & 8 vector figures **Done & Assembled** (`paper/`). **Remaining:** integrate Gate 1 human audit tables + final prose/compile `paper/main.tex` PDF | `SBIF-30..46`, `SBIF-50` | **Active (Paper Finalization)** |
 
 ---
 

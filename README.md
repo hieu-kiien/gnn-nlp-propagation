@@ -59,6 +59,8 @@ Kiến trúc đề xuất **SBi-FAGAT** (*Stance-Guided Bidirectional Frequency-
 │   ├── run_phase2.sh           # Pipeline Dual-Teacher NLI + Hostility -> DualHeadCrossEncoder & .pt (2D)
 │   ├── compute_kappa.py        # Tính Cohen's Kappa, Machine-vs-Gold, chấm cấp cây & xuất bảng LaTeX
 │   ├── audit_vn_50_trees.py    # Xuất phiếu chấm mù 50 cây Test VN & đánh giá tương quan y_polar
+│   ├── human_audit_ui.py       # Phòng chấm tay Web UI tiếng Việt chạy cục bộ (chấm mù 2 người, lưu CSV an toàn)
+│   ├── analyze_mechanisms.py   # Phân tầng xung đột & can thiệp phản thực chứng (counterfactual)
 │   ├── assemble_paper_artifacts.py # Gộp bảng EDA/Efficiency từ 2 track Kaggle & kiểm tra cú pháp LaTeX
 │   ├── benchmark_efficiency.py # Đo #Params, tốc độ suy luận/huấn luyện & RAM/VRAM 8 mô hình (LaTeX/JSON)
 │   ├── demo_research_walkthrough.py # Demo minh họa cơ chế GCN vs SBi-FAGAT trên CPU (<5s)
@@ -112,6 +114,17 @@ python -m scripts.predict_live_thread --reddit-url "https://www.reddit.com/r/Vie
 
 # Chạy kiểm thử cấu trúc (dry-run) bằng trọng số ngẫu nhiên:
 python -m scripts.predict_live_thread --url "https://www.reddit.com/r/VietNam/comments/..." --allow-untrained
+```
+
+### Chấm tay Kiểm định Mù (Gate 1 Human Audit Web UI)
+
+```bash
+# Mở phòng chấm tay Web UI tiếng Việt cục bộ tại http://127.0.0.1:8765/
+python -m scripts.human_audit_ui
+
+# Sau khi Người 1, Người 2 chấm độc lập và chốt Gold xong:
+python -m scripts.compute_kappa --input data/interim/human_audit_vi_300.csv --strict-adjudication --output-json paper/results_human_audit_vi.json
+python -m scripts.audit_vn_50_trees --evaluate --strict-adjudication --audit-csv data/interim/human_audit_vn_50_trees.csv --output-json paper/results_human_audit_vn_50_trees.json
 ```
 
 ---
