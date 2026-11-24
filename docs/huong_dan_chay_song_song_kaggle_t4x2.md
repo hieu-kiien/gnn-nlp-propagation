@@ -1,6 +1,6 @@
 # Hướng dẫn Chạy Song Song trên Kaggle `GPU T4 x 2` (32 GB VRAM) — Pipeline 2D Hợp nhất
 
-Tài liệu này hướng dẫn trực tiếp cho **2 thành viên trong nhóm** cách đưa mã nguồn mới nhất từ GitHub lên **Kaggle `T4 x 2`** (mỗi bạn có **30 giờ GPU miễn phí/tuần**, tổng **60 giờ GPU/tuần**) để chạy song song không phải chờ nhau trên **kiến trúc hai tầng 2D hợp nhất** (`hidden_dim = 64`, VN `K=20, min_total_replies=25` và PHEME Tier 2A `K=10, min_total_replies=15`, kèm sổ tay Tầng 2 `kaggle_macro_signed_gnn_t4.ipynb` cho Signed Link Prediction GPU).
+Tài liệu này hướng dẫn trực tiếp cho **2 thành viên trong nhóm** cách đưa mã nguồn mới nhất từ GitHub lên **Kaggle `T4 x 2`** (mỗi bạn có **30 giờ GPU miễn phí/tuần**, tổng **60 giờ GPU/tuần**) để chạy song song không phải chờ nhau trên **kiến trúc hai tầng 2D hợp nhất** (`hidden_dim = 64`, VN `K=20, min_total_replies=25` và PHEME giảm cửa sổ quan sát `K=10, min_total_replies=15`, kèm sổ tay Tầng 2 `kaggle_macro_signed_gnn_t4.ipynb` cho Signed Link Prediction GPU).
 
 ---
 
@@ -39,7 +39,7 @@ Hệ thống AI của nhóm hoạt động theo **dây chuyền 3 tầng sạch 
   ```bash
   python -m scripts.assemble_paper_artifacts --paper-dir paper
   ```
-  Lệnh này gộp bảng EDA (`tables_dataset_eda.tex`), bảng hiệu năng (`tables_efficiency.tex`), bảng kiểm định con người (`tables_human_audit.tex` nếu đã có JSON báo cáo), kiểm tra sạch lỗi `_` LaTeX và xuất báo cáo tồn kho `paper/assembly_manifest.json`.
+  Lệnh này gộp bảng EDA (`tables_dataset_eda.tex`), bảng mạng xã hội vĩ mô (`tables_macro_network.tex`), bảng hiệu năng (`tables_efficiency.tex`), bảng kiểm định con người (`tables_human_audit.tex` nếu đã có JSON báo cáo), kiểm tra sạch lỗi `_` LaTeX và xuất báo cáo tồn kho `paper/assembly_manifest.json`.
 
 ### Cách B — Chia mỗi người chuyên trách một loại Mô hình (NLP vs GNN)
 * **Thành viên 1 (Chuyên NLP):** Đổi `ROLE = "model_nlp_only"` trong sổ tay 1 để train Teacher/Student 2D và xuất `data/processed/{vn,pheme}/nlp_features.pt`.

@@ -39,5 +39,10 @@
     "figures/vn/fig4_counterfactual_interventions.pdf"
   ],
   "missing_figures": [],
+  "optional_figures_present": [
+    "figures/vn/fig5_macro_signed_network.pdf",
+    "figures/pheme/fig5_macro_signed_network.pdf"
+  ],
+  "optional_figures_missing": [],
   "latex_underscore_issues": {}
 }

@@ -7,7 +7,7 @@ Tài liệu này trình bày đánh giá thiết kế tổng quan (theo chuẩn 
 ## 0. Tóm tắt Thiết kế & Đánh giá Kỹ thuật (Heilmeier Assessment)
 
 ### 0.1. Mục tiêu Phi kỹ thuật & Đối tượng Thụ hưởng
-- **Bài toán thực tế & Phạm vi phân tích**: Khi một thông tin nóng hoặc tin thất thiệt bắt đầu lan truyền trên mạng xã hội, nền tảng kiểm duyệt (*Trust & Safety*) và nhóm ứng phó khủng hoảng truyền thông chỉ có một cửa sổ thời gian rất ngắn (tối đa $K = 20$ bình luận đầu tiên cho VN hoặc $K = 10, N_{\text{reply}} \ge 15$ cho PHEME Tier 2A) trước khi làn sóng chia rẽ hoặc tin giả bùng phát vượt kiểm soát. Hệ thống giải quyết đồng thời hai cấp độ: **Tầng 1** mô hình hóa ở **cấp chuỗi thảo luận vi mô (cascade-level, $|\mathcal{V}_K| \le 21$)** với vector cạnh 2D ($s_{uv}, h_{uv}$), trong khi **Tầng 2** mô hình hóa cấu trúc phân cực và liên kết có dấu trên đồ thị người dùng vĩ mô xuyên nhiều chủ đề qua thời gian ($\mathcal{G}_{\text{macro}}$, Mục 6).
+- **Bài toán thực tế & Phạm vi phân tích**: Khi một thông tin nóng hoặc tin thất thiệt bắt đầu lan truyền trên mạng xã hội, nền tảng kiểm duyệt (*Trust & Safety*) và nhóm ứng phó khủng hoảng truyền thông chỉ có một cửa sổ thời gian rất ngắn (tối đa $K = 20, N_{\text{reply}} \ge 25$ bình luận đầu tiên cho VN hoặc ngoại lệ giảm cửa sổ quan sát $K = 10, N_{\text{reply}} \ge 15$ cho PHEME) trước khi làn sóng chia rẽ hoặc tin giả bùng phát vượt kiểm soát. Hệ thống giải quyết đồng thời hai cấp độ: **Tầng 1** mô hình hóa ở **cấp chuỗi thảo luận vi mô (cascade-level, $|\mathcal{V}_K| \le 21$)** với vector cạnh 2D ($s_{uv}, h_{uv}$), trong khi **Tầng 2** mô hình hóa cấu trúc phân cực và liên kết có dấu trên đồ thị người dùng vĩ mô xuyên nhiều chủ đề qua thời gian ($\mathcal{G}_{\text{macro}}$, Mục 6).
 - **Mục tiêu**: Xây dựng kiến trúc đồ thị có dấu hai tầng: **Tầng 1 (Early Cascade)** dự đoán sớm từ bài đăng gốc và tối đa $20$ tương tác đầu để ước lượng đồng thời: (1) quy mô lan rộng cuối kỳ ($y_{\text{size}}$), (2) mức độ chia rẽ hai phe ủng hộ–phản bác về cuối kỳ ($y_{\text{polar}}$), (3) xác thực tin đồn/tin giả ($y_{\text{rumor}}$ trên PHEME), và (4) phân tầng xung đột & phân tích độ nhạy nhiễu đặc trưng cạnh hậu huấn luyện (*observational edge-feature sensitivity*, `scripts/analyze_mechanisms.py`); **Tầng 2 (Macro Signed Network)** chiếu các tương tác người dùng xuyên chuỗi lên đồ thị xã hội có dấu toàn cục ($\mathcal{G}_{\text{macro}}$).
 
 ### 0.2. Hiện trạng & Điểm mù Kỹ thuật
@@ -51,14 +51,14 @@ Tài liệu này trình bày đánh giá thiết kế tổng quan (theo chuẩn 
 | $\mathbf{h}_v^{(0)}$ | $\mathbb{R}^{d}$ | Biểu diễn nút sau `TwoStreamNodeStem` ($d = 64$ mặc định) |
 | $\mathbf{a}_{uv} = [s_{uv}, h_{uv}]^\top$ | $[-1, 1] \times [0, 1]$ | Vector cạnh 2D (lập trường $s_{uv}$ + độ gay gắt $h_{uv}$) |
 | $\gamma_{uv}^{(l, \delta)}, \alpha_{uv}^{\text{exc}}$ | $(-1, 1), (0, 1)$ | Cổng tần số có dấu (kênh phân cực) và cổng kích thích không dấu (kênh cường độ) |
-| $\mathbf{z}_{\mathcal{G}_K}$ | $\mathbb{R}^{2d}$ | Biểu diễn toàn đồ thị chiếu từ $5d + 6$ chiều sau pooling TD/BU và camp dipoles |
+| $\mathbf{z}_{\mathcal{G}_K}$ | $\mathbb{R}^{2d}$ | Biểu diễn toàn đồ thị chiếu từ $3d + 6$ chiều sau pooling TD/BU và camp dipoles |
 | $y_{\text{size}}, y_{\text{polar}}, y_{\text{rumor}}$ | $\mathbb{R}_{\ge 0}, [0, 1], \{0..C-1\}$ | Quy mô $\ln(1+N_{\text{total}})$, chỉ số phân cực tương lai (`future_only`), nhãn tin đồn |
 
 ---
 
 ## 2. Định nghĩa Cây Lan truyền Sớm $\mathcal{G}_K$ & Bất biến Chống Rò rỉ
 
-Xét cây hội thoại hoàn chỉnh $\mathcal{G}_{\text{full}} = (\mathcal{V}_{\text{full}}, \mathcal{E}_{\text{full}})$ thỏa nhân quả thời gian $t_u \le t_v$. Sắp xếp phản hồi theo bộ khóa từ điển $(t_v, \ell_v, \texttt{node\_id}(v))$ và lọc $N_{\text{total}} \ge \texttt{min\_total\_replies} = 25$:
+Xét cây hội thoại hoàn chỉnh $\mathcal{G}_{\text{full}} = (\mathcal{V}_{\text{full}}, \mathcal{E}_{\text{full}})$ thỏa nhân quả thời gian $t_u \le t_v$. Sắp xếp phản hồi theo bộ khóa từ điển $(t_v, \ell_v, \texttt{node\_id}(v))$ và lọc $N_{\text{total}} \ge \texttt{min\_total\_replies} = 25$ trên VN (ngoại lệ giảm cửa sổ quan sát $K=10, N_{\text{total}} \ge 15$ trên PHEME):
 $$\mathcal{V}_K = \{r\} \cup \left\{v_1, \dots, v_{\min(K, N_{\text{total}})}\right\}, \qquad \mathcal{E}_K = \left\{(u, v) \in \mathcal{E}_{\text{full}} \mid u \in \mathcal{V}_K \land v \in \mathcal{V}_K\right\}.$$
 
 Mọi thành phần đặc trưng trong `EarlyCascadeDataset` đều tuân thủ bất biến nhân quả tại $t \le t_K$:
@@ -126,11 +126,11 @@ Nhằm khắc phục giới hạn độ sâu nhỏ của từng chuỗi đơn l�
 
 1. **Hình học Phân cực Vĩ mô (Sparse CPU Analytics, `scripts/run_macro_signed_network.py --analysis-only`):**
    - Các cặp người dùng vô hướng có lập trường trung bình $|\bar{s}_{uv}| \ge 0.1$ nhận trọng số có dấu $w_{uv} = \operatorname{sign}(\bar{s}_{uv})|\bar{s}_{uv}|\ln(1 + c_{uv})$ qua $c_{uv}$ tương tác.
-   - Trên thành phần liên thông lớn nhất, phân đôi quang phổ bằng vector riêng thứ hai của **Signed Normalized Laplacian** $\bar{L}_{\text{signed}} = I - \bar{D}^{-1/2} W \bar{D}^{-1/2}$ (*Kunegis et al., SDM 2010*) thành hai phe $(\mathcal{C}_0, \mathcal{C}_1)$ để đo:
-     - **Structural Balance Theory** (*Cartwright & Harary, 1956*): tỷ lệ tam giác cân bằng $(N_{+++} + N_{+--}) / N_{\triangle}$ và kiểm định $z$-score trước $100$ hoán vị dấu bảo toàn bậc nút.
+   - Trên thành phần liên thông lớn nhất, phân đôi quang phổ bằng vector riêng nhỏ nhất đầu tiên (`evecs[:, 0]`) của **Signed Normalized Laplacian** $\bar{L}_{\text{signed}} = I - \bar{D}^{-1/2} W \bar{D}^{-1/2}$ (*Kunegis et al., SDM 2010*) thành hai phe $(\mathcal{C}_0, \mathcal{C}_1)$ để đo:
+     - **Structural Balance Theory** (*Cartwright & Harary, 1956*): tỷ lệ tam giác cân bằng $(N_{+++} + N_{+--}) / N_{\triangle}$ và kiểm định $z$-score trước $100$ hoán vị dấu đều toàn cục.
      - **Signed Modularity ($Q_{\text{signed}} = Q^+ - Q^-$)** và **Garimella Random Walk Controversy (RWC)** trên cụm nút bậc cao của hai phe.
      - Chênh lệch tỷ lệ đối đầu ($s_{uv} \le -0.1$) và mức gay gắt ($h_{uv} \ge 0.5$) giữa các tương tác nội phe vs. liên phe.
 2. **Dự báo Liên kết Có dấu Theo Thời gian Chống Rò rỉ (`build_temporal_signed_link_dataset`):**
    - Toàn bộ cạnh có dấu ($|s_{uv}| \ge 0.1$) được tách tuyến tính theo mốc UTC (`70%/15%/15%`) sao cho $t_{\text{train}} < t_{\text{val}} < t_{\text{test}}$.
-   - Vector đặc trưng người dùng $x_u^{\text{macro}} = [\bar{\mathbf{e}}_u^{\text{Span}} \Vert \mathbf{a}_u^{\text{4D}}] \in \mathbb{R}^{772}$ chỉ tổng hợp nhúng văn bản tại $t \le t_{\text{train}}^{\max}$ kèm **4 chiều hoạt động không dấu** ($\ln(1+\text{posts})/5$, $\ln(1+\text{cascades})/5$, $\ln(1+\text{out})/5$, $\ln(1+\text{in})/5$) để loại bỏ rò rỉ dấu bậc 1 và trả về $0$ tuyệt đối cho người dùng mới chỉ xuất hiện ở Val/Test.
+   - Vector đặc trưng người dùng $x_u^{\text{macro}} = [\bar{\mathbf{e}}_u^{\text{Span}} \Vert \mathbf{a}_u^{\text{4D}}] \in \mathbb{R}^{772}$ chỉ tổng hợp nhúng văn bản tại $t \le t_{\text{train}}^{\max}$ kèm **4 chiều hoạt động không dấu** ($\ln(1+\text{posts})/5$, $\ln(1+\text{cascades})/5$, $\ln(1+\text{out})/5$, $\ln(1+\text{in})/5$) để loại bỏ rò rỉ dấu bậc 1 và trả về $0$ cho người dùng chưa có bài đăng nào trước $t_{\text{train}}^{\max}$ (người dùng chỉ có bài trung lập hoặc dưới ngưỡng trước mốc cắt vẫn giữ nhúng tiền mốc cắt).
    - Khi huấn luyện theo mini-batch, mọi cạnh trong cùng cặp vô hướng $\{u, v\}$ của batch giám sát được che khỏi đồ thị truyền thông điệp để mô hình không thể đọc trực tiếp $e_{uv}$; thi đấu công bằng 5 hạt giống ở `hidden_dim = 64` gồm `UserTextMLP`, `StandardGCN`, `StandardGATv2`, `SGCN`, `FAGCN` và `SBiFAGAT-Link`.

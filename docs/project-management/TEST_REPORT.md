@@ -12,9 +12,10 @@
 | **Python** | CPython | `>=3.10` | `3.13.14` |
 | **PyTorch** | `torch` | `>=2.3.0` | `2.15.0+cpu` |
 | **PyG** | `torch-geometric` | `>=2.5.0` | `2.8.1` |
-| **Transformers** | `transformers` | `>=4.38.0,<5.0.0` | `5.23.0` (local) / `4.x` (Kaggle & CI) |
+| **Transformers** | `transformers` | `>=4.38.0,<5.0.0` | `5.23.0` (local Windows env; note `<5.0.0` pinned for Kaggle & CI) |
 | **Arrow / Tabular** | `pyarrow`, `pandas` | `>=14.0.0` / `>=2.1.0` | `25.0.1` / `3.1.1` |
 | **Scientific** | `numpy`, `scipy`, `scikit-learn` | `>=1.24.0,<3.0.0` / `>=1.11.0` / `>=1.3.0` | `2.4.6` / `1.18.1` / `1.9.1` |
+| **Web / PDF Tools** | `fastapi`, `flask`, `uvicorn`, `pypdf` | *(local tooling)* | `0.139.0` / `3.1.3` / `0.51.0` / `6.14.2` |
 | **Test Runner** | `pytest` | `>=8.0.0` | `9.1.0` |
 
 ---
