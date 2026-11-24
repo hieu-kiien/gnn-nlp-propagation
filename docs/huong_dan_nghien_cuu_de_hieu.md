@@ -30,12 +30,17 @@ Hãy tưởng tượng lúc 8 giờ sáng, một người đăng một bài gây
 
 ---
 
-## 3. Tại sao GCN truyền thống thất bại, còn SBi-FAGAT lại hiệu quả?
+## 3. Kết quả thực nghiệm thực tế: Giới hạn cây nhỏ vs. Sức mạnh Mạng người dùng Tầng 2
 
 * **Bệnh "San phẳng quan điểm" (Over-smoothing) của GCN thường (`StandardGCN`, `BiGCN`)**:  
   GNN thông thường mặc định **cộng trung bình** vector của bạn với người phản bác bạn. Khi Phe Ủng hộ ($+1$) và Phe Phản đối ($-1$) cãi nhau kịch liệt ở cùng một nhánh, GCN cộng trung bình lại thành $0$ (**trung lập giả tạo**)!
-* **Cách SBi-FAGAT (2D hợp nhất) giải quyết**:  
-  Nhờ đọc trực tiếp cặp $[s_{uv}, h_{uv}]^\top$, kênh phân cực của `StanceGuidedFAConv` sinh cổng $\gamma_{uv} < 0$ trên cạnh phản bác để trừ ngược hướng phe đối lập (kèm hàm kích hoạt lẻ đối xứng $x + 0.2\tanh(x)$), đồng thời kênh kích thích $\alpha_{uv}^{\text{exc}}$ giữ lại năng lượng tranh cãi giúp dự báo bùng nổ quy mô $y_{\text{size}}$ và độ chia rẽ $y_{\text{polar}}$ ngay từ 20 bình luận đầu!
+* **Cách `SBi-FAGAT` xử lý & Thực tế số liệu đo được**:  
+  - Nhờ đọc cặp $[s_{uv}, h_{uv}]^\top$, kênh phân cực của `StanceGuidedFAConv` sinh cổng $\gamma_{uv} < 0$ trên cạnh phản bác để đẩy ngược phe đối lập (kèm hàm kích hoạt lẻ $x + 0.2\tanh(x)$), đồng thời kênh kích thích $\alpha_{uv}^{\text{exc}}$ giữ cường độ tranh luận.
+  - **Nhìn thẳng vào kết quả thực nghiệm (nghiên cứu trung thực):**
+    1. **Trên từng cây thảo luận nhỏ tiếng Việt ($K=20, |\mathcal{V}_K| \le 21$):** Toàn bộ các mô hình đều vượt xa ngưỡng không học `Early-K Persistence` ($R^2_{\text{polar}} = -3.1986$), nhưng do cây đầu vào còn nhỏ và nhiều bài trên `r/vozforums` là tâm sự/hỏi đáp ít chia phe, `SBi-FAGAT` ($R^2_{\text{polar}} = 0.0742$) **hòa thống kê** với `TextMLP` ($0.0741$, không cần đồ thị) và `BiEdgeGATv2` ($0.0789$ vs. $0.0777$, $p_{\text{adj}} = 1.00$), còn trên quy mô lan truyền thì `StandardGCN`/`FAGCN` nhỉnh hơn.
+    2. **Phát hiện quan trọng về `hostility` (công kích) vs. `stance` (lập trường 3 lớp):** Khi tắt hoàn toàn kênh công kích ($h_{uv}=0$), độ chính xác phân cực trên VN gần như không đổi ($R^2_{\text{polar}}$ từ `0.0777` xuống `0.0757`), trong khi tắt lập trường ($s_{uv}=0$) làm tụt xuống `0.0669`. Điều này chứng minh **3 lớp lập trường (Tán thành / Phản đối / Trung lập)** mới là tín hiệu cốt lõi; bản Demo MVP vì vậy ưu tiên hiển thị sạch 3 nhóm lập trường này kết hợp lọc rác bảo toàn cây.
+    3. **Trên tập tin đồn tiếng Anh PHEME (`K=10, N>=15`, `2,664` chuỗi):** `SBi-FAGAT` dẫn đầu phân loại 4 lớp tin đồn (**Macro-F1 `0.3541`**, Accuracy `0.6359**` vs. `EdgeGATv2` `0.5988`; dẫn LOO về $R^2_{\text{polar}} = 0.0512$ và Macro-F1 `0.2978`).
+    4. **Khi nâng lên Tầng 2 — Mạng xã hội Người dùng Có dấu Vĩ mô (`src/data/user_network.py`):** Chiếu toàn bộ tương tác xuyên chủ đề thành mạng cộng đồng lớn lộ rõ cấu trúc chia 2 phe: trên **VN** (`13,718` người dùng) có $Q_{\text{signed}} = 0.4280$ và tỷ lệ phản đối khi khác phe vọt lên **57,0%** (so với **37,9%** cùng phe); trên **PHEME** (`50,062` người dùng) đạt $Q_{\text{signed}} = 0.8232$, **RWC = `0.6218`**, khác phe phản đối tới **60,6%** (so với **6,0%** cùng phe).
 
 👉 **Tự chạy minh họa 5 giây ngay trên máy CPU (không cần GPU hay tải dữ liệu lớn):**
 
@@ -64,5 +69,5 @@ python -m scripts.benchmark_efficiency --use-cascade-stats --hidden-dim 64 --edg
    Đọc `src/data/schema.py` $\to$ `src/data/pheme_loader.py` $\to$ `src/data/arctic_shift_vn.py` $\to$ `src/data/pyg_dataset.py` $\to$ `src/data/user_network.py`.
 3. **Bước 3 — Đọc mô hình SBi-FAGAT (15 phút)**:  
    Đọc `src/models/baselines.py` (`TwoStreamNodeStem`, `MultiTaskHead`, `BiGCN`) rồi sang `src/models/sbi_fagat.py` (`StanceGuidedFAConv`).
-4. **Bước 4 — Chạy thực nghiệm thật trên Kaggle T4x2 & Kiểm định người**:  
-   Chạy 2 sổ tay song song trong `notebooks/` (kèm `kaggle_macro_signed_gnn_t4.ipynb` cho Tầng 2) $\to$ chấm mù/kiểm định phiếu tinh gọn `20 pilot + 120 cặp Test + 30 cây Test VN` qua `scripts/human_audit_ui.py` $\to$ ghép bảng LaTeX thật vào `paper/main.tex`!
+4. **Bước 4 — Hoàn tất & Đóng gói Sản phẩm Nộp (7 Ngày cuối)**:  
+   Các lượt chạy chính VN, PHEME Tier 2A (`K=10, N>=15`), kiểm định VN `120` cặp + `30` cây (`--allow-single-gold`) và phân tích mạng người dùng Tầng 2 trên CPU đã hoàn tất; đã gộp xong kết quả Kaggle V2 (`kaggle_macro_signed_gnn_t4.ipynb` + `RumourEval --context-mode root`) và biên dịch `paper/main.pdf`; chỉ còn dựng **Giao diện Demo Web MVP** (lọc rác giữ nguyên cây + 3 màu lập trường + xem mạng 2 phe Tầng 2) và viết trọn bộ **Báo cáo đề tài tiếng Việt 4 chương** đồng bộ với `paper/main.pdf`!

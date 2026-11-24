@@ -115,8 +115,8 @@ $$\operatorname{RWC} = P_{XX} P_{YY} - P_{YX} P_{XY}$$
 
 trong đó $P_{AB} = P(\text{bắt đầu ở } A \mid \text{kết thúc ở } B)$ là xác suất có điều kiện của bước đi ngẫu nhiên trên đồ thị phân hoạch.
 
-- **Hạn chế đối với bài toán**:
-  1. **Phụ thuộc đồ thị trưởng thành cỡ lớn**: RWC đòi hỏi đồ thị tương tác/retweet quy mô lớn, dày đặc đủ để thuật toán phân hoạch hai cụm cộng đồng rõ nét. Trên một cây hội thoại đơn lẻ chỉ có tối đa $K=20$ bình luận ban đầu, cấu trúc liên thông hình cây bị chi phối bởi nút gốc khiến RWC suy biến và mất độ nhạy.
+- **Hạn chế đối với bài toán & phạm vi áp dụng Hai tầng**:
+  1. **Phụ thuộc đồ thị trưởng thành cỡ lớn**: RWC đòi hỏi đồ thị tương tác/retweet quy mô lớn, dày đặc đủ để thuật toán phân hoạch hai cụm cộng đồng rõ nét. Trên **Tầng 1** (một cây hội thoại đơn lẻ chỉ có tối đa $K=20$ bình luận ban đầu), cấu trúc liên thông hình cây bị chi phối bởi nút gốc khiến RWC suy biến và mất độ nhạy. Tuy nhiên ở **Tầng 2** (`src/data/user_network.py`), khi chiếu toàn bộ tương tác xuyên chủ đề lên mạng người dùng vĩ mô (`13,718` người dùng VN; `50,062` người dùng PHEME), RWC và Signed Modularity ($Q_{\text{signed}}$, `kunegis2010spectral`) lại đo lường rất sắc nét mức độ phân cực hai phe.
   2. **Bỏ qua nội dung phản bác trong văn bản**: Phương pháp thuần cấu trúc (*structure-only*) coi mọi cạnh kết nối (dù là trả lời để tranh luận gay gắt hay retweet để tán thành) là như nhau nếu không phân tích ngữ nghĩa lập trường.
 
 ---
@@ -201,8 +201,8 @@ $$\mathcal{L}_{\text{MLM}}(\theta) = -\sum_{i \in \mathcal{M}} \ln P_\theta\left
 | **SGCN** (`derr2018signed`) | Không (Vô hướng) | Rời rạc $\{-1, +1\}$ | Cân bằng $B/U$ cứng | Không | Không | Không |
 | **Bi-GCN** (`bian2020rumor`) | **Có (TD + BU)** | Không | Không (Thông thấp) | Không | Có | Có |
 | **FAGCN** (`bo2021beyond`) | Không (Vô hướng) | Ngầm định $\alpha_{ij}^G$ | **Có ($\tanh$)** | Không | Có | Có |
-| **RWC** (`garimella2018quantifying`) | Không | Không | Không (Bước đi ngẫu nhiên) | Không | Suy biến trên cây nhỏ | Chỉ đo phân cực |
+| **RWC** (`garimella2018quantifying`) | Không | Không | Không (Bước đi ngẫu nhiên) | Không | Suy biến ở Tầng 1 (cây nhỏ); **Dùng ở Tầng 2** | Chỉ đo phân cực |
 | **ViSoBERT / Twitter-RoBERTa** (`nguyen2023visobert`, `barbieri2020tweeteval`) | Không | Tinh chỉnh cặp câu | Không | **Nền tảng SpanPool & Cross-Encoder 2D** | Mù cấu trúc cây | Cần kết hợp GNN |
 | **SBi-FAGAT (Đề xuất)** | **Có (TD + BU + Dir-GNN Mix)** | **Có ($[s_{uv}, h_{uv}]^\top$)** | **2 kênh Phân cực/Kích thích + Pre-Norm + BFS 64-hop Dipole** | **Symmetric NLI + ViHSD/TweetEval $\to$ Segment-Isolated Student** | **8 mô hình cố định công bằng (`hidden_dim=64`)** | **KL-calibrated BCE + Smooth-L1 + Warmup/EMA** |
 
-**Kết luận tổng hợp**: SBi-FAGAT lấp đầy khoảng trống nghiên cứu bằng cách kết nối **vector ngữ nghĩa nút Ancestor-Conditioned SpanPool** và **tín hiệu cạnh 2D $[s_{uv}, h_{uv}]^\top$** (từ bộ thầy kép `mDeBERTa-v3-xnli` Symmetric Stance Verbalizer + `ViSoBERT`/`twitter-roberta-base-offensive` chưng cất cô lập phân đoạn trên phân hoạch chủ đề nhất quán `topic_splits.json`) trực tiếp vào **hai kênh truyền thông điệp Phân cực có dấu / Kích thích không dấu**, trộn hai hướng **Dir-GNN (TD + BU)** và đọc cực phe quy chiếu gốc `max_hops=64`, được kiểm định công bằng giữa 8 mô hình ở `hidden_dim = 64` kèm đối chứng **Early-K Persistence**.
+**Kết luận tổng hợp**: Hệ thống kết nối **vector ngữ nghĩa nút Ancestor-Conditioned SpanPool** và **tín hiệu cạnh 2D $[s_{uv}, h_{uv}]^\top$** (từ bộ thầy kép `mDeBERTa-v3-xnli` Symmetric Stance Verbalizer + `ViSoBERT`/`twitter-roberta-base-offensive` chưng cất cô lập phân đoạn trên phân hoạch chủ đề nhất quán `topic_splits.json`) trực tiếp vào **hai kênh truyền thông điệp Phân cực có dấu / Kích thích không dấu** của `SBi-FAGAT` ở Tầng 1 (kết hợp phân tích trung thực giới hạn cây nhỏ $\le 21$ nút và đóng góp của 3 lớp lập trường so với kênh công kích), đồng thời mở rộng sang **Tầng 2 Mạng người dùng có dấu vĩ mô** dùng Signed Laplacian (`kunegis2010spectral`), Structural Balance, $Q_{\text{signed}}$ và RWC (`garimella2018quantifying`) trên tập `13,718` người dùng VN & `50,062` người dùng PHEME.

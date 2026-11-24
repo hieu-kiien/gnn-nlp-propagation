@@ -23,12 +23,11 @@
   "optional_tables_present": [
     "tables_upfd_politifact.tex",
     "tables_human_audit.tex",
-    "tables_macro_network.tex"
-  ],
-  "optional_tables_missing": [
+    "tables_macro_network.tex",
     "tables_signed_link_vn.tex",
     "tables_signed_link_pheme.tex"
   ],
+  "optional_tables_missing": [],
   "present_figures": [
     "figures/pheme/fig1_umap_polarization.pdf",
     "figures/pheme/fig2_early_k_curve.pdf",

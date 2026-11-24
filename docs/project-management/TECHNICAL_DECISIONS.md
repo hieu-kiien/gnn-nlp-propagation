@@ -28,9 +28,9 @@
 
 ---
 
-## ADR-04: Rejection of RWC and Modularity for Sparse Early Trees ($K=20$)
-- **Context:** Random Walk Controversy (RWC) and Modularity ($Q$) require denser community graphs than a $K=20$ shallow propagation tree, where random walks fail to mix and modularity degenerates.
-- **Decision:** Reject RWC/$Q$ in favor of node/edge stance dispersion, Sarle's Bimodality Coefficient, and Signed Assortativity (`docs/math_spec.md`).
+## ADR-04: Rejection of RWC and Modularity for Sparse Early Trees (Tier 1) vs. Macro Adoption (Tier 2)
+- **Context:** Random Walk Controversy (RWC) and Modularity ($Q$) require denser community graphs than a $K \le 20$ shallow propagation tree, where random walks fail to mix and modularity degenerates.
+- **Decision:** Reject RWC/$Q$ strictly at **Tier 1** in favor of node/edge stance dispersion, Sarle's Bimodality Coefficient, and Signed Assortativity (`docs/math_spec.md`), and adopt Signed Modularity ($Q_{\text{signed}}$), RWC, and Structural Balance at **Tier 2** on the global cross-thread user graph $\mathcal{G}_{\text{macro}}$ (see **ADR-09**).
 - **Status:** Accepted & Documented.
 
 ---
@@ -56,7 +56,26 @@
 
 ---
 
-## ADR-08: Binary Reply Incivility & Strict Gate 1 Blinding / PII Hygiene
-- **Context:** Separating `offensive` vs. `hate` on Vietnamese social media replies caused ambiguity and asymmetric numeric bug (`0.5` vs `1.0`), while minor/doxxing PII and `LMGX` spam leaked into unscreened crawls and Pilot splits collapsed to 100%-hostile samples.
-- **Decision:** Standardize pair-level `h_uv` construct to **Binary Reply Incivility** (`clean` vs. `uncivil`, keeping legacy alias compatibility in `compute_kappa.py`), scrub phone/bank/CCCD/FB-profile/doxxing/`LMGX` before persistence and audit export, export balanced 50/50 uncivil/clean `20`-pair pilot + `120`-pair Test + `30`-tree Test sheets with `grandparent_text` & `sampling_weight`, and isolate role notes/blinding in `human_audit_ui.py --lock-role`.
-- **Status:** Accepted & Implemented (v3 Overhaul).
+## ADR-08: Binary Reply Incivility & Strict Gate 1 Blinding / Verified Gold Protocol
+- **Context:** Separating `offensive` vs. `hate` on Vietnamese social media replies caused ambiguity and asymmetric numeric bug (`0.5` vs `1.0`), while minor/doxxing PII and `LMGX` spam leaked into unscreened crawls and Pilot splits collapsed to 100%-hostile samples. Additionally, single-reviewer LLM-assisted pre-annotation required `--allow-single-gold` without fabricating dual-annotator IAA.
+- **Decision:** Standardize pair-level `h_uv` construct to **Binary Reply Incivility** (`clean` vs. `uncivil`, keeping legacy alias compatibility in `compute_kappa.py`), scrub phone/bank/CCCD/FB-profile/doxxing/`LMGX` before persistence and audit export, export balanced 50/50 uncivil/clean `20`-pair pilot + `120`-pair Test + `30`-tree Test sheets with `grandparent_text` & `sampling_weight`, isolate role notes/blinding in `human_audit_ui.py --lock-role`, and support `--allow-single-gold` (`single_verified_gold`, `IAA = --`) alongside `--strict-adjudication` (VN `120` pairs + `30` trees executed in `a95537a`).
+- **Status:** Accepted & Implemented (`v3 Overhaul` + `a95537a`).
+
+---
+
+## ADR-09: Two-Tier Micro + Macro Signed User Network (Option A+)
+- **Context:** On shallow Tier 1 single-thread cascades ($|\mathcal{V}_K| \le 21$), empirical benchmarks show `SBiFAGAT` tying `TextMLP` ($R^2_{\text{polar}} = 0.0742$ vs. $0.0741$) and `BiEdgeGATv2` ($0.0777$ vs. $0.0789$, $p_{\text{adj}} = 1.00$), because star-like early trees limit multi-hop signed propagation and `cluster_vn_cascade_topics` yields `1,496/1,500` singleton topic clusters.
+- **Decision:** Elevate the existing datasets onto a **Two-Tier** framework (`src/data/user_network.py`, `scripts/run_macro_signed_network.py`, `notebooks/kaggle_macro_signed_gnn_t4.ipynb`) without collecting extra data:
+  1. **Macro Polarization Geometry (CPU Analytics, completed in `c02b40d`/`a95537a`):** Project valid non-deleted, non-self-loop user replies onto $\mathcal{G}_{\text{macro}}$, bipartition the largest signed WCC via Signed Normalized Laplacian, and measure Structural Balance, $Q_{\text{signed}}$, RWC, and cross- vs. within-camp opposition (VN: `13,718` users, `85,398` interactions, `10,475` WCC, $Q_{\text{signed}} = 0.4280$, RWC $= 0.0957$, Balance `25.3%` $z = -15.17$, cross-camp opp. `57.0%` vs. `37.9%`; PHEME: `50,062` users, `10,364` WCC, $Q_{\text{signed}} = 0.8232$, RWC $= 0.6218$, Balance `35.4%` $z = -4.30$, cross-camp opp. `60.6%` vs. `6.0%`).
+  2. **Chronological Zero-Leakage Signed Link Prediction (GPU 5-Seed Benchmark):** Chronologically split (`70/15/15`, $t_{\text{train}} < t_{\text{val}} < t_{\text{test}}$) with $772$-D user features ($\le t_{\text{train}}^{\max}$ SpanPool + `4`-D unsigned activity counts, zeroed for unseen Test users) and batch pair masking across 6 equal-width ($d=64$) architectures.
+- **Status:** Accepted & Executed (CPU analytics and Kaggle V2 GPU 5-seed benchmarks complete for both VN and PHEME).
+
+---
+
+## ADR-10: 7-Day Submission Scope Freeze, 3-Class Stance Demo MVP & Bilingual Deliverables
+- **Context:** With 7 days before the final submission deadline, rebuilding the core pipeline to strip `h_uv` or crawling new Vietnamese corpora risks missing required bilingual documentation and live software deliverables. Meanwhile, VN ablation (`tables_ablation_vn.tex`) already proves removing hostility (`h_uv=0`) shifts $R^2_{\text{polar}}$ negligibly (`0.0757 ± 0.0240` vs. Full `0.0777 ± 0.0141`, $\Delta = 0.002$) compared to removing stance (`0.0669`).
+- **Decision:** Freeze the scientific core under **Option A+ Scope Freeze**:
+  1. **No New Data Crawling & No Core Pipeline Rewrite:** Finish remaining GPU runs (`kaggle_macro_signed_gnn_t4` V2 + RumourEval `--context-mode root`) and integrate into `paper/main.tex` using honest diagnostic framing. Report the `h_uv=0` ablation finding explicitly to prove 3-class stance (*Support / Oppose / Neutral*) is the primary polarization driver.
+  2. **Tree-Preserving Junk Filtering & 3-Class Stance Demo MVP:** Build a local runnable Web Demo using trained checkpoints + offline fallback presets that applies structured spam/empty/deleted filtering (dropping leaf junk nodes directly while preserving intermediate paths via path contraction or neutral bridging) and highlights 3-class stance trees plus Tier 2 two-camp network insights without exposing noisy technical internals by default.
+  3. **Mandatory Bilingual Deliverables:** Deliver (a) finalized English IEEE paper (`paper/main.pdf`), (b) full 4-chapter Vietnamese Research Report (`Mở đầu`, `Chương 1 Cơ sở lý thuyết`, `Chương 2 Thiết kế & Phương pháp`, `Chương 3 Thực nghiệm & Thảo luận trung thực`, `Chương 4 Hệ thống Demo`, `Kết luận & Hướng phát triển`) 100% metric-synced with the English paper + defense slides/Q&A handbook, and (c) Live Demo Web UI.
+- **Status:** Accepted & Active (7-Day Final Delivery Plan).

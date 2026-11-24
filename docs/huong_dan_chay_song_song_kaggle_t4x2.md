@@ -1,6 +1,6 @@
 # Hướng dẫn Chạy Song Song trên Kaggle `GPU T4 x 2` (32 GB VRAM) — Pipeline 2D Hợp nhất
 
-Tài liệu này hướng dẫn trực tiếp cho **2 thành viên trong nhóm** cách đưa mã nguồn mới nhất từ GitHub lên **Kaggle `T4 x 2`** (mỗi bạn có **30 giờ GPU miễn phí/tuần**, tổng **60 giờ GPU/tuần**) để chạy song song không phải chờ nhau trên **kiến trúc 2D hợp nhất** (`hidden_dim = 64`, `min_total_replies = 25`).
+Tài liệu này hướng dẫn trực tiếp cho **2 thành viên trong nhóm** cách đưa mã nguồn mới nhất từ GitHub lên **Kaggle `T4 x 2`** (mỗi bạn có **30 giờ GPU miễn phí/tuần**, tổng **60 giờ GPU/tuần**) để chạy song song không phải chờ nhau trên **kiến trúc hai tầng 2D hợp nhất** (`hidden_dim = 64`, VN `K=20, min_total_replies=25` và PHEME Tier 2A `K=10, min_total_replies=15`, kèm sổ tay Tầng 2 `kaggle_macro_signed_gnn_t4.ipynb` cho Signed Link Prediction GPU).
 
 ---
 

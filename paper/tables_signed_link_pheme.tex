@@ -1,0 +1,24 @@
+\begin{table*}[t]
+\centering
+\caption{Macro Temporal Signed Link Prediction on PHEME (opposing vs.\ supporting reply edges, mean $\pm$ std over 5 seeds; unseen users have zeroed features and train batch pairs are masked).}
+\label{tab:signed_link_pheme}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lcccccc}
+\toprule
+Model & ROC-AUC $\uparrow$ & PR-AUC $\uparrow$ & Macro-F1 $\uparrow$ & Trans.\ ROC-AUC $\uparrow$ & Trans.\ PR-AUC $\uparrow$ & Trans.\ Macro-F1 $\uparrow$ \\
+\midrule
+UserTextMLP & \textbf{0.7331 $\pm$ 0.0048} & 0.6014 $\pm$ 0.0044 & 0.5694 $\pm$ 0.0881 & 0.9081 $\pm$ 0.0055 & 0.7232 $\pm$ 0.0269 & 0.7943 $\pm$ 0.0244 \\
+StandardGCN & 0.7241 $\pm$ 0.0087 & 0.5951 $\pm$ 0.0077 & 0.5568 $\pm$ 0.0723 & 0.9113 $\pm$ 0.0045 & 0.7311 $\pm$ 0.0124 & 0.7772 $\pm$ 0.0105 \\
+StandardGATv2 & 0.7172 $\pm$ 0.0161 & 0.5882 $\pm$ 0.0166 & 0.5748 $\pm$ 0.0656 & 0.9105 $\pm$ 0.0025 & 0.7232 $\pm$ 0.0164 & 0.7804 $\pm$ 0.0221 \\
+SGCN & 0.7143 $\pm$ 0.0193 & 0.5820 $\pm$ 0.0146 & 0.5315 $\pm$ 0.0747 & 0.9078 $\pm$ 0.0057 & 0.7002 $\pm$ 0.0221 & 0.7782 $\pm$ 0.0276 \\
+FAGCN & 0.7123 $\pm$ 0.0242 & 0.5853 $\pm$ 0.0234 & \textbf{0.6209 $\pm$ 0.0375} & 0.9007 $\pm$ 0.0063 & 0.6882 $\pm$ 0.0303 & 0.7755 $\pm$ 0.0130 \\
+SBiFAGAT-Link & 0.7328 $\pm$ 0.0107 & \textbf{0.6019 $\pm$ 0.0104} & 0.5860 $\pm$ 0.0759 & \textbf{0.9181 $\pm$ 0.0102} & \textbf{0.7616 $\pm$ 0.0600} & \textbf{0.8006 $\pm$ 0.0068} \\
+\midrule
+$p$-value (SBiFAGAT-Link vs. StandardGCN) & 3.03e-01 & 3.12e-01 & 1.71e-01 & 2.25e-01 & 3.50e-01 & 2.70e-02 \\
+Exact Perm $p$ (SBiFAGAT-Link vs. StandardGCN) & 4.38e-01 & 3.75e-01 & 2.50e-01 & 2.50e-01 & 3.75e-01 & 6.25e-02 \\
+Holm-Bonferroni $p$ (SBiFAGAT-Link vs. StandardGCN) & 9.08e-01 & 9.08e-01 & 8.53e-01 & 9.01e-01 & 9.08e-01 & 1.62e-01 \\
+Holm-Bonf Exact Perm $p$ (SBiFAGAT-Link vs. StandardGCN) & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 3.75e-01 \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}

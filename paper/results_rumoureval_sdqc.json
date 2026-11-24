@@ -1,0 +1,48 @@
+{
+  "rumoureval_sdqc": {
+    "rumoureval_json": "/tmp/tmpjr6aia6j.json",
+    "num_samples": 1675,
+    "sdqc_distribution": {
+      "support": 104,
+      "deny": 100,
+      "query": 66,
+      "comment": 1405
+    },
+    "labels": [
+      "support",
+      "neutral",
+      "oppose"
+    ],
+    "macro_f1": 0.3311225958567086,
+    "accuracy": 0.817910447761194,
+    "cohen_kappa_unweighted": -0.014893380322540839,
+    "pearson_r": 0.06918744723909513,
+    "spearman_r": 0.09169647591414587,
+    "confusion_matrix": [
+      [
+        4,
+        97,
+        3
+      ],
+      [
+        21,
+        1363,
+        87
+      ],
+      [
+        0,
+        97,
+        3
+      ]
+    ]
+  },
+  "meta": {
+    "model_name": "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+    "context_mode": "root",
+    "num_scored_replies": 1675,
+    "platform_counts": {
+      "twitter": 1010,
+      "reddit": 665
+    }
+  }
+}

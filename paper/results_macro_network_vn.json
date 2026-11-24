@@ -15,8 +15,8 @@
   "largest_signed_wcc_nodes": 10475,
   "largest_signed_wcc_ratio": 0.763595276279341,
   "camp_sizes": [
-    4807,
-    5668
+    5668,
+    4807
   ],
   "structural_balance": {
     "num_triangles": 5143,
@@ -30,10 +30,10 @@
     "balance_z_score": -15.173719169332172
   },
   "polarization": {
-    "rwc": 0.09569888179105077,
-    "signed_modularity": 0.4280127931473891,
-    "q_pos": 0.23674885408042107,
-    "q_neg": -0.19126393906696804,
+    "rwc": 0.09569888179105068,
+    "signed_modularity": 0.42801279314738905,
+    "q_pos": 0.23674885408042118,
+    "q_neg": -0.19126393906696787,
     "within_camp_mean_stance": -0.05380459120962074,
     "cross_camp_mean_stance": -0.14251893222705478,
     "within_camp_neg_rate": 0.3788704627159921,

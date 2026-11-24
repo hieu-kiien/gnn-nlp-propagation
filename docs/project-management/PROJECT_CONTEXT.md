@@ -36,19 +36,26 @@ Early-stage prediction of viral cascades and polarization is intrinsically chall
    - Supports optional 8-dimensional early structural/temporal `cascade_stats` (`--use-cascade-stats`) and symmetric uncertainty prediction (`predict_uncertainty`) passed across all 8 neural models.
    - Optimizes Huber (`y_size`), KL-calibrated `BCEWithLogitsLoss + SmoothL1(beta=0.05)` (`y_polar`), and class-weighted CE (`y_rumor`) using train-only target scaling and bias initialization, linear warmup + `ReduceLROnPlateau`, EMA (`decay = 0.985`), Early Stopping on validation `task_loss`, and Validation-only comparator selection (`val_summary_stats`) across 5 seeds.
 
+### Tier 2: Macro Signed User-Interaction Social Network (`src/data/user_network.py`)
+1. **Macro Polarization Geometry (`scripts/run_macro_signed_network.py --analysis-only`):** Projects valid non-deleted, non-self-loop reply pairs $(u, v)$ across cascades onto $\mathcal{G}_{\text{macro}}$, partitions the largest signed WCC via the normalized Signed Laplacian (`kunegis2010spectral`), and evaluates Structural Balance ($z$-score vs. 100 degree-preserving sign permutations), Signed Modularity ($Q_{\text{signed}}$), Garimella RWC, and cross- vs. within-camp opposition/incivility rates (executed on both VN [`13,718` users, $Q_{\text{signed}} = 0.4280$] and PHEME [`50,062` users, $Q_{\text{signed}} = 0.8232$, RWC `0.6218`]).
+2. **Chronological Zero-Leakage Signed Link Prediction (`build_temporal_signed_link_dataset`):** Splits signed interactions ($|s_{uv}| \ge 0.1$) chronologically (`70/15/15`) at non-overlapping UTC cutpoints ($t_{\text{train}} < t_{\text{val}} < t_{\text{test}}$) using $772$-D user representations ($\le t_{\text{train}}^{\max}$ SpanPool + `4`-D unsigned activity features, zeroed for unseen Test users) and mini-batch pair masking across 6 equal-width ($d=64$) architectures (`UserTextMLP`, `StandardGCN`, `StandardGATv2`, `SGCN`, `FAGCN`, `SBiFAGAT-Link`).
+
 ---
 
-## 3. Data Contract & Ingestion Pipelines
+## 3. Data Contract, Ingestion & 7-Day Delivery Scope
 
 ### Datasets
 1. **PHEME Dataset (English Benchmark):**
-   - Rumor and non-rumor cascades ingested from Figshare article `6392078` via `src/data/pheme_loader.py` into validated `nodes.parquet` / `edges.parquet`.
-   - Truly inductive topic split grouped strictly by breaking news event (`topic_id`) + LOO (`edge_source="teacher"`).
+   - Rumor and non-rumor cascades (`6,425` raw threads, `101,342` nodes, `9` news events) ingested from Figshare article `6392078` via `src/data/pheme_loader.py` into validated `nodes.parquet` / `edges.parquet`, supporting both canonical $K=20, N \ge 25$ and executed Tier 2A $K=10, N \ge 15$ (`2,664` eligible cascades, `1786/544/334` split) + LOO (`edge_source="teacher"`).
 2. **Vietnamese Social Media Dataset (Arctic Shift / Reddit VN):**
-   - Ingested from Vietnamese Reddit subreddits (`r/vozforums`, `r/VietNam`) via `src/data/arctic_shift_vn.py` with `--before-epoch` cutoff, `--min-comments 25`, `--min-vi-ratio 0.65`, PII/doxxing/crypto-spam filtering & redaction, and resumable `.state.json` cursor persistence.
-   - Uses a **Heuristic Temporal-Keyword / 30-day TF-IDF Grouped Inductive Split** (`cluster_vn_cascade_topics`, cosine `>= 0.30`), cross-checked via Temporal Holdout and Embedding-Cluster Holdout (`edge_source="teacher"`).
-3. **UPFD Benchmark (GossipCop / PolitiFact):**
-   - External post-hoc text-free structural transfer benchmark ingested via `scripts/run_upfd_extension.py` using `LatentConflictMLP`.
+   - Ingested from Vietnamese Reddit subreddits (`r/vozforums` `87,788` nodes, `r/VietNam` `32` nodes; `1,500` eligible cascades at $K=20, N \ge 25$) via `src/data/arctic_shift_vn.py` with `--before-epoch` cutoff, `--min-comments 25`, `--min-vi-ratio 0.65`, PII/doxxing/crypto-spam filtering & redaction, and resumable `.state.json` cursor persistence.
+   - Uses a **Heuristic Temporal-Keyword / 30-day TF-IDF Grouped Inductive Split** (`cluster_vn_cascade_topics`, cosine `>= 0.30`, yielding `1,496` clusters), cross-checked via Temporal Holdout and Embedding-Cluster Holdout (`edge_source="teacher"`).
+3. **UPFD & RumourEval-2019 Benchmarks:**
+   - External post-hoc text-free structural transfer (`GossipCop` + `PolitiFact`) via `scripts/run_upfd_extension.py`, and SemEval-2019 RumourEval SDQC stance validation (`1,675` Test pairs) via `scripts/eval_rumoureval_sdqc.py`.
+
+### 7-Day Submission Scope Freeze & Mandatory Deliverables (`ADR-10`)
+- **Scope Freeze:** No additional data crawling and no core pipeline rewrites prior to submission; honestly report `w/o Hostility` ablation parity (`0.0757` vs. `0.0777`) showing 3-class stance is the primary signal.
+- **Mandatory Deliverables:** (1) Finalized English IEEE paper (`paper/main.pdf`), (2) full 4-chapter Vietnamese Research Report + defense slides/Q&A handbook synced 100% with verified metrics, and (3) runnable local Live Demo Web UI MVP featuring tree-preserving junk filtering and 3-class stance + Tier 2 camp visualization.
 
 ### Five Iron Laws (`GEMINI.md`)
 - **Zero Synthetic Results:** Never report synthetic/mock numbers in experimental paper tables; synthetic tensors are strictly restricted to unit tests (`tests/`) and profiling (`scripts/benchmark_efficiency.py`).
