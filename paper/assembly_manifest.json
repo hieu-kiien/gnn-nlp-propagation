@@ -1,8 +1,9 @@
 {
   "paper_dir": "paper",
   "generated_tables": [
-    "paper\\tables_dataset_eda.tex",
-    "paper\\tables_efficiency.tex"
+    "paper/tables_dataset_eda.tex",
+    "paper/tables_macro_network.tex",
+    "paper/tables_efficiency.tex"
   ],
   "present_tables": [
     "tables_dataset_eda.tex",
@@ -18,6 +19,15 @@
     "tables_efficiency.tex"
   ],
   "missing_tables": [],
+  "optional_tables_present": [
+    "tables_upfd_politifact.tex",
+    "tables_macro_network.tex"
+  ],
+  "optional_tables_missing": [
+    "tables_human_audit.tex",
+    "tables_signed_link_vn.tex",
+    "tables_signed_link_pheme.tex"
+  ],
   "present_figures": [
     "figures/pheme/fig1_umap_polarization.pdf",
     "figures/pheme/fig2_early_k_curve.pdf",

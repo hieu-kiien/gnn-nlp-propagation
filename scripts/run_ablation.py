@@ -332,6 +332,16 @@ def main() -> None:
     print(build_markdown_table(ablation_res, active_metrics))
 
     cmp_abl = str(ablation_res.get("comparator_model") or "BiEdgeGATv2 (Matched)").replace("_", "\\_").replace("&", "\\&")
+    cmp_desc = (
+        f"against a matched {cmp_abl} comparator "
+        if cmp_abl == "BiEdgeGATv2 (Matched)"
+        else f"(significance comparator: {cmp_abl}, "
+    )
+    sig_suffix = (
+        f"(significance stars vs. {cmp_abl}, Holm-Bonferroni adjusted)."
+        if cmp_abl == "BiEdgeGATv2 (Matched)"
+        else "Holm-Bonferroni adjusted)."
+    )
     export_latex_table(
         ablation_res,
         out_table,
@@ -339,8 +349,8 @@ def main() -> None:
             f"Ablation Study of SBi-FAGAT Components at $K={args.k_horizon}$ Across 5 Random Seeds. "
             "Separates stance polarity $s_{uv}$, hostility $h_{uv}$, signed $\\tanh$ gate, "
             "Bottom-Up feedback, Dir-GNN mixing, dual-channel split, Camp Dipole \\& Moments readout, "
-            "and Global Attention Readout against a matched BiEdgeGATv2 comparator "
-            f"(significance stars vs. {cmp_abl}, Holm-Bonferroni adjusted)."
+            "Persistence-Residual anchoring, 8-D Burst Stats, and Global Attention Readout "
+            f"{cmp_desc}{sig_suffix}"
         ),
         label=_resolve_ablation_table_label(args.data_dir, out_table),
         metrics=active_metrics,

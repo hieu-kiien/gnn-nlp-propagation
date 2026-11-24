@@ -56,14 +56,18 @@ def _resolve_output_paths(
     figures_dir: Path | None,
     *,
     split_mode: str = "canonical",
+    eval_protocol: str = "inductive",
 ) -> tuple[Path, Path, Path]:
     ds_name = data_dir.name.lower() if data_dir.name.lower() in {"pheme", "vn"} else ""
     suffix = f"_{ds_name}" if ds_name else ""
-    prefix = (
-        "temporal"
-        if split_mode == "temporal"
-        else ("cluster" if split_mode == "embedding_cluster" else "main")
-    )
+    if split_mode == "temporal":
+        prefix = "temporal"
+    elif split_mode == "embedding_cluster":
+        prefix = "cluster"
+    elif str(eval_protocol).lower() == "loo":
+        prefix = "loo"
+    else:
+        prefix = "main"
     tbl = output_table or Path(f"paper/tables_{prefix}{suffix}.tex")
     jsn = output_json or Path(f"paper/results_{prefix}{suffix}.json")
     if split_mode != "canonical" and figures_dir is None:
@@ -321,6 +325,7 @@ def main() -> None:
         args.output_json,
         args.figures_dir,
         split_mode=args.split_mode,
+        eval_protocol=args.eval_protocol,
     )
     effective_edge_source = (
         "teacher" if args.split_mode != "canonical" else args.edge_source
@@ -505,6 +510,7 @@ def main() -> None:
         active_metrics = MAIN_METRICS if has_rumor_labels else VN_MAIN_METRICS
         active_keys = [k for k, _, _ in active_metrics]
         fold_raw: dict[str, list[dict[str, float]]] = {m: [] for m in model_factories}
+        fold_val_raw: dict[str, list[dict[str, float]]] = {m: [] for m in model_factories}
         persist_folds: list[dict[str, Any]] = []
         last_bundle: dict[str, Any] = {}
         for fold in folds:
@@ -545,21 +551,33 @@ def main() -> None:
             )
             for m_name, m_stats in fold_res["summary_stats"].items():
                 fold_raw[m_name].append({k: v[0] for k, v in m_stats.items()})
+            for m_name, vm_stats in (fold_res.get("val_summary_stats") or {}).items():
+                if m_name in fold_val_raw:
+                    fold_val_raw[m_name].append({k: v[0] for k, v in vm_stats.items()})
             test_ds, test_loader, last_bundle = t_ds, te_l, fold_res
 
-        summary_stats: dict[str, dict[str, tuple[float, float]]] = {}
+        def _agg_fold_rows(src_rows: dict[str, list[dict[str, float]]], keys: tuple[str, ...]) -> dict[str, dict[str, tuple[float, float]]]:
+            out_stats: dict[str, dict[str, tuple[float, float]]] = {}
+            for m_name, rows in src_rows.items():
+                agg: dict[str, tuple[float, float]] = {}
+                for k in keys:
+                    arr = np.asarray([r.get(k, float("nan")) for r in rows], dtype=np.float64)
+                    arr = arr[~np.isnan(arr)]
+                    agg[k] = (
+                        (float(np.mean(arr)), float(np.std(arr, ddof=1)) if arr.size >= 2 else 0.0)
+                        if arr.size > 0
+                        else (float("nan"), float("nan"))
+                    )
+                out_stats[m_name] = agg
+            return out_stats
+
         metric_keys = tuple(fold_raw["SBiFAGAT"][0].keys())
-        for m_name, rows in fold_raw.items():
-            agg: dict[str, tuple[float, float]] = {}
-            for k in metric_keys:
-                arr = np.asarray([r[k] for r in rows], dtype=np.float64)
-                arr = arr[~np.isnan(arr)]
-                agg[k] = (
-                    (float(np.mean(arr)), float(np.std(arr, ddof=1)) if arr.size >= 2 else 0.0)
-                    if arr.size > 0
-                    else (float("nan"), float("nan"))
-                )
-            summary_stats[m_name] = agg
+        summary_stats = _agg_fold_rows(fold_raw, metric_keys)
+        val_summary_stats = (
+            _agg_fold_rows(fold_val_raw, metric_keys)
+            if all(len(v) > 0 for v in fold_val_raw.values())
+            else {}
+        )
 
         persist_agg: dict[str, tuple[float, float]] = {}
         for pk in (
@@ -586,8 +604,9 @@ def main() -> None:
             **summary_stats,
         }
 
+        cmp_pool = val_summary_stats if len(val_summary_stats) == len(fold_raw) else summary_stats
         cmp_name = (
-            select_best_comparator(summary_stats, reference_model="SBiFAGAT")
+            select_best_comparator(cmp_pool, reference_model="SBiFAGAT")
             if args.comparator_model == "auto"
             else args.comparator_model
         )

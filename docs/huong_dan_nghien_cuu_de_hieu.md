@@ -25,7 +25,8 @@ Hãy tưởng tượng lúc 8 giờ sáng, một người đăng một bài gây
 | **TD / BU + Dir-GNN** | Top-Down & Bottom-Up Mixing | Hai luồng truyền tin hai hướng: **TD** (từ gốc xuống lá) và **BU** (từ bình luận lá dội ngược lên gốc), có ma trận trộn chéo giữa 2 hướng qua từng tầng. | `src/models/sbi_fagat.py` |
 | $\gamma_{uv}, \alpha_{uv}^{\text{exc}}$ | 2-Channel Adaptive Gates | **Trái tim của SBi-FAGAT**: Nửa kênh đầu dùng van có dấu $\gamma_{uv} \in (-1, +1)$ để **đẩy hai phe đối lập tách xa nhau**; nửa kênh sau dùng van không dấu $\alpha_{uv}^{\text{exc}} \in (0, 1)$ đo mức **kích thích / gay gắt** làm câu tranh luận lan rộng hơn. | `StanceGuidedFAConv` trong `src/models/sbi_fagat.py` |
 | **BFS Dipole** (`max_hops=64`) | Root-Aligned Camp Readout | Lần ngược dấu cạnh từ gốc $r$: *"phản đối của phản đối = ủng hộ gốc"*, nhờ vậy gom đúng 2 cụm Ủng hộ gốc vs. Phản đối gốc ở tầng sâu. | `_propagate_root_aligned_edge_signal` |
-| $y_{\text{polar}} \in [0, 1]$ | Polarization Target | Mức độ chia rẽ hai phe ở toàn cây tương lai ($t > K$), kết hợp phương sai lập trường $\sigma_{\tilde{s}}^2$ và cân bằng 2 phe $4 p_+ p_-$. | `_compute_full_tree_polarization` |
+| $y_{\text{polar}} \in [0, 1]$ | Polarization Target (biên độ tuyến tính) | Mức độ chia rẽ hai phe ở toàn cây tương lai ($t > K$), kết hợp $\sqrt{\sigma_{\tilde{s}}^2}$ và cân bằng 2 phe $2\sqrt{\frac{n}{n-1} m_+ m_-}$. | `_compute_full_tree_polarization` |
+| **Tier 2 Macro** | Mạng người dùng có dấu vĩ mô | Chiếu các tương tác $(u, v)$ xuyên chủ đề để đo *Structural Balance*, $Q_{\text{signed}}$, *RWC* và dự báo liên kết đối đầu theo thời gian (ẩn đặc trưng tương lai). | `src/data/user_network.py` & `scripts/run_macro_signed_network.py` |
 
 ---
 
@@ -50,18 +51,18 @@ python -m scripts.benchmark_efficiency --use-cascade-stats --hidden-dim 64 --edg
 
 1. **Độ phủ 100% Teacher sạch**: Bỏ hoàn toàn mô hình 27B nặng nề dễ lỗi OOM/timeout; thay bằng bộ thầy NLI + ViHSD/TweetEval độ phủ 100%, chưng cất cô lập trên tập Train của `topic_splits.json`.
 2. **Chặt chẽ `min_total_replies = 25` & Không rò rỉ khi quét $K=50$**: Mọi cây đều có tối thiểu $\ge 5$ bình luận tương lai ngoài $K=20$; `EarlyCascadeDataset` và `run_ablation.py` luôn khóa cứng phân hoạch từ `topic_splits.json` dù ở mức lọc `K=50`.
-3. **Thi đấu Công bằng 8 Mô hình ở `hidden_dim = 64`**: Không tune riêng siêu tham số cho `SBiFAGAT`; cả 8 mô hình cùng chia sẻ `TwoStreamNodeStem`, đầu ra 128 chiều, `cascade_stats` 8 chiều và hàm mất mát KL-calibrated BCE + Huber tối ưu, so sánh thêm với baseline không cần học **Early-K Persistence**.
-4. **Kiểm định Người–Máy Nghiêm ngặt**: `compute_kappa.py` cảnh báo nếu còn cặp hai người chấm lệch nhau chưa hòa giải (`gold_adjudicated_*`) để không làm đẹp giả tạo độ chính xác trên các câu dễ.
+3. **Thi đấu Công bằng 8 Mô hình ở `hidden_dim = 64`**: Không tune riêng siêu tham số cho `SBiFAGAT`; cả 8 mô hình cùng chia sẻ `TwoStreamNodeStem`, đầu ra 128 chiều, `cascade_stats` 8 chiều và hàm mất mát **KL-calibrated BCE + Smooth-L1 ($\beta = 0.05$)** cho $y_{\text{polar}}$ (kèm Huber cho $y_{\text{size}}$), so sánh thêm với baseline không cần học **Early-K Persistence**.
+4. **Kiểm định Người–Máy Nghiêm ngặt**: `compute_kappa.py` hỗ trợ cả `--strict-adjudication` (2 người chấm chéo) lẫn `--allow-single-gold` (tiền chú thích + tác giả duyệt, ghi `IAA = --`), kết hợp đối chứng tiếng Anh `RumourEval SDQC` (`--context-mode root`).
 
 ---
 
 ## 5. Lộ trình 4 bước đọc code & thực hành
 
 1. **Bước 1 — Chạy kiểm thử & Demo (5 phút, trên laptop CPU)**:  
-   Chạy `pytest -q` và `python -m scripts.demo_research_walkthrough`.
+   Chạy `pytest -q`, `python -m scripts.demo_research_walkthrough` và `python -m scripts.run_macro_signed_network --smoke-test`.
 2. **Bước 2 — Đọc luồng dữ liệu chống rò rỉ (15 phút)**:  
-   Đọc `src/data/schema.py` $\to$ `src/data/pheme_loader.py` $\to$ `src/data/arctic_shift_vn.py` $\to$ `src/data/pyg_dataset.py`.
+   Đọc `src/data/schema.py` $\to$ `src/data/pheme_loader.py` $\to$ `src/data/arctic_shift_vn.py` $\to$ `src/data/pyg_dataset.py` $\to$ `src/data/user_network.py`.
 3. **Bước 3 — Đọc mô hình SBi-FAGAT (15 phút)**:  
    Đọc `src/models/baselines.py` (`TwoStreamNodeStem`, `MultiTaskHead`, `BiGCN`) rồi sang `src/models/sbi_fagat.py` (`StanceGuidedFAConv`).
 4. **Bước 4 — Chạy thực nghiệm thật trên Kaggle T4x2 & Kiểm định người**:  
-   Chạy 2 sổ tay song song trong `notebooks/` $\to$ 2 thành viên chấm mù 300 cặp câu (`compute_kappa.py --strict-adjudication`) + chấm tay 50 cây Test VN $\to$ ghép bảng LaTeX thật vào `paper/main.tex`!
+   Chạy 2 sổ tay song song trong `notebooks/` (kèm `kaggle_macro_signed_gnn_t4.ipynb` cho Tầng 2) $\to$ chấm mù/kiểm định phiếu tinh gọn `20 pilot + 120 cặp Test + 30 cây Test VN` qua `scripts/human_audit_ui.py` $\to$ ghép bảng LaTeX thật vào `paper/main.tex`!

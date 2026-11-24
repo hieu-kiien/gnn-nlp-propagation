@@ -483,6 +483,7 @@ def evaluate_audit_csv(
     *,
     machine_key_csv: Path | None = None,
     strict_adjudication: bool = False,
+    allow_single_gold: bool = False,
 ) -> dict[str, Any]:
     """Read dual-annotated audit CSV and compute Cohen's Kappa (+ optional machine-vs-gold)."""
     path = Path(csv_path)
@@ -555,17 +556,36 @@ def evaluate_audit_csv(
     if behavior_1:
         report["behavior_5class"] = _compute_pair_agreement(behavior_1, behavior_2, behavior_order)
 
+    report["annotation_protocol"] = "dual_annotator"
     if "stance" not in report and "hostility" not in report and "behavior_5class" not in report:
-        raise ValueError(
-            f"No completed dual annotations found in '{path}'. "
-            "Fill annotator_1_* and annotator_2_* columns before running compute_kappa.py."
-        )
+        if not allow_single_gold:
+            raise ValueError(
+                f"No completed dual annotations found in '{path}'. "
+                "Fill annotator_1_* and annotator_2_* columns before running compute_kappa.py "
+                "(or pass --allow-single-gold when evaluating pre-adjudicated gold_adjudicated_* labels)."
+            )
+        if machine_key_csv is None:
+            raise ValueError(
+                "Single-gold evaluation (--allow-single-gold) requires a valid machine_key_csv to compute machine_vs_gold."
+            )
+        report["annotation_protocol"] = "single_verified_gold"
+
     if machine_key_csv is not None:
-        report["machine_vs_gold"] = evaluate_machine_vs_human(
+        mvg_res = evaluate_machine_vs_human(
             path,
             machine_key_csv,
             strict_adjudication=strict_adjudication,
         )
+        if (
+            report["annotation_protocol"] == "single_verified_gold"
+            and "stance" not in mvg_res
+            and "hostility" not in mvg_res
+            and "behavior_5class" not in mvg_res
+        ):
+            raise ValueError(
+                f"No completed dual annotations or gold_adjudicated_* labels found in '{path}'."
+            )
+        report["machine_vs_gold"] = mvg_res
     return report
 
 
@@ -608,6 +628,7 @@ def evaluate_thread_level_audit_csv(
     machine_key_csv: Path | None = None,
     *,
     strict_adjudication: bool = False,
+    allow_single_gold: bool = False,
 ) -> dict[str, Any]:
     """Evaluate 50-tree thread-level polarization blind human audit (0-4 Likert scale)."""
     audit_path = Path(audit_csv)
@@ -662,14 +683,22 @@ def evaluate_thread_level_audit_csv(
             raise ValueError(msg)
         warnings.warn(msg, UserWarning, stacklevel=2)
 
-    if not g1 and not gold_by_id:
-        raise ValueError(
-            f"No completed thread-level annotations found in '{audit_path}'. "
-            "Fill annotator_1_polar_grade / annotator_2_polar_grade (0-4) first."
-        )
+    if not g1:
+        if not allow_single_gold:
+            raise ValueError(
+                f"No completed dual thread-level annotations found in '{audit_path}'. "
+                "Fill annotator_1_polar_grade and annotator_2_polar_grade (0-4), "
+                "or pass --allow-single-gold when evaluating pre-adjudicated gold_adjudicated_polar_grade labels."
+            )
+        if not gold_by_id:
+            raise ValueError(
+                f"No completed thread-level annotations found in '{audit_path}'. "
+                "Fill annotator_1_polar_grade / annotator_2_polar_grade (0-4) or gold_adjudicated_polar_grade first."
+            )
 
     report: dict[str, Any] = {
         "input_csv": str(audit_path),
+        "annotation_protocol": "dual_annotator" if g1 else "single_verified_gold",
         "total_matched_rows": matched_rows,
         "unadjudicated_disagreements": unadj_rows,
     }
@@ -781,6 +810,7 @@ def evaluate_thread_level_audit_csv(
 def _append_human_audit_rows(rows: list[str], report: Mapping[str, Any], *, prefix: str = "") -> None:
     p = f"{prefix} " if prefix else ""
     mvg = report.get("machine_vs_gold") if isinstance(report.get("machine_vs_gold"), Mapping) else {}
+    is_single_gold = report.get("annotation_protocol") == "single_verified_gold"
 
     if isinstance(report.get("stance"), Mapping):
         st = report["stance"]
@@ -792,6 +822,15 @@ def _append_human_audit_rows(rows: list[str], report: Mapping[str, Any], *, pref
             f"{float(st['cohen_kappa_unweighted']):.4f} & {float(st['cohen_kappa_quadratic']):.4f} & "
             f"{f1_str} & {r_str} \\\\"
         )
+    elif is_single_gold and isinstance(mvg.get("stance"), Mapping):
+        mg_s = mvg["stance"]
+        n_s = int(mg_s.get("num_samples", 0))
+        f1_str = f"{float(mg_s['macro_f1']):.4f}" if "macro_f1" in mg_s else "--"
+        r_str = f"{float(mg_s['spearman_r']):.4f}" if "spearman_r" in mg_s else "--"
+        rows.append(
+            f"{p}Pair Stance (3-cls, Verified Gold) & {n_s} & -- & -- & {f1_str} & {r_str} \\\\"
+        )
+
     if isinstance(report.get("hostility"), Mapping):
         ho = report["hostility"]
         mg_h = mvg.get("hostility") if isinstance(mvg.get("hostility"), Mapping) else {}
@@ -802,12 +841,22 @@ def _append_human_audit_rows(rows: list[str], report: Mapping[str, Any], *, pref
             f"{float(ho['cohen_kappa_unweighted']):.4f} & {float(ho['cohen_kappa_quadratic']):.4f} & "
             f"{f1_str} & {r_str} \\\\"
         )
+    elif is_single_gold and isinstance(mvg.get("hostility"), Mapping):
+        mg_h = mvg["hostility"]
+        n_h = int(mg_h.get("num_samples", 0))
+        f1_str = f"{float(mg_h['macro_f1']):.4f}" if "macro_f1" in mg_h else "--"
+        r_str = f"{float(mg_h['spearman_r']):.4f}" if "spearman_r" in mg_h else "--"
+        rows.append(
+            f"{p}Pair Incivility (2-cls, Verified Gold) & {n_h} & -- & -- & {f1_str} & {r_str} \\\\"
+        )
+
     if isinstance(report.get("rumoureval_sdqc"), Mapping):
         re_m = report["rumoureval_sdqc"]
         rows.append(
             f"RumourEval SDQC & {int(re_m['num_samples'])} & -- & -- & "
             f"{float(re_m['macro_f1']):.4f} & {float(re_m['spearman_r']):.4f} \\\\"
         )
+
     if isinstance(report.get("inter_annotator"), Mapping):
         ia = report["inter_annotator"]
         r_str = f"{float(mvg['spearman_r']):.4f}" if "spearman_r" in mvg else "--"
@@ -815,6 +864,12 @@ def _append_human_audit_rows(rows: list[str], report: Mapping[str, Any], *, pref
             f"{p}Thread $y_{{\\text{{polar}}}}$ (0--4) & {int(ia['num_threads'])} & "
             f"{float(ia['cohen_kappa_unweighted']):.4f} & {float(ia['cohen_kappa_quadratic']):.4f} & "
             f"-- & {r_str} \\\\"
+        )
+    elif "num_threads" in mvg:
+        n_t = int(mvg["num_threads"])
+        r_str = f"{float(mvg['spearman_r']):.4f}" if "spearman_r" in mvg else "--"
+        rows.append(
+            f"{p}Thread $y_{{\\text{{polar}}}}$ (0--4, Verified Gold) & {n_t} & -- & -- & -- & {r_str} \\\\"
         )
 
 
@@ -872,12 +927,14 @@ def main() -> None:
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--output-table", type=Path, default=None)
     parser.add_argument("--strict-adjudication", action="store_true")
+    parser.add_argument("--allow-single-gold", action="store_true")
     args = parser.parse_args()
 
     resolved_input = args.input
     if resolved_input is None:
         for candidate in (
             Path("data/interim/human_audit_vi_120.csv"),
+            Path("data/interim/human_audit_en_120.csv"),
             Path("data/interim/human_audit_vi_300.csv"),
             Path("data/interim/human_audit_en_300.csv"),
             Path("data/interim/human_audit_300.csv"),
@@ -903,6 +960,7 @@ def main() -> None:
                 resolved_input,
                 machine_key_csv=resolved_key,
                 strict_adjudication=bool(args.strict_adjudication),
+                allow_single_gold=bool(args.allow_single_gold),
             )
         )
         if args.rumoureval_json is not None:

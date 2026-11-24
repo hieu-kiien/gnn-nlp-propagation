@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -21,6 +22,36 @@ from src.training.reporting import (
 )
 from src.training.trainer import run_multi_seed_benchmark
 from src.utils.seed import OFFICIAL_SEEDS
+
+UPFD_REPORT_METRICS: tuple[tuple[str, str, bool], ...] = (
+    *UPFD_METRICS,
+    ("auc_roc", "ROC-AUC $\\uparrow$", False),
+)
+
+
+def _load_upfd_split(
+    root: Path,
+    name: str,
+    feature: str,
+    split: str,
+    transform: UPFDAdapterTransform,
+    *,
+    max_retries: int = 3,
+) -> UPFD:
+    """Load a PyG UPFD split with exponential backoff when Google Drive rate-limits downloads."""
+    last_exc: Exception | None = None
+    for attempt in range(max(1, int(max_retries))):
+        try:
+            return UPFD(root=str(root), name=name, feature=feature, split=split, transform=transform)
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < max(1, int(max_retries)):
+                time.sleep(float(2 ** (attempt + 1)))
+    raise RuntimeError(
+        f"Failed to load UPFD ({name}, feature={feature}, split={split}) under '{root}' after {max_retries} attempt(s). "
+        "If Google Drive quota/rate-limiting blocks PyG downloads, manually stage `data.zip` inside "
+        f"'{Path(root) / name / 'raw'}' and re-run."
+    ) from last_exc
 
 
 def main() -> None:
@@ -48,9 +79,9 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     transform = UPFDAdapterTransform()
 
-    train_ds = UPFD(root=str(args.upfd_root), name=args.dataset_name, feature=args.feature, split="train", transform=transform)
-    val_ds = UPFD(root=str(args.upfd_root), name=args.dataset_name, feature=args.feature, split="val", transform=transform)
-    test_ds = UPFD(root=str(args.upfd_root), name=args.dataset_name, feature=args.feature, split="test", transform=transform)
+    train_ds = _load_upfd_split(args.upfd_root, args.dataset_name, args.feature, "train", transform)
+    val_ds = _load_upfd_split(args.upfd_root, args.dataset_name, args.feature, "val", transform)
+    test_ds = _load_upfd_split(args.upfd_root, args.dataset_name, args.feature, "test", transform)
 
     in_dim = int(train_ds[0].x.size(-1))
     h_dim = args.hidden_dim
@@ -93,7 +124,7 @@ def main() -> None:
     )
 
     print(f"\n=== UPFD ({args.dataset_name}, {args.feature}) Structural Transfer Results (5 Seeds) ===")
-    print(build_markdown_table(result, UPFD_METRICS))
+    print(build_markdown_table(result, UPFD_REPORT_METRICS))
 
     tbl_label = (
         "tab:upfd_results"
@@ -110,7 +141,7 @@ def main() -> None:
             "\\mathrm{MLP}([\\mathbf{x}_u \\parallel \\mathbf{x}_v \\parallel \\mathbf{x}_u - \\mathbf{x}_v])$."
         ),
         label=tbl_label,
-        metrics=UPFD_METRICS,
+        metrics=UPFD_REPORT_METRICS,
     )
     serialize_benchmark_json(
         result,

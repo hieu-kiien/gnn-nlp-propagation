@@ -300,17 +300,41 @@ def compute_dataset_statistics(
 def format_dataset_stats_latex(
     stats_list: Sequence[Mapping[str, Any]] | Mapping[str, Any],
     *,
-    caption: str = (
-        "Exploratory dataset statistics ($K=20$, $N_{\\text{reply}} \\ge 25$ forecasting filter) "
-        "and Early-$K$ Persistence Baseline on Test splits."
-    ),
+    caption: str | None = None,
     label: str = "tab:dataset_eda",
 ) -> str:
     """Render dataset EDA statistics as an IEEEtran `booktabs` LaTeX table."""
     items = [stats_list] if isinstance(stats_list, Mapping) else list(stats_list)
+    cohorts = {
+        (int(it.get("k_horizon", 20) or 20), int(it.get("min_total_replies", 25) or 25))
+        for it in items
+    }
+    uniform_cohort = len(cohorts) == 1
+    if uniform_cohort:
+        k_val, min_rep = next(iter(cohorts))
+        col_elig = f"Forecast ($\\ge {min_rep}$)"
+        resolved_caption = caption or (
+            f"Exploratory dataset statistics ($K={k_val}$, $N_{{\\text{{reply}}}} \\ge {min_rep}$ forecasting filter) "
+            "and Early-$K$ Persistence Baseline on Test splits."
+        )
+    else:
+        col_elig = "Forecast Eligible"
+        cohort_desc = ", ".join(
+            f"{str(it.get('name', 'dataset')).upper()}: $K={int(it.get('k_horizon', 20) or 20)}, N_{{\\text{{reply}}}} \\ge {int(it.get('min_total_replies', 25) or 25)}$"
+            for it in items
+        )
+        resolved_caption = caption or (
+            f"Exploratory dataset statistics ({cohort_desc}) and Early-$K$ Persistence Baseline on Test splits."
+        )
+
     rows: list[str] = []
     for item in items:
-        ds_name = str(item.get("name", "dataset")).replace("_", "\\_")
+        raw_name = str(item.get("name", "dataset"))
+        ds_name = raw_name.replace("_", "\\_")
+        if not uniform_cohort:
+            k_i = int(item.get("k_horizon", 20) or 20)
+            m_i = int(item.get("min_total_replies", 25) or 25)
+            ds_name = f"{ds_name} ($K{{=}}{k_i}, \\ge {m_i}$)"
         raw_c = int(item.get("raw_cascades", 0))
         elig_c = int(item.get("eligible_cascades", 0))
         topics = int(item.get("eligible_topics", item.get("raw_topics", 0)))
@@ -342,12 +366,12 @@ def format_dataset_stats_latex(
         [
             "\\begin{table*}[t]",
             "\\centering",
-            f"\\caption{{{caption}}}",
+            f"\\caption{{{resolved_caption}}}",
             f"\\label{{{label}}}",
             "\\resizebox{\\textwidth}{!}{",
             "\\begin{tabular}{lcccccccc}",
             "\\toprule",
-            "Dataset & Raw & Forecast ($\\ge 25$) & Topics & Train/Val/Test & Med (Mean) Replies & Med Span (h) & Persist RMSE$\\downarrow$ & Persist $r$$\\uparrow$ \\\\",
+            f"Dataset & Raw & {col_elig} & Topics & Train/Val/Test & Med (Mean) Replies & Med Span (h) & Persist RMSE$\\downarrow$ & Persist $r$$\\uparrow$ \\\\",
             "\\midrule",
             *rows,
             "\\bottomrule",
@@ -361,11 +385,27 @@ def format_dataset_stats_latex(
 
 def format_dataset_stats_markdown(stats_list: Sequence[Mapping[str, Any]]) -> str:
     """Render concise Markdown summary table for CLI inspection."""
+    items = list(stats_list)
+    cohorts = {
+        (int(it.get("k_horizon", 20) or 20), int(it.get("min_total_replies", 25) or 25))
+        for it in items
+    }
+    uniform_cohort = len(cohorts) == 1
+    if uniform_cohort and cohorts:
+        _, min_rep = next(iter(cohorts))
+        col_elig = f"Forecast (>={min_rep})"
+    else:
+        col_elig = "Forecast Eligible"
     lines = [
-        "| Dataset | Raw Cascades | Forecast (>=25) | Topics | Train/Val/Test | Med (Mean) Replies | Med Span (h) | Persist RMSE | Persist r |",
+        f"| Dataset | Raw Cascades | {col_elig} | Topics | Train/Val/Test | Med (Mean) Replies | Med Span (h) | Persist RMSE | Persist r |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
-    for item in stats_list:
+    for item in items:
+        ds_label = str(item.get("name", "dataset"))
+        if not uniform_cohort:
+            k_i = int(item.get("k_horizon", 20) or 20)
+            m_i = int(item.get("min_total_replies", 25) or 25)
+            ds_label = f"{ds_label} (K={k_i}, >={m_i})"
         sp = item.get("split_cascade_counts", {})
         split_str = f"{int(sp.get('train', 0))}/{int(sp.get('val', 0))}/{int(sp.get('test', 0))}"
         persist = item.get("early_k_persistence")
@@ -383,7 +423,7 @@ def format_dataset_stats_markdown(stats_list: Sequence[Mapping[str, Any]]) -> st
             p_rmse = "--"
             p_r = "--"
         lines.append(
-            f"| {item.get('name')} | {int(item.get('raw_cascades', 0)):,} | "
+            f"| {ds_label} | {int(item.get('raw_cascades', 0)):,} | "
             f"{int(item.get('eligible_cascades', 0)):,} | {int(item.get('eligible_topics', 0)):,} | "
             f"{split_str} | {float(item.get('median_replies', 0.0)):.1f} ({float(item.get('mean_replies', 0.0)):.1f}) | "
             f"{float(item.get('median_duration_hours', 0.0)):.2f} | {p_rmse} | {p_r} |"

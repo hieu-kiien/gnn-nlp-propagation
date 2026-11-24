@@ -23,6 +23,7 @@ from typing import Any
 from scripts.benchmark_efficiency import format_efficiency_latex
 from scripts.compute_kappa import format_human_audit_latex
 from scripts.export_dataset_stats import format_dataset_stats_latex
+from src.data.user_network import format_macro_network_latex
 
 _SAFE_CMD_RE = re.compile(
     r"\\(?:label|ref|eqref|pageref|cite|citep|citet|input|includegraphics|url|href)\{[^}]*\}"
@@ -69,22 +70,43 @@ def assemble_paper_artifacts(
             format_dataset_stats_latex(eda_datasets, label="tab:dataset_eda"),
             encoding="utf-8",
         )
-        generated.append(str(eda_tex))
+        generated.append(eda_tex.as_posix())
 
-    # 2. Ensure unified `tables_efficiency.tex` exists from PHEME or VN efficiency JSON
-    eff_tex = pdir / "tables_efficiency.tex"
+    # 1b. Merge PHEME + VN Macro Signed Social Network JSON summaries into `tables_macro_network.tex`
+    macro_datasets: list[dict[str, Any]] = []
     for ds_tag in ("pheme", "vn"):
+        macro_json = pdir / f"results_macro_network_{ds_tag}.json"
+        if macro_json.is_file():
+            blob = json.loads(macro_json.read_text(encoding="utf-8"))
+            if isinstance(blob, dict):
+                macro_datasets.append(blob)
+    if macro_datasets:
+        macro_tex = pdir / "tables_macro_network.tex"
+        macro_tex.write_text(
+            format_macro_network_latex(macro_datasets, label="tab:macro_network"),
+            encoding="utf-8",
+        )
+        generated.append(macro_tex.as_posix())
+
+    # 2. Ensure unified `tables_efficiency.tex` exists, preferring v3 ReZero outputs (>=137086 SBiFAGAT params)
+    eff_tex = pdir / "tables_efficiency.tex"
+    eff_candidates: list[tuple[int, list[dict[str, Any]]]] = []
+    for ds_tag in ("vn", "pheme"):
         eff_json = pdir / f"results_efficiency_{ds_tag}.json"
         if eff_json.is_file():
             blob = json.loads(eff_json.read_text(encoding="utf-8"))
             rows = blob.get("models") if isinstance(blob, dict) else blob
             if isinstance(rows, list) and rows:
-                eff_tex.write_text(
-                    format_efficiency_latex(rows, label="tab:efficiency"),
-                    encoding="utf-8",
-                )
-                generated.append(str(eff_tex))
-                break
+                sbif_params = next((int(r.get("params", 0)) for r in rows if r.get("model") == "SBiFAGAT"), 0)
+                is_v3 = 1 if sbif_params >= 137086 else 0
+                eff_candidates.append((is_v3, rows))
+    if eff_candidates:
+        eff_candidates.sort(key=lambda item: item[0], reverse=True)
+        eff_tex.write_text(
+            format_efficiency_latex(eff_candidates[0][1], label="tab:efficiency"),
+            encoding="utf-8",
+        )
+        generated.append(eff_tex.as_posix())
 
     # 2b. Merge pair-level & thread-level human audit JSON reports without overwriting VI vs EN
     corpus_candidates = (
@@ -116,7 +138,7 @@ def assemble_paper_artifacts(
             format_human_audit_latex({"corpora": corpus_reports}, label="tab:human_audit"),
             encoding="utf-8",
         )
-        generated.append(str(audit_tex))
+        generated.append(audit_tex.as_posix())
 
     # 3. Validate LaTeX tables for unescaped underscores outside math mode
     latex_issues: dict[str, list[dict[str, Any]]] = {}
@@ -151,11 +173,20 @@ def assemble_paper_artifacts(
         "figures/vn/fig3_cascade_heatmap.pdf",
         "figures/vn/fig4_counterfactual_interventions.pdf",
     ]
+    optional_tables = [
+        "tables_upfd_politifact.tex",
+        "tables_human_audit.tex",
+        "tables_macro_network.tex",
+        "tables_signed_link_vn.tex",
+        "tables_signed_link_pheme.tex",
+    ]
     manifest: dict[str, Any] = {
-        "paper_dir": str(pdir),
+        "paper_dir": pdir.as_posix(),
         "generated_tables": generated,
         "present_tables": [t for t in expected_tables if (pdir / t).is_file()],
         "missing_tables": [t for t in expected_tables if not (pdir / t).is_file()],
+        "optional_tables_present": [t for t in optional_tables if (pdir / t).is_file()],
+        "optional_tables_missing": [t for t in optional_tables if not (pdir / t).is_file()],
         "present_figures": [f for f in expected_figures if (pdir / f).is_file()],
         "missing_figures": [f for f in expected_figures if not (pdir / f).is_file()],
         "latex_underscore_issues": latex_issues,

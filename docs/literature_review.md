@@ -40,9 +40,9 @@ $$\alpha_{ij} = \operatorname{softmax}_j\left(e(\mathbf{h}_i, \mathbf{h}_j)\righ
 
 ---
 
-## 3. SGCN — Signed Graph Convolutional Network (`derr2018signed`)
+## 3. SGCN — Signed Graph Convolutional Networks (`derr2018signed`)
 
-- **Tiêu đề**: *Signed Graph Convolutional Network*
+- **Tiêu đề**: *Signed Graph Convolutional Networks*
 - **Tác giả**: Tyler Derr, Yao Ma, Jiliang Tang
 - **Xuất bản xác minh**: *2018 IEEE International Conference on Data Mining (ICDM)*, pp. 929–934, 2018
 - **Liên kết xác minh**: DOI `10.1109/ICDM.2018.00113` | `arXiv:1808.06354`
@@ -154,8 +154,8 @@ $$\mathcal{L}_{\text{MLM}}(\theta) = -\sum_{i \in \mathcal{M}} \ln P_\theta\left
 
 - **ViSoBERT (`nguyen2023visobert`)**:
   - **Tiêu đề**: *ViSoBERT: A Pre-Trained Language Model for Vietnamese Social Media Text Processing*
-  - **Tác giả**: Quoc-Nam Nguyen, Thang Chau Phan, Duc-Vu Nguyen, Kiet Van Nguyen
-  - **Xuất bản**: *EMNLP 2023* (Main Conference), pp. 5177–5191, ACL Anthology `2023.emnlp-main.315` — DOI `10.18653/v1/2023.emnlp-main.315` | `arXiv:2310.11166`.
+  - **Tác giả**: Nam Quoc Nguyen, Thang Chau Phan, Duc-Vu Nguyen, Kiet Van Nguyen
+  - **Xuất bản**: *EMNLP 2023* (Main Conference), pp. 5191–5207, ACL Anthology `2023.emnlp-main.315` — DOI `10.18653/v1/2023.emnlp-main.315` | `arXiv:2310.11166`.
   - **Vai trò trong SBi-FAGAT**: Là kiến trúc XLM-R tiền huấn luyện chuyên biệt trên ngữ liệu mạng xã hội tiếng Việt (hỗ trợ emoji, teencode, văn phong diễn đàn/Reddit với tokenizer SentencePiece), đảm nhiệm vai trò **bộ mã hóa nút Ancestor-Conditioned SpanPool đóng băng** ($\mathbf{e}_v^{\text{Span}} \in \mathbb{R}^{768}$), **bộ chấm độ gay gắt** ($h_{uv}$) khi tinh chỉnh trên `UIT-ViHSD`, và **bộ mã hóa chéo** `DualHeadCrossEncoder` nhánh tiếng Việt.
 - **UIT-ViHSD (`luu2021vihsd`)**:
   - **Tiêu đề**: *A Large-scale Dataset for Hate Speech Detection on Vietnamese Social Media Texts*
@@ -187,7 +187,7 @@ $$\mathcal{L}_{\text{MLM}}(\theta) = -\sum_{i \in \mathcal{M}} \ln P_\theta\left
 ## 12. Các Công trình Nâng cấp & Nền tảng Kiểm chứng cho SBi-FAGAT (`platonov2023critical`, `rossi2023edge`, `pfister2013good`, `li2017deepcas`)
 
 1. **Đánh giá GNN dưới Heterophily (`platonov2023critical`)**: Oleg Platonov et al. (*ICLR 2023*, `arXiv:2302.11640`) chứng minh tầm quan trọng của tách phân hoạch nghiêm ngặt không trùng thực thể (`topic_splits.json`), tiền chuẩn hóa (Pre-Norm) và cơ chế kết nối dư khi cạnh mang tính dị biệt lập trường (*heterophily*).
-2. **Dir-GNN cho Đồ thị Có hướng Dị biệt (`rossi2023edge`)**: Emanuele Rossi, Bertrand Charpentier, Francesco Di Giovanni, Fabrizio Frasca, Stephan Günnemann (*LoG 2023*, PMLR 231, `arXiv:2305.10498`, DOI `10.48550/arXiv.2305.10498`) chứng minh việc tách biệt phép tổng hợp theo chiều đi (Top-Down) và chiều ngược (Bottom-Up) kết hợp trộn có học cải thiện mạnh hiệu năng trên đồ thị dị biệt — là cơ sở lý thuyết trực tiếp cho tầng trộn hai hướng Dir-GNN trong `SBi-FAGAT`.
+2. **Dir-GNN cho Đồ thị Có hướng Dị biệt (`rossi2023edge`)**: Emanuele Rossi, Bertrand Charpentier, Francesco Di Giovanni, Fabrizio Frasca, Stephan Günnemann, Michael M. Bronstein (*LoG 2023*, PMLR 231:25:1–25:27, 2024, `arXiv:2305.10498`, `https://proceedings.mlr.press/v231/rossi24a.html`) chứng minh việc tách biệt phép tổng hợp theo chiều đi (Top-Down) và chiều ngược (Bottom-Up) kết hợp trộn có học cải thiện mạnh hiệu năng trên đồ thị dị biệt — là cơ sở lý thuyết trực tiếp cho tầng trộn hai hướng Dir-GNN trong `SBi-FAGAT`.
 3. **DeepCas & Bimodality Coefficient (`li2017deepcas`, `pfister2013good`)**: Thành phần dự báo quy mô lan truyền theo cửa sổ sớm kế thừa bài toán từ *DeepCas* (*WWW '17*, DOI `10.1145/3038912.3052643`, `arXiv:1611.05373`), trong khi kiểm chứng phân đôi lập trường độc lập tham chiếu công thức *Sarle Bimodality Coefficient* của Pfister et al. (*Frontiers in Psychology 2013*, DOI `10.3389/fpsyg.2013.00700`).
 
 ---
@@ -203,6 +203,6 @@ $$\mathcal{L}_{\text{MLM}}(\theta) = -\sum_{i \in \mathcal{M}} \ln P_\theta\left
 | **FAGCN** (`bo2021beyond`) | Không (Vô hướng) | Ngầm định $\alpha_{ij}^G$ | **Có ($\tanh$)** | Không | Có | Có |
 | **RWC** (`garimella2018quantifying`) | Không | Không | Không (Bước đi ngẫu nhiên) | Không | Suy biến trên cây nhỏ | Chỉ đo phân cực |
 | **ViSoBERT / Twitter-RoBERTa** (`nguyen2023visobert`, `barbieri2020tweeteval`) | Không | Tinh chỉnh cặp câu | Không | **Nền tảng SpanPool & Cross-Encoder 2D** | Mù cấu trúc cây | Cần kết hợp GNN |
-| **SBi-FAGAT (Đề xuất)** | **Có (TD + BU + Dir-GNN Mix)** | **Có ($[s_{uv}, h_{uv}]^\top$)** | **2 kênh Phân cực/Kích thích + Pre-Norm + BFS 64-hop Dipole** | **Symmetric NLI + ViHSD/TweetEval $\to$ Segment-Isolated Student** | **8 mô hình cố định công bằng (`hidden_dim=64`)** | **KL-calibrated BCE + Huber + Warmup/EMA** |
+| **SBi-FAGAT (Đề xuất)** | **Có (TD + BU + Dir-GNN Mix)** | **Có ($[s_{uv}, h_{uv}]^\top$)** | **2 kênh Phân cực/Kích thích + Pre-Norm + BFS 64-hop Dipole** | **Symmetric NLI + ViHSD/TweetEval $\to$ Segment-Isolated Student** | **8 mô hình cố định công bằng (`hidden_dim=64`)** | **KL-calibrated BCE + Smooth-L1 + Warmup/EMA** |
 
 **Kết luận tổng hợp**: SBi-FAGAT lấp đầy khoảng trống nghiên cứu bằng cách kết nối **vector ngữ nghĩa nút Ancestor-Conditioned SpanPool** và **tín hiệu cạnh 2D $[s_{uv}, h_{uv}]^\top$** (từ bộ thầy kép `mDeBERTa-v3-xnli` Symmetric Stance Verbalizer + `ViSoBERT`/`twitter-roberta-base-offensive` chưng cất cô lập phân đoạn trên phân hoạch chủ đề nhất quán `topic_splits.json`) trực tiếp vào **hai kênh truyền thông điệp Phân cực có dấu / Kích thích không dấu**, trộn hai hướng **Dir-GNN (TD + BU)** và đọc cực phe quy chiếu gốc `max_hops=64`, được kiểm định công bằng giữa 8 mô hình ở `hidden_dim = 64` kèm đối chứng **Early-K Persistence**.

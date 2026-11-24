@@ -11,7 +11,7 @@
 
 \begin{document}
 
-\title{SBi-FAGAT: Stance-Guided Bidirectional Frequency-Adaptive Graph Attention for Early Cascade Size and Polarization Prediction}
+\title{Two-Tier Stance-Guided Signed Graph Neural Networks for Early Cascade Forecasting and Macro Social Network Polarization}
 
 \author{
 \IEEEauthorblockN{Vu Hieu Kien}
@@ -28,204 +28,160 @@ Thai Nguyen, Vietnam}
 \maketitle
 
 \begin{abstract}
-Predicting the eventual reach and community polarization of social media discussions from only the initial replies is challenging due to extreme early-stage sparsity, heterophilic conflict interactions, and asymmetric parent--child propagation dynamics. Existing rumor and cascade predictors predominantly rely on edge-sign-agnostic graph convolutions or post-hoc full-tree features that induce temporal leakage. Focusing specifically on \textbf{early cascade-level} (thread-level) stance dispersion and affective conflict rather than longitudinal user-network echo chambers, we present \textbf{SBi-FAGAT} (\emph{Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network}), a unified multi-task framework operating strictly on the source post and the earliest $K = 20$ chronological interactions. Our pipeline combines frozen \emph{Ancestor-Conditioned SpanPool} node embeddings and $10$-D causal structural-temporal descriptors with distilled 2D pairwise discourse attributes $e_{uv} = [s_{uv}, h_{uv}]^\top$ (ideological stance polarity separated from affective hostility) obtained from multilingual NLI stance verbalizers and class-weighted hostility teachers via reply-span-pooled cross-encoders. Inside the graph backbone, dual-channel Top-Down and Bottom-Up \texttt{StanceGuidedFAConv} layers pair signed frequency gates $\gamma_{uv} \in (-1, +1)$ with unsigned excitation gates, Dir-GNN bidirectional mixing, and root-aligned camp dipole readouts. Across inductive benchmarks on English PHEME and Vietnamese Reddit discussions, temporal holdout verification, leave-one-event-out evaluation, post-hoc text-free UPFD structural transfer, and observational edge-feature sensitivity analysis, SBi-FAGAT provides an interpretable, leakage-free framework verified against matched neural competitors, a non-learned Early-$K$ Persistence Baseline, RumourEval SDQC stance validation, and streamlined dual-annotator Vietnamese reliability audits.
+Predicting the eventual reach and community polarization of social media discussions alongside macro-scale ideological divisions is challenging due to extreme early-stage structural sparsity, heterophilic conflict edges, and temporal leakage pitfalls. We present a two-tier signed graph framework combining (i) \textbf{SBi-FAGAT} (\emph{Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network}), which forecasts final cascade size $y_{\text{size}} = \ln(1 + N_{\text{total}})$ and future stance polarization $y_{\text{polar}} \in [0, 1]$ from the source post and at most $K = 20$ earliest replies, and (ii) a macro cross-thread signed user-interaction social network linking $13{,}718$ users and $85{,}398$ interactions. Our Natural Language Processing (NLP) pipeline extracts causal \emph{Ancestor-Conditioned SpanPool} node embeddings and distills 2D discourse vectors $e_{uv} = [s_{uv}, h_{uv}]^\top$ (stance polarity separated from affective hostility) via multilingual Natural Language Inference (NLI) verbalizers and class-weighted hostility teachers. Controlled five-seed experiments yield an honest diagnostic contrast across scales. On shallow single-thread Vietnamese Reddit cascades ($|\mathcal{V}_K| \le 21$, $N = 225$ Test threads), SBi-FAGAT ($R^2_{\text{polar}} = 0.0742$) strongly outperforms an unlearned Early-$K$ Persistence Baseline ($-3.1986$) and matches or trails matched baselines (\texttt{TextMLP} $R^2_{\text{polar}} = 0.0741$, Pearson $r = 0.2989$ vs.\ $0.2899$; \texttt{BiEdgeGATv2} $R^2_{\text{polar}} = 0.0789$ vs.\ $0.0777$, Holm--Bonferroni $p_{\text{adj}} \ge 0.574$; \texttt{StandardGCN} MSLE $= 0.1542$ vs.\ $0.1580$; temporal \texttt{FAGCN} $R^2_{\text{size}} = 0.2586$ vs.\ $0.1914$), and on post-hoc text-free UPFD GossipCop \texttt{StandardGATv2} outperforms latent-edge SBi-FAGAT ($0.9684$ vs.\ $0.9486$, $p_{\text{adj}} = 8.00\text{e-}04$). Conversely, lifting the same 2D discourse attributes onto the macro cross-thread Vietnamese user graph exposes pronounced two-camp polarization (Signed Modularity $Q_{\text{signed}} = 0.4280$, cross-camp opposition $57.0\%$ vs.\ within-camp $37.9\%$, Random Walk Controversy $= 0.0957$, and pervasive multi-way negative triads with structural balance $z = -15.17$).
 \end{abstract}
 
 \begin{IEEEkeywords}
-Graph Neural Networks, Social Media Polarization, Information Cascades, Stance Detection, Early Prediction, Frequency-Adaptive Attention
+Graph Neural Networks, Signed Networks, Social Media Polarization, Information Cascades, Stance Detection, Structural Balance
 \end{IEEEkeywords}
 
 \section{Introduction}
-Online information cascades frequently trigger rapid viral amplification alongside sharp ideological polarization. Forecasting both the ultimate cascade size $y_{\text{size}} = \ln(1 + N_{\text{total}})$ and future community polarization $y_{\text{polar}} \in [0, 1]$ before a thread matures enables proactive moderation and misinformation triage \cite{zubiaga2016analysing,li2017deepcas}. However, early prediction restricted strictly to the root post and the first $K=20$ interactions ($t \le t_K$) exposes three fundamental obstacles: (i) standard graph neural networks assume homophily (low-pass smoothing), erasing disagreement signals between conflicting commenters \cite{bo2021beyond,platonov2023critical}; (ii) unidirectional top-down convolutions ignore how reply subtrees synthesize conflict back toward the root \cite{bian2020rumor}; and (iii) unguarded feature engineering often leaks post-$t_K$ timestamps, tree depth statistics, or shared topic splits into early inputs.
+Online discussions rapidly generate both viral reach and sharp attitudinal division. Forecasting ultimate cascade size $y_{\text{size}} = \ln(1 + N_{\text{total}})$ and future polarization $y_{\text{polar}} \in [0, 1]$ from the earliest interactions while mapping macro community segregation informs early moderation and misinformation triage \cite{zubiaga2016analysing,li2017deepcas,garimella2018quantifying}. Yet learning jointly from Graph Neural Networks (GNNs) and NLP across early cascades confronts three obstacles: (i) standard GNN aggregators assume homophily via low-pass smoothing, washing out heterophilic disagreement signals \cite{bo2021beyond,platonov2023critical}; (ii) unidirectional top-down convolutions ignore how reply subtrees synthesize conflict back toward the root \cite{bian2020rumor}; and (iii) unguarded benchmarks leak post-observation reply counts, future tree depths, or shared topics across splits.
 
-To address these gaps within commodity 16~GB GPU and dual Tesla T4 budgets without sacrificing teacher coverage, we present a unified 2D architecture with the following contributions:
+To investigate where signed message passing succeeds and where shallow tree size imposes structural limits, we present a leakage-checked, two-tier bilingual framework for Vietnamese Reddit and English PHEME data within $16$~GB GPU and dual Tesla T4 budgets:
 \begin{enumerate}
-    \item \textbf{Leakage-Free Early Cascade Contract:} We formalize strict Parquet/PyG validation requiring UTC causality, fixed-horizon temporal normalization inside $t \le t_K$, forecasting eligibility ($N_{\text{reply}} \ge 25$), unified canonical topic splits (\texttt{topic\_splits.json}) shared across distillation, benchmark, and $K$-ablation subsets, and leave-one-out teacher edge isolation.
-    \item \textbf{Ancestor-Conditioned SpanPool \& Reply-Span 2D Distillation:} Frozen bilingual social encoders (\texttt{uitnlp/visobert} \cite{nguyen2023visobert} for Vietnamese; \texttt{cardiffnlp/twitter-roberta-base} \cite{barbieri2020tweeteval} for English) extract contextual reply embeddings conditioned solely on causal ancestors (\texttt{[root, parent, reply]}). Pairwise $e_{uv} = [s_{uv}, h_{uv}]^\top$ teachers fuse a symmetric two-hypothesis \texttt{mDeBERTa-v3-xnli} stance verbalizer \cite{laurer2024less,he2023debertav3} with class-weighted hostility classifiers (\texttt{UIT-ViHSD} \cite{luu2021vihsd} / \texttt{TweetEval-Offensive} \cite{barbieri2020tweeteval}), distilling into a reply-span-pooled \texttt{DualHeadCrossEncoder}.
-    \item \textbf{Dual-Channel Bidirectional SBi-FAGAT (\texttt{hidden\_dim=64}):} Two-stream node stems separate semantic embeddings from $10$-D causal topology descriptors, feeding Top-Down and Bottom-Up \texttt{StanceGuidedFAConv} stacks with explicit Dir-GNN cross-direction mixing \cite{rossi2023edge}, dual polarity/excitation message channels, and root-aligned BFS camp dipole readouts.
-    \item \textbf{Multi-Faceted Scientific Verification:} Beyond fixed-hyperparameter comparison against seven matched neural baselines (\texttt{hidden\_dim=64}, symmetric uncertainty prediction, and shared causal Persistence-Residual anchoring for stance-aware architectures) plus a matched \texttt{BiEdgeGATv2} ablation comparator, we evaluate non-learned Early-$K$ Persistence, Sarle's Bimodality Coefficient \cite{pfister2013good}, signed assortativity, Vietnamese temporal holdout (\texttt{edge\_source="teacher"}), post-hoc text-free UPFD \cite{dou2021upfd} structural transfer via \texttt{LatentConflictMLP}, RumourEval SDQC and Vietnamese dual-annotator pair/thread reliability audits, and observational edge-feature sensitivity analysis.
+    \item \textbf{Strict Early-Cascade Zero-Leakage Contract:} Using Arrow/PyTorch Geometric (PyG) schema validators, all cascade inputs are truncated strictly at $t \le t_K$ ($K=20$, eligibility $N_{\text{reply}} \ge 25$, alongside reduced-horizon $K=10, N_{\text{reply}} \ge 15$ configuration support), sharing canonical topic splits (\texttt{topic\_splits.json}), Leave-One-Event-Out (LOO) teacher edge isolation, and personally identifiable information (PII) redaction.
+    \item \textbf{Causal SpanPool \& Reply-Span 2D Distillation:} Frozen encoders (\texttt{uitnlp/visobert} \cite{nguyen2023visobert} for Vietnamese; \texttt{cardiffnlp/twitter-roberta-base} \cite{barbieri2020tweeteval} for English) compute ancestor-conditioned reply representations. A multilingual \texttt{mDeBERTa-v3-xnli} stance verbalizer \cite{laurer2024less,he2023debertav3} and class-weighted hostility teachers (\texttt{UIT-ViHSD} \cite{luu2021vihsd} and \texttt{TweetEval-Offensive} \cite{barbieri2020tweeteval}) distill $e_{uv} = [s_{uv}, h_{uv}]^\top$ into a train-split \texttt{DualHeadCrossEncoder}.
+    \item \textbf{Dual-Channel Bidirectional SBi-FAGAT:} Paired Top-Down (TD) and Bottom-Up (BU) \texttt{StanceGuidedFAConv} layers combine signed frequency gates $\gamma_{uv}$, unsigned excitation gates $\alpha_{uv}^{\text{exc}}$, Dir-GNN cross-mixing \cite{rossi2023edge}, root-aligned camp dipoles, and a Persistence-Residual logit anchor trained under KL-calibrated optimization.
+    \item \textbf{Tier 2 Macro Signed Network \& Honest Multi-Faceted Verification:} Beyond fair five-seed micro comparisons against seven neural baselines, a matched \texttt{BiEdgeGATv2} comparator, Early-$K$ Persistence, external UPFD \cite{dou2021upfd} transfer, RumourEval-2019 SDQC \cite{gorrell2019semeval}, construct correlations (Sarle's Bimodality Coefficient \cite{pfister2013good} and signed assortativity), and observational edge sensitivity probes, we project all valid cross-thread interactions onto a global signed user social network analyzed via Structural Balance Theory \cite{cartwright1956structural}, Signed Laplacian bipartition \cite{kunegis2010spectral}, $Q_{\text{signed}}$, and Random Walk Controversy (RWC) \cite{garimella2018quantifying}, plus zero-leakage temporal signed link prediction.
 \end{enumerate}
 
 \section{Related Work}
-\subsection{Graph Neural Networks for Cascades and Heterophily}
-Conventional GCN \cite{kipf2017semisupervised} and dynamic GATv2 \cite{brody2022how} aggregate neighborhood features via strictly positive weights, acting as low-pass filters that degrade when adjacent nodes hold opposing viewpoints \cite{platonov2023critical}. Bi-GCN \cite{bian2020rumor} introduced bidirectional top-down and bottom-up propagation with root enhancement for rumor detection, Dir-GNN \cite{rossi2023edge} demonstrated that decoupling directed message directions improves learning on heterophilic graphs, and FAGCN \cite{bo2021beyond} and Signed GCN \cite{derr2018signed} introduced negative edge weights to separate low- and high-frequency components. SBi-FAGAT unifies directional tree asymmetry with explicitly NLP-guided continuous 2D edge vectors $e_{uv}$, symmetric activations, and root-aligned dipole pooling.
+\subsection{GNNs for Information Cascades, Heterophily, and Signed Graphs}
+Homophilic graph networks such as GCN \cite{kipf2017semisupervised} and GATv2 \cite{brody2022how} perform low-pass smoothing, which degrades when neighboring commenters express opposing stances \cite{platonov2023critical}. For cascade size prediction, DeepCas \cite{li2017deepcas} models sampled random-walk diffusion paths rather than explicit edge stance conflict, whereas Bi-GCN \cite{bian2020rumor} models bidirectional tree propagation with root enhancement for rumor classification. Dir-GNN \cite{rossi2023edge} proves that decoupling incoming and outgoing directed transformations strengthens learning on heterophilic topologies. Signed Graph Convolutional Networks (SGCN) \cite{derr2018signed} apply Cartwright--Harary balance paths \cite{cartwright1956structural} to discrete positive/negative links, and FAGCN \cite{bo2021beyond} learns self-gating signed attention coefficients to mix low- and high-frequency signals. SBi-FAGAT extends this lineage to continuous 2D NLP discourse edges $e_{uv} = [s_{uv}, h_{uv}]^\top$ with separate polarity/excitation channels and camp-dipole readouts, while Kunegis et al.~\cite{kunegis2010spectral} provide the Signed Laplacian spectral foundation for our macro network tier.
 
-\subsection{NLP Stance Detection and Controversy Quantification}
-Discourse stance benchmarks such as PHEME \cite{zubiaga2016analysing,kochkina2018pheme} and RumourEval-2019 \cite{gorrell2019semeval} classify replies relative to claims. Multilingual NLI transfer \cite{laurer2024less}, social hate/offensive detection \cite{barbieri2020tweeteval,luu2021vihsd}, and DeBERTaV3 \cite{he2023debertav3} / ViSoBERT \cite{nguyen2023visobert} backbones provide domain-adapted discourse representations. Because random-walk controversy metrics such as RWC \cite{garimella2016quantifying,garimella2018quantifying} degenerate on sparse shallow trees ($|\mathcal{V}_K| \le 21$), we quantify polarization via continuous root-aligned future stance dispersion verified against Sarle's Bimodality Coefficient \cite{pfister2013good} and signed assortativity.
+\subsection{Multilingual Stance Detection and Social Polarization}
+Social rumor corpora including PHEME \cite{zubiaga2016analysing,kochkina2018pheme} and SemEval-2019 RumourEval \cite{gorrell2019semeval} evaluate stance across conversation threads using Support, Deny, Query, and Comment (SDQC) categories. Advances in RoBERTa \cite{liu2019roberta}, TweetEval \cite{barbieri2020tweeteval}, DeBERTaV3 \cite{he2023debertav3}, PhoBERT \cite{nguyen2020phobert}, and ViSoBERT \cite{nguyen2023visobert} alongside Vietnamese hate speech resources (UIT-ViHSD \cite{luu2021vihsd}) and multilingual NLI transfer \cite{laurer2024less} enable scalable cross-lingual stance and incivility extraction. At macro user-graph scales, Garimella et al.~\cite{garimella2016quantifying,garimella2018quantifying} quantify echo-chamber segregation via RWC, whereas shallow early trees ($|\mathcal{V}_K| \le 21$) are too small for random-walk segregation, motivating our joint micro--macro evaluation paired with Sarle's Bimodality Coefficient \cite{pfister2013good}.
 
 \section{Methodology}
-\subsection{Problem Formulation and Zero-Leakage Protocol}
-Given a propagation tree observed up to the earliest $K=20$ chronological replies $\mathcal{G}_K = (\mathcal{V}_K, \mathcal{E}_K^{\text{TD}}, \mathcal{E}_K^{\text{BU}})$, each node $v \in \mathcal{V}_K$ carries a $770$-D feature vector $x_v = [\mathbf{e}_v^{\text{Span}} \Vert t_{\text{norm}}(v) \Vert d_{\text{norm}}(v)]$ paired with a $10$-D causal structural vector $s_v \in [0, 1]^{10}$ and an $8$-D cascade summary vector $c_{\mathcal{G}}$ (all computed strictly from $t \le t_K$). Post-observation replies ($t > t_K$, count $n \ge 2$) define targets:
+\subsection{Data Provenance, Early Formulation, and Zero-Leakage Protocol}
+We evaluate two bilingual corpora with strict leakage guards:
+\begin{itemize}
+    \item \textbf{Vietnamese Reddit Corpus:} Public discussions crawled via Arctic Shift from \texttt{r/vozforums} ($87{,}788$ nodes) and \texttt{r/VietNam} ($32$ nodes) between 2025-06-15 and 2026-06-04 UTC ($87{,}820$ total nodes, $86{,}320$ edges across $1{,}500$ cascades with $N_{\text{reply}} \ge 25$, median $44.0$ and mean $57.5$ replies, median duration $95.22$~h). Because Reddit lacks shared external event labels, Train/Val/Test ($1{,}050/225/225$) uses a heuristic 30-day temporal-window and TF-IDF cosine ($\ge 0.30$) topic grouping yielding $1{,}496$ clusters, audited against a strict chronological temporal holdout ($225$ Test cascades).
+    \item \textbf{English PHEME Corpus:} $6{,}425$ raw Twitter rumor threads ($101{,}342$ nodes, $94{,}917$ edges across $9$ news events; $1{,}067$ true, $697$ unverified, $638$ false, $4{,}023$ non-rumor), partitioned canonically by event into Train/Val/Test ($570/228/76$ cascades over $6$ events with $N_{\text{reply}} \ge 25$ at $K=20$; raw median $11.0$ replies, median span $2.53$~h) alongside 4-fold LOO evaluation. We note transparently that archived PHEME tables below correspond to this prior $K=20, N_{\text{reply}} \ge 25$ quadratic-target extraction (mean $y_{\text{polar}} = 0.0104$), whereas the pipeline supports reduced-horizon $K=10, N_{\text{reply}} \ge 15$ extraction for sparser events.
+\end{itemize}
+
+For each early graph $\mathcal{G}_K = (\mathcal{V}_K, \mathcal{E}_K^{\text{TD}}, \mathcal{E}_K^{\text{BU}})$ retaining only the root and earliest $K=20$ chronological replies ($t \le t_K$), every node $v \in \mathcal{V}_K$ carries $x_v = [\mathbf{e}_v^{\text{Span}} \Vert t_{\text{norm}}(v) \Vert d_{\text{norm}}(v)] \in \mathbb{R}^{770}$, where $t_{\text{norm}}(v) = \min\!\bigl(1, \ln(1 + \Delta t_v)/\ln(1 + T_{\text{ref}})\bigr)$ with fixed $T_{\text{ref}} = 604{,}800$~s (7 days) and $d_{\text{norm}}(v) = \min\!\bigl(1, \operatorname{depth}(v)/K\bigr)$, paired with a $10$-D causal structural tensor $s_v \in [0, 1]^{10}$ and an $8$-D cascade summary vector $c_{\mathcal{G}} \in [0, 1]^8$ (Table~\ref{tab:features}). All inputs strictly exclude post-$t_K$ timestamps, full-tree degrees, or global label statistics. Unobserved post-horizon replies ($t > t_K$, count $n \ge 2$) define continuous regression targets:
 \begin{multline}
-y_{\text{size}} = \ln(1 + N_{\text{total}}), \quad
+y_{\text{size}} = \ln(1 + N_{\text{total}}), \\
 y_{\text{polar}} = \operatorname{clip}\!\Biggl(\lambda_p \min\!\left(1, \sqrt{\min(1, s_{\tilde{s}, \text{ddof}=1}^2)}\right) \\
 + (1-\lambda_p)\min\!\left(1, 2\sqrt{\frac{n}{n-1} m_+ m_-}\right),\, 0,\, 1\Biggr),
 \end{multline}
-where $\lambda_p = 0.5$, $\tilde{s}_v \in [-1, 1]$ denotes root-aligned future stances over $t > t_K$ (\texttt{future\_only}), $m_+ = \frac{1}{n}\sum_v \max(\tilde{s}_v, 0)$ and $m_- = \frac{1}{n}\sum_v \max(-\tilde{s}_v, 0)$ are continuous camp intensities whose finite-sample covariance bias is removed prior to square-root linear amplitude scaling and $[0, 1]$ clipping by $\frac{n}{n-1}$ (preventing quadratic collapse on empirical cascades), and PHEME cascades additionally supervise $y_{\text{rumor}}$. Forecasting splits require $N_{\text{reply}} \ge 25$ (with optional $K=10, N_{\text{reply}} \ge 15$ evaluation on sparser PHEME events) so non-trivial future evolution exists. Topic splits partition Train/Val/Test (70\%/15\%/15\%) canonically across news events (PHEME) or via a \emph{Heuristic Temporal-Keyword / 30-day TF-IDF ($\cos \ge 0.30$) Grouped Inductive Split} (Vietnamese Reddit, alongside chronological temporal holdout with \texttt{edge\_source="teacher"}), persisting \texttt{topic\_splits.json} so distillation, evaluation, and fixed-horizon $K \in \{10, 20, 30, 50\}$ sensitivity runs never re-split Train topics into Test.
+where $\lambda_p = 0.5$, $\tilde{s}_v \in [-1, 1]$ is the root-aligned future stance via breadth-first sign propagation ($\tilde{s}_v = \tilde{s}_{\operatorname{par}(v)} \cdot s_{\operatorname{par}(v),v}$ over $[-1, 1]$), $m_+ = \frac{1}{n}\sum_v \max(\tilde{s}_v, 0)$, and $m_- = \frac{1}{n}\sum_v \max(-\tilde{s}_v, 0)$, removing finite-sample covariance bias via $\frac{n}{n-1}$ prior to square-root linear amplitude scaling. On PHEME, models also predict 4-class veracity $y_{\text{rumor}}$.
+
+\begin{table}[t]
+\centering
+\caption{Causal Early-Window Structural Descriptors ($s_v \in [0,1]^{10}$) and Cascade Burst-Velocity Summary ($c_{\mathcal{G}} \in [0,1]^8$) Extracted Strictly on $\mathcal{G}_K$.}
+\label{tab:features}
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{lp{5.8cm}}
+\toprule
+Vector & Feature Components ($t \le t_K$, Bounded in $[0, 1]$) \\
+\midrule
+$s_v$ (10-D) & (0) $t_{\text{norm}}$ root lag; (1) parent--reply log lag $\Delta t_{\text{par}}$; (2) relative horizon arrival phase $\Delta t_v / t_K$; (3) chronological rank $i/K$; (4) $d_{\text{norm}}$; (5) \texttt{is\_root}; (6) normalized early out-degree in $\mathcal{V}_K$; (7) \texttt{is\_early\_leaf}; (8) root-author re-entry indicator; (9) cumulative author repeat count $/K$. \\
+\midrule
+$c_{\mathcal{G}}$ (8-D) & (0) normalized horizon elapsed span; (1) mean normalized inter-arrival gap; (2) logistic burst acceleration ($\sigma(\ln\bar{g}_{\text{early}} - \ln\bar{g}_{\text{late}})$); (3) direct-to-root reply fraction; (4) max early tree depth $/K$; (5) unique hashed author ratio; (6) substantive reply fraction ($\ge 8$ tokens); (7) one-sided hostility index ($|\bar{s}_{uv}|\cdot\bar{h}_{uv}$). \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
 
 \subsection{Offline Ancestor-Conditioned SpanPool and 2D Distillation}
-To decouple transformer memory from multi-seed GNN sweeps, node embeddings and edge scores are precomputed offline in mixed precision (\texttt{FP16}). For node embeddings $\mathbf{e}_v^{\text{Span}} \in \mathbb{R}^{768}$, frozen encoders (\texttt{uitnlp/visobert} for VI, \texttt{cardiffnlp/twitter-roberta-base} for EN) process causal context sequences \texttt{[CLS] root [SEP] parent [SEP] reply [SEP]} (with 60/40 head--tail root truncation) and mean-pool exclusively over reply tokens, disambiguating short replies without accessing future nodes.
-
-For 2D edge attributes $e_{uv} = [s_{uv}, h_{uv}]^\top \in [-1, 1] \times [0, 1]$:
+To decouple transformer memory from five-seed GNN training, frozen backbones (\texttt{uitnlp/visobert} for VI, \texttt{cardiffnlp/twitter-roberta-base} for EN) encode causal paths \texttt{[CLS] root [SEP] parent [SEP] reply [SEP]} (with 60/40 head--tail truncation on long roots) and mean-pool exclusively over reply tokens to obtain $\mathbf{e}_v^{\text{Span}} \in \mathbb{R}^{768}$. Pairwise 2D discourse attributes $e_{uv} = [s_{uv}, h_{uv}]^\top \in [-1, 1] \times [0, 1]$ are scored by two teachers:
 \begin{itemize}
-    \item \textbf{Symmetric NLI Stance Teacher ($s_{uv}$):} Within a 384-token budget preserving the full reply span, \texttt{mDeBERTa-v3-base-xnli} evaluates two symmetric hypotheses (support vs.\ opposition) over parent--reply pairs, attributing double contradictions $\min(c_{\text{sup}}, c_{\text{opp}})$ to neutral on the 3-class stance simplex so $s_{uv} = P(\text{support}) - P(\text{oppose})$.
-    \item \textbf{Class-Weighted Hostility Teacher ($h_{uv}$):} Inverse-frequency square-root class weighting fine-tunes \texttt{uitnlp/visobert} on \texttt{UIT-ViHSD} \cite{luu2021vihsd} (VI), paired with \texttt{twitter-roberta-base-offensive} \cite{barbieri2020tweeteval} (EN).
-    \item \textbf{Reply-Span-Pooled Student (\texttt{DualHeadCrossEncoder}):} Trained strictly on $\mathcal{T}_{\text{train}}$ with a 5-block relational interaction vector $[h_{\text{CLS}} \Vert h_{\text{ctx}} \Vert h_{\text{reply}} \Vert h_{\text{ctx}} \odot h_{\text{reply}} \Vert |h_{\text{ctx}} - h_{\text{reply}}|]$ for stance and reply-span pooling for $h_{uv}$ (attenuating parent profanity bleed into clean replies), temperature-scaled KL ($T=2.0$) + $0.5\,\text{SmoothL1}$ + \texttt{BCEWithLogitsLoss}, deep \texttt{(root, reply)} pairs, differential AdamW learning rates, and LOO \texttt{edge\_source="teacher"} isolation.
+    \item \textbf{Symmetric NLI Stance Teacher ($s_{uv}$):} Evaluating paired NLI hypotheses (entailment for supporting vs.\ opposing the target claim under a 384-token budget preserving the full reply), double contradictions refine neutral mass via $c_{\text{neut}}^{\star} = c_{\text{neut}} + \min(c_{\text{sup}}, c_{\text{opp}})$ before simplex normalization, defining $s_{uv} = P(\text{support}) - P(\text{oppose})$.
+    \item \textbf{Class-Weighted Hostility Teacher ($h_{uv}$):} Inverse-frequency square-root class weighting fine-tunes \texttt{uitnlp/visobert} on UIT-ViHSD \cite{luu2021vihsd} (VI), alongside \texttt{twitter-roberta-base-offensive} \cite{barbieri2020tweeteval} (EN).
+    \item \textbf{Cross-Encoder Distillation:} Strictly within $\mathcal{T}_{\text{train}}$, a shared-encoder \texttt{DualHeadCrossEncoder} processes interaction vectors $[h_{\text{CLS}} \Vert h_{\text{ctx}} \Vert h_{\text{reply}} \Vert h_{\text{ctx}} \odot h_{\text{reply}} \Vert |h_{\text{ctx}} - h_{\text{reply}}|]$ for stance and reply-span pooling for $h_{uv}$ (preventing parent profanity bleed), optimized with temperature-scaled Kullback--Leibler divergence $T^2 \cdot \operatorname{KL}_T$ ($T=2.0$), $\operatorname{SmoothL1}$ ($\beta=0.1$) on $s_{uv}$, and binary cross-entropy (\texttt{BCEWithLogits}) on $h_{uv}$. Inductive evaluation uses student scores; LOO isolates teachers (\texttt{edge\_source="teacher"}).
 \end{itemize}
 
-\subsection{Dual-Channel Bidirectional SBi-FAGAT Architecture}
-A shared \texttt{TwoStreamNodeStem} projects semantic and $10$-D causal structural inputs into $h^{(0)} \in \mathbb{R}^{64}$ (masking topology columns in both \texttt{struct\_x} and \texttt{cascade\_stats} for \texttt{TextMLP}). Each \texttt{StanceGuidedFAConv} layer normalizes linear node projections $z^{\text{norm}} = \operatorname{LN}(W h^{(l-1)})$ and evaluates scaled node--edge gates (with node-attention Xavier gain $0.2$ and initial cosine weight $\omega^{(0)} = 0.10$):
+\subsection{Tier 1 SBi-FAGAT Architecture and Optimization}
+A shared \texttt{TwoStreamNodeStem} embeds semantic and structural inputs into $h^{(0)} \in \mathbb{R}^{d}$ ($d=64$); for the graph-agnostic baseline \texttt{TextMLP}, topology columns $\{1, 4, 6, 7\}$ in $s_v$ and columns $\{0, 1, 2, 3, 4, 7\}$ in $c_{\mathcal{G}}$ are zero-masked. Inside each \texttt{StanceGuidedFAConv} layer, normalized projections $z^{\text{norm}} = \operatorname{LN}(W h^{(l-1)})$ drive a signed polarity gate $\gamma_{uv} \in (-1, 1)$ (Xavier node gain $0.2$, initial cosine weight $\omega^{(0)} = 0.10$) and an unsigned excitation gate $\alpha_{uv}^{\text{exc}} \in (0, 1)$:
 \begin{multline}
-\gamma_{uv} = \tanh\!\Biggl(\frac{\mathbf{a}_{\text{node}}^\top [z_u^{\text{norm}} \Vert z_v^{\text{norm}}]}{\sqrt{2d}} + \omega \cos(z_u^{\text{norm}}, z_v^{\text{norm}}) \\
-+ \mathbf{a}_{\text{edge}}^\top e_{uv} + \delta_{\gamma}(e_{uv})\Biggr),
+\gamma_{uv} = \tanh\!\Biggl(\frac{\mathbf{a}_{\text{node}}^\top [z_u^{\text{norm}} \Vert z_v^{\text{norm}}]}{\sqrt{2d}} \\
++ \omega \cos(z_u^{\text{norm}}, z_v^{\text{norm}}) + \mathbf{a}_{\text{edge}}^\top e_{uv} + \delta_{\gamma}(e_{uv})\Biggr),
 \end{multline}
-alongside an unsigned excitation gate $\alpha_{uv}^{\text{exc}} = \sigma(0.8|s_{uv}| + 0.8 h_{uv} + \delta_{\alpha}(e_{uv}))$. Messages split evenly into signed polarity ($\gamma_{uv} z_u[:d/2]$) and unsigned excitation ($\alpha_{uv}^{\text{exc}} z_u[d/2:]$) channels under symmetric degree normalization $c_{uv} = \sqrt{(d_{\text{out}}(u)+1)(d_{\text{in}}(v)+1)}$, updated with initial residual anchoring ($0.5 h^{(l-1)} + \epsilon h^{(0)} + m_v + W_{\text{root}} h_r^{(0)}$) and odd-symmetric stabilization $r + 0.2\tanh(r)$. After each layer, Dir-GNN cross-mixing ($\eta_l^{(0)} = 0.10$) \cite{rossi2023edge} couples TD and BU states ($\tilde{h}^{\delta} = h^{\delta} + \tanh(\eta_l) W_{\text{mix}}^{\delta} h^{\bar{\delta}}$). Finally, base pooling $z_{\text{base}} = [z_{\text{root}} \Vert z_{\text{att}}]$ is modulated by a residual CleanRes Camp Dipole bottleneck $\operatorname{dipole\_proj}: \mathbb{R}^{3d+6} \to \mathbb{R}^{\max(16, d/2)} \to \mathbb{R}^{2d}$ scaled by $\tanh(\beta_{\text{dip}})$ ($\beta_{\text{dip}}^{(0)} = 0.25$) over node dispersion $z_{\text{disp}}$, BFS root-aligned camp dipoles up to $64$ hops (detached parent ramp $\operatorname{clip}(u_{\text{ori}}/0.1, -1, 1)$, continuous ReLU camp weights $w_\pm = \operatorname{ReLU}(\pm\hat{\gamma}_{uv})$, masked camp centroids $\mu_\pm = \mathbb{I}[\sum w_\pm > 10^{-6}]\frac{\sum w_\pm h_v}{\max(\sum w_\pm, 10^{-6})}$, dual-camp indicator $b = 2\,\mathbb{I}[\text{both\_camps}]\sqrt{\operatorname{clip}(f_+ f_-, 0, 0.25) + 10^{-8}}$, yielding zeroed single-camp vectors $z_{\text{dipole}}^{\text{polar}} = b\sqrt{(\mu_+ - \mu_-)^2 \mathbb{I}[\text{both\_camps}] + 10^{-8}}$ and $z_{\text{dipole}}^{\text{signed}} = (\mu_+ - \mu_-)\mathbb{I}[\text{both\_camps}]$), and 6 scalar gate moments before $\operatorname{LN}(z_{\text{base}} + \tanh(\beta_{\text{dip}})\,\operatorname{dipole\_proj}(\cdot))$. Inside \texttt{MultiTaskHead}, \texttt{polar\_head} reads strictly from $2d$-D \texttt{graph\_emb} across all compared architectures, decoupling polarization inference from $8$-D \texttt{cascade\_stats}; for all stance-aware models consuming explicit edge stances (\texttt{TemporalStanceMLP}, non-latent \texttt{EdgeGATv2}, \texttt{BiEdgeGATv2}, and non-ablated \texttt{SBiFAGAT}), logits add a learnable causal Persistence-Residual anchor $z_{\text{polar}} = \tanh(w_p)\bigl(\operatorname{logit}(\operatorname{clip}(y_{\text{polar}}(\mathcal{G}_K), 0.02, 0.98)) - \bar{\ell}_{\text{train}}\bigr) + \Delta z_{\text{polar}}$.
+\begin{multline}
+\alpha_{uv}^{\text{exc}} = \sigma\bigl(0.8|s_{uv}| + 0.8 h_{uv} + \delta_{\alpha}(e_{uv})\bigr), \\
+\phi_{uv}(z_u) = \begin{bmatrix} \gamma_{uv} z_u[:d/2] \\ \alpha_{uv}^{\text{exc}} z_u[d/2:] \end{bmatrix},
+\end{multline}
+where $\delta_{\gamma}, \delta_{\alpha}$ are outputs of a two-layer Gaussian Error Linear Unit (GELU) edge basis network over $[s_{uv}, h_{uv}, s_{uv} h_{uv}, |s_{uv}|]^\top$. Under symmetric degree normalization $c_{uv} = \sqrt{(d_{\text{out}}(u)+1)(d_{\text{in}}(v)+1)}$, layer updates combine aggregated messages $m_v$, initial residual $\epsilon = 0.5$, root broadcast, odd-symmetric stabilization, and Dir-GNN directional cross-mixing ($\eta_l^{(0)} = 0.10$) \cite{rossi2023edge} across TD ($\delta$) and BU ($\bar{\delta}$) streams:
+\begin{multline}
+r_v^{\delta} = 0.5 h_v^{\delta,(l-1)} + \epsilon h_v^{(0)} + \sum_{u \in \mathcal{N}^{\delta}(v)} \frac{1}{c_{uv}}\phi_{uv}(z_u^{\delta}) + W_{\text{root}} h_{\text{root}}^{(0)}, \\
+h_v^{\delta,(l)} = \operatorname{LN}\!\bigl(r_v^{\delta} + 0.2\tanh(r_v^{\delta})\bigr), \\
+\tilde{h}^{\delta,(l)} = h^{\delta,(l)} + \tanh(\eta_l) W_{\text{mix}}^{\delta} h^{\bar{\delta},(l)}.
+\end{multline}
 
-\subsection{Multi-Task Optimization}
-To prevent sigmoid tail gradient starvation on $y_{\text{polar}}$, we replace raw sigmoid Huber loss with zero-minimum KL-calibrated binary cross-entropy over logits $z_{\text{polar}}$ combined with Smooth-L1 regression ($\beta=0.05$):
+Graph pooling joins root and attention-pooled node states $z_{\text{base}} = [z_{\text{root}} \Vert z_{\text{att}}]$ with a residual Camp Dipole bottleneck scaled by $\tanh(\beta_{\text{dip}})$ ($\beta_{\text{dip}}^{(0)} = 0.25$) operating over node dispersion, BFS root-aligned camp weights $w_\pm = \operatorname{ReLU}(\pm\hat{\gamma}_{uv})$ up to $64$ hops, dual-camp balanced centroids $z_{\text{dipole}}^{\text{polar}}, z_{\text{dipole}}^{\text{signed}}$ zeroed whenever one camp has zero mass, and 6 scalar gate moments. To keep polarization inference comparable across baselines, \texttt{MultiTaskHead} decodes $\hat{y}_{\text{polar}}$ solely from the $2d$-D \texttt{graph\_emb}, adding a zero-initialized causal Persistence-Residual anchor for all stance-aware architectures:
+\begin{multline}
+z_{\text{polar}} = \tanh(w_p)\bigl(\operatorname{logit}(\operatorname{clip}(y_{\text{polar}}^{\text{early}}(\mathcal{G}_K), 0.02, 0.98)) \\
+- \bar{\ell}_{\text{train}}\bigr) + \Delta z_{\text{polar}}.
+\end{multline}
+To avoid sigmoid tail gradient vanishing on continuous targets $y_{\text{polar}} \in [0, 1]$, we minimize zero-minimum KL-calibrated binary cross-entropy combined with Smooth-L1 ($\beta = 0.05$):
 \begin{multline}
 \mathcal{L}_{\text{polar}} = \bigl(\operatorname{BCEWithLogits}(z_{\text{polar}}, y_{\text{polar}}) - H(y_{\text{polar}})\bigr)_+ \\
 + \operatorname{SmoothL1}(\sigma(z_{\text{polar}}), y_{\text{polar}}),
 \end{multline}
-jointly with Huber loss on $y_{\text{size}}$ and masked dampened class-weighted Cross-Entropy on $y_{\text{rumor}}$. Training applies strictly train-only 2:1 constant-mean baseline-normalized loss scaling ($s_{\text{size}}, s_{\text{polar}}$) and calibrated output bias initialization ($p \in [10^{-3}, 0.99]$), symmetric uncertainty prediction across all 8 architectures when enabled, paired per-seed DataLoader shuffle ordering, linear warmup followed by \texttt{ReduceLROnPlateau}, Exponential Moving Average (EMA) validation selection, Early Stopping on validation task loss, validation-only comparator model selection (\texttt{val\_summary\_stats}), and $R^2_{\text{polar}}$ reporting across five deterministic seeds ($[42, 100, 2024, 777, 999]$).
+paired with Huber regression on $y_{\text{size}}$ (and dampened class-weighted cross-entropy on PHEME $y_{\text{rumor}}$; uncertainty weight $\lambda_{\text{unc}} = 0$ in fixed benchmarks), train-only 2:1 normalized task scaling, linear warmup with \texttt{ReduceLROnPlateau}, EMA checkpointing, validation early stopping, validation-only comparator selection, and exact paired tests across seeds $[42, 100, 2024, 777, 999]$.
+
+\subsection{Tier 2 Macro Signed User-Interaction Social Network}
+To bridge isolated early trees with global community structure without additional data collection, we project all valid non-deleted, non-self-loop user reply interactions $(u, v)$ across cascades onto a global signed social graph $\mathcal{G}_{\text{macro}} = (\mathcal{U}, \mathcal{E}_{\text{user}})$. Two complementary analyses operate on $\mathcal{G}_{\text{macro}}$:
+\begin{itemize}
+    \item \textbf{Macro Polarization Geometry:} Undirected user pairs with mean stance $|\bar{s}_{uv}| \ge 0.1$ induce signed weights $w_{uv} = \operatorname{sign}(\bar{s}_{uv}) |\bar{s}_{uv}| \ln(1 + c_{uv})$ over $c_{uv}$ interactions. On the largest connected component, we extract the normalized Signed Laplacian \cite{kunegis2010spectral} eigenvector $\bar{L}_{\text{signed}} = I - \bar{D}^{-1/2} W \bar{D}^{-1/2}$ to bipartition users into two latent camps $(\mathcal{C}_0, \mathcal{C}_1)$, evaluating (a) Structural Balance \cite{cartwright1956structural} balanced triangle fraction $(N_{+++} + N_{+--})/N_{\triangle}$ and its $z$-score against $100$ degree-preserving sign permutations, (b) Signed Modularity $Q_{\text{signed}} = Q^+ - Q^-$, (c) Garimella RWC \cite{garimella2018quantifying} via absorbing random walks between degree hubs, and (d) within- vs.\ cross-camp opposition and incivility rates.
+    \item \textbf{Zero-Leakage Chronological Signed Link Prediction:} All signed interactions ($|s_{uv}| \ge 0.1$) are partitioned chronologically ($70\%/15\%/15\%$) at non-overlapping UTC cutpoints $t_{\text{train}} < t_{\text{val}} < t_{\text{test}}$. Node features $x_u^{\text{macro}} = [\bar{\mathbf{e}}_u^{\text{Span}} \Vert \mathbf{a}_u^{\text{4D}}] \in \mathbb{R}^{772}$ aggregate strictly $\le t_{\text{train}}^{\max}$ post embeddings and 4-D unsigned log-activity counts (posts, cascades, out-replies, in-replies; strictly zeroed for unseen Test users and free of degree-1 sign leakage). During training mini-batches, unordered target pairs $\{u, v\}$ are masked out of message passing so no model can inspect the predicted interaction's own edge attribute $e_{uv}$. We benchmark six equal-width ($d=64$) architectures (\texttt{UserTextMLP}, \texttt{StandardGCN}, \texttt{StandardGATv2}, \texttt{SGCN} \cite{derr2018signed}, \texttt{FAGCN} \cite{bo2021beyond}, and bidirectional \texttt{SBiFAGAT-Link}) over 5 seeds predicting opposing ($s_{uv} \le -0.1$) vs.\ supporting links.
+\end{itemize}
 
 \section{Experimental Setup}
-All experiments evaluate 8 architectures fairly at fixed shared hyperparameters (\texttt{hidden\_dim=64}, matching $128$-D regression heads) alongside the non-learned Early-$K$ Persistence Baseline across 5 deterministic seeds, reporting paired $t$-tests, sample/topic-cluster paired bootstrap $p$-values (and exact sign-flip permutation tests for $F < 6$ LOO folds), and Holm--Bonferroni adjusted direction-aware significance against the strongest learned comparator. \IfFileExists{tables_dataset_eda.tex}{Table~\ref{tab:dataset_eda}}{\IfFileExists{tables_dataset_eda_pheme.tex}{Table~\ref{tab:dataset_eda_pheme}\IfFileExists{tables_dataset_eda_vn.tex}{ and Table~\ref{tab:dataset_eda_vn}}{}}{\IfFileExists{tables_dataset_eda_vn.tex}{Table~\ref{tab:dataset_eda_vn}}{Table~\ref{tab:dataset_eda}}}} reports dataset splits and Early-$K$ Persistence statistics generated directly from validated Parquet tables.
+All neural models share fixed hidden width ($d=64$) and matched $128$-D regression heads evaluated over five deterministic seeds, reporting paired $t$-tests, sample/topic-cluster bootstrap $p$-values (exact sign-flip permutation for $F=4$ LOO folds), and Holm--Bonferroni corrections against the strongest validation-selected comparator. Table~\ref{tab:dataset_eda} summarizes exploratory corpus splits and Early-$K$ Persistence performance directly from validated Parquet tables.
 
 \IfFileExists{tables_dataset_eda.tex}{
   \input{tables_dataset_eda}
 }{
-  \IfFileExists{tables_dataset_eda_pheme.tex}{
-    \input{tables_dataset_eda_pheme}
-  }{}
-  \IfFileExists{tables_dataset_eda_vn.tex}{
-    \input{tables_dataset_eda_vn}
-  }{
-    \IfFileExists{tables_dataset_eda_pheme.tex}{}{
-      \begin{table}[t]
-      \centering
-      \caption{Dataset EDA and Early-$K$ Persistence Baseline (pending \texttt{scripts/export\_dataset\_stats.py} execution on processed datasets).}
-      \label{tab:dataset_eda}
-      \begin{tabular}{lc}
-      \toprule
-      Artifact & Status \\
-      \midrule
-      \texttt{tables\_dataset\_eda.tex} & Pending corpus execution \\
-      \bottomrule
-      \end{tabular}
-      \end{table}
-    }
-  }
+  \IfFileExists{tables_dataset_eda_pheme.tex}{\input{tables_dataset_eda_pheme}}{}
+  \IfFileExists{tables_dataset_eda_vn.tex}{\input{tables_dataset_eda_vn}}{}
 }
 
-\section{Results and Ablation Studies}
-This manuscript template strictly forbids pre-filled or synthetic metric numbers; all empirical values below are read directly from validated pipeline outputs. On the 225-cascade Vietnamese Reddit Test split ($1,500$ eligible cascades / $1,496$ heuristic topics; \texttt{future\_only} linear-amplitude target, $K=20, N_{\text{reply}} \ge 25$), the non-learned Early-$K$ Persistence Baseline yields RMSE $= 0.0788$, $R^2_{\text{polar}} = -3.1986$, Pearson $r = 0.0217$, and Spearman $\rho = 0.0363$, confirming that early-window variance alone poorly predicts post-$K$ polarization dynamics. In the 5-seed v3 canonical VN benchmark (Table~\ref{tab:main_vn}), ReZero zero-initialized Persistence-Residual anchoring eliminates negative-$R^2$ collapse across stance-aware architectures: SBi-FAGAT achieves the lowest polarization RMSE ($0.0370 \pm 0.0003$) and highest $R^2_{\text{polar}}$ ($0.0742 \pm 0.0157$, $r = 0.2899 \pm 0.0278$, $\rho = 0.2272 \pm 0.0176$), closely trailed by \texttt{TextMLP} ($0.0370 \pm 0.0004$, $R^2_{\text{polar}} = 0.0741 \pm 0.0181$, $r = 0.2989 \pm 0.0110$), \texttt{EdgeGATv2} ($R^2_{\text{polar}} = 0.0689 \pm 0.0206$), and validation-selected comparator \texttt{TemporalStanceMLP} ($R^2_{\text{polar}} = 0.0608 \pm 0.0239$; Holm--Bonferroni adjusted $p_{\text{adj}} \ge 0.574$, showing statistically comparable headline accuracy on $K=20$ VN alongside \texttt{StandardGCN} at lowest size MSLE $0.1542 \pm 0.0048$). Under chronological VN temporal holdout (\texttt{split\_mode="temporal"}, \texttt{edge\_source="teacher"}, $225$ Test cascades; Table~\ref{tab:temporal_vn}), Early-$K$ Persistence degrades to $R^2_{\text{polar}} = -5.4386$ (RMSE $= 0.0874$, $r = 0.1778$, $\rho = 0.1741$), whereas all learned architectures generalize with strictly positive $R^2_{\text{polar}} \in [0.0481, 0.0815]$: \texttt{SBiFAGAT} attains the strongest rank correlation ($\rho = 0.3058 \pm 0.0187$, RMSE $= 0.0334 \pm 0.0009$, $r = 0.3338 \pm 0.0319$), validation-selected \texttt{TemporalStanceMLP} reaches $R^2_{\text{polar}} = 0.0815 \pm 0.0198$ ($r = 0.3377 \pm 0.0112$, RMSE $= 0.0330 \pm 0.0004$; Holm--Bonferroni $p_{\text{adj}} = 1.00$), and \texttt{FAGCN} leads size prediction (MSLE $= 0.1881 \pm 0.0129$, $R^2_{\text{size}} = 0.2586 \pm 0.0509$). In the refreshed 5-seed v3 ReZero VN component ablation (Table~\ref{tab:ablation_vn}), \texttt{SBiFAGAT (Full)} achieves MSLE $= 0.1580 \pm 0.0070$, $R^2_{\text{size}} = 0.2925 \pm 0.0315$, RMSE $= 0.0369 \pm 0.0003$, $R^2_{\text{polar}} = 0.0777 \pm 0.0141$, $r = 0.2939 \pm 0.0223$, and $\rho = 0.2335 \pm 0.0180$, remaining statistically comparable to matched \texttt{BiEdgeGATv2 (Matched)} ($R^2_{\text{polar}} = 0.0789 \pm 0.0172$, Holm--Bonferroni $p_{\text{adj}} = 1.00$); ablating Camp Dipole \& Moments ($R^2_{\text{polar}} = 0.0503 \pm 0.0208$) or the signed Conflict Gate ($0.0527 \pm 0.0258$) causes the largest drops in polarization explained variance, while removing 8-D Burst Stats cuts $R^2_{\text{size}}$ from $0.2925$ to $0.2215 \pm 0.0429$. On the fixed-future common subset ($N_{\text{reply}} \ge 55$, future window $k > 50$; Fig.~\ref{fig:k_curve_vn}), \texttt{SBiFAGAT} size MSLE tightens monotonically from $0.1443$ ($K=10$) to $0.1370$ ($K=20$), $0.1352$ ($K=30$), and $0.1053$ ($K=50$, $R^2_{\text{size}} = 0.2882$), with polarization correlation rising from $r = 0.2523$ ($\rho = 0.1813$) at $K=10$ to $r = 0.2921$ ($\rho = 0.2346$) at $K=20$ and $r = 0.2882$ ($\rho = 0.2362$) at $K=50$. In observational VN Test sensitivity analysis (Table~\ref{tab:mechanisms_vn}), early hostility correlates modestly with cascade size ($\rho = 0.2128, r = 0.2044$) and early stance spread with future polarization ($r = 0.1593$), while neutralizing all early opposition shifts predicted polarization by $\Delta \hat{y}_{\text{polar}} = -0.0035$ overall ($-0.0037$ on Q75+ cascades). Locally profiled VN CPU inference requires $1.1721$\,ms/cascade across $137,086$ parameters ($0.03$\,MB peak allocated RAM), complementing Table~\ref{tab:efficiency}. Optional Track 2 PHEME Tier 2A ($K=10, N_{\text{reply}} \ge 15$) multi-seed re-execution requires re-extracting \texttt{pheme/nlp\_features.pt} with \texttt{min\_total\_replies=15} because the existing archive was extracted at \texttt{min\_total\_replies\_extracted=25} (legacy Cohort B); accordingly, existing \texttt{tables\_*\_pheme.tex} reflect legacy Cohort B, UPFD tables report post-hoc text-free structural transfer, and blind VN Gate 1 audit sheets ($20$ pilot / $120$ pairs / $30$ trees) are exported and sealed pending manual annotation.
+\section{Results and Analysis}
+\subsection{Vietnamese Early-Cascade Inductive and Temporal Holdout}
+On the $225$-cascade Vietnamese Reddit Test split (Table~\ref{tab:main_vn}), non-learned Early-$K$ Persistence collapses to $R^2_{\text{polar}} = -3.1986$ (RMSE $= 0.0788$, $r = 0.0217$), whereas all neural models achieve positive explained variance. \texttt{SBiFAGAT} attains the top $R^2_{\text{polar}} = 0.0742 \pm 0.0157$ (RMSE $= 0.0370 \pm 0.0003$, $r = 0.2899$, $\rho = 0.2272$), essentially matching graph-agnostic \texttt{TextMLP} ($R^2_{\text{polar}} = 0.0741 \pm 0.0181$, $r = 0.2989$, $\rho = 0.2501$) and \texttt{EdgeGATv2} ($0.0689$), with Holm--Bonferroni $p_{\text{adj}} \ge 0.574$ vs.\ validation-selected \texttt{TemporalStanceMLP} ($0.0608$). For early size prediction, \texttt{StandardGCN} ($0.1542 \pm 0.0048$, $R^2_{\text{size}} = 0.3097$) leads while \texttt{SBiFAGAT} ranks seventh ($0.1580$, $R^2_{\text{size}} = 0.2926$). Figure~\ref{fig:umap_vn} contrasts UMAP node projections on the VN test split.
 
-\IfFileExists{tables_main_pheme.tex}{
-  \input{tables_main_pheme}
-}{
-  \begin{table}[t]
-  \centering
-  \caption{PHEME 5-Seed Inductive Benchmark Comparison (pending GPU run of \texttt{scripts/run\_experiments.py}).}
-  \label{tab:main_pheme}
-  \begin{tabular}{lc}
-  \toprule
-  Artifact & Status \\
-  \midrule
-  \texttt{tables\_main\_pheme.tex} & Pending 5-seed execution \\
-  \bottomrule
-  \end{tabular}
-  \end{table}
-}
+Under strict chronological VN temporal holdout (\texttt{edge\_source="teacher"}, $225$ Test cascades; Table~\ref{tab:temporal_vn}), Early-$K$ Persistence degrades further ($R^2_{\text{polar}} = -5.4386$), whereas all learned architectures maintain $R^2_{\text{polar}} \in [0.0481, 0.0815]$: \texttt{SBiFAGAT} obtains the strongest polarization rank correlation ($\rho = 0.3058 \pm 0.0187$, $r = 0.3338$), trailing \texttt{TemporalStanceMLP} ($R^2_{\text{polar}} = 0.0815$, $p_{\text{adj}} = 1.00$) and \texttt{FAGCN} on size ($0.1881$ vs.\ $0.2051$ MSLE). Practically, on shallow single-thread trees ($|\mathcal{V}_K| \le 21$) with weak topic clustering ($1{,}496/1{,}500$), frozen ancestor-conditioned NLP embeddings already capture nearly all predictive signal available to early GNNs.
 
-\IfFileExists{tables_loo_pheme.tex}{
-  \input{tables_loo_pheme}
-}{}
+\subsection{Tier 2 Macro Signed Social Network Polarization}
+Lifting the Vietnamese corpus from isolated threads to the global signed user-reply network reveals strong macro community structure (\IfFileExists{tables_macro_network.tex}{Table~\ref{tab:macro_network}}{summary computed from validated VN Parquet} and \IfFileExists{figures/vn/fig5_macro_signed_network.pdf}{Figure~\ref{fig:macro_vn}}{pending vector plot}). Across $13{,}718$ unique pseudonymous users and $85{,}398$ valid user-user interactions ($58{,}041$ undirected pairs; $32{,}787$ strong signed pairs), the largest signed Weakly Connected Component (WCC) spans $10{,}475$ users ($76.4\%$). Signed Laplacian spectral bipartition divides this component into balanced opposing camps ($4{,}807$ vs.\ $5{,}668$ users) with Signed Modularity $Q_{\text{signed}} = 0.4280$ ($Q^+ = 0.2367, Q^- = -0.1913$) and RWC $= 0.0957$. Crucially, \textbf{cross-camp replies exhibit a $+19.1$ percentage-point surge in ideological opposition} ($57.0\%$ cross-camp vs.\ $37.9\%$ within-camp; mean stance $-0.1425$ vs.\ $-0.0538$) alongside elevated incivility ($5.09\%$ vs.\ $3.95\%$). Meanwhile, across $5{,}143$ signed triangles ($70$ $(+++)$, $306$ $(++-)$, $1{,}232$ $(+--)$, $3{,}535$ $(---)$), strong Heiderian balance stands at $25.3\%$ ($z = -15.17$ below the $37.0\%$ permutation null) because Reddit opposition replies ($39{,}499$) heavily outnumber support ($10{,}200$), generating abundant three-way mutually contentious triads $(---)$ alongside clear two-camp spectral separation. Five-seed GPU temporal signed link prediction outputs integrate cleanly into this manuscript once executed via \texttt{notebooks/kaggle\_macro\_signed\_gnn\_t4.ipynb} (\IfFileExists{tables_signed_link_vn.tex}{Table~\ref{tab:signed_link_vn}}{VN link table pending GPU run}; \IfFileExists{tables_signed_link_pheme.tex}{Table~\ref{tab:signed_link_pheme}}{PHEME link table pending GPU run}; \IfFileExists{figures/pheme/fig5_macro_signed_network.pdf}{Figure~\ref{fig:macro_pheme}}{PHEME macro figure pending extraction}).
 
-\IfFileExists{tables_main_vn.tex}{
-  \input{tables_main_vn}
-}{
-  \begin{table}[t]
-  \centering
-  \caption{Vietnamese Reddit 5-Seed Benchmark Comparison (pending GPU run of \texttt{scripts/run\_experiments.py}).}
-  \label{tab:main_vn}
-  \begin{tabular}{lc}
-  \toprule
-  Artifact & Status \\
-  \midrule
-  \texttt{tables\_main\_vn.tex} & Pending 5-seed execution \\
-  \bottomrule
-  \end{tabular}
-  \end{table}
-}
+\subsection{English PHEME Inductive and Leave-One-Event-Out Results}
+In the prior $K=20, N_{\text{reply}} \ge 25$ quadratic-target PHEME archive (Tables~\ref{tab:main_pheme} and~\ref{tab:loo_pheme}; UMAP in Figure~\ref{fig:umap_pheme}), targets have low variance (mean $y_{\text{polar}} = 0.0104$), yielding negative size explained variance across most models (\texttt{StandardGCN} leads MSLE $= 0.0928, R^2_{\text{size}} = 0.0498$ vs.\ \texttt{SBiFAGAT} $0.1062, -0.0867$). On polarization, \texttt{SBiFAGAT} attains the lowest RMSE ($0.0124 \pm 0.0002$, Holm--Bonferroni bootstrap $p = 0.0256$ vs.\ \texttt{EdgeGATv2}) and highest linear correlation ($r = 0.3001$) inductively, and lowers LOO MSLE ($0.1651$, Exact Perm.\ $p \ge 0.688$), while \texttt{BiGCN} leads 4-class veracity Macro-F1 ($0.3411$ inductive, $0.2991$ LOO). We emphasize that PHEME ablation and $K$-curve results (Table~\ref{tab:ablation_pheme} and Figure~\ref{fig:k_curve_pheme}) reflect that same prior extraction, and the $N_{\text{reply}} \ge 55$ horizon subset on PHEME contains very few Test threads ($n=10$), inducing wide variance across $K \in \{10, 20, 30, 50\}$.
 
-\IfFileExists{tables_temporal_vn.tex}{
-  \input{tables_temporal_vn}
-}{}
+\subsection{Component Ablation and Early-Horizon Sensitivity}
+On the Vietnamese component ablation (Table~\ref{tab:ablation_vn}), \texttt{SBiFAGAT (Full)} achieves $R^2_{\text{polar}} = 0.0777 \pm 0.0141$ and $R^2_{\text{size}} = 0.2925 \pm 0.0315$, statistically tied with matched \texttt{BiEdgeGATv2} ($R^2_{\text{polar}} = 0.0789$, $R^2_{\text{size}} = 0.2962$, $\rho = 0.2530$; Holm--Bonferroni $p_{\text{adj}} = 1.00$). Ablating Camp Dipole \& Moments ($R^2_{\text{polar}} = 0.0503$) or replacing the signed Conflict Gate with an unsigned sigmoid ($0.0527$) causes the largest drops in polarization explained variance, while removing $c_{\mathcal{G}}$ drops $R^2_{\text{size}}$ from $0.2925$ to $0.2215$; removing the Persistence Anchor retains positive performance ($+0.0727$). Across $K \in \{10, 20, 30, 50\}$ on a common fixed-future subset ($N_{\text{reply}} \ge 55$, $k > 50$; Figure~\ref{fig:k_curve_vn}), \texttt{SBiFAGAT} size MSLE tightens steadily from $0.1443$ ($K=10$) and $0.1370$ ($K=20$) to $0.1352$ ($K=30$) and $0.1053$ ($K=50$, vs.\ \texttt{StandardGCN} $0.0995$), while Pearson $r$ moves non-monotonically from $0.2523$ ($K=10$) to $0.2921$ ($K=20$), dips at $K=30$ ($0.2782$, $\rho = 0.2063$), and recovers to $0.2882$ at $K=50$ ($\rho = 0.2362$). Minor metric differences between Table~\ref{tab:main_vn} ($0.0742$) and Table~\ref{tab:ablation_vn} ($0.0777$) stem from global RNG draw order across differing model counts before benchmark evaluation.
 
-\IfFileExists{tables_ablation_pheme.tex}{
-  \input{tables_ablation_pheme}
-}{
-  \begin{table}[t]
-  \centering
-  \caption{Component Ablation and Early Horizon Sensitivity $K \in \{10, 20, 30, 50\}$ (pending \texttt{scripts/run\_ablation.py}).}
-  \label{tab:ablation_pheme}
-  \begin{tabular}{lc}
-  \toprule
-  Artifact & Status \\
-  \midrule
-  \texttt{tables\_ablation\_pheme.tex} & Pending ablation execution \\
-  \bottomrule
-  \end{tabular}
-  \end{table}
-}
+\subsection{Post-Hoc Text-Free UPFD Structural Transfer}
+Tables~\ref{tab:upfd_results} and~\ref{tab:upfd_politifact} report post-hoc text-free fake-news detection on PyG UPFD (BERT 768-d node embeddings with learned latent edges). On GossipCop, \texttt{StandardGATv2} ($0.9684 \pm 0.0032$ accuracy) and \texttt{EdgeGATv2 (Latent)} ($0.9682$) significantly outperform \texttt{SBiFAGAT (Latent)} ($0.9486 \pm 0.0077$, Holm--Bonferroni bootstrap $p_{\text{adj}} = 8.00\text{e-}04$), showing that latent stance gating adds no benefit when reply texts and real conflict labels are absent. On smaller PolitiFact, \texttt{EdgeGATv2 (Latent)} ($0.8253 \pm 0.0099$) and \texttt{SBiFAGAT (Latent)} ($0.8090 \pm 0.0240$) exhibit substantially lower seed variance than \texttt{StandardGCN} ($0.8063 \pm 0.1650$).
 
-\IfFileExists{tables_ablation_vn.tex}{
-  \input{tables_ablation_vn}
-}{}
+\subsection{Reliability, Construct Alignment, Sensitivity, and Efficiency}
+\textbf{Silver-Label Construct Validity \& Human Audits:} Early-graph construct correlations remain weak on shallow $K=20$ VN trees (\texttt{construct\_corr\_bc} $= -0.0152$, \texttt{construct\_corr\_assort} $= -0.0589$ vs.\ PHEME $0.1654 / 0.0191$). For external stance validation on SemEval-2019 RumourEval Test ($1{,}675$ pairs), $476$ replies ($28.4\%$) lie at depth $\ge 2$ where \texttt{parent} diverges from \texttt{root} (e.g., agreeing with the root rumor while negating a skeptical parent); accordingly, our evaluation script verifies against \texttt{--context-mode root} alongside \texttt{parent}, noting that collapsing SDQC into 3 classes maps $87.8\%$ (\texttt{query+comment}) to neutral. On VN, blinded human-verification sheets ($20$ pilot, $120$ Test pairs for 3-class stance + binary \texttt{clean}/\texttt{uncivil}, $30$ Test trees for 0--4 Likert grading with max $12$ snippets and quintile keys) are exported and sealed under single-verified-gold protocol compatibility (\IfFileExists{tables_human_audit.tex}{Table~\ref{tab:human_audit}}{audit table pending final approval}).
 
-\IfFileExists{tables_upfd.tex}{
-  \input{tables_upfd}
-}{}
+\textbf{Interpretability, Sensitivity, and Cost:} Figure~\ref{fig:heatmap_vn} and Figure~\ref{fig:heatmap_pheme} visualize top trigger replies ranked by $|\gamma|$. In observational edge-sensitivity analysis (Tables~\ref{tab:mechanisms_vn} and~\ref{tab:mechanisms_pheme}; Figures~\ref{fig:cf_vn} and~\ref{fig:cf_pheme}), early hostility correlates positively with VN cascade size ($\rho = 0.2128, r = 0.2044$) and early stance dispersion correlates with future polarization ($r = 0.1593$). Only $1/225$ VN Test cascades falls in the \texttt{hostile\_conflict} regime (vs.\ $149$ civil disagreement, $75$ low conflict). Zeroing hostility or opposition lowers predicted polarization slightly ($\Delta\hat{y}_{\text{polar}} = -0.0035$) while inducing small positive linear-interpolation shifts in predicted size ($\Delta\hat{y}_{\text{size}} = +0.0024 / +0.0048$) rather than causal moderation effects. Efficiency profiling (Table~\ref{tab:efficiency}) shows \texttt{SBiFAGAT} uses $137{,}086$ parameters and $1.1721$~ms/cascade ($0.03$~MB peak allocated RAM on CPU) vs.\ $71{,}110$ parameters and $0.0787$~ms/cascade for \texttt{TextMLP}.
 
-\IfFileExists{tables_upfd_politifact.tex}{
-  \input{tables_upfd_politifact}
-}{}
-
-\IfFileExists{tables_human_audit.tex}{
-  \input{tables_human_audit}
-}{}
-
-\IfFileExists{tables_efficiency.tex}{
-  \input{tables_efficiency}
-}{
-  \IfFileExists{tables_efficiency_pheme.tex}{
-    \input{tables_efficiency_pheme}
-  }{
-    \IfFileExists{tables_efficiency_vn.tex}{
-      \input{tables_efficiency_vn}
-    }{
-      \begin{table}[t]
-      \centering
-      \caption{Computational Efficiency Benchmark (pending \texttt{scripts/benchmark\_efficiency.py --output-table}).}
-      \label{tab:efficiency}
-      \begin{tabular}{lc}
-      \toprule
-      Artifact & Status \\
-      \midrule
-      \texttt{tables\_efficiency.tex} & Pending profiler execution \\
-      \bottomrule
-      \end{tabular}
-      \end{table}
-    }
-  }
-}
+\IfFileExists{tables_main_pheme.tex}{\input{tables_main_pheme}}{}
+\IfFileExists{tables_loo_pheme.tex}{\input{tables_loo_pheme}}{}
+\IfFileExists{tables_main_vn.tex}{\input{tables_main_vn}}{}
+\IfFileExists{tables_temporal_vn.tex}{\input{tables_temporal_vn}}{}
+\IfFileExists{tables_macro_network.tex}{\input{tables_macro_network}}{}
+\IfFileExists{tables_signed_link_vn.tex}{\input{tables_signed_link_vn}}{}
+\IfFileExists{tables_signed_link_pheme.tex}{\input{tables_signed_link_pheme}}{}
+\IfFileExists{tables_ablation_pheme.tex}{\input{tables_ablation_pheme}}{}
+\IfFileExists{tables_ablation_vn.tex}{\input{tables_ablation_vn}}{}
+\IfFileExists{tables_upfd.tex}{\input{tables_upfd}}{}
+\IfFileExists{tables_upfd_politifact.tex}{\input{tables_upfd_politifact}}{}
+\IfFileExists{tables_human_audit.tex}{\input{tables_human_audit}}{}
+\IfFileExists{tables_efficiency.tex}{\input{tables_efficiency}}{}
 
 \IfFileExists{figures/pheme/fig1_umap_polarization.pdf}{
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/pheme/fig1_umap_polarization.pdf}
-\caption{PHEME Test-Split UMAP Node Embeddings: StandardGCN (left) vs.\ SBi-FAGAT (right), colored by causal root-aligned stance polarity on $\mathcal{V}_K$.}
+\caption{PHEME Test UMAP Node Embeddings: \texttt{StandardGCN} (left) vs.\ \texttt{SBiFAGAT} (right), colored by root-aligned stance polarity.}
 \label{fig:umap_pheme}
 \end{figure*}
 }{}
@@ -234,7 +190,7 @@ This manuscript template strictly forbids pre-filled or synthetic metric numbers
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/vn/fig1_umap_polarization.pdf}
-\caption{Vietnamese Reddit Test-Split UMAP Node Embeddings: StandardGCN (left) vs.\ SBi-FAGAT (right), colored by causal root-aligned stance polarity on $\mathcal{V}_K$.}
+\caption{Vietnamese Reddit Test UMAP Node Embeddings: \texttt{StandardGCN} (left) vs.\ \texttt{SBiFAGAT} (right), colored by root-aligned stance polarity.}
 \label{fig:umap_vn}
 \end{figure*}
 }{}
@@ -243,7 +199,7 @@ This manuscript template strictly forbids pre-filled or synthetic metric numbers
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/pheme/fig2_early_k_curve.pdf}
-\caption{PHEME Early Observation Horizon Sensitivity ($K \in \{10, 20, 30, 50\}$) evaluated on a common subset against a fixed future target window.}
+\caption{PHEME Early Horizon Sensitivity ($K \in \{10, 20, 30, 50\}$) on the common fixed-future subset ($n=10$ Test cascades).}
 \label{fig:k_curve_pheme}
 \end{figure*}
 }{}
@@ -252,20 +208,16 @@ This manuscript template strictly forbids pre-filled or synthetic metric numbers
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/vn/fig2_early_k_curve.pdf}
-\caption{Vietnamese Reddit Early Observation Horizon Sensitivity ($K \in \{10, 20, 30, 50\}$) evaluated on a common subset against a fixed future target window.}
+\caption{Vietnamese Reddit Early Horizon Sensitivity ($K \in \{10, 20, 30, 50\}$) on the common fixed-future subset ($N_{\text{reply}} \ge 55, k > 50$).}
 \label{fig:k_curve_vn}
 \end{figure*}
 }{}
-
-\section{Case Study and Limitations}
-\subsection{Trigger Comment Analysis}
-For qualitative interpretability, \texttt{extract\_edge\_gates} ranks edges by gate magnitude $|\gamma_{uv}|$ and signed conflict polarity, exporting cascade tree heatmaps alongside top trigger comments (\texttt{fig3\_top5\_trigger\_comments.txt}).
 
 \IfFileExists{figures/pheme/fig3_cascade_heatmap.pdf}{
 \begin{figure*}[t]
 \centering
 \includegraphics[width=0.92\textwidth]{figures/pheme/fig3_cascade_heatmap.pdf}
-\caption{PHEME High-Polarization Cascade Gate Heatmap showing $|\gamma_{uv}|$ importance and signed polarity across early replies.}
+\caption{PHEME High-Polarization Cascade Gate Heatmap ranking early replies by $|\gamma_{uv}|$.}
 \label{fig:heatmap_pheme}
 \end{figure*}
 }{}
@@ -274,13 +226,46 @@ For qualitative interpretability, \texttt{extract\_edge\_gates} ranks edges by g
 \begin{figure*}[t]
 \centering
 \includegraphics[width=0.92\textwidth]{figures/vn/fig3_cascade_heatmap.pdf}
-\caption{Vietnamese Reddit High-Polarization Cascade Gate Heatmap showing $|\gamma_{uv}|$ importance and signed polarity across early replies.}
+\caption{Vietnamese Reddit High-Polarization Cascade Gate Heatmap ranking early replies by $|\gamma_{uv}|$.}
 \label{fig:heatmap_vn}
 \end{figure*}
 }{}
 
-\subsection{Observational Edge-Feature Sensitivity Analysis}
-To examine how early affective incivility and ideological disagreement relate to model predictions beyond black-box accuracy, \texttt{scripts/analyze\_mechanisms.py} conducts empirical regime stratification (low conflict, civil disagreement, hostile conflict), trigger-edge depth profiling ($d=1$ vs.\ $d \ge 2$), and non-mutating input-feature sensitivity perturbations on trained test checkpoints. Generated LaTeX summaries and paired bootstrap shift plots are reported strictly as observational model-sensitivity associations rather than causal intervention effects.
+\IfFileExists{figures/pheme/fig4_counterfactual_interventions.pdf}{
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.92\textwidth]{figures/pheme/fig4_counterfactual_interventions.pdf}
+\caption{PHEME Observational Edge-Feature Sensitivity Probe across All Test and Top-Quartile (75th+ percentile) cohorts with 95\% paired bootstrap CIs.}
+\label{fig:cf_pheme}
+\end{figure*}
+}{}
+
+\IfFileExists{figures/vn/fig4_counterfactual_interventions.pdf}{
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.92\textwidth]{figures/vn/fig4_counterfactual_interventions.pdf}
+\caption{Vietnamese Reddit Observational Edge-Feature Sensitivity Probe across All Test and Top-Quartile (75th+ percentile) cohorts with 95\% paired bootstrap CIs.}
+\label{fig:cf_vn}
+\end{figure*}
+}{}
+
+\IfFileExists{figures/vn/fig5_macro_signed_network.pdf}{
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/vn/fig5_macro_signed_network.pdf}
+\caption{Vietnamese Macro Signed User-Interaction Social Network ($13{,}718$ users, $85{,}398$ interactions): Structural Balance triad distribution vs.\ permutation null ($z = -15.17$) and spectral two-camp opposition separation ($Q_{\text{signed}} = 0.4280$, $+19.1$~pp cross-camp conflict jump).}
+\label{fig:macro_vn}
+\end{figure*}
+}{}
+
+\IfFileExists{figures/pheme/fig5_macro_signed_network.pdf}{
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/pheme/fig5_macro_signed_network.pdf}
+\caption{PHEME Macro Signed User-Interaction Social Network Polarization Profile.}
+\label{fig:macro_pheme}
+\end{figure*}
+}{}
 
 \IfFileExists{tables_mechanisms_pheme.tex}{
   {\scriptsize\setlength{\tabcolsep}{2.5pt}
@@ -292,35 +277,18 @@ To examine how early affective incivility and ideological disagreement relate to
   \input{tables_mechanisms_vn}}
 }{}
 
-\IfFileExists{figures/pheme/fig4_counterfactual_interventions.pdf}{
-\begin{figure*}[t]
-\centering
-\includegraphics[width=0.92\textwidth]{figures/pheme/fig4_counterfactual_interventions.pdf}
-\caption{PHEME Observational Edge-Feature Sensitivity Analysis: predicted cascade size ($\Delta\hat{y}_{\mathrm{size}}$) and polarization ($\Delta\hat{y}_{\mathrm{polar}}$) shifts under edge-attribute perturbation across All Test and High-Polarization (Q75+) cohorts with 95\% paired bootstrap confidence intervals (non-causal sensitivity probe).}
-\label{fig:cf_pheme}
-\end{figure*}
-}{}
-
-\IfFileExists{figures/vn/fig4_counterfactual_interventions.pdf}{
-\begin{figure*}[t]
-\centering
-\includegraphics[width=0.92\textwidth]{figures/vn/fig4_counterfactual_interventions.pdf}
-\caption{Vietnamese Reddit Observational Edge-Feature Sensitivity Analysis: predicted cascade size ($\Delta\hat{y}_{\mathrm{size}}$) and polarization ($\Delta\hat{y}_{\mathrm{polar}}$) shifts under edge-attribute perturbation across All Test and High-Polarization (Q75+) cohorts with 95\% paired bootstrap confidence intervals (non-causal sensitivity probe).}
-\label{fig:cf_vn}
-\end{figure*}
-}{}
-
-\subsection{Methodological Limitations and Ethical Safeguards}
-We explicitly acknowledge four methodological constraints:
-\begin{itemize}
-    \item \textbf{Early Cascade Scale vs.\ Macro Echo Chambers:} Each observed graph models an isolated discussion cascade up to $|\mathcal{V}_K| \le 21$ nodes using intra-cascade structural-temporal descriptors rather than a cross-topic longitudinal user-interaction graph; consequently, SBi-FAGAT captures thread-level ideological and affective polarization rather than macro-level community echo chambers, which remain left for future work. Likewise, external UPFD transfer experiments reflect post-hoc text-free structural propagation (without linguistic early-reply features) rather than early discourse polarization.
-    \item \textbf{Silver-Standard Polarization Label \& Gate 1 Audit Scope:} $y_{\text{polar}}$ (linear-amplitude scale) is derived from NLP stance models over future interactions rather than exhaustive manual tree annotation. English stance reliability uses the external RumourEval SDQC benchmark, while Vietnamese reliability is structured around a streamlined 20-pair pilot calibration, 120-pair Test dual-annotator audit (3-class stance and binary \texttt{clean} vs.\ \texttt{uncivil} reply incivility with inverse-propensity weighting and ROC-AUC/PR-AUC via \texttt{scripts/compute\_kappa.py}), and 30 held-out Test trees (0--4 Likert grading evaluated with Kendall $\tau_b$ and AUROC $@ \ge 2$ via \texttt{scripts/audit\_vn\_50\_trees.py}), alongside construct validity against Sarle's Bimodality Coefficient, signed assortativity, and Early-$K$ Persistence comparison; human scoring of these exported blind VN sheets remains active in Gate 1.
-    \item \textbf{Heuristic VN Split \& Pending Track 2 v3 Re-Execution:} Lacking exogenous news event IDs on Reddit Vietnam, canonical Train/Val/Test separation uses 30-day temporal windows and TF-IDF cosine ($\ge 0.30$) clustering, cross-checked via a chronological temporal holdout (\texttt{edge\_source="teacher"}, Table~\ref{tab:temporal_vn}). Current \texttt{tables\_*\_pheme.tex} reflect the prior quadratic-target $K=20, N_{\text{reply}} \ge 25$ Kaggle Cohort B archive (\texttt{min\_total\_replies\_extracted=25}) pending optional \texttt{min\_total\_replies=15} feature re-extraction for Track 2 v3 ($K=10, N_{\text{reply}} \ge 15$) GPU execution.
-    \item \textbf{Privacy Preservation \& Data Hygiene:} User identifiers are pseudonymized via salted SHA-256 hashing prior to persistence, personal PII (phone numbers, national IDs, bank accounts, personal Facebook profiles), doxxing posts, and crypto spam are automatically redacted or filtered prior to storage and blind audit export, and sealed answer-key audit files are excluded from distribution archives.
-\end{itemize}
+\section{Limitations and Ethical Safeguards}
+We explicitly acknowledge five methodological constraints:
+\begin{enumerate}
+    \item \textbf{Early Tree Ceiling vs.\ Macro Network Richness:} Micro early trees ($|\mathcal{V}_K| \le 21$) are text-dominated, explaining why \texttt{SBiFAGAT} ties \texttt{TextMLP} and \texttt{BiEdgeGATv2} on $K=20$ polarization and trails homophilic/simpler GNNs on size; macro cross-thread graphs unlock genuine signed structural separation ($Q_{\text{signed}} = 0.4280$).
+    \item \textbf{Label Silver-Standard Asymmetry:} Early-window diagnostic $y_{\text{polar}}^{\text{early}}$ uses student scores without root-stance mapping, whereas future $y_{\text{polar}}$ uses teachers ($\pm 0.1$ discrete thresholds vs.\ \texttt{argmax}; sparse future $n < 2 \to 0$).
+    \item \textbf{Heuristic VN Topics and Cohort Transition:} VN Reddit yields $1{,}496/1{,}500$ singleton topic clusters, while archived PHEME tables reflect legacy $K=20, N \ge 25$ targets pending reduced-horizon re-execution.
+    \item \textbf{Audit Sampling and Observational Sensitivity:} Tree audits display up to $12$ evenly spaced future replies against empirical quintile grades; Section~V-F perturbations probe model linearity rather than causal moderation effects.
+    \item \textbf{Privacy Protection:} All user identifiers undergo salted SHA-256 pseudonymization (\texttt{SBIF\_HASH\_SALT}), PII and crypto spam are automatically filtered prior to persistence, and sealed machine keys are excluded from public artifacts.
+\end{enumerate}
 
 \section{Conclusion}
-We presented SBi-FAGAT under a unified, leakage-checked 2D bilingual architecture combining Ancestor-Conditioned SpanPool node representations, reply-span-pooled stance--hostility distillation, dual-channel Top-Down/Bottom-Up signed graph attention, and KL-calibrated multi-task optimization. Following GPU execution on full PHEME and Vietnamese Reddit splits and human reliability audits, generated LaTeX tables and vector figures integrate directly into this IEEEtran manuscript via \texttt{scripts/assemble\_paper\_artifacts.py}.
+We presented a unified, leakage-free two-tier signed GNN and NLP framework spanning early-cascade size/polarization forecasting (\texttt{SBi-FAGAT}) and macro cross-thread user-interaction polarization. Controlled five-seed experiments establish an honest empirical boundary: on shallow single-thread $K=20$ cascades, bidirectional signed attention clearly outperforms unlearned early persistence and isolates Camp Dipole and Conflict Gate effects via ablation, yet achieves headline parity with well-regularized text/edge baselines due to early structural sparsity—whereas projecting the same NLI stance and hostility signals onto the macro $13{,}718$-user Vietnamese network reveals pronounced spectral two-camp segregation ($Q_{\text{signed}} = 0.4280$) and a $+19.1$ percentage-point cross-camp opposition surge.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}

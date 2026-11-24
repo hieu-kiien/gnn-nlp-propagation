@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import tarfile
 import tempfile
 import time
@@ -206,11 +207,33 @@ def download_pheme_from_figshare(
                 archive_path.unlink(missing_ok=True)
 
     part_path = dest_dir / f"{PHEME_ARCHIVE_FILENAME}.part"
+    part_path.unlink(missing_ok=True)
+    # Try native curl first because Figshare AWS WAF rejects spoofed Chrome UAs paired with Python TLS.
+    try:
+        curl_res = subprocess.run(
+            ["curl", "-L", "--fail", "-s", "-S", "-o", str(part_path), download_url],
+            capture_output=True,
+            text=True,
+            timeout=max(120, int(timeout)),
+        )
+        if curl_res.returncode == 0 and part_path.is_file() and part_path.stat().st_size > 1_000_000:
+            try:
+                _, sha256_hex = verify_archive_integrity(part_path, expected_md5=expected_md5)
+                os.replace(part_path, archive_path)
+                sha_sidecar.write_text(f"{sha256_hex}  {archive_path.name}\n", encoding="utf-8")
+                return archive_path
+            except ValueError:
+                part_path.unlink(missing_ok=True)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
     last_exc: Exception | None = None
     with requests.Session() as session:
-        session.headers.update(FIGSHARE_HTTP_HEADERS)
+        session.headers.update({"User-Agent": "curl/8.7.1", "Accept": "*/*"})
         for attempt in range(3):
             part_path.unlink(missing_ok=True)
+            if attempt > 0:
+                session.headers.update(FIGSHARE_HTTP_HEADERS)
             try:
                 with session.get(download_url, stream=True, timeout=timeout) as resp:
                     resp.raise_for_status()

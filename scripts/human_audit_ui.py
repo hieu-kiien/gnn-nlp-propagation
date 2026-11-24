@@ -101,17 +101,34 @@ ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
         ),
     ),
     DatasetSpec(
+        filename="pilot_calibration_en_20.csv",
+        mode="pair",
+        title="Tùy chọn: Pilot EN PHEME (20 cặp)",
+        subtitle="Tùy chọn: 20 cặp tiếng Anh PHEME (EN pair validation ưu tiên dùng RumourEval SDQC làm chuẩn chính).",
+        kappa_command="python -m scripts.compute_kappa --input data/interim/pilot_calibration_en_20.csv",
+    ),
+    DatasetSpec(
+        filename="human_audit_en_120.csv",
+        mode="pair",
+        title="Tùy chọn: Kiểm định EN PHEME (120 cặp)",
+        subtitle="Tùy chọn: 120 cặp tiếng Anh PHEME (clean vs. uncivil + 3-class stance).",
+        kappa_command=(
+            "python -m scripts.compute_kappa --input data/interim/human_audit_en_120.csv "
+            "--strict-adjudication --output-json paper/results_human_audit_en.json"
+        ),
+    ),
+    DatasetSpec(
         filename="pilot_calibration_en_30.csv",
         mode="pair",
-        title="Tuỳ chọn: Pilot EN PHEME (30 cặp)",
-        subtitle="Tuỳ chọn: 30 cặp tiếng Anh PHEME (EN pair validation sử dụng RumourEval SDQC làm chuẩn chính).",
+        title="Tuỳ chọn: Pilot EN PHEME (30 cặp cũ)",
+        subtitle="Tuỳ chọn: 30 cặp tiếng Anh PHEME (tương thích ngược).",
         kappa_command="python -m scripts.compute_kappa --input data/interim/pilot_calibration_en_30.csv",
     ),
     DatasetSpec(
         filename="human_audit_en_300.csv",
         mode="pair",
-        title="Tuỳ chọn: Kiểm định EN PHEME (300 cặp)",
-        subtitle="Tuỳ chọn: 300 cặp tiếng Anh PHEME.",
+        title="Tuỳ chọn: Kiểm định EN PHEME (300 cặp cũ)",
+        subtitle="Tuỳ chọn: 300 cặp tiếng Anh PHEME (tương thích ngược).",
         kappa_command=(
             "python -m scripts.compute_kappa --input data/interim/human_audit_en_300.csv "
             "--strict-adjudication --output-json paper/results_human_audit_en.json"

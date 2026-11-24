@@ -27,7 +27,7 @@ import tempfile
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 from torch_geometric.loader import DataLoader
@@ -497,6 +497,27 @@ def _run_smoke_pipeline(role: str, lang: str, work_dir: Path) -> dict[str, Any]:
     return summary
 
 
+def _nlp_features_match_cohort(feats_path: Path, expected_min_replies: int) -> bool:
+    """Return True only if `nlp_features.pt` exists and matches `expected_min_replies`."""
+    if not feats_path.is_file():
+        return False
+    try:
+        payload = torch.load(feats_path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    ext_min = payload.get("min_total_replies_extracted")
+    if ext_min is None and isinstance(payload.get("_meta"), Mapping):
+        ext_min = payload["_meta"].get("min_total_replies_extracted")
+    if ext_min is None:
+        return int(expected_min_replies) >= int(DEFAULT_FORECAST_MIN_REPLIES)
+    try:
+        return int(ext_min) == int(expected_min_replies)
+    except (TypeError, ValueError):
+        return False
+
+
 def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
     lang = args.lang or ("en" if args.role == "member2_en" else "vi")
     ds_name = "pheme" if lang == "en" else "vn"
@@ -530,11 +551,14 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
     run_nlp = args.role in {"member1_vn", "member2_en", "model_nlp_only"}
     run_gnn = args.role in {"member1_vn", "member2_en", "model_gnn_only"}
 
-    if args.role == "model_gnn_only" and not (processed_dir / "nlp_features.pt").exists():
+    if args.role == "model_gnn_only" and not _nlp_features_match_cohort(
+        processed_dir / "nlp_features.pt", int(args.min_total_replies)
+    ):
         if not args.bootstrap_if_missing:
             raise FileNotFoundError(
-                f"Missing '{processed_dir / 'nlp_features.pt'}' for model_gnn_only. "
-                "Provide --processed-dir from Member 1 or pass --bootstrap-if-missing."
+                f"Missing or cohort-mismatched '{processed_dir / 'nlp_features.pt'}' "
+                f"(expected min_total_replies={int(args.min_total_replies)}) for model_gnn_only. "
+                "Provide matching --processed-dir from Member 1 or pass --bootstrap-if-missing."
             )
         run_nlp = True
 
@@ -572,7 +596,7 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
         # Stage 2: Unified 2D Teacher scoring (Hostility + mDeBERTa Stance Verbalizer) -> Cross-Encoder
         if (
             not force
-            and (processed_dir / "nlp_features.pt").exists()
+            and _nlp_features_match_cohort(processed_dir / "nlp_features.pt", int(args.min_total_replies))
             and (ce_ckpt / "dual_head_weights.pt").exists()
             and audit_csv.exists()
         ):
@@ -626,7 +650,7 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
         # Stage 3: Frozen 768-d Ancestor SpanPool node embeddings + 2D edge attributes
         if (
             not force
-            and (processed_dir / "nlp_features.pt").exists()
+            and _nlp_features_match_cohort(processed_dir / "nlp_features.pt", int(args.min_total_replies))
             and (processed_dir / "nodes.parquet").exists()
             and (processed_dir / "edges.parquet").exists()
         ):

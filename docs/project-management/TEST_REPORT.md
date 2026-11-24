@@ -1,7 +1,7 @@
 # SBi-FAGAT: Test & Verification Report
 
 **Platform:** Windows (`win32`, CPU verification pass) + GitHub Actions Ubuntu (`Python 3.11`)  
-**Suite Scope:** 18 test modules in `tests/` — **128 passed, 0 failed** (`563.27s`, zero skipped — covering unified 2D architecture, multi-task KL-BCE optimization, zero data leakage, EGM Round-1/Round-2 remediations, and **v3 EGM Overhaul**: PII/doxxing/spam filtering, linear `y_polar`, ReZero `tanh(w_p)` centered Persistence-Residual anchor, masked single-camp Camp Dipole, Smooth-L1 `beta=0.05` + validation-only comparator selection, `temporal`/`embedding_cluster` splits with `edge_source="teacher"`, binary `clean`/`uncivil` Gate 1 audit, `--lock-role` UI isolation, and non-overwriting multi-corpus LaTeX assembly)
+**Suite Scope:** 21 test modules in `tests/` (`0 failed, 0 skipped` verified post-final-edit via `python -u -m pytest -q`; includes full Tier 1 early-cascade contracts, Tier 2 macro signed network analytics & temporal signed link GNN smoke tests, SemEval-2019 RumourEval-2019 SDQC root-context verification, and EGM v2 regression checks for `--allow-single-gold`, cohort-aware EDA formatting, LOO validation comparator selection, native `curl` download fallback, EN audit UI allowlist, lazy `umap`, and UPFD retry/`ROC-AUC`)
 
 ---
 
@@ -23,9 +23,12 @@
 
 | Test Module | Focus |
 | :--- | :--- |
-| `tests/test_egm_audit_remediation.py` | Full EGM audit regressions (`B1–B10`, `M1–M8`): `min_total_replies` LOO teacher coverage, `edge_source="auto"` Student consistency, $O(N)$ JSONL teacher delta resume, crawl `.state.json` + salted PHEME, LaTeX `_` escaping & `table*` + RFC JSON, NLI double-contradiction neutral + 50-tree VN blind audit, direction-aware stars + exact $F=4$ LOO permutation + topic-cluster bootstrap, continuous `y_polar` + fixed future $K$-window, Camp Dipole/Dir-GNN/Dual-Channel ablations + `BiEdgeGATv2` + `TextMLP` topology mask + `assemble_paper_artifacts` + UPFD fault isolation |
+| `tests/test_egm_v2_fixes.py` | EGM v2 regressions: `--allow-single-gold` (`compute_kappa.py` & `audit_vn_50_trees.py`), mixed-cohort EDA formatting, LOO output paths, RumourEval `--context-mode root` & SHA-256 verification, Figshare native `curl` mock, EN audit UI HTTP GET/POST, lazy `umap`, cohort guard (`_nlp_features_match_cohort`), UPFD retry/`ROC-AUC`, and 4 notebooks JSON+AST |
+| `tests/test_macro_signed_network.py` | Tier 2 Macro Signed User-Interaction Social Network (`build_user_interaction_records` filtering, 2-camp balanced triad $z$-score & $Q_{\text{signed}}$ / RWC, LaTeX underscore cleanliness, chronological zero-leakage split & unseen user masking, `--smoke-test` 6-model benchmark) |
+| `tests/test_rumoureval_sdqc.py` | SemEval-2019 RumourEval SDQC archive validation, `parent`/`root` text extraction, and NLI verbalizer scoring interface |
+| `tests/test_egm_audit_remediation.py` | Full EGM audit regressions (`B1–B10`, `M1–M8`): `min_total_replies` LOO teacher coverage, `edge_source="auto"` Student consistency, $O(N)$ JSONL teacher delta resume, crawl `.state.json` + salted PHEME, LaTeX `_` escaping & `table*` + RFC JSON, NLI double-contradiction neutral + 30-tree/pair VN blind audit, direction-aware stars + exact $F=4$ LOO permutation + topic-cluster bootstrap, continuous `y_polar` + fixed future $K$-window, Camp Dipole/Dir-GNN/Dual-Channel ablations + `BiEdgeGATv2` + `TextMLP` topology mask + `assemble_paper_artifacts` + UPFD fault isolation |
 | `tests/test_egm_fixes.py` | EGM hardening fixes (`F1–F6`), `node_backbone`, fair model parity, `min_total_replies=25` |
-| `tests/test_human_audit_ui.py` | Localhost blind audit Web UI: `127.0.0.1` binding, `403` 5-CSV allowlist, role blinding, atomic UTF-8 BOM saves + `.bak`, `compute_kappa`/`audit_vn_50_trees` strict-adjudication compatibility, native `<dialog>` & IME-safe UI invariants |
+| `tests/test_human_audit_ui.py` | Localhost blind audit Web UI: `127.0.0.1` binding, `403` strict CSV allowlist, role blinding, atomic UTF-8 BOM saves + `.bak`, `compute_kappa`/`audit_vn_50_trees` strict-adjudication compatibility, native `<dialog>` & IME-safe UI invariants |
 | `tests/test_kaggle_t4x2_v2_pipeline.py` | Unified 2D discourse labels, NLI verbalizer simplex, `DualHeadCrossEncoder`, `auto_loop`, smoke runner & notebooks |
 | `tests/test_live_predictor_audit.py` | Live predictor untrained guard, `--allow-untrained`, corrupt checkpoints, `--demo-offline` |
 | `tests/test_mechanisms_and_optimizations.py` | Lossless NLP length-bucketing/DP wrappers, mechanistic counterfactual edge/hop/polarity interventions, LaTeX & underscore validation |
@@ -48,6 +51,8 @@
 
 1. `python -u -m scripts.demo_research_walkthrough` — Exited `0` (CPU walkthrough comparing `StandardGCN` vs. `SBiFAGAT`).
 2. `python -u -m scripts.predict_live_thread --demo-offline` — Exited `0` (verified live safety guard + offline diagnostics).
-3. `python -u -m scripts.benchmark_efficiency --use-cascade-stats --hidden-dim 64 --edge-dim 2` — Exited `0` (`SBiFAGAT = 137,086` params, `1.1843 ms/cascade`, `155.79 ms/batch`, `0.03 MB` peak alloc RAM on CPU).
+3. `python -u -m scripts.benchmark_efficiency --use-cascade-stats --hidden-dim 64 --edge-dim 2` — Exited `0` (`SBiFAGAT = 137,086` params, `1.1721 ms/cascade`, `155.54 ms/batch`, `0.03 MB` peak alloc RAM on CPU).
 4. `python -u -m scripts.kaggle_parallel_runner --role member1_vn --smoke-test` — Exited `0` (verified temp-isolated 2D VN distillation + sealed machine-key separation).
 5. `python -u -m scripts.kaggle_parallel_runner --role member2_en --smoke-test` — Exited `0` (verified temp-isolated 2D EN distillation + LOO/UPFD path).
+6. `python -u -m scripts.run_macro_signed_network --smoke-test` — Exited `0` (verified Tier 2 Macro stats + 6-model zero-leakage temporal link benchmark in tempdir).
+7. `python -u -m scripts.run_macro_signed_network --data-dir data/processed/vn --dataset-name vn --analysis-only` — Exited `0` (real VN macro social graph: `13,718` users, `85,398` interactions, $Q_{\text{signed}} = 0.4280$, `z = -15.17`, `RWC = 0.0957`, `within=37.9%` vs `cross=57.0%`).

@@ -25,7 +25,6 @@ import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import umap
 from matplotlib.lines import Line2D
 
 
@@ -77,6 +76,8 @@ def _save_vector_pair(fig: plt.Figure, output_dir: Path, stem: str) -> tuple[Pat
 
 
 def _project_umap_2d(embeddings: np.ndarray, random_state: int = 42) -> np.ndarray:
+    import umap
+
     n_samples = embeddings.shape[0]
     if n_samples < 4:
         # Degenerate tiny fallback (safety guard; real graphs have dozens/hundreds of nodes)
@@ -356,8 +357,8 @@ def plot_cascade_heatmap(
         v_id = node_ids[v] if v < len(node_ids) else f"node_{v}"
         v_text = node_texts[v] if v < len(node_texts) else ""
         lines.append(
-            f"#{rank} | node_id={v_id} (parent={u_id}) | |gamma_uv|={float(imp[e_idx]):.4f} "
-            f"| gamma={float(gamma[e_idx]):+.4f} | s_uv={s_uv:+.4f} | h_uv={h_uv:.4f}"
+            f"#{rank} | node_id={v_id} (parent={u_id}) | |gamma_mean|={float(imp[e_idx]):.4f} "
+            f"| gamma_td={float(gamma[e_idx]):+.4f} | s_uv={s_uv:+.4f} | h_uv={h_uv:.4f}"
         )
         lines.append(f"    Text: {v_text}")
     txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

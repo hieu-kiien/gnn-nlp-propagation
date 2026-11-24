@@ -304,6 +304,7 @@ def main() -> None:
     parser.add_argument("--export", action="store_true")
     parser.add_argument("--evaluate", action="store_true")
     parser.add_argument("--strict-adjudication", action="store_true")
+    parser.add_argument("--allow-single-gold", action="store_true")
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--output-table", type=Path, default=None)
     args = parser.parse_args()
@@ -331,6 +332,7 @@ def main() -> None:
             args.audit_csv,
             machine_key_csv=key_csv if key_csv.is_file() else None,
             strict_adjudication=bool(args.strict_adjudication),
+            allow_single_gold=bool(args.allow_single_gold),
         )
         print(json.dumps(report, indent=2, ensure_ascii=False))
         if args.output_json is not None:

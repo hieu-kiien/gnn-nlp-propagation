@@ -8,7 +8,7 @@ Tài liệu này trình bày đánh giá thiết kế tổng quan (theo chuẩn 
 
 ### 0.1. Mục tiêu Phi kỹ thuật & Đối tượng Thụ hưởng
 - **Bài toán thực tế & Phạm vi phân tích**: Khi một thông tin nóng hoặc tin thất thiệt bắt đầu lan truyền trên mạng xã hội, nền tảng kiểm duyệt (*Trust & Safety*) và nhóm ứng phó khủng hoảng truyền thông chỉ có một cửa sổ thời gian rất ngắn (tối đa $K = 20$ bình luận đầu tiên) trước khi làn sóng chia rẽ hoặc tin giả bùng phát vượt kiểm soát. Đề tài xác định rõ phạm vi ở **cấp chuỗi thảo luận vi mô (cascade-level, $|\mathcal{V}_K| \le 21$)**, đo lường đồng thời *phân cực lập trường* ($s_{uv}$) và *phân cực cảm xúc/gay gắt* ($h_{uv}$), thay vì mô hình hóa cấu trúc buồng vang người dùng vĩ mô xuyên nhiều chủ đề qua thời gian dài.
-- **Mục tiêu**: Xây dựng mô hình dự đoán sớm từ bài đăng gốc và tối đa $20$ tương tác đầu để ước lượng đồng thời: (1) quy mô lan rộng cuối kỳ ($y_{\text{size}}$), (2) mức độ chia rẽ hai phe ủng hộ–phản bác về cuối kỳ ($y_{\text{polar}}$), (3) xác thực tin đồn/tin giả ($y_{\text{rumor}}$ trên PHEME), và (4) phân tích cơ chế tương tác & kiểm thử can thiệp giả định (*counterfactual moderation*) hậu huấn luyện (`scripts/analyze_mechanisms.py`).
+- **Mục tiêu**: Xây dựng kiến trúc đồ thị có dấu hai tầng: **Tầng 1 (Early Cascade)** dự đoán sớm từ bài đăng gốc và tối đa $20$ tương tác đầu để ước lượng đồng thời: (1) quy mô lan rộng cuối kỳ ($y_{\text{size}}$), (2) mức độ chia rẽ hai phe ủng hộ–phản bác về cuối kỳ ($y_{\text{polar}}$), (3) xác thực tin đồn/tin giả ($y_{\text{rumor}}$ trên PHEME), và (4) phân tầng xung đột & phân tích độ nhạy nhiễu đặc trưng cạnh hậu huấn luyện (*observational edge-feature sensitivity*, `scripts/analyze_mechanisms.py`); **Tầng 2 (Macro Signed Network)** chiếu các tương tác người dùng xuyên chuỗi lên đồ thị xã hội có dấu toàn cục ($\mathcal{G}_{\text{macro}}$).
 
 ### 0.2. Hiện trạng & Điểm mù Kỹ thuật
 - Các mô hình chuỗi thời gian/đồ thị lan truyền truyền thống (*DeepCas*, *GCN*, *GATv2*, *Bi-GCN*) bỏ qua thái độ đồng tình hay phản bác giữa từng cặp bình luận và dùng bộ lọc trung bình (low-pass) làm nhòa sự đối lập giữa hai phe.
@@ -117,3 +117,20 @@ cùng 6 mô-men cổng vô hướng (`g_mean, g_std, g_abs_mean, frac_pos, frac_
      $$\mathcal{L}_{\text{polar}} = \left(\operatorname{BCEWithLogits}(z_{\text{polar}}, y_{\text{polar}}) - H(y_{\text{polar}})\right)_+ + \mathcal{L}_{0.05}^{\text{SmoothL1}}(\hat{y}_{\text{polar}}, y_{\text{polar}}).$$
    - Trọng số cân bằng chuẩn hóa theo loss cơ sở trung bình hằng trên `train_loader` theo tỷ lệ 2:1 ($s_{\text{size}} = \operatorname{clip}(1.0/\max(L_{\text{base}}^{\text{size}}, 10^{-4}), 0.5, 16.0)$, $s_{\text{polar}} = \operatorname{clip}(0.5/\max(L_{\text{base}}^{\text{polar}}, 10^{-4}), 0.5, 250.0)$) và khởi tạo bias cho `size_head`/`polar_head` (kẹp $p \in [10^{-3}, 0.99]$) được ước lượng **thuần túy trên `train_loader`**.
    - Lịch học **Linear Warmup + `ReduceLROnPlateau`** cùng **EMA (`decay=0.985`, bật khi `epochs >= 10`)**, dừng sớm theo `val task_loss` và chọn seed có `val_task_loss` nhỏ nhất làm checkpoint chính thức của mỗi mô hình qua 5 hạt giống `[42, 100, 2024, 777, 999]`.
+
+---
+
+## 6. Tầng 2 — Mạng Xã hội Người dùng Có dấu Vĩ mô & Dự báo Liên kết Theo Thời gian (`src/data/user_network.py`)
+
+Nhằm khắc phục giới hạn độ sâu nhỏ của từng chuỗi đơn lẻ ($|\mathcal{V}_K| \le 21$) mà không cần thu thập thêm dữ liệu mới, Tầng 2 chiếu mọi tương tác trả lời hợp lệ $(u, v)$ (đã lọc tự lặp và tài khoản ẩn/`[deleted]`) xuyên suốt các chủ đề thành đồ thị xã hội có dấu $\mathcal{G}_{\text{macro}} = (\mathcal{U}, \mathcal{E}_{\text{user}})$:
+
+1. **Hình học Phân cực Vĩ mô (Sparse CPU Analytics, `scripts/run_macro_signed_network.py --analysis-only`):**
+   - Các cặp người dùng vô hướng có lập trường trung bình $|\bar{s}_{uv}| \ge 0.1$ nhận trọng số có dấu $w_{uv} = \operatorname{sign}(\bar{s}_{uv})|\bar{s}_{uv}|\ln(1 + c_{uv})$ qua $c_{uv}$ tương tác.
+   - Trên thành phần liên thông lớn nhất, phân đôi quang phổ bằng vector riêng thứ hai của **Signed Normalized Laplacian** $\bar{L}_{\text{signed}} = I - \bar{D}^{-1/2} W \bar{D}^{-1/2}$ (*Kunegis et al., SDM 2010*) thành hai phe $(\mathcal{C}_0, \mathcal{C}_1)$ để đo:
+     - **Structural Balance Theory** (*Cartwright & Harary, 1956*): tỷ lệ tam giác cân bằng $(N_{+++} + N_{+--}) / N_{\triangle}$ và kiểm định $z$-score trước $100$ hoán vị dấu bảo toàn bậc nút.
+     - **Signed Modularity ($Q_{\text{signed}} = Q^+ - Q^-$)** và **Garimella Random Walk Controversy (RWC)** trên cụm nút bậc cao của hai phe.
+     - Chênh lệch tỷ lệ đối đầu ($s_{uv} \le -0.1$) và mức gay gắt ($h_{uv} \ge 0.5$) giữa các tương tác nội phe vs. liên phe.
+2. **Dự báo Liên kết Có dấu Theo Thời gian Chống Rò rỉ (`build_temporal_signed_link_dataset`):**
+   - Toàn bộ cạnh có dấu ($|s_{uv}| \ge 0.1$) được tách tuyến tính theo mốc UTC (`70%/15%/15%`) sao cho $t_{\text{train}} < t_{\text{val}} < t_{\text{test}}$.
+   - Vector đặc trưng người dùng $x_u^{\text{macro}} = [\bar{\mathbf{e}}_u^{\text{Span}} \Vert \mathbf{a}_u^{\text{4D}}] \in \mathbb{R}^{772}$ chỉ tổng hợp nhúng văn bản tại $t \le t_{\text{train}}^{\max}$ kèm **4 chiều hoạt động không dấu** ($\ln(1+\text{posts})/5$, $\ln(1+\text{cascades})/5$, $\ln(1+\text{out})/5$, $\ln(1+\text{in})/5$) để loại bỏ rò rỉ dấu bậc 1 và trả về $0$ tuyệt đối cho người dùng mới chỉ xuất hiện ở Val/Test.
+   - Khi huấn luyện theo mini-batch, mọi cạnh trong cùng cặp vô hướng $\{u, v\}$ của batch giám sát được che khỏi đồ thị truyền thông điệp để mô hình không thể đọc trực tiếp $e_{uv}$; thi đấu công bằng 5 hạt giống ở `hidden_dim = 64` gồm `UserTextMLP`, `StandardGCN`, `StandardGATv2`, `SGCN`, `FAGCN` và `SBiFAGAT-Link`.

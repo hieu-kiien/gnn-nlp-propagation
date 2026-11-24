@@ -9,6 +9,7 @@ alignment (`Support / Deny / Query / Comment` -> `support / oppose / neutral`), 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -25,6 +26,7 @@ from src.nlp.dual_edge_scorer import MDEBERTA_NLI_MODEL_NAME, NLIStanceTeacherSc
 
 RUMOUREVAL_FIGSHARE_URL = "https://ndownloader.figshare.com/files/16188500"
 RUMOUREVAL_ARCHIVE_NAME = "rumoureval2019.tar.bz2"
+RUMOUREVAL_EXPECTED_SHA256 = "2b9bde22c38d6fe6b2f4fe52de7544444e0c6436201f79600854a38522dfd76c"
 
 _SPLIT_KEY_FILENAMES: dict[str, tuple[str, ...]] = {
     "test": ("final-eval-key.json",),
@@ -133,11 +135,26 @@ def _download_archive(url: str, dest_path: Path) -> None:
     part_path.replace(dest_path)
 
 
+def _verify_archive_sha256(archive_path: Path, expected_sha256: str) -> str:
+    h = hashlib.sha256()
+    with Path(archive_path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    actual = h.hexdigest().lower()
+    if actual != expected_sha256.strip().lower():
+        raise ValueError(
+            f"SHA-256 mismatch for '{archive_path}': expected {expected_sha256}, got {actual}"
+        )
+    return actual
+
+
 def download_and_extract_rumoureval(
     data_dir: Path = Path("data/raw/rumoureval2019"),
     *,
     url: str = RUMOUREVAL_FIGSHARE_URL,
     split: str = "all",
+    verify_checksum: bool = True,
+    expected_sha256: str | None = RUMOUREVAL_EXPECTED_SHA256,
 ) -> Path:
     """Ensure `rumoureval2019.tar.bz2` and requested inner split zips are safely extracted."""
     root = Path(data_dir)
@@ -147,6 +164,13 @@ def download_and_extract_rumoureval(
 
     if not archive_path.is_file() or archive_path.stat().st_size < 1_000_000:
         _download_archive(url, archive_path)
+    if verify_checksum and expected_sha256:
+        try:
+            _verify_archive_sha256(archive_path, expected_sha256)
+        except ValueError:
+            archive_path.unlink(missing_ok=True)
+            _download_archive(url, archive_path)
+            _verify_archive_sha256(archive_path, expected_sha256)
 
     has_keys = any(extracted_dir.rglob("final-eval-key.json")) if extracted_dir.exists() else False
     if not has_keys:
@@ -333,7 +357,7 @@ def evaluate_nli_on_rumoureval(
     batch_size: int = 32,
     output_json: Path = Path("paper/results_rumoureval_sdqc.json"),
     predictions_json: Path | None = None,
-    context_mode: str = "parent",
+    context_mode: str = "root",
 ) -> dict[str, Any]:
     """Score `(parent_text, reply_text)` pairs with NLI verbalizer and evaluate SDQC metrics."""
     if not pairs:
@@ -425,12 +449,17 @@ def main() -> None:
     parser.add_argument("--model-name", type=str, default=MDEBERTA_NLI_MODEL_NAME)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--context-mode", choices=("parent", "root"), default="parent")
+    parser.add_argument("--context-mode", choices=("root", "parent"), default="root")
+    parser.add_argument("--no-verify-checksum", action="store_true")
     parser.add_argument("--output-json", type=Path, default=Path("paper/results_rumoureval_sdqc.json"))
     parser.add_argument("--predictions-json", type=Path, default=None)
     args = parser.parse_args()
 
-    extracted = download_and_extract_rumoureval(args.data_dir, split=args.split)
+    extracted = download_and_extract_rumoureval(
+        args.data_dir,
+        split=args.split,
+        verify_checksum=not bool(args.no_verify_checksum),
+    )
     pairs = load_rumoureval_sdqc_pairs(extracted, split=args.split)
     if args.max_samples is not None:
         pairs = pairs[: max(1, int(args.max_samples))]
