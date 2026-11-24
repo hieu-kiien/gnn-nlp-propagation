@@ -56,10 +56,11 @@ Discourse stance benchmarks such as PHEME \cite{zubiaga2016analysing,kochkina201
 \section{Methodology}
 \subsection{Problem Formulation and Zero-Leakage Protocol}
 Given a propagation tree observed up to the earliest $K=20$ chronological replies $\mathcal{G}_K = (\mathcal{V}_K, \mathcal{E}_K^{\text{TD}}, \mathcal{E}_K^{\text{BU}})$, each node $v \in \mathcal{V}_K$ carries a $770$-D feature vector $x_v = [\mathbf{e}_v^{\text{Span}} \Vert t_{\text{norm}}(v) \Vert d_{\text{norm}}(v)]$ paired with a $10$-D causal structural vector $s_v \in [0, 1]^{10}$ and an $8$-D cascade summary vector $c_{\mathcal{G}}$ (all computed strictly from $t \le t_K$). Post-observation replies ($t > t_K$, count $n \ge 2$) define targets:
-\begin{equation}
+\begin{multline}
 y_{\text{size}} = \ln(1 + N_{\text{total}}), \quad
-y_{\text{polar}} = \operatorname{clip}\!\left(\lambda_p \min\!\left(1, \sqrt{\min(1, s_{\tilde{s}, \text{ddof}=1}^2)}\right) + (1-\lambda_p)\min\!\left(1, 2\sqrt{\frac{n}{n-1} m_+ m_-}\right), 0, 1\right),
-\end{equation}
+y_{\text{polar}} = \operatorname{clip}\!\Biggl(\lambda_p \min\!\left(1, \sqrt{\min(1, s_{\tilde{s}, \text{ddof}=1}^2)}\right) \\
++ (1-\lambda_p)\min\!\left(1, 2\sqrt{\frac{n}{n-1} m_+ m_-}\right),\, 0,\, 1\Biggr),
+\end{multline}
 where $\lambda_p = 0.5$, $\tilde{s}_v \in [-1, 1]$ denotes root-aligned future stances over $t > t_K$ (\texttt{future\_only}), $m_+ = \frac{1}{n}\sum_v \max(\tilde{s}_v, 0)$ and $m_- = \frac{1}{n}\sum_v \max(-\tilde{s}_v, 0)$ are continuous camp intensities whose finite-sample covariance bias is removed prior to square-root linear amplitude scaling and $[0, 1]$ clipping by $\frac{n}{n-1}$ (preventing quadratic collapse on empirical cascades), and PHEME cascades additionally supervise $y_{\text{rumor}}$. Forecasting splits require $N_{\text{reply}} \ge 25$ (with optional $K=10, N_{\text{reply}} \ge 15$ evaluation on sparser PHEME events) so non-trivial future evolution exists. Topic splits partition Train/Val/Test (70\%/15\%/15\%) canonically across news events (PHEME) or via a \emph{Heuristic Temporal-Keyword / 30-day TF-IDF ($\cos \ge 0.30$) Grouped Inductive Split} (Vietnamese Reddit, alongside chronological temporal holdout with \texttt{edge\_source="teacher"}), persisting \texttt{topic\_splits.json} so distillation, evaluation, and fixed-horizon $K \in \{10, 20, 30, 50\}$ sensitivity runs never re-split Train topics into Test.
 
 \subsection{Offline Ancestor-Conditioned SpanPool and 2D Distillation}
@@ -74,16 +75,18 @@ For 2D edge attributes $e_{uv} = [s_{uv}, h_{uv}]^\top \in [-1, 1] \times [0, 1]
 
 \subsection{Dual-Channel Bidirectional SBi-FAGAT Architecture}
 A shared \texttt{TwoStreamNodeStem} projects semantic and $10$-D causal structural inputs into $h^{(0)} \in \mathbb{R}^{64}$ (masking topology columns in both \texttt{struct\_x} and \texttt{cascade\_stats} for \texttt{TextMLP}). Each \texttt{StanceGuidedFAConv} layer normalizes linear node projections $z^{\text{norm}} = \operatorname{LN}(W h^{(l-1)})$ and evaluates scaled node--edge gates (with node-attention Xavier gain $0.2$ and initial cosine weight $\omega^{(0)} = 0.10$):
-\begin{equation}
-\gamma_{uv} = \tanh\!\left(\frac{\mathbf{a}_{\text{node}}^\top [z_u^{\text{norm}} \Vert z_v^{\text{norm}}]}{\sqrt{2d}} + \omega \cos(z_u^{\text{norm}}, z_v^{\text{norm}}) + \mathbf{a}_{\text{edge}}^\top e_{uv} + \delta_{\gamma}(e_{uv})\right),
-\end{equation}
+\begin{multline}
+\gamma_{uv} = \tanh\!\Biggl(\frac{\mathbf{a}_{\text{node}}^\top [z_u^{\text{norm}} \Vert z_v^{\text{norm}}]}{\sqrt{2d}} + \omega \cos(z_u^{\text{norm}}, z_v^{\text{norm}}) \\
++ \mathbf{a}_{\text{edge}}^\top e_{uv} + \delta_{\gamma}(e_{uv})\Biggr),
+\end{multline}
 alongside an unsigned excitation gate $\alpha_{uv}^{\text{exc}} = \sigma(0.8|s_{uv}| + 0.8 h_{uv} + \delta_{\alpha}(e_{uv}))$. Messages split evenly into signed polarity ($\gamma_{uv} z_u[:d/2]$) and unsigned excitation ($\alpha_{uv}^{\text{exc}} z_u[d/2:]$) channels under symmetric degree normalization $c_{uv} = \sqrt{(d_{\text{out}}(u)+1)(d_{\text{in}}(v)+1)}$, updated with initial residual anchoring ($0.5 h^{(l-1)} + \epsilon h^{(0)} + m_v + W_{\text{root}} h_r^{(0)}$) and odd-symmetric stabilization $r + 0.2\tanh(r)$. After each layer, Dir-GNN cross-mixing ($\eta_l^{(0)} = 0.10$) \cite{rossi2023edge} couples TD and BU states ($\tilde{h}^{\delta} = h^{\delta} + \tanh(\eta_l) W_{\text{mix}}^{\delta} h^{\bar{\delta}}$). Finally, base pooling $z_{\text{base}} = [z_{\text{root}} \Vert z_{\text{att}}]$ is modulated by a residual CleanRes Camp Dipole bottleneck $\operatorname{dipole\_proj}: \mathbb{R}^{3d+6} \to \mathbb{R}^{\max(16, d/2)} \to \mathbb{R}^{2d}$ scaled by $\tanh(\beta_{\text{dip}})$ ($\beta_{\text{dip}}^{(0)} = 0.25$) over node dispersion $z_{\text{disp}}$, BFS root-aligned camp dipoles up to $64$ hops (detached parent ramp $\operatorname{clip}(u_{\text{ori}}/0.1, -1, 1)$, continuous ReLU camp weights $w_\pm = \operatorname{ReLU}(\pm\hat{\gamma}_{uv})$, masked camp centroids $\mu_\pm = \mathbb{I}[\sum w_\pm > 10^{-6}]\frac{\sum w_\pm h_v}{\max(\sum w_\pm, 10^{-6})}$, dual-camp indicator $b = 2\,\mathbb{I}[\text{both\_camps}]\sqrt{\operatorname{clip}(f_+ f_-, 0, 0.25) + 10^{-8}}$, yielding zeroed single-camp vectors $z_{\text{dipole}}^{\text{polar}} = b\sqrt{(\mu_+ - \mu_-)^2 \mathbb{I}[\text{both\_camps}] + 10^{-8}}$ and $z_{\text{dipole}}^{\text{signed}} = (\mu_+ - \mu_-)\mathbb{I}[\text{both\_camps}]$), and 6 scalar gate moments before $\operatorname{LN}(z_{\text{base}} + \tanh(\beta_{\text{dip}})\,\operatorname{dipole\_proj}(\cdot))$. Inside \texttt{MultiTaskHead}, \texttt{polar\_head} reads strictly from $2d$-D \texttt{graph\_emb} across all compared architectures, decoupling polarization inference from $8$-D \texttt{cascade\_stats}; for all stance-aware models consuming explicit edge stances (\texttt{TemporalStanceMLP}, non-latent \texttt{EdgeGATv2}, \texttt{BiEdgeGATv2}, and non-ablated \texttt{SBiFAGAT}), logits add a learnable causal Persistence-Residual anchor $z_{\text{polar}} = \tanh(w_p)\bigl(\operatorname{logit}(\operatorname{clip}(y_{\text{polar}}(\mathcal{G}_K), 0.02, 0.98)) - \bar{\ell}_{\text{train}}\bigr) + \Delta z_{\text{polar}}$.
 
 \subsection{Multi-Task Optimization}
 To prevent sigmoid tail gradient starvation on $y_{\text{polar}}$, we replace raw sigmoid Huber loss with zero-minimum KL-calibrated binary cross-entropy over logits $z_{\text{polar}}$ combined with Smooth-L1 regression ($\beta=0.05$):
-\begin{equation}
-\mathcal{L}_{\text{polar}} = \bigl(\operatorname{BCEWithLogits}(z_{\text{polar}}, y_{\text{polar}}) - H(y_{\text{polar}})\bigr)_+ + \operatorname{SmoothL1}(\sigma(z_{\text{polar}}), y_{\text{polar}}),
-\end{equation}
+\begin{multline}
+\mathcal{L}_{\text{polar}} = \bigl(\operatorname{BCEWithLogits}(z_{\text{polar}}, y_{\text{polar}}) - H(y_{\text{polar}})\bigr)_+ \\
++ \operatorname{SmoothL1}(\sigma(z_{\text{polar}}), y_{\text{polar}}),
+\end{multline}
 jointly with Huber loss on $y_{\text{size}}$ and masked dampened class-weighted Cross-Entropy on $y_{\text{rumor}}$. Training applies strictly train-only 2:1 constant-mean baseline-normalized loss scaling ($s_{\text{size}}, s_{\text{polar}}$) and calibrated output bias initialization ($p \in [10^{-3}, 0.99]$), symmetric uncertainty prediction across all 8 architectures when enabled, paired per-seed DataLoader shuffle ordering, linear warmup followed by \texttt{ReduceLROnPlateau}, Exponential Moving Average (EMA) validation selection, Early Stopping on validation task loss, validation-only comparator model selection (\texttt{val\_summary\_stats}), and $R^2_{\text{polar}}$ reporting across five deterministic seeds ($[42, 100, 2024, 777, 999]$).
 
 \section{Experimental Setup}
@@ -280,11 +283,13 @@ For qualitative interpretability, \texttt{extract\_edge\_gates} ranks edges by g
 To examine how early affective incivility and ideological disagreement relate to model predictions beyond black-box accuracy, \texttt{scripts/analyze\_mechanisms.py} conducts empirical regime stratification (low conflict, civil disagreement, hostile conflict), trigger-edge depth profiling ($d=1$ vs.\ $d \ge 2$), and non-mutating input-feature sensitivity perturbations on trained test checkpoints. Generated LaTeX summaries and paired bootstrap shift plots are reported strictly as observational model-sensitivity associations rather than causal intervention effects.
 
 \IfFileExists{tables_mechanisms_pheme.tex}{
-  \input{tables_mechanisms_pheme}
+  {\scriptsize\setlength{\tabcolsep}{2.5pt}
+  \input{tables_mechanisms_pheme}}
 }{}
 
 \IfFileExists{tables_mechanisms_vn.tex}{
-  \input{tables_mechanisms_vn}
+  {\scriptsize\setlength{\tabcolsep}{2.5pt}
+  \input{tables_mechanisms_vn}}
 }{}
 
 \IfFileExists{figures/pheme/fig4_counterfactual_interventions.pdf}{
