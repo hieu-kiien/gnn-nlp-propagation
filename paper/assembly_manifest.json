@@ -3,7 +3,8 @@
   "generated_tables": [
     "paper/tables_dataset_eda.tex",
     "paper/tables_macro_network.tex",
-    "paper/tables_efficiency.tex"
+    "paper/tables_efficiency.tex",
+    "paper/tables_human_audit.tex"
   ],
   "present_tables": [
     "tables_dataset_eda.tex",
@@ -21,10 +22,10 @@
   "missing_tables": [],
   "optional_tables_present": [
     "tables_upfd_politifact.tex",
+    "tables_human_audit.tex",
     "tables_macro_network.tex"
   ],
   "optional_tables_missing": [
-    "tables_human_audit.tex",
     "tables_signed_link_vn.tex",
     "tables_signed_link_pheme.tex"
   ],

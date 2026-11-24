@@ -1,13 +1,13 @@
-Cascade ID: pheme_ottawashooting_524953569762766848
+Cascade ID: pheme_ottawashooting_524966946467749888
 Top-5 Trigger Comments Ranked by |gamma_uv|
 ========================================================================
-#1 | node_id=pheme_524953569762766848_524957701345132544 (parent=pheme_524953569762766848_524957479298686979) | |gamma_uv|=0.3563 | gamma=-0.3200 | s_uv=-0.4960 | h_uv=0.4446
-    Text: @safety_ninja @RCMPONT I think they think they're helping? Its misguided and scary.
-#2 | node_id=pheme_524953569762766848_524954406329262080 (parent=pheme_524953569762766848_524953569762766848) | |gamma_uv|=0.3196 | gamma=-0.2791 | s_uv=-0.1448 | h_uv=0.8909
-    Text: you fucking idiots really blew it, .@RCMPONT. you stop a pot leaf t shirt at the memorial flame, but let a gunman INSIDE!?!?!
-#3 | node_id=pheme_524953569762766848_524957927023841280 (parent=pheme_524953569762766848_524957628469104640) | |gamma_uv|=0.2562 | gamma=-0.2226 | s_uv=-0.1968 | h_uv=0.6469
-    Text: @Martyp55 bombing pipelines, burning barns, lying under oath after murdering people in an airport on video, and you believe them NOW!?!?!?
-#4 | node_id=pheme_524953569762766848_524955184985014272 (parent=pheme_524953569762766848_524954848970956800) | |gamma_uv|=0.2451 | gamma=-0.2013 | s_uv=-0.1397 | h_uv=0.7051
-    Text: @Mistletoe_Rowan RCMP kill, and lie, and rape, and bomb, and burn, and propagandize, and DON'T look for missing native women....
-#5 | node_id=pheme_524953569762766848_524957479298686979 (parent=pheme_524953569762766848_524953569762766848) | |gamma_uv|=0.2348 | gamma=-0.1951 | s_uv=-0.1660 | h_uv=0.6268
-    Text: @RCMPONT @SassyTravis the fact that this needs to be said is ridiculous. This isnt time to fame seek on twitter people. Put your phones down
+#1 | node_id=pheme_524966946467749888_524967392372617217 (parent=pheme_524966946467749888_524966946467749888) | |gamma_uv|=0.2166 | gamma=+0.2296 | s_uv=+0.1816 | h_uv=0.0805
+    Text: @waltandperry @lustyfan Deutsch Lernen mit http://t.co/kT9LrG4jFr
+#2 | node_id=pheme_524966946467749888_524974608013737984 (parent=pheme_524966946467749888_524966946467749888) | |gamma_uv|=0.1945 | gamma=+0.2066 | s_uv=+0.1540 | h_uv=0.1174
+    Text: @waltandperry @Nunavut_Tweeter Am very sad to hear of today's events.
+#3 | node_id=pheme_524966946467749888_524968371461160960 (parent=pheme_524966946467749888_524966946467749888) | |gamma_uv|=0.1679 | gamma=-0.1580 | s_uv=-0.1231 | h_uv=0.5830
+    Text: @waltandperry this is what terrorist want to exploit, they focus to kill while civilised ppl focus to save victims,
+#4 | node_id=pheme_524966946467749888_524971404073398273 (parent=pheme_524966946467749888_524970963474337792) | |gamma_uv|=0.1654 | gamma=+0.1749 | s_uv=+0.0274 | h_uv=0.0351
+    Text: @ItsMeIsibalo None taken. That's precisely what stood out to me:)
+#5 | node_id=pheme_524966946467749888_524970963474337792 (parent=pheme_524966946467749888_524966946467749888) | |gamma_uv|=0.1471 | gamma=+0.1598 | s_uv=+0.0599 | h_uv=0.1078
+    Text: @waltandperry Probably one of the many differences between Canadian and US-mentality. No offense :-S

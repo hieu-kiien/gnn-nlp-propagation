@@ -1,0 +1,68 @@
+{
+  "input_csv": "data\\interim\\pilot_calibration_vi_20.csv",
+  "unadjudicated_disagreements": {
+    "stance": 0,
+    "hostility": 0,
+    "behavior_5class": 0
+  },
+  "annotation_protocol": "single_verified_gold",
+  "machine_vs_gold": {
+    "adjudication_summary": {
+      "stance": {
+        "total_matched_rows": 20,
+        "unadjudicated_disagreements": 0,
+        "adjudication_coverage": 1.0
+      },
+      "hostility": {
+        "total_matched_rows": 20,
+        "unadjudicated_disagreements": 0,
+        "adjudication_coverage": 1.0
+      }
+    },
+    "stance": {
+      "num_samples": 20,
+      "total_matched_rows": 20,
+      "unadjudicated_disagreements": 0,
+      "adjudication_coverage": 1.0,
+      "macro_f1": 0.6640211640211641,
+      "accuracy": 0.7,
+      "weighted_macro_f1": 0.4658706739270136,
+      "weighted_accuracy": 0.6478447975896662,
+      "cohen_kappa_unweighted": 0.5419847328244276,
+      "pearson_r": 0.567777553646866,
+      "spearman_r": 0.5855894293419964,
+      "confusion_matrix": [
+        [
+          7,
+          2,
+          2
+        ],
+        [
+          0,
+          5,
+          2
+        ],
+        [
+          0,
+          0,
+          2
+        ]
+      ]
+    },
+    "hostility": {
+      "num_samples": 20,
+      "total_matched_rows": 20,
+      "unadjudicated_disagreements": 0,
+      "adjudication_coverage": 1.0,
+      "macro_f1": 0.5670995670995671,
+      "accuracy": 0.75,
+      "weighted_macro_f1": 0.6526144710386205,
+      "weighted_accuracy": 0.966091998388828,
+      "roc_auc": 1.0,
+      "pr_auc": 1.0,
+      "cohen_kappa_unweighted": 0.21875,
+      "pearson_r": 0.41553847312245784,
+      "spearman_r": 0.3779644730092272
+    }
+  }
+}

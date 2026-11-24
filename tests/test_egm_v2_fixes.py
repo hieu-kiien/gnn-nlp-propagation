@@ -274,12 +274,21 @@ def test_human_audit_ui_en_allowlist_and_notebooks() -> None:
     allow_names = {spec.filename for spec in ALLOWLISTED_SPECS}
     assert "pilot_calibration_en_20.csv" in allow_names
     assert "human_audit_en_120.csv" in allow_names
+    from scripts import human_audit_ui
+
+    assert "Target-of-Profanity Rule" in human_audit_ui.HTML_PAGE
+    assert "Thằng súc vật đấy thì hiếu j" in human_audit_ui.HTML_PAGE
 
     notebooks_expected = {
         Path("notebooks/colab_gpu_v3_gnn_benchmarks.ipynb"): ("min_total_replies_extracted", "tables_loo_pheme.tex"),
         Path("notebooks/kaggle_member1_nlp_and_vn_t4x2.ipynb"): ("SBIF_BRANCH", "member1_vn"),
         Path("notebooks/kaggle_member2_gnn_and_en_t4x2.ipynb"): ("--context-mode", "root"),
-        Path("notebooks/kaggle_macro_signed_gnn_t4.ipynb"): ("run_macro_signed_network", "--dataset-name"),
+        Path("notebooks/kaggle_macro_signed_gnn_t4.ipynb"): (
+            "run_macro_signed_network",
+            "--dataset-name",
+            "https://github.com/hieu-kiien/gnn-nlp-propagation.git",
+            "results_rumoureval_sdqc.json",
+        ),
     }
     for nb_path, required_tokens in notebooks_expected.items():
         nb = json.loads(nb_path.read_text(encoding="utf-8"))
