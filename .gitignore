@@ -58,3 +58,17 @@ wandb/
 paper/*smoke*
 paper/*draft*
 paper/*debug*
+
+# Backup, temp & LaTeX build artifacts
+*.bak
+*.tmp
+*.part
+*.aux
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+paper/*.log
+paper/*.out
+paper/*.toc

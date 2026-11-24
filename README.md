@@ -44,7 +44,6 @@ Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional
 ├── pyproject.toml              # Khai báo package (sbi-fagat) & cấu hình pytest
 ├── requirements.txt            # Thư viện Python (>=3.10), PyTorch, PyG, Transformers, tzdata (Windows)
 ├── run_all.sh                  # Pipeline kiểm thử + thực nghiệm Giai đoạn 3 & UPFD (2D thống nhất)
-├── configs/                    # Chứa tệp cấu hình thực nghiệm (giữ chỗ .gitkeep)
 ├── data/                       # Dữ liệu local (raw/interim/processed bị ignore trên Git)
 ├── docs/
 │   ├── project-management/     # Hồ sơ quản trị dự án, kiểm toán kỹ thuật & lộ trình
