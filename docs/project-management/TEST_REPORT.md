@@ -1,7 +1,7 @@
 # SBi-FAGAT: Test & Verification Report
 
 **Platform:** Windows (`win32`, CPU verification pass) + GitHub Actions Ubuntu (`Python 3.11`)  
-**Suite Scope:** 21 test modules in `tests/` (`0 failed, 0 skipped` verified post-final-edit via `python -u -m pytest -q`; includes full Tier 1 early-cascade contracts, Tier 2 macro signed network analytics & temporal signed link GNN smoke tests, SemEval-2019 RumourEval-2019 SDQC root-context verification, and EGM v2 regression checks for `--allow-single-gold`, cohort-aware EDA formatting, LOO validation comparator selection, native `curl` download fallback, EN audit UI allowlist, lazy `umap`, and UPFD retry/`ROC-AUC`)
+**Suite Scope:** 23 test modules in `tests/` (`0 failed, 0 skipped` verified post-final-edit via `python -u -m pytest -q`; includes all Tier 1 early-cascade contracts, opt-in *Path Contraction*, live-predictor/audit/CI hardening, Tier 2 macro signed network analytics & temporal signed link GNN smoke tests, SemEval-2019 RumourEval-2019 SDQC root-context verification, Offline-First 2-Tab Demo Web MVP security & functional checks, and EGM v2/v3 regression suites)
 
 ---
 
@@ -44,7 +44,9 @@
 | `tests/test_sota_v2_upgrades.py` | LOO `edge_source="teacher"`, EDA/Persistence & Efficiency LaTeX, CLI aliases, fair runner config |
 | `tests/test_step3_training_and_audit_fixes.py` | KL-BCE zero min & tail gradient, EMA/best-val seed selection, `EarlyStopping` NaN/Inf guard, sealed key bundles, canonical split locks, dynamic LaTeX labels, NLI reply preservation |
 | `tests/test_v3_egm_overhaul.py` | v3 EGM overhaul: PII/doxxing/LMGX spam redaction, linear `y_polar`, `early_y_polar` & chronological/embedding splits, ReZero `tanh(w_p)` centered Persistence anchor + `persist_ep_logit_ref` + consistent mechanism perturbation clone, `predict_uncertainty` parity & validation-only comparator selection, binary `clean`/`uncivil` Gate 1 (`ROC-AUC`/`PR-AUC`), `--lock-role` 403 UI isolation, Kendall $\tau_b$/AUROC $@\ge 2$ thread audit, multi-corpus LaTeX merge |
-| `tests/test_vn_tree.py` | Arctic Shift VN tree builder & salted SHA-256 pseudonymization |
+| `tests/test_vn_tree.py` | Arctic Shift VN tree builder, salted SHA-256 pseudonymization, and two-pass cycle-guarded `junk_mode="contract"` Path Contraction |
+| `tests/test_p2_hardening.py` | URL/post-ID regex guard, 3-tier `nlp_backend` & `dual_head_weights.pt` presence checks, VN Train `Q50/Q75/Q90` threshold calibration, audit overwrite guards, pure-stdlib multi-line LaTeX underscore verifier |
+| `tests/test_demo_web_app.py` | Local Demo Web MVP (`127.0.0.1` loopback guard, static allowlist & `403` path traversal check, CSP/no-store headers, CI synthetic fallback, Sandbox Path Contraction API, Tier 2 macro JSON/SVG endpoints) |
 
 ---
 
@@ -61,4 +63,7 @@
    - `scripts.run_macro_signed_network --data-dir data/processed/pheme --dataset-name pheme --analysis-only` — Exited `0` (`50,062` users, `10,364` Signed WCC, $Q_{\text{signed}} = 0.8232$, `z = -4.30`, `RWC = 0.6218`, `within=6.0%` vs `cross=60.6%`, `cross_uncivil=28.8%` vs `within=10.5%`).
    - Kaggle V2 (`kaggle_macro_signed_gnn_t4.ipynb`): 5-seed Temporal Signed Link Prediction completed for both VN (`10,974` users, `2,255` transductive test edges, `SBiFAGAT-Link` `Trans. ROC-AUC = 0.6001`, `Trans. Macro-F1 = 0.5526`) and PHEME (`18,985` users, `212` transductive test edges, `SBiFAGAT-Link` #1 seen-user `Trans. ROC-AUC = 0.9181`, `Trans. PR-AUC = 0.7616`, `Trans. Macro-F1 = 0.8006`), plus `eval_rumoureval_sdqc --context-mode root` (`1,675` pairs, `Macro-F1 = 0.3311`, `Acc = 0.8179`).
    - `scripts.compute_kappa --allow-single-gold`, `scripts.audit_vn_50_trees --allow-single-gold`, & Target-Misattributed Profanity (`results_profanity_stance_analysis_vn.json`) — Exited `0` (`corr(s,h) = -0.1832`, `62.97%` of `h>=0.5` edges assigned `s<-0.15`, `4/7 = 57.1%` `support+uncivil` pairs misclassified as `oppose` by NLI).
-   - `scripts.assemble_paper_artifacts --paper-dir paper` + Tectonic build of `paper/main.tex` -> `paper/main.pdf` (`latex_underscore_issues: {}`).
+   - `scripts.assemble_paper_artifacts --paper-dir paper` + Tectonic build of `paper/main.tex` -> `paper/main.pdf` (`20` pages, `latex_underscore_issues: {}`, `egm-comprehension` Gate 1 **PASS `0` Blockers**).
+9. **Pha 2–5 Hardening, Offline Demo MVP & Vietnamese Research Delivery:**
+   - `python -m scripts.demo_web_app --host 127.0.0.1 --port 8765 --no-browser` — Verified via `tests/test_demo_web_app.py` (`7` tests) and live desktop browser QA (`0` console/network errors across Real VN Test, Thread User-Graph, Sandbox Path Contraction `15 -> 9`, and Tab 2 Macro).
+   - `reports/bao_cao_de_tai_vn.{md,pdf}` (`40`-page XeLaTeX PDF via `tectonic`) + `reports/slide_outline_va_hoi_dap_bao_ve.md` (14 slides + 15 Q&As) — Verified via Zero-Context `egm-codebase-details` cross-audit (**PASS `0` Blockers, `0` Majors, `0` Nits**).

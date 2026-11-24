@@ -3,11 +3,12 @@
 Kho mã nguồn nghiên cứu cho đề tài khoa học:  
 **"Mạng nơ-ron đồ thị và xử lý ngôn ngữ tự nhiên trong mô hình hóa sự phân cực quan điểm và lan truyền thông tin trên mạng xã hội"**.
 
-Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network* + *Macro Signed User-Interaction Social Network*): **Tầng 1 (Early Cascade)** (`hidden_dim = 64`, VN `K = 20, min_total_replies = 25` và PHEME Tier 2A `K = 10, min_total_replies = 15`) dự đoán đồng thời quy mô lan truyền cuối kỳ ($y_{\text{size}}$), mức độ phân cực cộng đồng ($y_{\text{polar}}$) và phân loại tin đồn (PHEME) chỉ từ bài đăng gốc và $K$ phản hồi sớm nhất; **Tầng 2 (Macro Social Network)** chiếu mọi tương tác $(u, v)$ xuyên chủ đề lên đồ thị người dùng có dấu (`13,718` người dùng VN, $Q_{\text{signed}} = 0.4280$; `50,062` người dùng PHEME, $Q_{\text{signed}} = 0.8232$, RWC $= 0.6218$) và chạy Temporal Signed Link Prediction chống rò rỉ.
+Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network* + *Macro Signed User-Interaction Social Network*): **Tầng 1 (Early Cascade)** (`hidden_dim = 64`, VN `K = 20, min_total_replies = 25` và PHEME reduced-horizon `K = 10, min_total_replies = 15`) dự đoán đồng thời quy mô lan truyền cuối kỳ ($y_{\text{size}}$), mức độ phân cực cộng đồng ($y_{\text{polar}}$) và phân loại tin đồn (PHEME) chỉ từ bài đăng gốc và $K$ phản hồi sớm nhất; **Tầng 2 (Macro Social Network)** chiếu mọi tương tác $(u, v)$ xuyên chủ đề lên đồ thị người dùng có dấu (`13,718` người dùng VN, $Q_{\text{signed}} = 0.4280$; `50,062` tổng người dùng PHEME / `36,606` người dùng tham gia cặp hợp lệ, $Q_{\text{signed}} = 0.8232$, RWC $= 0.6218$) và chạy Temporal Signed Link Prediction chống rò rỉ.
 
-> **Lộ trình Bàn giao 7 ngày (Scope Freeze — Xem chi tiết tại [TODO_ROADMAP.md](docs/project-management/TODO_ROADMAP.md)):**
-> - **Không cào thêm dữ liệu mới / Không đập lõi làm lại:** Đã hoàn tất Track 1 VN, PHEME Tier 2A (`K=10, N>=15`), kiểm định VN Verified Gold (`120` cặp + `30` cây) kèm phân tích *Target-Misattributed Profanity* (`57.1%` câu `support+uncivil` chửi bên thứ 3 bị NLI gán nhầm `oppose`), `RumourEval --context-mode root` (`Macro-F1 = 0.3311`), và Tầng 2 Macro (CPU + GPU 5-seed Signed Link Prediction cho cả VN & PHEME: `SBiFAGAT-Link` dẫn đầu `Trans. ROC-AUC = 0.9181` trên PHEME).
-> - **3 sản phẩm nộp cuối:** (1) Bài báo tiếng Anh chuẩn IEEE ([paper/main.pdf](paper/main.pdf)), (2) **Giao diện Demo Web MVP** chạy cục bộ (lọc rác bảo toàn cây, tô 3 màu lập trường *Tán thành / Phản đối / Trung lập*, xem mạng 2 phe Tầng 2), và (3) **Báo cáo đề tài tiếng Việt 4 chương** + Slide/Hỏi–Đáp bảo vệ đồng bộ 100% số liệu.
+> **Bộ Sản phẩm Bàn giao Đề tài (Đã hoàn tất — Xem chi tiết tại [TODO_ROADMAP.md](docs/project-management/TODO_ROADMAP.md)):**
+> - **Báo cáo Kỹ thuật Mở rộng Tiếng Anh (`paper/`):** [paper/main.pdf](paper/main.pdf) (`20` trang `IEEEtran`, vượt qua kiểm toán Gate 1 `0` Blocker) tích hợp đủ Track 1 VN, PHEME reduced-horizon (`K=10, N>=15`), kiểm định VN Verified Gold (`120` cặp + `30` cây) kèm phân tích *Target-Misattributed Profanity* (`57.1%` câu `support+uncivil` chửi bên thứ 3 bị NLI gán nhầm `oppose`), `RumourEval --context-mode root` (`Macro-F1 = 0.3311`), và Tầng 2 Macro 5-seed Signed Link Prediction (`SBiFAGAT-Link` dẫn đầu `Trans. ROC-AUC = 0.9181` trên PHEME).
+> - **Báo cáo Đề tài Tiếng Việt & Bộ Bảo vệ (`reports/`):** [bao_cao_de_tai_vn.md](reports/bao_cao_de_tai_vn.md) + PDF xuất bản [bao_cao_de_tai_vn.pdf](reports/bao_cao_de_tai_vn.pdf) (`40` trang `Times New Roman`, đồng bộ 100% số liệu với `paper/main.tex`), kèm dàn ý 14 slide & 15 câu Hỏi–Đáp phản biện tại [slide_outline_va_hoi_dap_bao_ve.md](reports/slide_outline_va_hoi_dap_bao_ve.md).
+> - **Giao diện Demo Web MVP Offline-First (`scripts/demo_web_app.py`, `web_demo/`):** Khởi chạy cục bộ `http://127.0.0.1:8765/` (0 dependency ngoài, 0 CDN), hỗ trợ bài Test VN thật từ `data/processed/vn/` + fallback ngoại tuyến trên CI, **Path Contraction** bảo toàn nhánh con (`junk_mode="contract"`), sơ đồ cây 3 màu lập trường tách bạch chỉ báo công kích, chuyển đổi Đồ thị Người dùng của từng Thread và bản đồ 2 phe Tầng 2.
 
 > **Mới bắt đầu hoặc muốn chạy trên GPU miễn phí (Google Colab / Kaggle `T4 x 2`)?**  
 > - **Chạy benchmark GNN Tầng 1 nhanh trên Colab / Kaggle T4:** Dùng [notebooks/colab_gpu_v3_gnn_benchmarks.ipynb](notebooks/colab_gpu_v3_gnn_benchmarks.ipynb) (Temporal Holdout VN, Ablation/$K$-Curve và PHEME $K=10, N \ge 15$).
@@ -57,11 +58,17 @@ Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional
 │   ├── kaggle_member1_nlp_and_vn_t4x2.ipynb # Sổ tay Track VN (`member1_vn`)
 │   └── kaggle_member2_gnn_and_en_t4x2.ipynb # Sổ tay Track EN (`member2_en`, PHEME + RumourEval SDQC)
 ├── paper/
-│   ├── main.tex                # Bản thảo bài báo chuẩn IEEE (IEEEtran) hai tầng Micro + Macro
-│   ├── main.pdf                # PDF bài báo đã biên dịch trực tiếp bằng Tectonic
+│   ├── main.tex                # Bản thảo Báo cáo Kỹ thuật Mở rộng chuẩn IEEEtran hai tầng Micro + Macro
+│   ├── main.pdf                # PDF bài báo đã biên dịch trực tiếp bằng Tectonic (20 trang)
 │   ├── references.bib          # Thư viện trích dẫn chuẩn BibTeX (24 tài liệu đã xác minh)
 │   └── figures/                # Thư mục xuất biểu đồ vector phục vụ bài báo
+├── reports/
+│   ├── bao_cao_de_tai_vn.md    # Báo cáo tổng kết đề tài NCKH tiếng Việt 4 chương (100% đồng bộ paper)
+│   ├── bao_cao_de_tai_vn.pdf   # Bản PDF tiếng Việt biên dịch qua XeLaTeX/Tectonic (40 trang)
+│   ├── slide_outline_va_hoi_dap_bao_ve.md # Khung 14 Slide thuyết trình & 15 Câu Hỏi–Đáp phản biện
+│   └── figures/                # Ảnh chụp kiểm chứng Gate 2 từ Demo Web cục bộ
 ├── scripts/
+│   ├── demo_web_app.py         # Máy chủ HTTP cục bộ (127.0.0.1, stdlib) cho Giao diện Demo Web MVP 2 Tab
 │   ├── kaggle_parallel_runner.py # Điều phối chạy song song 4 role (kiểm tra cohort min_total_replies_extracted)
 │   ├── export_dataset_stats.py # Xuất Bảng 1 EDA LaTeX động theo cohort & Early-K Persistence Baseline
 │   ├── predict_live_thread.py  # Dự báo trực tiếp từ URL/ID bài viết thật trên mạng
@@ -84,7 +91,8 @@ Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional
 │   ├── models/                 # baselines.py (TwoStreamNodeStem, MultiTaskHead, 7 baselines), sbi_fagat.py
 │   ├── training/               # metrics.py (KL-calibrated BCE + Smooth-L1 & Huber), trainer.py, auto_loop.py, reporting.py
 │   └── utils/                  # seed.py, text.py, visualize.py (lazy UMAP import)
-└── tests/                      # Bộ unit test kiểm chứng toàn diện
+└── web_demo/                   # Giao diện Demo Web MVP thuần HTML/CSS/SVG/JS (0 CDN, Path Contraction)
+└── tests/                      # Bộ unit test kiểm chứng toàn diện (23 test modules)
 ```
 
 ---
@@ -133,9 +141,12 @@ python -m scripts.predict_live_thread --reddit-url "https://www.reddit.com/r/Vie
 python -m scripts.predict_live_thread --url "https://www.reddit.com/r/VietNam/comments/..." --allow-untrained
 ```
 
-### Chấm tay & Kiểm định Mù (Human Audit Web UI & Verified Gold)
+### Chấm tay, Kiểm định Mù & Giao diện Demo Web MVP (127.0.0.1)
 
 ```bash
+# Khởi chạy Giao diện Demo Web MVP 2 Tab tại http://127.0.0.1:8765/ (offline-first, 0 CDN)
+python scripts/demo_web_app.py --port 8765
+
 # Mở phòng chấm tay Web UI tiếng Việt cục bộ tại http://127.0.0.1:8765/
 python -m scripts.human_audit_ui
 # Hoặc khóa cứng từng vai trò cho mỗi người chấm:
