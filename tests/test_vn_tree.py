@@ -12,8 +12,10 @@ from src.data.arctic_shift_vn import (
     contains_vietnamese_chars,
     extract_comments_from_arctic_payload,
     hash_author_sha256,
+    is_filler_junk_text,
     is_invalid_or_spam_text,
     normalize_social_text_nfc,
+    resolve_contracted_parent_id,
 )
 from src.data.schema import (
     build_edges_table,
@@ -235,3 +237,243 @@ def test_build_vn_cascade_nested_tree_depth_utc_and_pruning(tmp_path: Path) -> N
     # Verify threshold enforcement rejects shallow or small trees
     assert build_vn_cascade_from_thread(post, extracted, min_comments=100, min_depth=3) is None
     assert build_vn_cascade_from_thread(post, extracted, min_comments=40, min_depth=10) is None
+
+
+def test_filler_junk_detector_preserves_short_vn_stances() -> None:
+    """Explicit filler/punctuation noise is flagged without a blind < 3 tokens rule."""
+    meaningful_short_stances = [
+        "Đồng ý",
+        "Phản đối",
+        "Không nên",
+        "Chuẩn bác",
+        "Đúng rồi",
+        "Sai rồi",
+        "+1",
+        "Đồng tình",
+        "Ủng hộ",
+        "Tào lao",
+        "Tôi rất hóng tin này từ sở",
+        "Ok đồng ý hoàn toàn với bác",
+    ]
+    for txt in meaningful_short_stances:
+        assert not is_filler_junk_text(txt), f"Must preserve short stance: {txt!r}"
+
+    explicit_fillers = [
+        "[deleted]",
+        "[removed]",
+        ".",
+        "..",
+        "...",
+        "-",
+        "???",
+        "👍",
+        "🤣❤️",
+        "=)))",
+        "hóng",
+        "Hong",
+        "chấm",
+        "cham",
+        "up",
+        "bump",
+        "cmt",
+        "ké",
+        "xin slot",
+        "chấm hóng",
+        "hóng ké",
+        "lót dép",
+        "lót dép hóng",
+        "đặt gạch",
+        "dấu chân",
+        "ok",
+        "oke",
+    ]
+    for txt in explicit_fillers:
+        assert is_filler_junk_text(txt), f"Must drop explicit filler/noise: {txt!r}"
+
+
+def test_build_vn_cascade_path_contraction_modes_and_cycle_guard() -> None:
+    """Path contraction drops leaf junk, relinks children across 1-2 middle junk nodes, and guards cycles."""
+    post_id = "1contract"
+    base_ts = 1795000000.0
+    post = {
+        "id": post_id,
+        "subreddit": "vozforums",
+        "title": "Thảo luận đề xuất phân làn xe buýt riêng giờ cao điểm",
+        "selftext": "Mọi người thấy khả thi không?",
+        "author": "op_user",
+        "created_utc": base_ts,
+    }
+
+    # Tree layout:
+    # root -> k_gp (valid) -> j_mid1 ("hóng") -> k_child1 (valid)
+    # root -> j_chain1 ("chấm") -> j_chain2 ("lót dép hóng") -> k_deep (valid)
+    # k_gp -> j_leaf ("...")
+    # root -> short_stance_nodes ("Đồng ý", "Phản đối", "Không nên", "Chuẩn bác", "+1")
+    payload = [
+        _make_t1_node(
+            "k_gp",
+            link_id=f"t3_{post_id}",
+            parent_id=f"t3_{post_id}",
+            author="u_gp",
+            body="Nên thử nghiệm trước trên một số trục đường rộng.",
+            created_utc=base_ts + 20.0,
+            children=[
+                _make_t1_node(
+                    "j_mid1",
+                    link_id=f"t3_{post_id}",
+                    parent_id="t1_k_gp",
+                    author="u_j1",
+                    body="hóng",
+                    created_utc=base_ts + 40.0,
+                    children=[
+                        _make_t1_node(
+                            "k_child1",
+                            link_id=f"t3_{post_id}",
+                            parent_id="t1_j_mid1",
+                            author="u_c1",
+                            body="Chuẩn bác, phải làm thí điểm có số liệu đàng hoàng.",
+                            created_utc=base_ts + 60.0,
+                        )
+                    ],
+                ),
+                _make_t1_node(
+                    "j_leaf",
+                    link_id=f"t3_{post_id}",
+                    parent_id="t1_k_gp",
+                    author="u_jl",
+                    body="...",
+                    created_utc=base_ts + 50.0,
+                ),
+            ],
+        ),
+        _make_t1_node(
+            "j_chain1",
+            link_id=f"t3_{post_id}",
+            parent_id=f"t3_{post_id}",
+            author="u_jc1",
+            body="chấm",
+            created_utc=base_ts + 30.0,
+            children=[
+                _make_t1_node(
+                    "j_chain2",
+                    link_id=f"t3_{post_id}",
+                    parent_id="t1_j_chain1",
+                    author="u_jc2",
+                    body="lót dép hóng",
+                    created_utc=base_ts + 35.0,
+                    children=[
+                        _make_t1_node(
+                            "k_deep",
+                            link_id=f"t3_{post_id}",
+                            parent_id="t1_j_chain2",
+                            author="u_kd",
+                            body="Tôi phản đối vì đường hẹp sẽ kẹt thêm cho xe máy.",
+                            created_utc=base_ts + 70.0,
+                        )
+                    ],
+                )
+            ],
+        ),
+        _make_t1_node("s_1", link_id=f"t3_{post_id}", parent_id=f"t3_{post_id}", author="us1", body="Đồng ý", created_utc=base_ts + 80.0),
+        _make_t1_node("s_2", link_id=f"t3_{post_id}", parent_id=f"t3_{post_id}", author="us2", body="Phản đối", created_utc=base_ts + 90.0),
+        _make_t1_node("s_3", link_id=f"t3_{post_id}", parent_id=f"t3_{post_id}", author="us3", body="Không nên", created_utc=base_ts + 100.0),
+        _make_t1_node("s_4", link_id=f"t3_{post_id}", parent_id=f"t3_{post_id}", author="us4", body="Chuẩn bác", created_utc=base_ts + 110.0),
+        _make_t1_node("s_5", link_id=f"t3_{post_id}", parent_id=f"t3_{post_id}", author="us5", body="+1", created_utc=base_ts + 120.0),
+    ]
+    extracted = extract_comments_from_arctic_payload(payload)
+
+    # Default junk_mode="prune" keeps existing behavior untouched (does not contract)
+    pruned = build_vn_cascade_from_thread(post, extracted, min_comments=1, min_depth=1, min_vi_ratio=0.0)
+    assert pruned is not None
+    _, _, prune_stats = pruned
+    assert prune_stats["junk_filter_stats"]["mode"] == "prune"
+    assert prune_stats["junk_filter_stats"]["contracted_nodes"] == 0
+
+    # Under junk_mode="contract": leaf junk dropped, 1-hop & 2-hop middle junk contracted
+    stats_out: dict = {}
+    contracted = build_vn_cascade_from_thread(
+        post,
+        extracted,
+        min_comments=1,
+        min_depth=1,
+        min_vi_ratio=0.0,
+        junk_mode="contract",
+        stats_out=stats_out,
+    )
+    assert contracted is not None
+    node_rows, edge_rows, c_stats = contracted
+    assert validate_cascade_contract(node_rows, edge_rows, raise_on_error=True) == []
+
+    by_nid = {r["node_id"]: r for r in node_rows}
+    root_nid = f"vn_{post_id}_t3_{post_id}"
+    gp_nid = f"vn_{post_id}_t1_k_gp"
+    c1_nid = f"vn_{post_id}_t1_k_child1"
+    deep_nid = f"vn_{post_id}_t1_k_deep"
+
+    # Junk nodes excluded
+    assert f"vn_{post_id}_t1_j_mid1" not in by_nid
+    assert f"vn_{post_id}_t1_j_leaf" not in by_nid
+    assert f"vn_{post_id}_t1_j_chain1" not in by_nid
+    assert f"vn_{post_id}_t1_j_chain2" not in by_nid
+
+    # Single middle junk contracted -> k_child1 relinked directly to k_gp (depth=2)
+    assert by_nid[c1_nid]["parent_id"] == gp_nid
+    # 2-hop middle junk chain contracted -> k_deep relinked directly to root (depth=1)
+    assert by_nid[deep_nid]["parent_id"] == root_nid
+
+    # Meaningful short stances preserved
+    for sid in ("s_1", "s_2", "s_3", "s_4", "s_5"):
+        assert f"vn_{post_id}_t1_{sid}" in by_nid
+
+    # Recompute depths via edges to verify topology
+    children: dict[str, list[str]] = {nid: [] for nid in by_nid}
+    for e in edge_rows:
+        children[e["source_id"]].append(e["target_id"])
+    depths = {root_nid: 0}
+    q = deque([root_nid])
+    while q:
+        cur = q.popleft()
+        for ch in children[cur]:
+            depths[ch] = depths[cur] + 1
+            q.append(ch)
+    assert depths[gp_nid] == 1
+    assert depths[c1_nid] == 2
+    assert depths[deep_nid] == 1
+
+    jstats = c_stats["junk_filter_stats"]
+    assert jstats == stats_out
+    assert jstats["mode"] == "contract"
+    assert jstats["raw_comments"] == 12
+    assert jstats["kept_comments"] == 8
+    assert jstats["dropped_leaves"] == 1
+    assert jstats["contracted_nodes"] == 3
+    assert jstats["relinked_edges"] == 2
+    assert jstats["relinked_edge_ids"] == [[root_nid, deep_nid], [gp_nid, c1_nid]]
+
+    # Cycle guard on malformed raw_parent_map
+    malformed_map = {"t1_k": "t1_j1", "t1_j1": "t1_j2", "t1_j2": "t1_j1", "t1_a": "t1_b", "t1_b": "t1_a"}
+    traversed: set[str] = set()
+    assert (
+        resolve_contracted_parent_id(
+            "t1_k", malformed_map, {"t1_k", "t1_a", "t1_b"}, f"t3_{post_id}", traversed_junk_out=traversed
+        )
+        == f"t3_{post_id}"
+    )
+    assert traversed == {"t1_j1", "t1_j2"}
+    assert (
+        resolve_contracted_parent_id("t1_a", malformed_map, {"t1_k", "t1_a", "t1_b"}, f"t3_{post_id}")
+        == f"t3_{post_id}"
+    )
+
+    cyc_comments = [
+        {"fullname": "t1_j1", "link_id": f"t3_{post_id}", "parent_id": "t1_j2", "text": "hóng", "created_utc": base_ts + 10.0},
+        {"fullname": "t1_j2", "link_id": f"t3_{post_id}", "parent_id": "t1_j1", "text": "chấm", "created_utc": base_ts + 15.0},
+        {"fullname": "t1_k1", "link_id": f"t3_{post_id}", "parent_id": "t1_j1", "text": "Đồng ý quan điểm này.", "created_utc": base_ts + 25.0},
+    ]
+    cyc_res = build_vn_cascade_from_thread(
+        post, cyc_comments, min_comments=1, min_depth=1, min_vi_ratio=0.0, junk_mode="contract"
+    )
+    assert cyc_res is not None
+    cyc_nodes, cyc_edges, _ = cyc_res
+    assert validate_cascade_contract(cyc_nodes, cyc_edges, raise_on_error=True) == []
+    assert next(r for r in cyc_nodes if r["node_id"] == f"vn_{post_id}_t1_k1")["parent_id"] == root_nid

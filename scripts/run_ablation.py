@@ -448,7 +448,7 @@ def main() -> None:
         del k_train, k_val, k_test
         gc.collect()
 
-    plot_early_k_curve(k_curve_results, output_dir=fig_dir)
+    plot_early_k_curve(k_curve_results, output_dir=fig_dir, target_k=int(args.k_horizon))
 
     serialize_benchmark_json(
         ablation_res,

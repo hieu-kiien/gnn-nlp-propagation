@@ -2,7 +2,7 @@
 
 Supports:
   1. Sparse CPU macro network polarization analytics (Structural Balance Theory
-     + degree-preserving permutation z-scores, Signed Laplacian spectral bipartition,
+     + uniform edge-sign permutations for z-scores, Signed Laplacian spectral bipartition,
      Signed Modularity Q_signed, Garimella Random Walk Controversy RWC, and fig5).
   2. Multi-seed Zero-Leakage Chronological Signed Link Prediction GNN benchmark
      comparing UserTextMLP, StandardGCN, StandardGATv2, SGCN (Derr et al., ICDM 2018),
@@ -847,7 +847,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=64, help="GNN latent width")
     parser.add_argument("--num-layers", type=int, default=2, help="GNN layer depth")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
-    parser.add_argument("--num-null-perms", type=int, default=100, help="Degree-preserving sign permutations for SBT z-score")
+    parser.add_argument("--num-null-perms", type=int, default=100, help="Uniform edge-sign permutations for SBT z-score")
     parser.add_argument("--paper-dir", type=Path, default=Path("paper"), help="Output directory for JSON and LaTeX tables")
     parser.add_argument("--figures-dir", type=Path, default=None, help="Override figure output dir (default paper/figures/<ds>)")
     parser.add_argument("--smoke-test", action="store_true", help="Run fast offline synthetic smoke test in tempdir")
@@ -914,7 +914,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         link_tex,
         caption=(
             f"Macro Temporal Signed Link Prediction on {ds_upper} (opposing vs.\\ supporting reply edges, "
-            f"mean $\\pm$ std over 5 seeds; unseen users have zeroed features and train batch pairs are masked)."
+            f"mean $\\pm$ std over 5 seeds; train batch pairs are masked; user features are aggregated strictly from pre-cutoff Train timestamps)."
         ),
         label=f"tab:signed_link_{ds_name}",
         metrics=LINK_PRED_METRICS,

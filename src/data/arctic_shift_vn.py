@@ -22,7 +22,7 @@ import warnings
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import pyarrow.parquet as pq
 import requests
@@ -180,6 +180,101 @@ def is_invalid_or_spam_text(text: str, author_raw: str | None = None) -> bool:
             return True
 
     return False
+
+
+_EXPLICIT_FILLER_PHRASES: frozenset[str] = frozenset(
+    {
+        "hong",
+        "hóng",
+        "cham",
+        "chấm",
+        "up",
+        "bump",
+        "cmt",
+        "ke",
+        "ké",
+        "xin slot",
+        "cham hong",
+        "chấm hóng",
+        "hong ke",
+        "hóng ké",
+        "lot dep",
+        "lót dép",
+        "lot dep hong",
+        "lót dép hóng",
+        "dau chan",
+        "dấu chân",
+        "dat gach",
+        "đặt gạch",
+        "ok",
+        "oke",
+    }
+)
+
+
+def is_filler_junk_text(text: str) -> bool:
+    """Return True for invalid/spam comments, punctuation/emoji-only noise, or explicit fillers.
+
+    Preserves meaningful short Vietnamese stances (e.g., ``Đồng ý``, ``Phản đối``,
+    ``Không nên``, ``Chuẩn bác``, ``Đúng rồi``, ``Sai rồi``, ``+1``, ``Đồng tình``,
+    ``Ủng hộ``, ``Tào lao``) instead of applying a blind token-length cutoff.
+    """
+    if is_invalid_or_spam_text(text):
+        return True
+
+    norm = normalize_social_text_nfc(text).strip()
+    if not norm:
+        return True
+    if norm in {"+1", "-1"}:
+        return False
+    if not any(ch.isalnum() for ch in norm):
+        return True
+
+    stripped = re.sub(r"[^\w\s]", " ", norm.lower(), flags=re.UNICODE)
+    collapsed = " ".join(stripped.split())
+    if not collapsed:
+        return True
+    return collapsed in _EXPLICIT_FILLER_PHRASES
+
+
+def resolve_contracted_parent_id(
+    node_id: str,
+    raw_parent_map: Mapping[str, str],
+    kept_ids: set[str],
+    root_id: str,
+    *,
+    traversed_junk_out: set[str] | None = None,
+) -> str:
+    """Climb ``raw_parent_map`` from ``node_id`` to nearest kept ancestor or ``root_id`` with cycle guard."""
+    seen: set[str] = {node_id}
+    traversed_junk: list[str] = []
+    curr = str(raw_parent_map.get(node_id) or "").strip()
+    while curr:
+        if curr == root_id or curr in seen:
+            if traversed_junk_out is not None:
+                traversed_junk_out.update(traversed_junk)
+            return root_id
+        if curr in kept_ids:
+            probe = curr
+            probe_seen: set[str] = set(seen)
+            has_cycle = False
+            while probe and probe != root_id:
+                if probe in probe_seen:
+                    has_cycle = True
+                    break
+                probe_seen.add(probe)
+                probe = str(raw_parent_map.get(probe) or "").strip()
+            if traversed_junk_out is not None:
+                traversed_junk_out.update(traversed_junk)
+            return root_id if has_cycle else curr
+        seen.add(curr)
+        if curr in raw_parent_map:
+            traversed_junk.append(curr)
+        curr = str(raw_parent_map.get(curr) or "").strip()
+
+    if traversed_junk_out is not None:
+        traversed_junk_out.update(traversed_junk)
+    return root_id
 
 
 def contains_vietnamese_chars(text: str) -> bool:
@@ -450,8 +545,13 @@ def build_vn_cascade_from_thread(
     min_comments: int = 25,
     min_depth: int = 3,
     min_vi_ratio: float = 0.65,
+    junk_mode: Literal["prune", "contract"] = "prune",
+    stats_out: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]] | None:
     """Validate and convert one Reddit thread into SBi-FAGAT node/edge record lists."""
+    if junk_mode not in {"prune", "contract"}:
+        raise ValueError(f"Unsupported junk_mode {junk_mode!r}; expected 'prune' or 'contract'")
+
     post_id = _strip_id_prefix(post.get("id") or post.get("name") or "")
     if not post_id:
         return None
@@ -482,10 +582,9 @@ def build_vn_cascade_from_thread(
     subreddit = str(post.get("subreddit") or "unknown").strip()
     topic_id = _compute_topic_id(post, title_nfc or root_text)
 
-    # Filter candidate comments (pre-cleaned text, valid link_id & parent_id, non-spam)
-    valid_comments: dict[str, dict[str, Any]] = {}
-    children_adj: dict[str, list[str]] = {root_fullname: []}
-
+    # Pass 1: Map every raw comment's node_id -> raw parent_id before filtering junk.
+    raw_comments_map: dict[str, Mapping[str, Any]] = {}
+    raw_parent_map: dict[str, str] = {}
     for c in comments:
         fullname = str(c.get("fullname") or "")
         if not fullname.startswith("t1_"):
@@ -496,25 +595,56 @@ def build_vn_cascade_from_thread(
         parent_id = str(c.get("parent_id") or "").strip()
         if not parent_id.startswith(("t3_", "t1_")) or parent_id == fullname:
             continue
+        if fullname in raw_comments_map:
+            continue
+        raw_comments_map[fullname] = c
+        raw_parent_map[fullname] = parent_id
+
+    valid_comments: dict[str, dict[str, Any]] = {}
+    junk_ids: set[str] = set()
+    for fullname, c in raw_comments_map.items():
         if bool(c.get("author_is_bot")):
+            junk_ids.add(fullname)
             continue
         c_text = normalize_social_text_nfc(str(c.get("text") or ""))
-        if is_invalid_or_spam_text(c_text):
+        is_junk = (
+            is_filler_junk_text(c_text)
+            if junk_mode == "contract"
+            else is_invalid_or_spam_text(c_text)
+        )
+        if is_junk:
+            junk_ids.add(fullname)
             continue
-        c_text = redact_pii_text(c_text)
         c_ts = _to_float_utc(c.get("created_utc"))
         if c_ts is None:
+            junk_ids.add(fullname)
             continue
+        valid_comments[fullname] = {
+            "fullname": fullname,
+            "parent_id": raw_parent_map[fullname],
+            "text": redact_pii_text(c_text),
+            "created_utc": c_ts,
+            "author_hash": c.get("author_hash"),
+        }
 
-        if fullname not in valid_comments:
-            valid_comments[fullname] = {
-                "fullname": fullname,
-                "parent_id": parent_id,
-                "text": c_text,
-                "created_utc": c_ts,
-                "author_hash": c.get("author_hash"),
-            }
-            children_adj.setdefault(parent_id, []).append(fullname)
+    # Pass 2: Build adjacency (pruning subtrees in "prune" mode; contracting junk in "contract" mode).
+    children_adj: dict[str, list[str]] = {root_fullname: []}
+    contracted_junk_ids: set[str] = set()
+    if junk_mode == "contract":
+        kept_ids_set = set(valid_comments.keys())
+        for fn, c_obj in valid_comments.items():
+            resolved_parent = resolve_contracted_parent_id(
+                fn,
+                raw_parent_map,
+                kept_ids_set,
+                root_fullname,
+                traversed_junk_out=contracted_junk_ids,
+            )
+            c_obj["parent_id"] = resolved_parent
+            children_adj.setdefault(resolved_parent, []).append(fn)
+    else:
+        for fn, c_obj in valid_comments.items():
+            children_adj.setdefault(c_obj["parent_id"], []).append(fn)
 
     # Sort children chronologically for deterministic BFS traversal
     for parent_key, c_list in children_adj.items():
@@ -524,7 +654,7 @@ def build_vn_cascade_from_thread(
             else (0.0, fn)
         )
 
-    # BFS from root_fullname automatically prunes subtrees beneath deleted/spam parents
+    # BFS from root_fullname computes topological depths, monotonic UTC timestamps, and edges
     root_dt = datetime.fromtimestamp(root_raw_ts, tz=timezone.utc)
     cascade_id = f"vn_{post_id}"
     source_dataset = f"arctic_shift_{subreddit.lower()}"
@@ -535,6 +665,7 @@ def build_vn_cascade_from_thread(
 
     node_records: list[dict[str, Any]] = []
     edge_records: list[dict[str, Any]] = []
+    relinked_edge_ids: list[list[str]] = []
     queue: deque[str] = deque([root_fullname])
     vi_node_count = 0
 
@@ -573,7 +704,7 @@ def build_vn_cascade_from_thread(
             }
         )
 
-        if not is_root and parent_fn is not None:
+        if not is_root and parent_fn is not None and parent_node_id is not None:
             delay_sec = max(
                 0.0,
                 (effective_dt[curr_fn] - effective_dt[parent_fn]).total_seconds(),
@@ -589,6 +720,8 @@ def build_vn_cascade_from_thread(
                     "edge_type": "reply",
                 }
             )
+            if junk_mode == "contract" and parent_fn != raw_parent_map.get(curr_fn):
+                relinked_edge_ids.append([parent_node_id, node_id])
 
         for child_fn in children_adj.get(curr_fn, []):
             if child_fn in visited or child_fn not in valid_comments:
@@ -606,6 +739,26 @@ def build_vn_cascade_from_thread(
     max_depth = max(depths.values()) if depths else 0
     vi_ratio = vi_node_count / max(1, len(node_records))
 
+    if junk_mode == "contract":
+        contracted_nodes = len(contracted_junk_ids)
+        dropped_leaves = len(junk_ids - contracted_junk_ids)
+    else:
+        contracted_nodes = 0
+        dropped_leaves = len(raw_comments_map) - valid_reply_count
+
+    junk_filter_stats: dict[str, Any] = {
+        "mode": junk_mode,
+        "raw_comments": len(raw_comments_map),
+        "kept_comments": valid_reply_count,
+        "dropped_leaves": dropped_leaves,
+        "contracted_nodes": contracted_nodes,
+        "relinked_edges": len(relinked_edge_ids),
+        "relinked_edge_ids": relinked_edge_ids,
+    }
+    if stats_out is not None:
+        stats_out.clear()
+        stats_out.update(junk_filter_stats)
+
     if valid_reply_count < min_comments:
         return None
     if max_depth < min_depth:
@@ -619,6 +772,7 @@ def build_vn_cascade_from_thread(
         "num_replies": valid_reply_count,
         "max_depth": max_depth,
         "vi_ratio": vi_ratio,
+        "junk_filter_stats": junk_filter_stats,
     }
     return node_records, edge_records, stats
 

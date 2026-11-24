@@ -328,7 +328,9 @@ def main() -> None:
         eval_protocol=args.eval_protocol,
     )
     effective_edge_source = (
-        "teacher" if args.split_mode != "canonical" else args.edge_source
+        "teacher"
+        if (args.split_mode != "canonical" or args.eval_protocol == "loo")
+        else args.edge_source
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

@@ -153,6 +153,7 @@ def plot_early_k_curve(
     *,
     output_dir: str | Path = "paper/figures",
     stem: str = "fig2_early_k_curve",
+    target_k: int | None = 20,
 ) -> tuple[Path, Path]:
     """Generate Fig 2: MSLE & RMSE error curves across observation horizons K in {10..50}."""
     _configure_academic_rcparams()
@@ -185,10 +186,11 @@ def plot_early_k_curve(
             )
             ax.fill_between(ks, means - stds, means + stds, color=color, alpha=0.14)
 
-        if 20 in ks:
-            ax.axvline(20, color="#444444", linestyle="--", linewidth=1.1, alpha=0.75)
+        if target_k is not None and int(target_k) in ks:
+            tk = int(target_k)
+            ax.axvline(tk, color="#444444", linestyle="--", linewidth=1.1, alpha=0.75)
             y_top = ax.get_ylim()[1]
-            ax.text(20.6, y_top * 0.96, "$K=20$ (Target)", fontsize=8.5, va="top", color="#333333")
+            ax.text(tk + 0.6, y_top * 0.96, f"$K={tk}$ (Target)", fontsize=8.5, va="top", color="#333333")
 
         ax.set_xticks(ks)
         ax.set_xlabel("Early Observation Horizon $K$ (Replies)")

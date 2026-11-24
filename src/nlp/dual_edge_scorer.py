@@ -2416,6 +2416,11 @@ def main() -> None:
     parser.add_argument("--student-backbone", type=str, default=None)
     parser.add_argument("--score-only", action="store_true")
     parser.add_argument("--export-audit", action="store_true")
+    parser.add_argument(
+        "--force-export-audit",
+        action="store_true",
+        help="Overwrite existing audit CSVs even when --skip-if-exists or existing audit files are present.",
+    )
     parser.add_argument("--distill", action="store_true")
     parser.add_argument("--skip-if-exists", action="store_true")
     parser.add_argument("--include-root-context", action="store_true")
@@ -2506,9 +2511,26 @@ def main() -> None:
                 )
 
         if args.export_audit:
-            pilot_ready = args.pilot_csv is None or args.pilot_csv.exists()
-            if args.skip_if_exists and audit_csv.exists() and machine_key_csv.exists() and pilot_ready:
-                print(f"[SKIP] Blind human audit CSV already exists: {audit_csv}")
+            if not args.force_export_audit and audit_csv.exists():
+                if args.skip_if_exists:
+                    print(f"[SKIP] Blind human audit CSV already exists: {audit_csv}")
+                else:
+                    raise FileExistsError(
+                        f"Refusing to overwrite existing audit CSV '{audit_csv}' without "
+                        "--force-export-audit (or pass --skip-if-exists to keep existing file)."
+                    )
+            elif (
+                not args.force_export_audit
+                and args.pilot_csv is not None
+                and args.pilot_csv.exists()
+            ):
+                if args.skip_if_exists:
+                    print(f"[SKIP] Pilot human audit CSV already exists: {args.pilot_csv}")
+                else:
+                    raise FileExistsError(
+                        f"Refusing to overwrite existing pilot CSV '{args.pilot_csv}' without "
+                        "--force-export-audit (or pass --skip-if-exists to keep existing file)."
+                    )
             else:
                 test_topics = {str(t) for t in canonical_splits.get("test", ())}
                 test_cids = {

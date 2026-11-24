@@ -72,3 +72,6 @@ paper/*debug*
 paper/*.log
 paper/*.out
 paper/*.toc
+
+# Generated Word reports
+reports/*.docx

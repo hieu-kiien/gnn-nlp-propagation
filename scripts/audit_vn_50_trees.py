@@ -302,6 +302,12 @@ def main() -> None:
     parser.add_argument("--polar-target-mode", choices=["future_only", "full"], default="future_only")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--export", action="store_true")
+    parser.add_argument("--skip-if-exists", action="store_true")
+    parser.add_argument(
+        "--force-export-audit",
+        action="store_true",
+        help="Overwrite existing audit CSV even when --skip-if-exists or an existing file is present.",
+    )
     parser.add_argument("--evaluate", action="store_true")
     parser.add_argument("--strict-adjudication", action="store_true")
     parser.add_argument("--allow-single-gold", action="store_true")
@@ -315,17 +321,26 @@ def main() -> None:
     key_csv = args.machine_key_csv or args.audit_csv.with_name(f"{args.audit_csv.stem}_machine_key.csv")
 
     if args.export:
-        out_csv, out_key = export_vn_50_tree_audit(
-            data_dir=args.data_dir,
-            output_csv=args.audit_csv,
-            machine_key_csv=key_csv,
-            n_samples=args.n_samples,
-            k_horizon=args.k_horizon,
-            min_total_replies=args.min_total_replies,
-            polar_target_mode=args.polar_target_mode,
-            seed=args.seed,
-        )
-        print(f"Exported blind {args.n_samples}-tree VN audit CSV: {out_csv} (sealed key: {out_key})")
+        if not args.force_export_audit and args.audit_csv.exists():
+            if args.skip_if_exists:
+                print(f"[SKIP] Blind {args.n_samples}-tree VN audit CSV already exists: {args.audit_csv}")
+            else:
+                raise FileExistsError(
+                    f"Refusing to overwrite existing audit CSV '{args.audit_csv}' without "
+                    "--force-export-audit (or pass --skip-if-exists to keep existing file)."
+                )
+        else:
+            out_csv, out_key = export_vn_50_tree_audit(
+                data_dir=args.data_dir,
+                output_csv=args.audit_csv,
+                machine_key_csv=key_csv,
+                n_samples=args.n_samples,
+                k_horizon=args.k_horizon,
+                min_total_replies=args.min_total_replies,
+                polar_target_mode=args.polar_target_mode,
+                seed=args.seed,
+            )
+            print(f"Exported blind {args.n_samples}-tree VN audit CSV: {out_csv} (sealed key: {out_key})")
 
     if args.evaluate:
         report = evaluate_thread_level_audit_csv(

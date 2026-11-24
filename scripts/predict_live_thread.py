@@ -24,12 +24,12 @@ import sys
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import numpy as np
 import requests
 import torch
-from transformers import AutoModel
+from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerFast
 
 from src.data.arctic_shift_vn import (
     ARCTIC_SHIFT_API_BASE,
@@ -65,7 +65,24 @@ from src.nlp.extract_features import (
     encode_node_embeddings,
 )
 
-_REDDIT_POST_ID_RE = re.compile(r"/comments/([A-Za-z0-9_]+)")
+_REDDIT_POST_ID_RE = re.compile(r"/comments/([^/?#]+)")
+_VALID_POST_ID_RE = re.compile(r"[A-Za-z0-9]{4,12}")
+_REQUIRED_CE_FILES: tuple[str, ...] = (
+    "dual_head_weights.pt",
+    "dual_head_meta.json",
+    "config.json",
+)
+
+# Empirical future_only y_polar quantiles computed strictly on the VN Train split
+# (N = 1,050 cascades, K = 20, min_total_replies = 25; data/processed/vn/nodes.parquet
+# UTC cutoff 2025-06-15 to 2026-06-04; topic_splits.json train split only — zero Val/Test leakage).
+VN_POLAR_Q50: float = 0.0927623026072979
+VN_POLAR_Q75: float = 0.12019770219922066
+VN_POLAR_Q90: float = 0.15035123974084857
+VN_QUANTILE_CALIBRATION_NOTE: str = (
+    "Regime thresholds calibrated strictly on VN Train split "
+    "(N=1,050 cascades, K=20, min_total_replies=25, UTC 2025-06-15 to 2026-06-04); zero Val/Test leakage."
+)
 
 
 def _make_demo_offline_thread() -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -126,18 +143,35 @@ def _make_demo_offline_thread() -> tuple[dict[str, Any], list[dict[str, Any]]]:
     return post, comments
 
 
-def _extract_post_id_from_url(url: str) -> str:
-    m = _REDDIT_POST_ID_RE.search(url)
-    if m:
-        return m.group(1)
-    cleaned = url.rstrip("/").split("/")[-1]
-    if cleaned.startswith("t3_"):
-        return cleaned[3:]
+def _validate_reddit_post_id(post_id: str, *, source: str = "input") -> str:
+    """Validate that a Reddit submission ID contains only safe alphanumeric characters."""
+    cleaned = str(post_id or "").strip()
+    if not _VALID_POST_ID_RE.fullmatch(cleaned):
+        raise ValueError(
+            f"Invalid Reddit post_id {cleaned!r} from {source}: expected [A-Za-z0-9]{{4,12}}."
+        )
     return cleaned
+
+
+def _extract_post_id_from_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw or "\\" in raw or any(ch.isspace() for ch in raw):
+        raise ValueError(f"Invalid Reddit URL or post ID: {url!r}")
+
+    m = _REDDIT_POST_ID_RE.search(raw)
+    if m:
+        return _validate_reddit_post_id(m.group(1), source=raw)
+
+    if "/" in raw or "://" in raw or ".." in raw:
+        raise ValueError(f"Reddit URL missing valid /comments/<post_id> segment: {url!r}")
+
+    candidate = raw[3:] if raw.startswith("t3_") else raw
+    return _validate_reddit_post_id(candidate, source=raw)
 
 
 def _fetch_reddit_thread(post_id: str, timeout: int = 20) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Fetch submission + comments via Arctic Shift API with Reddit public JSON fallback."""
+    post_id = _validate_reddit_post_id(post_id, source="fetch")
     headers = {"User-Agent": "SBi-FAGAT-LiveCheck/2.0"}
     try:
         sub_resp = requests.get(
@@ -315,6 +349,204 @@ def _deterministic_text_projection(text: str, dim: int = 768) -> torch.Tensor:
     return torch.from_numpy(vec)
 
 
+def _resolve_local_hf_snapshot(repo_or_path: str) -> str | None:
+    """Resolve a local directory or cached Hugging Face snapshot without network calls."""
+    if Path(repo_or_path).is_dir():
+        return str(repo_or_path)
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(repo_or_path, local_files_only=True)
+    except Exception:
+        return None
+
+
+def _load_local_model_from_pretrained(backbone_id: str, *, allow_network: bool) -> Any | None:
+    """Load an AutoModel locally without triggering unexpected downloads or Hub threads."""
+    local_dir = _resolve_local_hf_snapshot(backbone_id)
+    if local_dir is not None:
+        try:
+            return AutoModel.from_pretrained(local_dir, local_files_only=True)
+        except TypeError:
+            try:
+                return AutoModel.from_pretrained(local_dir)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    is_real_hf = getattr(AutoModel.from_pretrained, "__module__", "").startswith("transformers.")
+    if allow_network or not is_real_hf:
+        try:
+            return AutoModel.from_pretrained(backbone_id)
+        except Exception:
+            return None
+    return None
+
+
+def _load_fast_tokenizer_json(target_dir: Path) -> Any | None:
+    """Load `tokenizer.json` directly via PreTrainedTokenizerFast when AutoTokenizer hits SentencePiece/Protobuf errors."""
+    tok_json = target_dir / "tokenizer.json"
+    if not tok_json.is_file():
+        return None
+    cfg_path = target_dir / "tokenizer_config.json"
+    cfg: dict[str, Any] = {}
+    if cfg_path.is_file():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+    try:
+        return PreTrainedTokenizerFast(
+            tokenizer_file=str(tok_json),
+            bos_token=str(cfg.get("bos_token") or "<s>"),
+            eos_token=str(cfg.get("eos_token") or "</s>"),
+            unk_token=str(cfg.get("unk_token") or "<unk>"),
+            pad_token=str(cfg.get("pad_token") or "<pad>"),
+            cls_token=str(cfg.get("cls_token") or "<s>"),
+            sep_token=str(cfg.get("sep_token") or "</s>"),
+            mask_token=str(cfg.get("mask_token") or "<mask>"),
+        )
+    except Exception:
+        return None
+
+
+def _load_local_tokenizer(
+    backbone_id: str,
+    ce_dir: Path | None,
+    *,
+    lang: str = "vi",
+    node_backbone_overridden: bool,
+    allow_network: bool,
+) -> Any | None:
+    """Load tokenizer from local cache or CE directory with SentencePiece/FastJSON fallback."""
+    local_dir = _resolve_local_hf_snapshot(backbone_id)
+    targets: list[Path] = [Path(local_dir)] if local_dir is not None else []
+    if ce_dir is not None and ce_dir.is_dir() and not node_backbone_overridden:
+        targets.append(ce_dir)
+    if not node_backbone_overridden:
+        default_dirs = (
+            (Path("checkpoints/dual_ce_vn"), Path("checkpoints/visobert_vihsd"))
+            if lang == "vi"
+            else (Path("checkpoints/dual_ce_pheme"),)
+        )
+        for d in default_dirs:
+            if d.is_dir() and d not in targets:
+                targets.append(d)
+
+    for target in targets:
+        has_tok = any(
+            (target / fname).is_file()
+            for fname in ("tokenizer_config.json", "tokenizer.json", "vocab.json", "sentencepiece.bpe.model")
+        )
+        if not has_tok:
+            continue
+        for use_fast in (True, False):
+            kw: dict[str, Any] = {"local_files_only": True}
+            if not use_fast:
+                kw["use_fast"] = False
+            try:
+                return AutoTokenizer.from_pretrained(str(target), **kw)
+            except TypeError:
+                try:
+                    return AutoTokenizer.from_pretrained(str(target))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        fast_tok = _load_fast_tokenizer_json(target)
+        if fast_tok is not None:
+            return fast_tok
+
+    is_real_hf = getattr(AutoTokenizer.from_pretrained, "__module__", "").startswith("transformers.")
+    if allow_network or not is_real_hf:
+        try:
+            return load_tokenizer_safe(backbone_id)
+        except Exception:
+            return None
+    return None
+
+
+def _resolve_nlp_backends(
+    *,
+    cross_encoder_ckpt: Path | None,
+    node_backbone: str | None,
+    lang: str,
+    is_demo: bool,
+) -> tuple[DualHeadCrossEncoder | None, Any | None, Any | None, Any | None, bool, str]:
+    """Load available Cross-Encoder & SpanPool backends without unwanted offline downloads."""
+    ce_dir = Path(cross_encoder_ckpt) if cross_encoder_ckpt is not None else None
+    ce_model: DualHeadCrossEncoder | None = None
+    ce_tok: Any | None = None
+
+    has_all_ce_files = bool(
+        ce_dir is not None
+        and ce_dir.is_dir()
+        and all((ce_dir / fname).is_file() for fname in _REQUIRED_CE_FILES)
+    )
+    if has_all_ce_files and ce_dir is not None:
+        try:
+            ce_model, ce_tok = DualHeadCrossEncoder.load_checkpoint(ce_dir, map_location="cpu")
+            ce_model.eval()
+        except Exception:
+            ce_model = None
+            ce_tok = None
+
+    backbone_id = node_backbone or (
+        VISOBERT_MODEL_NAME if lang == "vi" else TWITTER_ROBERTA_MODEL_NAME
+    )
+    allow_net = bool(ce_model is not None and not is_demo)
+    frozen_node_encoder = _load_local_model_from_pretrained(backbone_id, allow_network=allow_net)
+    frozen_node_tok: Any | None = None
+
+    if frozen_node_encoder is not None:
+        frozen_node_tok = _load_local_tokenizer(
+            backbone_id,
+            ce_dir,
+            lang=lang,
+            node_backbone_overridden=node_backbone is not None,
+            allow_network=allow_net,
+        )
+        if frozen_node_tok is None and ce_tok is not None and node_backbone is None:
+            frozen_node_tok = ce_tok
+        if frozen_node_tok is None:
+            frozen_node_encoder = None
+
+    if frozen_node_encoder is None and ce_model is not None and ce_tok is not None:
+        frozen_node_encoder = ce_model.encoder
+        frozen_node_tok = ce_tok
+
+    if frozen_node_encoder is not None:
+        frozen_node_encoder.eval()
+        for p in frozen_node_encoder.parameters():
+            p.requires_grad_(False)
+
+    spanpool_ready = frozen_node_encoder is not None and frozen_node_tok is not None
+    ce_ready = ce_model is not None and ce_tok is not None and spanpool_ready
+    if ce_ready:
+        return ce_model, ce_tok, frozen_node_encoder, frozen_node_tok, True, "full_2d_cross_encoder"
+    if spanpool_ready:
+        return None, None, frozen_node_encoder, frozen_node_tok, False, "visobert_spanpool_heuristic_edges"
+    return None, None, None, None, False, "heuristic_hash_sandbox"
+
+
+def _classify_calibrated_regime(
+    pred_polar: float,
+    behavior_counts: Mapping[str, int],
+) -> str:
+    """Classify cascade polarization regime calibrated strictly against VN Train quantiles."""
+    hostile_or_irr = int(behavior_counts.get("hostile_conflict", 0)) + int(
+        behavior_counts.get("irrational_fallacy", 0)
+    )
+    if pred_polar >= VN_POLAR_Q90 or hostile_or_irr >= 3:
+        return "Phân cực xung đột gay gắt (>= Q90 VN Train)"
+    if pred_polar >= VN_POLAR_Q75 or int(behavior_counts.get("constructive_oppose", 0)) >= 2:
+        return "Tranh luận đa chiều văn minh (Q75-Q90 VN Train)"
+    if pred_polar >= VN_POLAR_Q50:
+        return "Phân hóa trung bình (Q50-Q75 VN Train)"
+    return "Tương đối đồng thuận / ít chia rẽ (< Q50 VN Train)"
+
+
 def predict_live_cascade(
     post: Mapping[str, Any],
     comments: Sequence[Mapping[str, Any]],
@@ -324,16 +556,20 @@ def predict_live_cascade(
     gnn_ckpt: Path | None = None,
     node_backbone: str | None = None,
     lang: str = "vi",
+    junk_mode: Literal["prune", "contract"] = "prune",
     allow_untrained: bool = False,
     is_demo: bool = False,
 ) -> dict[str, Any]:
     """Build cascade graph, score early behavior, run SBiFAGAT, and emit live forecast report."""
+    junk_stats: dict[str, Any] = {}
     built = build_vn_cascade_from_thread(
         post,
         comments,
         min_comments=1,
         min_depth=1,
         min_vi_ratio=0.0,
+        junk_mode=junk_mode,
+        stats_out=junk_stats,
     )
     if built is None:
         raise ValueError("Thread has insufficient valid comments after spam/deleted filtering.")
@@ -364,30 +600,17 @@ def predict_live_cascade(
     non_roots.sort(key=lambda n: (n["created_at_utc"], depth_map.get(str(n["node_id"]), 999), str(n["node_id"])))
 
     kept_nodes = [root_row] + non_roots[:k_horizon]
-    kept_ids = {str(n["node_id"]) for n in kept_nodes}
     kept_id_to_idx = {str(n["node_id"]): idx for idx, n in enumerate(kept_nodes)}
 
     # Score edges (all edges for post-hoc check; strictly isolated from model features beyond K)
-    ce_model: DualHeadCrossEncoder | None = None
-    ce_tok: Any | None = None
-    frozen_node_encoder: Any | None = None
-    frozen_node_tok: Any | None = None
-    if cross_encoder_ckpt is not None and Path(cross_encoder_ckpt).exists():
-        ce_model, ce_tok = DualHeadCrossEncoder.load_checkpoint(Path(cross_encoder_ckpt), map_location="cpu")
-        ce_model.eval()
-        # Use frozen pre-trained backbone + SpanPool matching extract_features.py
-        backbone_id = node_backbone or (
-            VISOBERT_MODEL_NAME if lang == "vi" else TWITTER_ROBERTA_MODEL_NAME
+    ce_model, ce_tok, frozen_node_encoder, frozen_node_tok, cross_encoder_loaded, nlp_backend = (
+        _resolve_nlp_backends(
+            cross_encoder_ckpt=cross_encoder_ckpt,
+            node_backbone=node_backbone,
+            lang=lang,
+            is_demo=is_demo,
         )
-        try:
-            frozen_node_encoder = AutoModel.from_pretrained(backbone_id)
-            frozen_node_encoder.eval()
-            for p in frozen_node_encoder.parameters():
-                p.requires_grad_(False)
-            frozen_node_tok = load_tokenizer_safe(backbone_id)
-        except Exception:
-            frozen_node_encoder = ce_model.encoder
-            frozen_node_tok = ce_tok
+    )
 
     use_root_ctx = bool(getattr(ce_model, "include_root_context", False)) if ce_model is not None else False
     root_text_str = str(root_row["text"])
@@ -623,17 +846,53 @@ def predict_live_cascade(
     actual_full_polar = _compute_full_tree_polarization(actual_aligned) if actual_aligned else 0.0
 
     stats_vec = cascade_stats.view(-1).tolist()
-    regimes_polar = (
-        "Phân cực xung đột gay gắt"
-        if raw_pred_polar >= 0.55 or (behavior_counts["hostile_conflict"] + behavior_counts["irrational_fallacy"]) >= 3
-        else ("Tranh luận đa chiều văn minh" if behavior_counts["constructive_oppose"] >= 2 else "Tương đối đồng thuận / ít chia rẽ")
-    )
+    regimes_polar = _classify_calibrated_regime(raw_pred_polar, behavior_counts)
+
+    relinked_pair_set: set[tuple[str, str]] = set()
+    for item in junk_stats.get("relinked_edge_ids", []):
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            relinked_pair_set.add((str(item[0]), str(item[1])))
+
+    serialized_kept_nodes = [
+        {
+            "node_id": str(n["node_id"]),
+            "parent_id": str(n["parent_id"]) if n.get("parent_id") is not None else None,
+            "author_hash": str(n["user_id_hash"]) if n.get("user_id_hash") is not None else None,
+            "depth": int(depth_map.get(str(n["node_id"]), 0)),
+            "time_delay_sec": float(dt_sec),
+            "text": str(n["text"]),
+        }
+        for n, dt_sec in zip(kept_nodes, delays_k)
+    ]
+    serialized_kept_edges = []
+    for d_e in kept_edge_details:
+        s_val = float(d_e["s_uv"])
+        stance_cls = "support" if s_val > 0.1 else ("oppose" if s_val < -0.1 else "neutral")
+        src_s = str(d_e["parent_id"])
+        dst_s = str(d_e["node_id"])
+        serialized_kept_edges.append(
+            {
+                "source_id": src_s,
+                "target_id": dst_s,
+                "s_uv": s_val,
+                "h_uv": float(d_e["h_uv"]),
+                "stance_class": stance_cls,
+                "behavior_label": str(d_e["behavior_label"]),
+                "relinked": (src_s, dst_s) in relinked_pair_set,
+            }
+        )
 
     return {
         "root_title": str(post.get("title") or root_row["text"][:120]),
         "k_observed": len(kept_nodes) - 1,
         "edge_dim": int(target_edge_dim),
         "checkpoint_loaded": checkpoint_loaded,
+        "cross_encoder_loaded": cross_encoder_loaded,
+        "nlp_backend": nlp_backend,
+        "junk_mode": junk_mode,
+        "junk_filter_stats": dict(junk_stats),
+        "kept_nodes": serialized_kept_nodes,
+        "kept_edges": serialized_kept_edges,
         "early_burst_metrics": {
             "elapsed_span_norm": stats_vec[0],
             "mean_interarrival_norm": stats_vec[1],
@@ -648,6 +907,12 @@ def predict_live_cascade(
         "predicted_total_replies": raw_pred_replies,
         "predicted_polarization_score": raw_pred_polar,
         "predicted_regime": regimes_polar,
+        "regime_thresholds": {
+            "q50": VN_POLAR_Q50,
+            "q75": VN_POLAR_Q75,
+            "q90": VN_POLAR_Q90,
+        },
+        "note": VN_QUANTILE_CALIBRATION_NOTE,
         "confidence_score": float(diag["confidence_score"].view(-1)[0].item()),
         "low_signal_warning": bool(diag["low_signal_warning"].view(-1)[0].item()),
         "top_trigger_edges": diag["top_trigger_edges"],
@@ -678,6 +943,8 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
             f"Bai goc      : {result['root_title']}",
             f"Cua so quan sat (V_K): {result['k_observed']} binh luan dau tien",
             f"Trang thai GNN       : {'Da nap checkpoint huan luyen (2D [s_uv, h_uv])' if is_2d else ('Da nap checkpoint huan luyen' if result['checkpoint_loaded'] else 'CHE DO KIEM THU CAU TRUC (CHUA NAP CHECKPOINT - KHONG CO GIA TRI DU BAO)')}",
+            f"Backend NLP          : {result.get('nlp_backend', 'unknown')} (cross_encoder_loaded={result.get('cross_encoder_loaded', False)})",
+            f"Che do loc rac       : {result.get('junk_mode', 'prune')}",
             "",
             (
                 "[1] PHAN BO LAP TRUONG & GAY GAT 2D [s_uv, h_uv] TRONG 20 BINH LUAN DAU:"
@@ -775,6 +1042,7 @@ def main() -> None:
     parser.add_argument("--node-backbone", type=str, default=None)
     parser.add_argument("--k-horizon", type=int, default=20)
     parser.add_argument("--lang", choices=["vi", "en"], default="vi")
+    parser.add_argument("--junk-mode", choices=["prune", "contract"], default="prune")
     parser.add_argument("--output-json", type=Path, default=None)
     args = parser.parse_args()
 
@@ -783,7 +1051,11 @@ def main() -> None:
     elif args.input_json is not None:
         post, comments = _load_thread_from_json(args.input_json)
     elif args.reddit_url or args.thread_id:
-        pid = args.thread_id or _extract_post_id_from_url(str(args.reddit_url))
+        pid = (
+            _validate_reddit_post_id(args.thread_id, source="--thread-id")
+            if args.thread_id
+            else _extract_post_id_from_url(str(args.reddit_url))
+        )
         post, comments = _fetch_reddit_thread(pid)
     else:
         raise ValueError("Provide one of --demo-offline, --input-json, --reddit-url, or --thread-id")
@@ -796,6 +1068,7 @@ def main() -> None:
         gnn_ckpt=args.gnn_ckpt,
         node_backbone=args.node_backbone,
         lang=args.lang,
+        junk_mode=args.junk_mode,
         allow_untrained=args.allow_untrained,
         is_demo=args.demo_offline,
     )
