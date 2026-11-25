@@ -21,6 +21,10 @@ from typing import Any, Mapping, Sequence
 
 import requests
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from scripts.compute_kappa import evaluate_rumoureval_sdqc
 from src.nlp.dual_edge_scorer import MDEBERTA_NLI_MODEL_NAME, NLIStanceTeacherScorer
 
@@ -355,7 +359,7 @@ def evaluate_nli_on_rumoureval(
     scorer: Any | None = None,
     model_name: str = MDEBERTA_NLI_MODEL_NAME,
     batch_size: int = 32,
-    output_json: Path = Path("paper/results_rumoureval_sdqc.json"),
+    output_json: Path = Path("results/results_rumoureval_sdqc.json"),
     predictions_json: Path | None = None,
     context_mode: str = "root",
 ) -> dict[str, Any]:
@@ -451,7 +455,7 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--context-mode", choices=("root", "parent"), default="root")
     parser.add_argument("--no-verify-checksum", action="store_true")
-    parser.add_argument("--output-json", type=Path, default=Path("paper/results_rumoureval_sdqc.json"))
+    parser.add_argument("--output-json", type=Path, default=Path("results/results_rumoureval_sdqc.json"))
     parser.add_argument("--predictions-json", type=Path, default=None)
     args = parser.parse_args()
 

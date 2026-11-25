@@ -16,7 +16,7 @@ from scripts.demo_web_app import create_server
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_DIR = REPO_ROOT / "web_demo"
-PAPER_DIR = REPO_ROOT / "paper"
+PAPER_DIR = REPO_ROOT / "results"
 DATA_VN_DIR = REPO_ROOT / "data" / "processed" / "vn"
 CKPT_VN_PATH = REPO_ROOT / "checkpoints" / "best_sbifagat_vn.pt"
 CE_VN_DIR = REPO_ROOT / "checkpoints" / "dual_ce_vn"
@@ -116,10 +116,13 @@ def test_static_allowlist_traversal_and_security_headers(tmp_path: Path) -> None
 
         for blocked_path in (
             "/../paper/main.tex",
+            "/../archive/docs_v1/paper/main.tex",
             "/assets/../../.env",
             "/%2e%2e/src/models/sbi_fagat.py",
             "/assets/other.svg",
             "/paper/results_macro_network_vn.json",
+            "/results/results_macro_network_vn.json",
+            "/archive/docs_v1/paper/results_macro_network_vn.json",
         ):
             status, hdrs, _ = _raw_http_get(port, blocked_path)
             assert status in (403, 404), f"Expected 403/404 on {blocked_path}, got {status}"
@@ -169,6 +172,10 @@ def test_ci_synthetic_fallback_when_data_and_checkpoint_absent(tmp_path: Path) -
         detail = json.loads(raw_d.decode("utf-8"))
         assert detail["meta"]["is_synthetic_fallback"] is True
         assert detail["meta"]["cross_encoder_loaded"] is False
+        assert detail["forecast"]["confidence_score"] is None
+        assert detail["forecast"]["uncertainty_available"] is False
+        assert "early_y_polar" in detail["forecast"]
+        assert "irrational_fallacy" not in detail["forecast"]["behavior_counts"]
         assert detail["tree"]["nodes"][0]["stance_class"] == "root"
         assert len(detail["tree"]["nodes"]) >= 10
         assert len(detail["user_graph"]["nodes"]) >= 3
@@ -262,6 +269,32 @@ def test_sandbox_path_contraction_and_custom_input(tmp_path: Path) -> None:
         )
         assert st_bad == 400
         assert "error" in body_bad
+
+        # Custom structured comments with author_raw="AutoModerator" must be dropped by M6 bot filter
+        st_bot, _, body_bot = _http_json_post(
+            port,
+            "/api/tier1/sandbox",
+            {
+                "mode": "custom",
+                "title": "Kiểm tra lọc bot AutoModerator qua author_raw",
+                "root_text": "Thảo luận chính sách công",
+                "comments": [
+                    {"id": "c1", "parent_id": "root", "text": "Bình luận hợp lệ ủng hộ.", "author": "user_ok"},
+                    {"id": "c_bot", "parent_id": "root", "text": "Bình luận tự động của bot cần lọc.", "author_raw": "AutoModerator"},
+                    {"id": "c2", "parent_id": "c1", "text": "Phản đối phương án này.", "author_raw": "user_2"},
+                ],
+                "junk_mode": "contract",
+            },
+        )
+        assert st_bot == 200
+        kept_bot_texts = [n["text"] for n in body_bot["kept_nodes"]]
+        assert not any("bot cần lọc" in t for t in kept_bot_texts)
+        assert any("Bình luận hợp lệ ủng hộ." in t for t in kept_bot_texts)
+        assert body_bot["forecast"]["confidence_score"] is None
+        assert body_bot["forecast"]["uncertainty_available"] is False
+        assert body_bot["forecast"]["has_future_replies"] is False
+        assert body_bot["forecast"]["actual_y_polar"] is None
+        assert "early_y_polar" in body_bot["forecast"]
     finally:
         server.shutdown()
         server.server_close()
@@ -300,6 +333,8 @@ def test_real_vn_test_threads_when_local_artifacts_present() -> None:
         listing = json.loads(raw_l.decode("utf-8"))
         assert listing["is_synthetic_fallback"] is False
         assert listing["count"] == 10
+        for item in listing["threads"]:
+            assert "[REDACTED" not in item["title_snippet"]
         polars = [t["actual_y_polar"] for t in listing["threads"]]
         assert max(polars) > min(polars)
 
@@ -310,6 +345,10 @@ def test_real_vn_test_threads_when_local_artifacts_present() -> None:
         assert detail["meta"]["is_synthetic_fallback"] is False
         assert detail["meta"]["cross_encoder_loaded"] is True
         assert detail["meta"]["nlp_backend"] == "preextracted_full_2d_ce"
+        assert detail["forecast"]["confidence_score"] is None
+        assert detail["forecast"]["uncertainty_available"] is False
+        assert "early_y_polar" in detail["forecast"]
+        assert "irrational_fallacy" not in detail["forecast"]["behavior_counts"]
         assert detail["tree"]["nodes"][0]["stance_class"] == "root"
         assert len(detail["tree"]["nodes"]) == 21
         assert len(detail["tree"]["edges"]) == 20
@@ -317,6 +356,7 @@ def test_real_vn_test_threads_when_local_artifacts_present() -> None:
         assert len(detail["user_graph"]["nodes"]) >= 2
         for node in detail["tree"]["nodes"]:
             assert len(node["author_hash"]) <= 16
+            assert "[REDACTED" not in node["text"]
     finally:
         server.shutdown()
         server.server_close()
@@ -324,7 +364,7 @@ def test_real_vn_test_threads_when_local_artifacts_present() -> None:
 
 
 def test_tier2_macro_metrics_match_paper_jsons(tmp_path: Path) -> None:
-    """GET /api/tier2/macro serves exact VN and PHEME metrics and caveats."""
+    """GET /api/tier2/macro serves exact verified results/ VN and PHEME metrics and caveats."""
     server, thread = _start_server(
         data_dir=tmp_path / "no_data",
         ckpt_path=tmp_path / "no_ckpt.pt",
@@ -338,15 +378,18 @@ def test_tier2_macro_metrics_match_paper_jsons(tmp_path: Path) -> None:
         vn = data["corpora"]["vn"]
         pheme = data["corpora"]["pheme"]
 
-        assert round(vn["macro"]["polarization"]["signed_modularity"], 4) == pytest.approx(0.4280, abs=1e-4)
-        assert round(pheme["macro"]["polarization"]["signed_modularity"], 4) == pytest.approx(0.8232, abs=1e-4)
+        assert round(vn["macro"]["polarization"]["signed_modularity"], 4) == pytest.approx(0.1988, abs=1e-4)
+        assert round(pheme["macro"]["polarization"]["signed_modularity"], 4) == pytest.approx(0.4000, abs=1e-4)
         assert vn["macro"]["structural_balance"]["balance_z_score"] == pytest.approx(-15.1737, abs=1e-3)
         assert pheme["macro"]["structural_balance"]["balance_z_score"] == pytest.approx(-4.2971, abs=1e-3)
 
         vn_rows = {r["model"]: r for r in vn["signed_link"]["rows"]}
         pheme_rows = {r["model"]: r for r in pheme["signed_link"]["rows"]}
-        assert vn_rows["SGCN"]["trans_roc_auc"]["mean"] == pytest.approx(0.6149, abs=1e-4)
-        assert pheme_rows["SBiFAGAT-Link"]["trans_roc_auc"]["mean"] == pytest.approx(0.9181, abs=1e-4)
+        assert vn_rows["PriorPairSignPersistence"]["trans_roc_auc"]["mean"] == pytest.approx(0.6296, abs=1e-4)
+        assert vn_rows["SGCN"]["trans_roc_auc"]["mean"] == pytest.approx(0.6101, abs=1e-4)
+        assert vn_rows["SBiFAGAT-Link"]["trans_roc_auc"]["mean"] == pytest.approx(0.5954, abs=1e-4)
+        assert pheme_rows["SiGAT"]["trans_roc_auc"]["mean"] == pytest.approx(0.9178, abs=1e-4)
+        assert pheme_rows["SBiFAGAT-Link"]["trans_roc_auc"]["mean"] == pytest.approx(0.9106, abs=1e-4)
         assert any("212" in c for c in data["caveats"])
     finally:
         server.shutdown()
@@ -370,6 +413,12 @@ def test_static_web_assets_are_offline_and_clean() -> None:
     assert 'role="tablist"' in html
     assert html.count('role="tabpanel"') == 2
     assert 'id="toggle-profanity-badge">' in html
+    assert 'id="kpi-early-polar"' in html
     assert "innerHTML" not in js
     assert "insertAdjacentHTML" not in js
     assert "eval(" not in js
+    assert "Ngụy biện / Bẻ lái" not in js
+    assert "irrational_fallacy" not in js
+    assert "active_graph_users" in js
+    assert "largest_signed_wcc_ratio_active" in js
+    assert "N/A (disabled)" in js

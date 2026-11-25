@@ -2,17 +2,19 @@
 
 Supports:
   1. Sparse CPU macro network polarization analytics (Structural Balance Theory
-     + uniform edge-sign permutations for z-scores, Signed Laplacian spectral bipartition,
-     Signed Modularity Q_signed, Garimella Random Walk Controversy RWC, and fig5).
+     + Davis Weak Balance + uniform edge-sign permutations, Signed Laplacian spectral
+     bipartition, Gómez Signed Modularity Q_signed + null-graph permutations,
+     Garimella Random Walk Controversy RWC, and fig5).
   2. Multi-seed Zero-Leakage Chronological Signed Link Prediction GNN benchmark
-     comparing UserTextMLP, StandardGCN, StandardGATv2, SGCN (Derr et al., ICDM 2018),
-     FAGCN (Bo et al., AAAI 2021), and SBiFAGAT-Link (bidirectional StanceGuidedFAConv).
+     comparing UserTextMLP, PriorPairSignPersistence, StandardGCN, StandardGATv2,
+     SGCN (Derr et al., ICDM 2018), FAGCN (Bo et al., AAAI 2021), BiEdgeGATv2-Link,
+     SiGAT (Huang et al., ICDM 2019), SDGNN (Huang et al., AAAI 2021), and
+     SBiFAGAT-Link (bidirectional StanceGuidedFAConv).
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import math
 import sys
@@ -23,11 +25,9 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from scipy.stats import wilcoxon
 from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
 from torch import Tensor
-from torch_geometric.nn import FAConv, GATv2Conv, GCNConv, SignedConv
-from torch_geometric.utils import to_undirected
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -39,8 +39,24 @@ from src.data.user_network import (
     format_macro_network_latex,
     plot_macro_signed_network,
 )
-from src.models.sbi_fagat import StanceGuidedFAConv
-from src.training.reporting import export_latex_table, serialize_benchmark_json
+from src.models.signed_gnns import (
+    BiEdgeGATv2Link,
+    FAGCNLink,
+    LINK_PRED_MODEL_NAMES,
+    PairwiseSignedHead,
+    PriorPairSignPersistence,
+    SBiFAGATLink,
+    SDGNN,
+    SGCNLink,
+    SiGAT,
+    StandardGATv2Link,
+    StandardGCNLink,
+    UserNodeStem,
+    UserTextMLP,
+    build_link_model,
+    prepare_mp_graph,
+)
+from src.training.reporting import serialize_benchmark_json
 from src.training.trainer import (
     compute_paired_bootstrap_pvalue,
     compute_paired_ttest,
@@ -55,331 +71,27 @@ LINK_PRED_METRICS: tuple[tuple[str, str, bool], ...] = (
     ("trans_roc_auc", "Trans.\\ ROC-AUC $\\uparrow$", False),
     ("trans_pr_auc", "Trans.\\ PR-AUC $\\uparrow$", False),
     ("trans_macro_f1", "Trans.\\ Macro-F1 $\\uparrow$", False),
+    ("unseen_pair_trans_roc_auc", "Unseen-Pair Trans.\\ ROC-AUC $\\uparrow$", False),
+    ("unseen_pair_trans_pr_auc", "Unseen-Pair Trans.\\ PR-AUC $\\uparrow$", False),
+    ("unseen_pair_trans_macro_f1", "Unseen-Pair Trans.\\ Macro-F1 $\\uparrow$", False),
+    ("unseen_roc_auc", "Unseen ROC-AUC $\\uparrow$", False),
+    ("unseen_pr_auc", "Unseen PR-AUC $\\uparrow$", False),
+    ("unseen_macro_f1", "Unseen Macro-F1 $\\uparrow$", False),
 )
 
-LINK_PRED_MODEL_NAMES: tuple[str, ...] = (
-    "UserTextMLP",
-    "StandardGCN",
-    "StandardGATv2",
-    "SGCN",
-    "FAGCN",
-    "SBiFAGAT-Link",
-)
+_NON_LEARNED_BASELINES: frozenset[str] = frozenset({"PriorPairSignPersistence"})
 
 _MODEL_TIE_PRIORITY: dict[str, int] = {
-    "SGCN": 0,
-    "FAGCN": 1,
-    "StandardGATv2": 2,
-    "StandardGCN": 3,
-    "UserTextMLP": 4,
+    "BiEdgeGATv2-Link": 0,
+    "SDGNN": 1,
+    "SiGAT": 2,
+    "SGCN": 3,
+    "FAGCN": 4,
+    "StandardGATv2": 5,
+    "StandardGCN": 6,
+    "UserTextMLP": 7,
+    "PriorPairSignPersistence": 8,
 }
-
-
-class UserNodeStem(nn.Module):
-    """Balanced encoder projecting user historical SpanPool embeddings + 4-D unsigned activity stats."""
-
-    def __init__(self, in_dim: int = 772, hidden_dim: int = 64, beh_dim: int = 4, dropout: float = 0.1) -> None:
-        super().__init__()
-        if hidden_dim < 8:
-            raise ValueError(f"hidden_dim must be >= 8 for UserNodeStem, got {hidden_dim}")
-        self.beh_dim = min(int(beh_dim), max(1, int(in_dim) - 1))
-        self.sem_dim = max(1, int(in_dim) - self.beh_dim)
-        beh_out = max(2, hidden_dim // 4)
-        sem_out = hidden_dim - beh_out
-
-        self.sem_proj = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(self.sem_dim, sem_out),
-            nn.GELU(),
-            nn.LayerNorm(sem_out),
-        )
-        self.beh_proj = nn.Sequential(
-            nn.Linear(self.beh_dim, beh_out),
-            nn.GELU(),
-            nn.LayerNorm(beh_out),
-        )
-        self.out_norm = nn.LayerNorm(hidden_dim)
-
-    def forward(self, x: Tensor) -> Tensor:
-        x_f = x.float()
-        sem_h = self.sem_proj(x_f[:, : self.sem_dim])
-        beh_in = x_f[:, self.sem_dim : self.sem_dim + self.beh_dim]
-        if beh_in.size(1) < self.beh_dim:
-            pad = beh_in.new_zeros((beh_in.size(0), self.beh_dim - beh_in.size(1)))
-            beh_in = torch.cat([beh_in, pad], dim=-1)
-        beh_h = self.beh_proj(beh_in)
-        return self.out_norm(torch.cat([sem_h, beh_h], dim=-1))
-
-
-class PairwiseSignedHead(nn.Module):
-    """Predict opposing-stance logit P(s_uv < 0) from endpoint user representations."""
-
-    def __init__(self, hidden_dim: int, dropout: float = 0.1) -> None:
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(4 * hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, h: Tensor, pairs: Tensor) -> Tensor:
-        if pairs.numel() == 0:
-            return h.new_zeros((0,))
-        hu = h[pairs[0]]
-        hv = h[pairs[1]]
-        feats = torch.cat([hu, hv, hu * hv, (hu - hv).abs()], dim=-1)
-        return self.mlp(feats).squeeze(-1)
-
-
-class UserTextMLP(nn.Module):
-    """Graph-agnostic node-embedding baseline for chronological signed link prediction."""
-
-    def __init__(self, in_dim: int = 772, hidden_dim: int = 64, dropout: float = 0.1) -> None:
-        super().__init__()
-        self.stem = UserNodeStem(in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout)
-        self.encoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-        )
-        self.head = PairwiseSignedHead(hidden_dim, dropout=dropout)
-
-    def encode(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
-        del edge_index, edge_attr
-        h0 = self.stem(x)
-        return h0 + self.encoder(h0)
-
-    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor, pairs: Tensor) -> Tensor:
-        return self.head(self.encode(x, edge_index, edge_attr), pairs)
-
-
-class StandardGCNLink(nn.Module):
-    """Unsigned undirected GCN encoder (Kipf & Welling, ICLR 2017) for link sign prediction."""
-
-    def __init__(self, in_dim: int = 772, hidden_dim: int = 64, num_layers: int = 2, dropout: float = 0.1) -> None:
-        super().__init__()
-        self.stem = UserNodeStem(in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout)
-        self.convs = nn.ModuleList([GCNConv(hidden_dim, hidden_dim) for _ in range(num_layers)])
-        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
-        self.drop = nn.Dropout(dropout)
-        self.head = PairwiseSignedHead(hidden_dim, dropout=dropout)
-
-    def encode(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
-        del edge_attr
-        num_nodes = x.size(0)
-        ei = to_undirected(edge_index, num_nodes=num_nodes) if edge_index.numel() > 0 else edge_index
-        h = self.stem(x)
-        for conv, norm in zip(self.convs, self.norms):
-            h = h + self.drop(norm(F.relu(conv(h, ei))))
-        return h
-
-    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor, pairs: Tensor) -> Tensor:
-        return self.head(self.encode(x, edge_index, edge_attr), pairs)
-
-
-class StandardGATv2Link(nn.Module):
-    """Unsigned undirected GATv2 encoder (Brody et al., ICLR 2022) for link sign prediction."""
-
-    def __init__(
-        self,
-        in_dim: int = 772,
-        hidden_dim: int = 64,
-        num_layers: int = 2,
-        heads: int = 4,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        if hidden_dim % heads != 0:
-            raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by heads ({heads})")
-        self.stem = UserNodeStem(in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout)
-        head_dim = hidden_dim // heads
-        self.convs = nn.ModuleList(
-            [GATv2Conv(hidden_dim, head_dim, heads=heads, concat=True, dropout=dropout, add_self_loops=True) for _ in range(num_layers)]
-        )
-        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
-        self.drop = nn.Dropout(dropout)
-        self.head = PairwiseSignedHead(hidden_dim, dropout=dropout)
-
-    def encode(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
-        del edge_attr
-        num_nodes = x.size(0)
-        ei = to_undirected(edge_index, num_nodes=num_nodes) if edge_index.numel() > 0 else edge_index
-        h = self.stem(x)
-        for conv, norm in zip(self.convs, self.norms):
-            h = h + self.drop(norm(F.elu(conv(h, ei))))
-        return h
-
-    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor, pairs: Tensor) -> Tensor:
-        return self.head(self.encode(x, edge_index, edge_attr), pairs)
-
-
-class SGCNLink(nn.Module):
-    """Signed Graph Convolutional Network (Derr et al., ICDM 2018) with balanced/unbalanced paths."""
-
-    def __init__(self, in_dim: int = 772, hidden_dim: int = 64, num_layers: int = 2, dropout: float = 0.1) -> None:
-        super().__init__()
-        if hidden_dim % 2 != 0:
-            raise ValueError(f"hidden_dim ({hidden_dim}) must be even for SGCN")
-        half = hidden_dim // 2
-        self.stem = UserNodeStem(in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout)
-        convs = [SignedConv(hidden_dim, half, first_aggr=True)]
-        for _ in range(max(0, num_layers - 1)):
-            convs.append(SignedConv(half, half, first_aggr=False))
-        self.convs = nn.ModuleList(convs)
-        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(len(convs))])
-        self.drop = nn.Dropout(dropout)
-        self.head = PairwiseSignedHead(hidden_dim, dropout=dropout)
-
-    def encode(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
-        num_nodes = x.size(0)
-        if edge_index.numel() > 0 and edge_attr.numel() > 0:
-            signs = edge_attr[:, 0]
-            pos_ei = edge_index[:, signs >= 0.0]
-            neg_ei = edge_index[:, signs < 0.0]
-            pos_ei = to_undirected(pos_ei, num_nodes=num_nodes) if pos_ei.numel() > 0 else pos_ei
-            neg_ei = to_undirected(neg_ei, num_nodes=num_nodes) if neg_ei.numel() > 0 else neg_ei
-        else:
-            pos_ei = edge_index.new_empty((2, 0))
-            neg_ei = edge_index.new_empty((2, 0))
-
-        h = self.stem(x)
-        for conv, norm in zip(self.convs, self.norms):
-            h = h + self.drop(norm(torch.tanh(conv(h, pos_ei, neg_ei))))
-        return h
-
-    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor, pairs: Tensor) -> Tensor:
-        return self.head(self.encode(x, edge_index, edge_attr), pairs)
-
-
-class FAGCNLink(nn.Module):
-    """Frequency Adaptation GCN (Bo et al., AAAI 2021) for signed link prediction."""
-
-    def __init__(
-        self,
-        in_dim: int = 772,
-        hidden_dim: int = 64,
-        num_layers: int = 2,
-        eps: float = 0.5,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.stem = UserNodeStem(in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout)
-        self.convs = nn.ModuleList(
-            [FAConv(channels=hidden_dim, eps=eps, dropout=dropout, add_self_loops=True) for _ in range(num_layers)]
-        )
-        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
-        self.drop = nn.Dropout(dropout)
-        self.head = PairwiseSignedHead(hidden_dim, dropout=dropout)
-
-    def encode(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
-        del edge_attr
-        num_nodes = x.size(0)
-        ei = to_undirected(edge_index, num_nodes=num_nodes) if edge_index.numel() > 0 else edge_index
-        h0 = self.stem(x)
-        h = h0
-        for conv, norm in zip(self.convs, self.norms):
-            h = h + self.drop(norm(F.elu(conv(h, h0, ei))))
-        return h
-
-    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor, pairs: Tensor) -> Tensor:
-        return self.head(self.encode(x, edge_index, edge_attr), pairs)
-
-
-class SBiFAGATLink(nn.Module):
-    """Bidirectional Stance-Guided Frequency-Adaptive GAT for Macro Signed Link Prediction."""
-
-    def __init__(
-        self,
-        in_dim: int = 772,
-        hidden_dim: int = 64,
-        num_layers: int = 2,
-        eps: float = 0.5,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.stem = UserNodeStem(in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout)
-        self.convs_td = nn.ModuleList(
-            [
-                StanceGuidedFAConv(
-                    hidden_dim=hidden_dim,
-                    edge_dim=2,
-                    eps=eps,
-                    gate_mode="tanh",
-                    dropout=dropout,
-                    use_dual_channel=True,
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        self.convs_bu = nn.ModuleList(
-            [
-                StanceGuidedFAConv(
-                    hidden_dim=hidden_dim,
-                    edge_dim=2,
-                    eps=eps,
-                    gate_mode="tanh",
-                    dropout=dropout,
-                    use_dual_channel=True,
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        self.mix_projs = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(2 * hidden_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        self.head = PairwiseSignedHead(hidden_dim, dropout=dropout)
-
-    def encode(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
-        h0 = self.stem(x)
-        h = h0
-        rev_ei = edge_index[[1, 0]] if edge_index.numel() > 0 else edge_index
-        for conv_td, conv_bu, mix in zip(self.convs_td, self.convs_bu, self.mix_projs):
-            h_td, _ = conv_td(h, h0, h0, edge_index, edge_attr)
-            h_bu, _ = conv_bu(h, h0, h0, rev_ei, edge_attr)
-            h = h + mix(torch.cat([h_td, h_bu], dim=-1))
-        return h
-
-    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor, pairs: Tensor) -> Tensor:
-        return self.head(self.encode(x, edge_index, edge_attr), pairs)
-
-
-def build_link_model(
-    model_name: str,
-    *,
-    in_dim: int,
-    hidden_dim: int = 64,
-    num_layers: int = 2,
-    dropout: float = 0.1,
-) -> nn.Module:
-    """Instantiate a signed link prediction architecture by canonical name."""
-    if model_name == "UserTextMLP":
-        return UserTextMLP(in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout)
-    if model_name == "StandardGCN":
-        return StandardGCNLink(in_dim=in_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout)
-    if model_name == "StandardGATv2":
-        return StandardGATv2Link(
-            in_dim=in_dim, hidden_dim=hidden_dim, num_layers=num_layers, heads=min(4, max(1, hidden_dim // 16)), dropout=dropout
-        )
-    if model_name == "SGCN":
-        return SGCNLink(in_dim=in_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout)
-    if model_name == "FAGCN":
-        return FAGCNLink(in_dim=in_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout)
-    if model_name == "SBiFAGAT-Link":
-        return SBiFAGATLink(in_dim=in_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout)
-    raise ValueError(f"Unknown link prediction model '{model_name}'")
 
 
 def _safe_binary_metrics(y_true: np.ndarray, probs: np.ndarray, threshold: float) -> tuple[float, float, float]:
@@ -420,16 +132,25 @@ def evaluate_link_split(
     threshold: float = 0.5,
     tune_threshold: bool = False,
 ) -> tuple[dict[str, float], float]:
-    """Evaluate all temporal edges and the transductive both-users-seen subset."""
+    """Evaluate all temporal edges, both_seen, unseen_pair_transductive, and unseen subsets."""
     model.eval()
     logits = model(x, mp_edge_index, mp_edge_attr, split["pairs"])
     probs = torch.sigmoid(logits).detach().cpu().numpy()
     y_true = split["y_oppose"].detach().cpu().numpy()
     both_seen = split["both_seen"].detach().cpu().numpy().astype(bool)
+    if "unseen_pair_mask" in split:
+        unseen_pair_mask = split["unseen_pair_mask"].detach().cpu().numpy().astype(bool)
+    else:
+        unseen_pair_mask = np.ones_like(both_seen, dtype=bool)
+    unseen_pair_trans = both_seen & unseen_pair_mask
+    unseen = ~both_seen
 
     used_th = _find_best_val_threshold(y_true, probs) if tune_threshold else float(threshold)
     roc, pr, mf1 = _safe_binary_metrics(y_true, probs, used_th)
     t_roc, t_pr, t_mf1 = _safe_binary_metrics(y_true[both_seen], probs[both_seen], used_th)
+    ut_roc, ut_pr, ut_mf1 = _safe_binary_metrics(y_true[unseen_pair_trans], probs[unseen_pair_trans], used_th)
+    u_roc, u_pr, u_mf1 = _safe_binary_metrics(y_true[unseen], probs[unseen], used_th)
+
     return {
         "roc_auc": roc,
         "pr_auc": pr,
@@ -437,6 +158,12 @@ def evaluate_link_split(
         "trans_roc_auc": t_roc,
         "trans_pr_auc": t_pr,
         "trans_macro_f1": t_mf1,
+        "unseen_pair_trans_roc_auc": ut_roc,
+        "unseen_pair_trans_pr_auc": ut_pr,
+        "unseen_pair_trans_macro_f1": ut_mf1,
+        "unseen_roc_auc": u_roc,
+        "unseen_pr_auc": u_pr,
+        "unseen_macro_f1": u_mf1,
     }, used_th
 
 
@@ -457,21 +184,39 @@ def _summarize_seed_metrics(runs: Sequence[Mapping[str, float]]) -> dict[str, tu
     return summary
 
 
+def _is_finite_num(val: Any) -> bool:
+    if val is None or isinstance(val, bool):
+        return False
+    try:
+        return math.isfinite(float(val))
+    except (TypeError, ValueError):
+        return False
+
+
 def _select_best_val_comparator(
-    val_summary_stats: Mapping[str, Mapping[str, tuple[float, float]]],
+    val_summary_stats: Mapping[str, Mapping[str, Sequence[float | None]]],
     *,
     reference_model: str = "SBiFAGAT-Link",
 ) -> str:
-    """Pick the strongest competing model strictly by average Val rank (zero Test peeking)."""
-    candidates = [m for m in val_summary_stats.keys() if m != reference_model]
+    """Pick the strongest learned competing model strictly by average Val rank (zero Test peeking)."""
+    candidates = [
+        m
+        for m in val_summary_stats.keys()
+        if m != reference_model and m not in _NON_LEARNED_BASELINES
+    ]
     if not candidates:
-        return "SGCN"
+        candidates = [m for m in val_summary_stats.keys() if m != reference_model]
+    if not candidates:
+        return "BiEdgeGATv2-Link"
     ranks: dict[str, list[float]] = {c: [] for c in candidates}
     for key, _, _ in LINK_PRED_METRICS:
         scored = [
             (c, float(val_summary_stats[c][key][0]))
             for c in candidates
-            if key in val_summary_stats[c] and math.isfinite(float(val_summary_stats[c][key][0]))
+            if key in val_summary_stats[c]
+            and val_summary_stats[c][key] is not None
+            and len(val_summary_stats[c][key]) >= 1
+            and _is_finite_num(val_summary_stats[c][key][0])
         ]
         if len(scored) < 2:
             continue
@@ -490,6 +235,278 @@ def _select_best_val_comparator(
     )
 
 
+def compute_wilcoxon_signed_rank(
+    scores_a: Sequence[float],
+    scores_b: Sequence[float],
+) -> float:
+    """Run two-sided paired Wilcoxon signed-rank test across matched seeds."""
+    arr_a = np.asarray(scores_a, dtype=np.float64)
+    arr_b = np.asarray(scores_b, dtype=np.float64)
+    valid = np.isfinite(arr_a) & np.isfinite(arr_b)
+    arr_a, arr_b = arr_a[valid], arr_b[valid]
+    n_obs = int(arr_a.size)
+    if n_obs < 2:
+        return float("nan")
+    diffs = arr_a - arr_b
+    if np.allclose(diffs, 0.0):
+        return 1.0
+    try:
+        res = wilcoxon(
+            arr_a,
+            arr_b,
+            zero_method="wilcox",
+            alternative="two-sided",
+            method="exact" if n_obs <= 25 else "auto",
+        )
+        p_val = float(res.pvalue)
+        return 1.0 if math.isnan(p_val) else p_val
+    except ValueError:
+        return 1.0
+
+
+def _resolve_link_marker(
+    benchmark_result: Mapping[str, Any],
+    key: str,
+    ref_model: str,
+    cmp_model: str,
+    lower_is_better: bool,
+    *,
+    latex: bool,
+) -> str:
+    """Return two-sided directional significance marker WITHOUT hiding comparator wins."""
+    summary_stats = benchmark_result["summary_stats"]
+    ref_stat = summary_stats.get(ref_model, {}).get(key)
+    cmp_stat = summary_stats.get(cmp_model, {}).get(key)
+    if ref_stat is None or cmp_stat is None or len(ref_stat) < 1 or len(cmp_stat) < 1:
+        return ""
+    if not (_is_finite_num(ref_stat[0]) and _is_finite_num(cmp_stat[0])):
+        return ""
+    ref_val, cmp_val = float(ref_stat[0]), float(cmp_stat[0])
+    if math.isclose(ref_val, cmp_val, abs_tol=1e-12):
+        return ""
+
+    p_val: float | None = None
+    for map_key in ("adjusted_p_values", "adjusted_bootstrap_p_values", "adjusted_wilcoxon_p_values", "p_values"):
+        pmap = benchmark_result.get(map_key) or {}
+        if key in pmap and _is_finite_num(pmap[key]):
+            p_val = float(pmap[key])
+            break
+    if p_val is None or p_val >= 0.05:
+        return ""
+
+    stars = "**" if p_val < 0.01 else "*"
+    ref_better = (ref_val < cmp_val) if lower_is_better else (ref_val > cmp_val)
+    direction = "+" if ref_better else "-"
+    if latex:
+        return f"$^{{{stars}({direction})}}$"
+    return f"{stars}({direction})"
+
+
+def _format_link_mean_std(
+    mean: float | None,
+    std: float | None,
+    *,
+    decimals: int = 4,
+    latex: bool = False,
+    bold: bool = False,
+    marker: str = "",
+) -> str:
+    if not _is_finite_num(mean):
+        return "--"
+    mean_val = float(mean)
+    std_safe = float(std) if _is_finite_num(std) else 0.0
+    pm = " $\\pm$ " if latex else " ± "
+    core = f"{mean_val:.{decimals}f}{pm}{std_safe:.{decimals}f}"
+    if bold and latex:
+        core = f"\\textbf{{{core}}}"
+    elif bold:
+        core = f"**{core}**"
+    return f"{core}{marker}"
+
+
+def _best_link_model_per_metric(
+    summary_stats: Mapping[str, Mapping[str, Sequence[float | None]]],
+    metrics: Sequence[tuple[str, str, bool]],
+) -> dict[str, str]:
+    best: dict[str, str] = {}
+    for key, _, lower_is_better in metrics:
+        candidates = [
+            (model_name, float(stats[key][0]))
+            for model_name, stats in summary_stats.items()
+            if key in stats
+            and stats[key] is not None
+            and len(stats[key]) >= 1
+            and _is_finite_num(stats[key][0])
+        ]
+        if not candidates:
+            continue
+        best[key] = (
+            min(candidates, key=lambda kv: kv[1])[0]
+            if lower_is_better
+            else max(candidates, key=lambda kv: kv[1])[0]
+        )
+    return best
+
+
+def build_link_markdown_table(
+    benchmark_result: Mapping[str, Any],
+    metrics: Sequence[tuple[str, str, bool]] = LINK_PRED_METRICS,
+    *,
+    decimals: int = 4,
+) -> str:
+    """Render Tier 2 signed link benchmark with two-sided directional significance markers."""
+    summary_stats = benchmark_result["summary_stats"]
+    ref_model = str(benchmark_result.get("reference_model", "SBiFAGAT-Link"))
+    cmp_model = str(benchmark_result.get("comparator_model", "BiEdgeGATv2-Link"))
+    best_by_metric = _best_link_model_per_metric(summary_stats, metrics)
+
+    headers = ["Model"] + [
+        label.replace("$\\downarrow$", "(↓)")
+        .replace("$\\uparrow$", "(↑)")
+        .replace(".\\", ".")
+        for _, label, _ in metrics
+    ]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join([":---"] + [":---:"] * len(metrics)) + " |",
+    ]
+    for model_name, stats in summary_stats.items():
+        cells = [model_name]
+        for key, _, lower_is_better in metrics:
+            pair = stats.get(key)
+            mean_v, std_v = (pair[0], pair[1]) if pair is not None and len(pair) >= 2 else (None, None)
+            marker = (
+                _resolve_link_marker(benchmark_result, key, ref_model, cmp_model, lower_is_better, latex=False)
+                if model_name == ref_model
+                else ""
+            )
+            cells.append(
+                _format_link_mean_std(
+                    mean_v,
+                    std_v,
+                    decimals=decimals,
+                    latex=False,
+                    bold=(best_by_metric.get(key) == model_name),
+                    marker=marker,
+                )
+            )
+        lines.append("| " + " | ".join(cells) + " |")
+
+    np_label = str(benchmark_result.get("nonparametric_test_label") or "Exact Perm")
+    stat_rows = (
+        (f"p-value ({ref_model} vs. {cmp_model})", "p_values"),
+        (f"Wilcoxon p ({ref_model} vs. {cmp_model})", "wilcoxon_p_values"),
+        (f"{np_label} p ({ref_model} vs. {cmp_model})", "bootstrap_p_values"),
+        (f"Holm-Bonf adj p ({ref_model} vs. {cmp_model})", "adjusted_p_values"),
+        (f"Holm-Bonf Wilcoxon p ({ref_model} vs. {cmp_model})", "adjusted_wilcoxon_p_values"),
+        (f"Holm-Bonf {np_label} p ({ref_model} vs. {cmp_model})", "adjusted_bootstrap_p_values"),
+    )
+    for row_title, map_key in stat_rows:
+        pmap = benchmark_result.get(map_key) or {}
+        if not pmap:
+            continue
+        p_cells = [row_title]
+        for key, _, _ in metrics:
+            pv = pmap.get(key)
+            p_cells.append("--" if not _is_finite_num(pv) else f"{float(pv):.4e}")
+        lines.append("| " + " | ".join(p_cells) + " |")
+
+    return "\n".join(lines)
+
+
+def export_link_latex_table(
+    benchmark_result: Mapping[str, Any],
+    output_path: str | Path,
+    *,
+    caption: str,
+    label: str,
+    metrics: Sequence[tuple[str, str, bool]] = LINK_PRED_METRICS,
+    decimals: int = 4,
+) -> Path:
+    """Export IEEEtran `booktabs` LaTeX table with two-sided directional significance markers."""
+    summary_stats = benchmark_result["summary_stats"]
+    ref_model = str(benchmark_result.get("reference_model", "SBiFAGAT-Link"))
+    cmp_model = str(benchmark_result.get("comparator_model", "BiEdgeGATv2-Link"))
+    ref_esc = ref_model.replace("_", "\\_").replace("&", "\\&")
+    cmp_esc = cmp_model.replace("_", "\\_").replace("&", "\\&")
+    best_by_metric = _best_link_model_per_metric(summary_stats, metrics)
+
+    col_spec = "l" + "c" * len(metrics)
+    header_row = " & ".join(["Model"] + [m_label for _, m_label, _ in metrics]) + r" \\"
+
+    body_rows: list[str] = []
+    for model_name, stats in summary_stats.items():
+        escaped_name = model_name.replace("_", "\\_").replace("&", "\\&")
+        cells = [escaped_name]
+        for key, _, lower_is_better in metrics:
+            pair = stats.get(key)
+            mean_v, std_v = (pair[0], pair[1]) if pair is not None and len(pair) >= 2 else (None, None)
+            marker = (
+                _resolve_link_marker(benchmark_result, key, ref_model, cmp_model, lower_is_better, latex=True)
+                if model_name == ref_model
+                else ""
+            )
+            cells.append(
+                _format_link_mean_std(
+                    mean_v,
+                    std_v,
+                    decimals=decimals,
+                    latex=True,
+                    bold=(best_by_metric.get(key) == model_name),
+                    marker=marker,
+                )
+            )
+        body_rows.append(" & ".join(cells) + r" \\")
+
+    np_label = str(benchmark_result.get("nonparametric_test_label") or "Exact Perm").replace("_", "\\_")
+    stat_rows = (
+        (f"$p$-value ({ref_esc} vs. {cmp_esc})", "p_values"),
+        (f"Wilcoxon $p$ ({ref_esc} vs. {cmp_esc})", "wilcoxon_p_values"),
+        (f"{np_label} $p$ ({ref_esc} vs. {cmp_esc})", "bootstrap_p_values"),
+        (f"Holm-Bonferroni $p$ ({ref_esc} vs. {cmp_esc})", "adjusted_p_values"),
+        (f"Holm-Bonf Wilcoxon $p$ ({ref_esc} vs. {cmp_esc})", "adjusted_wilcoxon_p_values"),
+        (f"Holm-Bonf {np_label} $p$ ({ref_esc} vs. {cmp_esc})", "adjusted_bootstrap_p_values"),
+    )
+    p_lines: list[str] = []
+    for row_title, map_key in stat_rows:
+        pmap = benchmark_result.get(map_key) or {}
+        if not pmap:
+            continue
+        p_cells = [row_title]
+        for key, _, _ in metrics:
+            pv = pmap.get(key)
+            p_cells.append("--" if not _is_finite_num(pv) else f"{float(pv):.2e}")
+        p_lines.append(" & ".join(p_cells) + r" \\")
+
+    p_row_str = ("\\midrule\n" + "\n".join(p_lines) + "\n") if p_lines else ""
+    is_wide = len(metrics) >= 5
+    env = "table*" if is_wide else "table"
+    box_width = "\\textwidth" if is_wide else "\\columnwidth"
+
+    latex = (
+        f"\\begin{{{env}}}[t]\n"
+        "\\centering\n"
+        f"\\caption{{{caption}}}\n"
+        f"\\label{{{label}}}\n"
+        f"\\resizebox{{{box_width}}}{{!}}{{\n"
+        f"\\begin{{tabular}}{{{col_spec}}}\n"
+        "\\toprule\n"
+        f"{header_row}\n"
+        "\\midrule\n"
+        + "\n".join(body_rows)
+        + "\n"
+        + p_row_str
+        + "\\bottomrule\n"
+        "\\end{tabular}\n"
+        "}\n"
+        f"\\end{{{env}}}\n"
+    )
+    out_file = Path(output_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_text(latex, encoding="utf-8")
+    return out_file
+
+
 def _train_single_seed(
     model_name: str,
     dataset: Mapping[str, Any],
@@ -502,10 +519,13 @@ def _train_single_seed(
     lr: float,
     patience: int,
     batch_size: int,
+    mp_graph_mode: str = "coalesced",
+    aux_weight: float = 0.2,
     device: torch.device,
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Train one model for one seed with strict intra-batch unordered-pair masking."""
     seed_everything(seed)
+    coalesce_edges = mp_graph_mode == "coalesced"
     x = dataset["x"].to(device)
     train_split = {k: v.to(device) for k, v in dataset["train"].items()}
     val_split = {k: v.to(device) for k, v in dataset["val"].items()}
@@ -516,6 +536,25 @@ def _train_single_seed(
     train_y = train_split["y_oppose"]
     num_users = int(dataset["num_users"])
     num_train = int(train_y.size(0))
+
+    model = build_link_model(
+        model_name,
+        in_dim=int(dataset["in_dim"]),
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        dropout=dropout,
+        coalesce_edges=coalesce_edges,
+    ).to(device)
+
+    if isinstance(model, PriorPairSignPersistence):
+        model.fit(train_pairs, train_y, num_users=num_users)
+        final_val, best_threshold = evaluate_link_split(
+            model, x, train_pairs, train_attr, val_split, tune_threshold=True
+        )
+        final_test, _ = evaluate_link_split(
+            model, x, train_pairs, train_attr, test_split, threshold=best_threshold, tune_threshold=False
+        )
+        return final_val, final_test
 
     # Precompute unordered pair IDs so mini-batch supervision pairs are masked out
     # of message passing (prevents reading the target edge's own [s_uv, h_uv] attr).
@@ -528,13 +567,6 @@ def _train_single_seed(
     pos_weight_val = min(10.0, max(0.1, n_neg / max(1.0, n_pos))) if n_pos > 0 else 1.0
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_val], device=device))
 
-    model = build_link_model(
-        model_name,
-        in_dim=int(dataset["in_dim"]),
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
-        dropout=dropout,
-    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
     best_score = -1.0
@@ -559,8 +591,15 @@ def _train_single_seed(
             mp_ea = train_attr[keep_mask]
 
             optimizer.zero_grad(set_to_none=True)
-            logits = model(x, mp_ei, mp_ea, train_pairs[:, b_idx])
-            loss = criterion(logits, train_y[b_idx])
+            if hasattr(model, "encode") and hasattr(model, "head"):
+                h = model.encode(x, mp_ei, mp_ea)
+                logits = model.head(h, train_pairs[:, b_idx])
+                loss = criterion(logits, train_y[b_idx])
+                if hasattr(model, "compute_aux_loss") and aux_weight > 0.0:
+                    loss = loss + float(aux_weight) * model.compute_aux_loss(h, mp_ei, mp_ea)
+            else:
+                logits = model(x, mp_ei, mp_ea, train_pairs[:, b_idx])
+                loss = criterion(logits, train_y[b_idx])
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -593,6 +632,10 @@ def _train_single_seed(
     return final_val, final_test
 
 
+def _fmt_metric_inline(val: float) -> str:
+    return "nan" if not math.isfinite(val) else f"{val:.4f}"
+
+
 def run_signed_link_benchmark(
     data_dir: Path,
     *,
@@ -607,14 +650,20 @@ def run_signed_link_benchmark(
     patience: int = 8,
     batch_size: int = 1024,
     stance_threshold: float = 0.1,
+    mp_graph_mode: str = "coalesced",
+    aux_weight: float = 0.2,
+    prefer_teacher: bool = True,
     device: torch.device | None = None,
 ) -> dict[str, Any]:
     """Run multi-seed chronological signed link prediction benchmark."""
+    if mp_graph_mode not in {"coalesced", "multiedge"}:
+        raise ValueError(f"mp_graph_mode must be 'coalesced' or 'multiedge', got {mp_graph_mode!r}")
     run_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset = build_temporal_signed_link_dataset(
         data_dir,
         dataset_name=dataset_name,
         stance_threshold=stance_threshold,
+        prefer_teacher=prefer_teacher,
     )
     raw_val: dict[str, list[dict[str, float]]] = {m: [] for m in models}
     raw_test: dict[str, list[dict[str, float]]] = {m: [] for m in models}
@@ -632,14 +681,18 @@ def run_signed_link_benchmark(
                 lr=lr,
                 patience=patience,
                 batch_size=batch_size,
+                mp_graph_mode=mp_graph_mode,
+                aux_weight=aux_weight,
                 device=run_device,
             )
             raw_val[model_name].append(v_m)
             raw_test[model_name].append(t_m)
             print(
                 f"  [{dataset['dataset']}] {model_name} seed={s}: "
-                f"Val ROC-AUC={v_m['roc_auc']:.4f} | Test ROC-AUC={t_m['roc_auc']:.4f} "
-                f"PR-AUC={t_m['pr_auc']:.4f} F1={t_m['macro_f1']:.4f}",
+                f"Val ROC={_fmt_metric_inline(v_m['roc_auc'])} | "
+                f"Test ROC={_fmt_metric_inline(t_m['roc_auc'])} "
+                f"UnseenPairTrans={_fmt_metric_inline(t_m['unseen_pair_trans_roc_auc'])} "
+                f"Unseen={_fmt_metric_inline(t_m['unseen_roc_auc'])}",
                 flush=True,
             )
 
@@ -651,16 +704,21 @@ def run_signed_link_benchmark(
 
     p_values: dict[str, float] = {}
     boot_p_values: dict[str, float] = {}
+    wilcoxon_p_values: dict[str, float] = {}
     if ref_model in raw_test and cmp_model in raw_test and len(seeds) >= 2:
         for key, _, _ in LINK_PRED_METRICS:
             a_vals = [float(r[key]) for r in raw_test[ref_model]]
             b_vals = [float(r[key]) for r in raw_test[cmp_model]]
             p_values[key] = compute_paired_ttest(a_vals, b_vals)
             boot_p_values[key] = compute_paired_bootstrap_pvalue(a_vals, b_vals)
+            wilcoxon_p_values[key] = compute_wilcoxon_signed_rank(a_vals, b_vals)
 
+    test_split = dataset["test"]
     return {
         "dataset": dataset["dataset"],
         "edge_label_source": dataset["edge_label_source"],
+        "edge_source": dataset.get("edge_source", dataset["edge_label_source"]),
+        "mp_graph_mode": mp_graph_mode,
         "seeds": [int(s) for s in seeds],
         "reference_model": ref_model,
         "comparator_model": cmp_model,
@@ -670,6 +728,8 @@ def run_signed_link_benchmark(
         "adjusted_p_values": holm_bonferroni_adjust(p_values),
         "bootstrap_p_values": boot_p_values,
         "adjusted_bootstrap_p_values": holm_bonferroni_adjust(boot_p_values),
+        "wilcoxon_p_values": wilcoxon_p_values,
+        "adjusted_wilcoxon_p_values": holm_bonferroni_adjust(wilcoxon_p_values),
         "nonparametric_test_label": "Exact Perm" if len(seeds) < 6 else "Bootstrap",
         "raw_results": raw_test,
         "val_raw_results": raw_val,
@@ -678,8 +738,10 @@ def run_signed_link_benchmark(
             "train_users": int(len(dataset["train_user_set"])),
             "train_edges": int(dataset["train"]["y_oppose"].numel()),
             "val_edges": int(dataset["val"]["y_oppose"].numel()),
-            "test_edges": int(dataset["test"]["y_oppose"].numel()),
-            "test_transductive_edges": int(dataset["test"]["both_seen"].sum().item()),
+            "test_edges": int(test_split["y_oppose"].numel()),
+            "test_transductive_edges": int(test_split["both_seen"].sum().item()),
+            "test_unseen_pair_transductive_edges": int(test_split["unseen_pair_transductive"].sum().item()),
+            "test_unseen_edges": int((~test_split["both_seen"]).sum().item()),
         },
     }
 
@@ -700,7 +762,7 @@ def _collect_macro_stats_for_table(paper_dir: Path, latest_stats: Mapping[str, A
 
 
 def run_smoke_test() -> None:
-    """Offline <5s synthetic smoke test verifying macro stats + link-pred GNNs end-to-end."""
+    """Offline <15s synthetic smoke test verifying macro stats + all 10 signed link models end-to-end."""
     from datetime import datetime, timezone
 
     import pyarrow as pa
@@ -714,7 +776,6 @@ def run_smoke_test() -> None:
         out_paper = Path(tmp) / "paper"
         out_fig = Path(tmp) / "figs"
 
-        # 2 polarized camps of users across 6 cascades with valid schema & advancing timestamps
         nodes_rows: list[dict[str, Any]] = []
         edges_rows: list[dict[str, Any]] = []
         edge_stance_map: dict[str, float] = {}
@@ -802,9 +863,11 @@ def run_smoke_test() -> None:
             d / "nlp_features.pt",
         )
 
-        stats = compute_macro_signed_network_stats(d, num_null_perms=20, seed=42)
+        stats = compute_macro_signed_network_stats(d, num_null_perms=20, num_q_null_perms=5, seed=42)
         assert stats["num_users"] >= 10
         assert stats["structural_balance"]["num_triangles"] >= 0
+        assert "weak_balance_ratio" in stats["structural_balance"]
+        assert "q_signed_z_score" in stats["polarization"]
         out_paper.mkdir(parents=True, exist_ok=True)
         out_fig.mkdir(parents=True, exist_ok=True)
         (out_paper / "results_macro_network_smoke.json").write_text(
@@ -820,18 +883,38 @@ def run_smoke_test() -> None:
             models=LINK_PRED_MODEL_NAMES,
             seeds=[42, 100],
             hidden_dim=16,
-            epochs=3,
-            patience=3,
+            num_layers=1,
+            epochs=1,
+            patience=1,
             batch_size=32,
         )
-        export_latex_table(
+        assert len(bench["summary_stats"]) == len(LINK_PRED_MODEL_NAMES)
+        assert "wilcoxon_p_values" in bench and "adjusted_wilcoxon_p_values" in bench
+        assert "unseen_pair_trans_roc_auc" in bench["summary_stats"]["SBiFAGAT-Link"]
+        assert "unseen_roc_auc" in bench["summary_stats"]["SBiFAGAT-Link"]
+
+        md_table = build_link_markdown_table(bench)
+        assert "Wilcoxon p" in md_table
+        tex_path = export_link_latex_table(
             bench,
             out_paper / "tables_signed_link_smoke.tex",
             caption="Smoke Signed Link Benchmark.",
             label="tab:smoke_link",
             metrics=LINK_PRED_METRICS,
         )
-        serialize_benchmark_json(bench, out_paper / "results_signed_link_smoke.json")
+        assert tex_path.exists()
+        serialize_benchmark_json(
+            bench,
+            out_paper / "results_signed_link_smoke.json",
+            extra={
+                "val_summary_stats": bench["val_summary_stats"],
+                "split_counts": bench["split_counts"],
+                "wilcoxon_p_values": bench["wilcoxon_p_values"],
+                "adjusted_wilcoxon_p_values": bench["adjusted_wilcoxon_p_values"],
+                "nonparametric_test_label": bench["nonparametric_test_label"],
+                "mp_graph_mode": bench["mp_graph_mode"],
+            },
+        )
         print("SMOKE TEST PASSED:", json.dumps(bench["split_counts"]))
 
 
@@ -840,6 +923,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed/vn"), help="Processed dataset directory")
     parser.add_argument("--dataset-name", type=str, default=None, help="Override canonical dataset tag (e.g. vn or pheme)")
     parser.add_argument("--analysis-only", action="store_true", help="Run sparse CPU network polarization analytics + fig5 only")
+    parser.add_argument("--models", type=str, nargs="+", default=None, help="Subset of link prediction models to run")
+    parser.add_argument("--seeds", type=int, nargs="+", default=list(OFFICIAL_SEEDS), help="Random seeds")
     parser.add_argument("--epochs", type=int, default=40, help="Max epochs per seed for signed link prediction")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--patience", type=int, default=8, help="Early stopping patience on Val ROC-AUC")
@@ -848,8 +933,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num-layers", type=int, default=2, help="GNN layer depth")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
     parser.add_argument("--num-null-perms", type=int, default=100, help="Uniform edge-sign permutations for SBT z-score")
-    parser.add_argument("--paper-dir", type=Path, default=Path("paper"), help="Output directory for JSON and LaTeX tables")
-    parser.add_argument("--figures-dir", type=Path, default=None, help="Override figure output dir (default paper/figures/<ds>)")
+    parser.add_argument("--num-q-null-perms", type=int, default=20, help="Sign permutations for Q_signed null-graph test")
+    parser.add_argument(
+        "--mp-graph-mode",
+        type=str,
+        choices=["coalesced", "multiedge"],
+        default="coalesced",
+        help="Message-passing edge canonicalization mode across all GNNs",
+    )
+    parser.add_argument("--aux-weight", type=float, default=0.2, help="Auxiliary structural loss weight (SDGNN)")
+    parser.add_argument("--stance-threshold", type=float, default=0.1, help="Minimum |s_uv| for signed interactions")
+    parser.add_argument("--prefer-student", action="store_true", help="Use student edge stance instead of teacher")
+    parser.add_argument("--paper-dir", type=Path, default=Path("results"), help="Output directory for JSON and LaTeX tables")
+    parser.add_argument("--figures-dir", type=Path, default=None, help="Override figure output dir (default results/figures/<ds>)")
     parser.add_argument("--smoke-test", action="store_true", help="Run fast offline synthetic smoke test in tempdir")
     return parser.parse_args(argv)
 
@@ -867,7 +963,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     stats = compute_macro_signed_network_stats(
         data_dir,
         dataset_name=args.dataset_name,
+        stance_threshold=args.stance_threshold,
         num_null_perms=args.num_null_perms,
+        num_q_null_perms=args.num_q_null_perms,
         seed=42,
     )
     ds_name = str(stats["dataset"])
@@ -881,10 +979,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     fig_dir = Path(args.figures_dir) if args.figures_dir is not None else (paper_dir / "figures" / ds_name)
     pdf_p, svg_p = plot_macro_signed_network(stats, output_dir=fig_dir)
     print(
-        f"[{ds_name}] Macro Signed Network: users={stats['num_users']:,} "
+        f"[{ds_name}] Macro Signed Network: active={stats['active_graph_users']:,}/{stats['num_users']:,} "
         f"interactions={stats['num_interactions']:,} balanced={stats['structural_balance']['balanced_ratio']:.4f} "
         f"(z={stats['structural_balance']['balance_z_score']:.2f}), "
-        f"Q_signed={stats['polarization']['signed_modularity']:.4f}, "
+        f"weak_bal={stats['structural_balance']['weak_balance_ratio']:.4f} "
+        f"(z={stats['structural_balance']['weak_balance_z_score']:.2f}), "
+        f"Q_signed={stats['polarization']['signed_modularity']:.4f} "
+        f"(z_Q={stats['polarization']['q_signed_z_score']:.2f}), "
         f"RWC={stats['polarization']['rwc']:.4f}",
         flush=True,
     )
@@ -893,11 +994,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.analysis_only:
         return
 
+    selected_models = tuple(args.models) if args.models else LINK_PRED_MODEL_NAMES
     bench = run_signed_link_benchmark(
         data_dir,
         dataset_name=args.dataset_name,
-        models=LINK_PRED_MODEL_NAMES,
-        seeds=OFFICIAL_SEEDS,
+        models=selected_models,
+        seeds=args.seeds,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
@@ -905,30 +1007,40 @@ def main(argv: Sequence[str] | None = None) -> None:
         lr=args.lr,
         patience=args.patience,
         batch_size=args.batch_size,
+        stance_threshold=args.stance_threshold,
+        mp_graph_mode=args.mp_graph_mode,
+        aux_weight=args.aux_weight,
+        prefer_teacher=not args.prefer_student,
     )
     link_json = paper_dir / f"results_signed_link_{ds_name}.json"
     link_tex = paper_dir / f"tables_signed_link_{ds_name}.tex"
+    link_md = paper_dir / f"summary_signed_link_{ds_name}.md"
     ds_upper = ds_name.upper().replace("_", "\\_")
-    export_latex_table(
+    export_link_latex_table(
         bench,
         link_tex,
         caption=(
             f"Macro Temporal Signed Link Prediction on {ds_upper} (opposing vs.\\ supporting reply edges, "
-            f"mean $\\pm$ std over 5 seeds; train batch pairs are masked; user features are aggregated strictly from pre-cutoff Train timestamps)."
+            f"mean $\\pm$ std over {len(args.seeds)} seeds; train batch pairs are masked; user features are aggregated strictly from pre-cutoff Train timestamps)."
         ),
         label=f"tab:signed_link_{ds_name}",
         metrics=LINK_PRED_METRICS,
     )
+    link_md.write_text(build_link_markdown_table(bench) + "\n", encoding="utf-8")
     serialize_benchmark_json(
         bench,
         link_json,
         extra={
             "val_summary_stats": bench["val_summary_stats"],
             "split_counts": bench["split_counts"],
+            "wilcoxon_p_values": bench["wilcoxon_p_values"],
+            "adjusted_wilcoxon_p_values": bench["adjusted_wilcoxon_p_values"],
             "nonparametric_test_label": bench["nonparametric_test_label"],
+            "mp_graph_mode": bench["mp_graph_mode"],
+            "edge_source": bench["edge_source"],
         },
     )
-    print(f"Exported signed link benchmark: {link_json}, {link_tex}", flush=True)
+    print(f"Exported signed link benchmark: {link_json}, {link_tex}, {link_md}", flush=True)
 
 
 if __name__ == "__main__":

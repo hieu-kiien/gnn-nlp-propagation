@@ -68,8 +68,16 @@ def test_vn_empirical_regime_thresholds_calibrated_and_ordered() -> None:
         "irrational_fallacy": 0,
         "hostile_conflict": 0,
     }
+    heavy_counts = {
+        "support": 0,
+        "neutral": 0,
+        "constructive_oppose": 6,
+        "hostile_conflict": 6,
+    }
     assert "< Q50" in plt_mod._classify_calibrated_regime(plt_mod.VN_POLAR_Q50 - 0.01, empty_counts)
+    assert "< Q50" in plt_mod._classify_calibrated_regime(plt_mod.VN_POLAR_Q50 - 0.01, heavy_counts)
     assert "Q50-Q75" in plt_mod._classify_calibrated_regime(plt_mod.VN_POLAR_Q50 + 0.005, empty_counts)
+    assert "Q50-Q75" in plt_mod._classify_calibrated_regime(plt_mod.VN_POLAR_Q50 + 0.005, heavy_counts)
     assert "Q75-Q90" in plt_mod._classify_calibrated_regime(plt_mod.VN_POLAR_Q75 + 0.005, empty_counts)
     assert ">= Q90" in plt_mod._classify_calibrated_regime(plt_mod.VN_POLAR_Q90 + 0.005, empty_counts)
 
@@ -444,3 +452,38 @@ def test_run_experiments_loo_edge_source_and_macro_wording(tmp_path: Path) -> No
 
     exp_src = (repo_root / "scripts" / "run_experiments.py").read_text(encoding="utf-8")
     assert 'args.eval_protocol == "loo"' in exp_src and '"teacher"' in exp_src
+
+
+def test_benchmark_efficiency_biedgegatv2_and_honest_e2e_profiler(tmp_path: Path) -> None:
+    """M7 regression: BiEdgeGATv2 is profiled and include_e2e=True honestly reports missing DualCE weights."""
+    from scripts.benchmark_efficiency import run_efficiency_benchmark
+
+    missing_ce = tmp_path / "missing_ce"
+    missing_ce.mkdir()
+    (missing_ce / "config.json").write_text("{}", encoding="utf-8")
+    (missing_ce / "dual_head_meta.json").write_text('{"lang":"vi"}', encoding="utf-8")
+
+    out = run_efficiency_benchmark(
+        num_cascades=2,
+        k_horizon=10,
+        hidden_dim=32,
+        edge_dim=2,
+        warmup=1,
+        repeats=1,
+        include_e2e=True,
+        ce_ckpt=missing_ce,
+        gnn_ckpt=tmp_path / "missing_gnn.pt",
+        device=torch.device("cpu"),
+    )
+    assert isinstance(out, dict)
+    models = {r["model"]: r for r in out["models"]}
+    assert "BiEdgeGATv2" in models
+    assert "SBiFAGAT" in models
+    e2e = out["e2e_raw_text_profile"]
+    assert e2e["num_nodes"] == 11
+    assert e2e["cross_encoder_loaded"] is False
+    assert e2e["cross_encoder_ms"] is None
+    assert e2e["is_partial_without_dual_ce"] is True
+    assert e2e["e2e_total_ms"] > 0.0
+    assert e2e["graph_and_stats_ms"] > 0.0
+    assert e2e["gnn_forward_ms"] > 0.0

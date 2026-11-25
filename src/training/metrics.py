@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -21,6 +22,7 @@ def compute_multitask_loss(
     alpha_rumor: float = 1.0,
     size_loss_scale: float = 1.0,
     polar_loss_scale: float = 1.0,
+    rumor_loss_scale: float | None = None,
     lambda_uncertainty: float = 0.0,
     beta_nll: float = 0.5,
     huber_delta: float | None = None,
@@ -94,12 +96,19 @@ def compute_multitask_loss(
                 y_rumor_flat[valid_mask],
                 weight=ce_weight,
             )
-            total_loss = total_loss + alpha_rumor * loss_rumor
+            r_scale = (
+                float(rumor_loss_scale)
+                if rumor_loss_scale is not None
+                else 1.0 / math.log(float(max(2, logits.size(-1))))
+            )
+            total_loss = total_loss + (float(alpha_rumor) * r_scale) * loss_rumor
 
     return total_loss
 
 
 def _safe_spearman(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    if y_true.size == 0 or not (np.all(np.isfinite(y_true)) and np.all(np.isfinite(y_pred))):
+        return float("nan")
     if y_true.size >= 2 and np.std(y_true) > 1e-12 and np.std(y_pred) > 1e-12:
         val = float(spearmanr(y_true, y_pred).statistic)
         return 0.0 if np.isnan(val) else val
@@ -107,8 +116,13 @@ def _safe_spearman(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 def _safe_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    if y_true.size == 0 or not (np.all(np.isfinite(y_true)) and np.all(np.isfinite(y_pred))):
+        return float("nan")
     if y_true.size >= 2 and np.std(y_true) > 1e-12:
-        return float(r2_score(y_true, y_pred))
+        try:
+            return float(r2_score(y_true, y_pred))
+        except ValueError:
+            return float("nan")
     return 0.0
 
 
@@ -132,21 +146,33 @@ def evaluate_predictions(
     y_polar_true = np.asarray(y_polar_true, dtype=np.float64).reshape(-1)
     y_polar_pred = np.asarray(y_polar_pred, dtype=np.float64).reshape(-1)
 
-    msle = float(np.mean((y_size_pred - y_size_true) ** 2)) if y_size_true.size > 0 else float("nan")
-    rmse_size = float(np.sqrt(msle)) if y_size_true.size > 0 else float("nan")
-    mae = float(np.mean(np.abs(y_size_pred - y_size_true))) if y_size_true.size > 0 else float("nan")
-    r2_size = _safe_r2(y_size_true, y_size_pred) if y_size_true.size > 0 else float("nan")
-    spearman_size = _safe_spearman(y_size_true, y_size_pred) if y_size_true.size > 0 else float("nan")
+    size_valid = y_size_true.size > 0 and bool(
+        np.all(np.isfinite(y_size_true)) and np.all(np.isfinite(y_size_pred))
+    )
+    msle = float(np.mean((y_size_pred - y_size_true) ** 2)) if size_valid else float("nan")
+    rmse_size = float(np.sqrt(msle)) if size_valid else float("nan")
+    mae = float(np.mean(np.abs(y_size_pred - y_size_true))) if size_valid else float("nan")
+    r2_size = _safe_r2(y_size_true, y_size_pred) if size_valid else float("nan")
+    spearman_size = _safe_spearman(y_size_true, y_size_pred) if size_valid else float("nan")
 
+    polar_valid = y_polar_true.size > 0 and bool(
+        np.all(np.isfinite(y_polar_true)) and np.all(np.isfinite(y_polar_pred))
+    )
     rmse = (
         float(np.sqrt(np.mean((y_polar_pred - y_polar_true) ** 2)))
-        if y_polar_true.size > 0
+        if polar_valid
         else float("nan")
     )
-    mae_polar = float(np.mean(np.abs(y_polar_pred - y_polar_true))) if y_polar_true.size > 0 else float("nan")
-    r2_polar = _safe_r2(y_polar_true, y_polar_pred) if y_polar_true.size > 0 else float("nan")
+    mae_polar = (
+        float(np.mean(np.abs(y_polar_pred - y_polar_true)))
+        if polar_valid
+        else float("nan")
+    )
+    r2_polar = _safe_r2(y_polar_true, y_polar_pred) if polar_valid else float("nan")
 
-    if (
+    if not polar_valid:
+        pearson_val = float("nan")
+    elif (
         y_polar_true.size >= 2
         and np.std(y_polar_true) > 1e-12
         and np.std(y_polar_pred) > 1e-12
@@ -156,7 +182,7 @@ def evaluate_predictions(
             pearson_val = 0.0
     else:
         pearson_val = 0.0
-    spearman_polar = _safe_spearman(y_polar_true, y_polar_pred) if y_polar_true.size > 0 else float("nan")
+    spearman_polar = _safe_spearman(y_polar_true, y_polar_pred) if polar_valid else float("nan")
 
     macro_f1 = float("nan")
     accuracy = float("nan")
@@ -166,31 +192,32 @@ def evaluate_predictions(
         valid_mask = y_rumor_arr >= 0
         if np.any(valid_mask):
             logits_valid = np.asarray(rumor_logits, dtype=np.float64)[valid_mask]
-            preds = np.argmax(logits_valid, axis=-1)
-            truth = y_rumor_arr[valid_mask]
-            macro_f1 = float(f1_score(truth, preds, average="macro", zero_division=0))
-            accuracy = float(accuracy_score(truth, preds))
+            if np.all(np.isfinite(logits_valid)):
+                preds = np.argmax(logits_valid, axis=-1)
+                truth = y_rumor_arr[valid_mask]
+                macro_f1 = float(f1_score(truth, preds, average="macro", zero_division=0))
+                accuracy = float(accuracy_score(truth, preds))
 
-            probs = torch.softmax(torch.as_tensor(logits_valid, dtype=torch.float64), dim=-1).numpy()
-            unique_cls = np.unique(truth)
-            if unique_cls.size >= 2 and probs.ndim == 2:
-                try:
-                    if probs.shape[1] == 2:
-                        auc_roc = float(roc_auc_score(truth, probs[:, 1]))
-                    elif unique_cls.size == probs.shape[1]:
-                        auc_roc = float(
-                            roc_auc_score(truth, probs, multi_class="ovr", average="macro")
-                        )
-                    else:
-                        cls_aucs = [
-                            float(roc_auc_score((truth == c).astype(np.int64), probs[:, int(c)]))
-                            for c in unique_cls
-                            if int(c) < probs.shape[1]
-                        ]
-                        if cls_aucs:
-                            auc_roc = float(np.mean(cls_aucs))
-                except ValueError:
-                    auc_roc = float("nan")
+                probs = torch.softmax(torch.as_tensor(logits_valid, dtype=torch.float64), dim=-1).numpy()
+                unique_cls = np.unique(truth)
+                if unique_cls.size >= 2 and probs.ndim == 2:
+                    try:
+                        if probs.shape[1] == 2:
+                            auc_roc = float(roc_auc_score(truth, probs[:, 1]))
+                        elif unique_cls.size == probs.shape[1]:
+                            auc_roc = float(
+                                roc_auc_score(truth, probs, multi_class="ovr", average="macro")
+                            )
+                        else:
+                            cls_aucs = [
+                                float(roc_auc_score((truth == c).astype(np.int64), probs[:, int(c)]))
+                                for c in unique_cls
+                                if int(c) < probs.shape[1]
+                            ]
+                            if cls_aucs:
+                                auc_roc = float(np.mean(cls_aucs))
+                    except ValueError:
+                        auc_roc = float("nan")
 
     out: dict[str, float] = {
         "msle": msle,

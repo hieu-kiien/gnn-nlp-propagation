@@ -15,7 +15,6 @@
     support: "Tán thành / Ủng hộ",
     neutral: "Trung lập / Hỏi thông tin",
     constructive_oppose: "Phản biện ôn hòa",
-    irrational_fallacy: "Ngụy biện / Bẻ lái",
     hostile_conflict: "Xung đột / Gay gắt cao",
   };
 
@@ -244,12 +243,17 @@
     $("kpi-actual-replies").textContent = fmtInt(fc.actual_total_replies);
 
     $("kpi-pred-polar").textContent = fmtNum(fc.predicted_polarization_score, 4);
-    $("kpi-actual-polar").textContent = fc.has_future_replies
-      ? fmtNum(fc.actual_y_polar, 4)
-      : `${fmtNum(fc.actual_y_polar, 4)} (quan sát)`;
+    $("kpi-early-polar").textContent = fmtNum(fc.early_y_polar, 4);
+    $("kpi-actual-polar").textContent =
+      fc.has_future_replies && fc.actual_y_polar !== null && fc.actual_y_polar !== undefined
+        ? fmtNum(fc.actual_y_polar, 4)
+        : "Chưa có (t <= K)";
 
     $("kpi-regime").textContent = fc.predicted_regime || "—";
-    $("kpi-confidence").textContent = fmtPct(fc.confidence_score, 1);
+    $("kpi-confidence").textContent =
+      fc.confidence_score !== null && fc.confidence_score !== undefined && fc.uncertainty_available !== false
+        ? fmtPct(fc.confidence_score, 1)
+        : "N/A (disabled)";
     $("kpi-authors").textContent = fmtInt(meta.author_count);
 
     const sc = fc.stance_counts || { support: 0, oppose: 0, neutral: 0 };
@@ -363,7 +367,7 @@
       ["Lập trường s_uv", node.is_root ? "Bài gốc (+1.0)" : fmtSigned(node.s_uv, 4)],
       ["Gay gắt h_uv", node.is_root ? "—" : fmtNum(node.h_uv, 4)],
       ["Cổng SBi-FAGAT γ_uv", node.is_root ? "—" : (node.gamma_td !== null && node.gamma_td !== undefined ? fmtSigned(node.gamma_td, 4) : "— (Top 5 bên dưới)")],
-      ["Nhóm diễn ngôn", BEHAVIOR_VI[node.behavior_label] || node.behavior_label || "—"],
+      ["Nhóm diễn ngôn 2D", BEHAVIOR_VI[node.behavior_label] || node.behavior_label || "—"],
     ];
     for (const [k, v] of entries) {
       const cell = el("div", { className: "kv-cell" });
@@ -943,7 +947,7 @@
 
     for (const item of idx.threads || []) {
       const label =
-        `${item.cascade_id} | y_polar=${fmtNum(item.actual_y_polar, 3)} | ` +
+        `${item.cascade_id} | y_polar=${fmtNum(item.actual_y_polar ?? item.early_y_polar, 3)} | ` +
         `N=${item.actual_total_replies} (dự báo ~${Math.round(item.predicted_total_replies)}) — ` +
         `${truncText(item.title_snippet, 68)}`;
       select.appendChild(el("option", { value: item.cascade_id }, label));
@@ -1034,9 +1038,14 @@
     const sb = m.structural_balance || {};
     const pol = m.polarization || {};
 
+    const activeUsers = m.active_graph_users ?? m.num_users;
+    const wccRatioActive =
+      m.largest_signed_wcc_ratio_active ??
+      (activeUsers ? Number(m.largest_signed_wcc_nodes || 0) / Number(activeUsers) : m.largest_signed_wcc_ratio);
+
     $("tier2-source-pill").textContent = `edge_label_source: ${m.edge_label_source || "teacher"}`;
     $("tier2-wcc-pill").textContent =
-      `WCC: ${fmtInt(m.largest_signed_wcc_nodes)} nút (${fmtPct(m.largest_signed_wcc_ratio, 1)})`;
+      `WCC: ${fmtInt(m.largest_signed_wcc_nodes)} / ${fmtInt(activeUsers)} active (${fmtPct(wccRatioActive, 1)})`;
 
     $("t2-q-signed").textContent = fmtNum(pol.signed_modularity, 4);
     $("t2-q-sub").textContent = `Q+: ${fmtNum(pol.q_pos, 4)} · Q-: ${fmtNum(pol.q_neg, 4)}`;
@@ -1052,14 +1061,15 @@
     const withinNeg = Number(pol.within_camp_neg_rate || 0);
     const crossNeg = Number(pol.cross_camp_neg_rate || 0);
     const deltaPp = (crossNeg - withinNeg) * 100;
-    $("t2-cross-delta").textContent = `+${deltaPp.toFixed(1)} pp`;
+    $("t2-cross-delta").textContent = `${deltaPp >= 0 ? "+" : ""}${deltaPp.toFixed(1)} pp`;
     $("t2-neg-rates").textContent = `Liên phe: ${fmtPct(crossNeg, 1)} · Trong phe: ${fmtPct(withinNeg, 1)}`;
 
     $("fig5-title").textContent = `Hình 5 · ${corp.label}: Cấu trúc 2 Phe & Tam giác Có dấu`;
     $("fig5-img").src = corp.figure_url;
     $("dialog-fig-img").src = corp.figure_url;
     $("fig5-caption").textContent =
-      `Tập ${corp.label}: ${fmtInt(m.num_users)} người dùng, ${fmtInt(m.num_interactions)} tương tác, ${fmtInt(m.signed_strong_pairs)} cặp có dấu mạnh.`;
+      `Tập ${corp.label}: ${fmtInt(activeUsers)} người dùng hoạt động trong đồ thị (${fmtInt(m.num_users)} tổng cohort), ` +
+      `${fmtInt(m.num_interactions)} tương tác, ${fmtInt(m.signed_strong_pairs)} cặp có dấu mạnh.`;
 
     renderSignedLinkTable(corp.signed_link);
   }

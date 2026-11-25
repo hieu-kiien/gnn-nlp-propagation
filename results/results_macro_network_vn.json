@@ -1,0 +1,72 @@
+{
+  "dataset": "vn",
+  "edge_label_source": "teacher",
+  "edge_source": "teacher",
+  "label_provenance": {
+    "edge_source": "teacher",
+    "is_silver_nli_derived": true,
+    "note": "Silver-standard model-derived stance/hostility scores (source=teacher); not human ground-truth annotations."
+  },
+  "filtered_zero_embedding_posts": 0,
+  "num_users": 13718,
+  "total_corpus_users": 13718,
+  "active_graph_users": 13718,
+  "multi_thread_users": 6541,
+  "active_5plus_users": 2567,
+  "num_interactions": 85398,
+  "unique_directed_pairs": 72406,
+  "unique_undirected_pairs": 58041,
+  "signed_strong_pairs": 32787,
+  "pos_interactions": 10200,
+  "neg_interactions": 39499,
+  "uncivil_interactions": 3816,
+  "largest_signed_wcc_nodes": 10475,
+  "largest_signed_wcc_ratio": 0.763595276279341,
+  "largest_signed_wcc_ratio_active": 0.763595276279341,
+  "largest_signed_wcc_ratio_corpus": 0.763595276279341,
+  "denominator_notes": {
+    "num_users": "Total valid-author nodes across cascades (including isolated authors without inter-user replies).",
+    "active_graph_users": "Users participating in >=1 valid non-self inter-user reply edge.",
+    "largest_signed_wcc_ratio": "largest_signed_wcc_nodes / active_graph_users (see largest_signed_wcc_ratio_corpus for total_corpus_users denominator)."
+  },
+  "camp_sizes": [
+    4807,
+    5668
+  ],
+  "structural_balance": {
+    "num_triangles": 5143,
+    "n_ppp": 70,
+    "n_ppn": 306,
+    "n_pnn": 1232,
+    "n_nnn": 3535,
+    "balanced_ratio": 0.2531596344545985,
+    "null_balanced_mean": 0.3696033443515459,
+    "null_balanced_std": 0.007674038816554186,
+    "balance_z_score": -15.173719169332172,
+    "weak_balance_ratio": 0.9405016527318686,
+    "weak_balance_null_mean": 0.9197102858253937,
+    "weak_balance_null_std": 0.004934097306974216,
+    "weak_balance_z_score": 4.213813715649025,
+    "weak_balance_p_value": 0.009900990099009901
+  },
+  "polarization": {
+    "rwc": -0.0924612362368521,
+    "rwc_used_all_adj_fallback": true,
+    "rwc_pos_undirected_edges": 5925,
+    "signed_modularity": 0.19878056337305192,
+    "q_pos": 0.23674885408042037,
+    "q_neg": -0.19126393906696953,
+    "q_signed_null_mean": 0.19771867167510715,
+    "q_signed_null_std": 0.003841208128436693,
+    "q_signed_z_score": 0.27644732137358535,
+    "q_signed_p_value": 0.3333333333333333,
+    "q_signed_null_perms": 20,
+    "spectral_bipartition_eigenvector": "evecs[:, 0] (smallest)",
+    "within_camp_mean_stance": -0.05380459120962074,
+    "cross_camp_mean_stance": -0.14251893222705478,
+    "within_camp_neg_rate": 0.3788704627159921,
+    "cross_camp_neg_rate": 0.5696898053895493,
+    "within_camp_uncivil_rate": 0.03954540183230894,
+    "cross_camp_uncivil_rate": 0.05085265208730107
+  }
+}

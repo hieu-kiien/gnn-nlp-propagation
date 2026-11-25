@@ -1,0 +1,82 @@
+{
+  "input_csv": "data\\interim\\pilot_calibration_vi_20.csv",
+  "unadjudicated_disagreements": {
+    "stance": 0,
+    "hostility": 0,
+    "behavior_5class": 0
+  },
+  "annotation_protocol": "single_verified_gold",
+  "machine_vs_gold": {
+    "adjudication_summary": {
+      "stance": {
+        "total_matched_rows": 20,
+        "unadjudicated_disagreements": 0,
+        "adjudication_coverage": 1.0
+      },
+      "hostility": {
+        "total_matched_rows": 20,
+        "unadjudicated_disagreements": 0,
+        "adjudication_coverage": 1.0
+      }
+    },
+    "stance": {
+      "num_samples": 20,
+      "total_matched_rows": 20,
+      "unadjudicated_disagreements": 0,
+      "adjudication_coverage": 1.0,
+      "macro_f1": 0.6640211640211641,
+      "accuracy": 0.7,
+      "weighted_macro_f1": 0.4658706739270136,
+      "weighted_accuracy": 0.6478447975896662,
+      "cohen_kappa_unweighted": 0.5419847328244276,
+      "pearson_r": 0.567777553646866,
+      "spearman_r": 0.5855894293419964,
+      "confusion_matrix": [
+        [
+          7,
+          2,
+          2
+        ],
+        [
+          0,
+          5,
+          2
+        ],
+        [
+          0,
+          0,
+          2
+        ]
+      ]
+    },
+    "hostility": {
+      "num_samples": 20,
+      "total_matched_rows": 20,
+      "unadjudicated_disagreements": 0,
+      "adjudication_coverage": 1.0,
+      "hostility_threshold": 0.5,
+      "positive_prevalence_unweighted": 0.05,
+      "positive_prevalence_weighted": 0.008074720267529359,
+      "macro_f1": 0.5670995670995671,
+      "accuracy": 0.75,
+      "uncivil_precision": 0.16666666666666666,
+      "uncivil_recall": 1.0,
+      "uncivil_f1": 0.2857142857142857,
+      "weighted_macro_f1": 0.6526144710386205,
+      "weighted_accuracy": 0.966091998388828,
+      "weighted_uncivil_precision": 0.19233436771582607,
+      "weighted_uncivil_recall": 1.0,
+      "weighted_uncivil_f1": 0.3226181730956629,
+      "roc_auc": 1.0,
+      "pr_auc": 1.0,
+      "weighted_roc_auc": 1.0,
+      "weighted_pr_auc": 1.0,
+      "unweighted_roc_auc": 1.0,
+      "unweighted_pr_auc": 1.0,
+      "roc_pr_auc_weighting_note": "roc_auc/pr_auc/weighted_* use inverse-propensity sampling_weight reflecting natural population prevalence (where rare positives yield lower PR-AUC despite high ROC-AUC); unweighted_* reflect the stratified audit sample.",
+      "cohen_kappa_unweighted": 0.21875,
+      "pearson_r": 0.41553847312245784,
+      "spearman_r": 0.3779644730092272
+    }
+  }
+}

@@ -30,6 +30,10 @@ import numpy as np
 import torch
 from scipy.stats import ConstantInputWarning, pearsonr, spearmanr
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from src.data.pyg_dataset import (
     DEFAULT_FORECAST_MIN_REPLIES,
     EarlyCascadeDataset,
@@ -125,6 +129,19 @@ def _bootstrap_mean_ci(
     return mean_v, [float(lo), float(hi)]
 
 
+def _resolve_single_root_idx(d: Any, num_nodes: int | None = None) -> int:
+    rt = getattr(d, "root_index", None)
+    if isinstance(rt, torch.Tensor) and rt.dtype != torch.bool and rt.numel() > 0:
+        r_idx = int(rt.view(-1)[0].item())
+    elif isinstance(rt, (int, np.integer)) and not isinstance(rt, bool):
+        r_idx = int(rt)
+    else:
+        r_idx = 0
+    if num_nodes is not None and num_nodes > 0 and not (0 <= r_idx < num_nodes):
+        return 0
+    return r_idx if r_idx >= 0 else 0
+
+
 def _resolve_edge_depths(data: Any) -> np.ndarray:
     """Compute destination node BFS depth relative to root for each edge in `edge_index_td`."""
     edge_index_td = getattr(data, "edge_index_td", getattr(data, "edge_index", None))
@@ -133,9 +150,14 @@ def _resolve_edge_depths(data: Any) -> np.ndarray:
 
     src_arr = edge_index_td[0].detach().cpu().numpy().astype(np.int64)
     dst_arr = edge_index_td[1].detach().cpu().numpy().astype(np.int64)
-    num_nodes = int(getattr(data, "num_nodes", int(data.x.size(0))))
-    root_t = getattr(data, "root_index", None)
-    root_idx = int(root_t.view(-1)[0].item()) if root_t is not None and root_t.numel() > 0 else 0
+    raw_nn = getattr(data, "num_nodes", None)
+    if raw_nn is not None:
+        num_nodes = int(raw_nn)
+    elif getattr(data, "x", None) is not None:
+        num_nodes = int(data.x.size(0))
+    else:
+        num_nodes = 0
+    root_idx = _resolve_single_root_idx(data, num_nodes if num_nodes > 0 else None)
 
     children: dict[int, list[int]] = {}
     for u, v in zip(src_arr.tolist(), dst_arr.tolist()):
@@ -189,19 +211,14 @@ def _clone_cascade_with_edge_attr(data: Any, new_edge_attr: torch.Tensor) -> Any
     raw_early = getattr(data, "early_y_polar", None)
     edge_index_td = getattr(data, "edge_index_td", getattr(data, "edge_index", None))
     if isinstance(raw_early, torch.Tensor) and edge_index_td is not None:
-        num_nodes = int(
-            getattr(
-                data,
-                "num_nodes",
-                int(data.x.size(0)) if getattr(data, "x", None) is not None else 0,
-            )
-        )
-        root_t = getattr(data, "root_index", None)
-        root_idx = (
-            int(root_t.view(-1)[0].item())
-            if root_t is not None and root_t.numel() > 0
-            else 0
-        )
+        raw_nn = getattr(data, "num_nodes", None)
+        if raw_nn is not None:
+            num_nodes = int(raw_nn)
+        elif getattr(data, "x", None) is not None:
+            num_nodes = int(data.x.size(0))
+        else:
+            num_nodes = 0
+        root_idx = _resolve_single_root_idx(data, num_nodes if num_nodes > 0 else None)
         children_adj: dict[str, list[str]] = {}
         edge_lookup: dict[tuple[str, str], dict[str, str]] = {}
         stance_map: dict[str, float] = {}
@@ -597,9 +614,9 @@ def main() -> None:
 
     ds_tag = args.data_dir.name.lower() if args.data_dir.name.lower() in {"pheme", "vn"} else ""
     suffix = f"_{ds_tag}" if ds_tag else ""
-    out_json = args.output_json or Path(f"paper/results_mechanisms{suffix}.json")
-    out_table = args.output_table or Path(f"paper/tables_mechanisms{suffix}.tex")
-    fig_dir = args.figures_dir or (Path("paper/figures") / ds_tag if ds_tag else Path("paper/figures"))
+    out_json = args.output_json or Path(f"results/results_mechanisms{suffix}.json")
+    out_table = args.output_table or Path(f"results/tables_mechanisms{suffix}.tex")
+    fig_dir = args.figures_dir or (Path("results/figures") / ds_tag if ds_tag else Path("results/figures"))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, _ = load_sbifagat_checkpoint(args.ckpt, device=device)

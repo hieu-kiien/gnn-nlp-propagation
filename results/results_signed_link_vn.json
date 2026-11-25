@@ -1,0 +1,1866 @@
+{
+  "seeds": [
+    42,
+    100,
+    2024,
+    777,
+    999
+  ],
+  "reference_model": "SBiFAGAT-Link",
+  "comparator_model": "SDGNN",
+  "summary_stats": {
+    "UserTextMLP": {
+      "roc_auc": [
+        0.5755208025414055,
+        0.013133347029131052
+      ],
+      "pr_auc": [
+        0.8406438281050734,
+        0.004499240569573154
+      ],
+      "macro_f1": [
+        0.5433700962055817,
+        0.010298579748818582
+      ],
+      "trans_roc_auc": [
+        0.590154943887683,
+        0.007297308902778703
+      ],
+      "trans_pr_auc": [
+        0.874964731757019,
+        0.0031109405985105315
+      ],
+      "trans_macro_f1": [
+        0.5409390883680805,
+        0.007417938866321089
+      ],
+      "unseen_pair_trans_roc_auc": [
+        0.5839655557868283,
+        0.007587201996861897
+      ],
+      "unseen_pair_trans_pr_auc": [
+        0.8729798064129038,
+        0.003347413966229908
+      ],
+      "unseen_pair_trans_macro_f1": [
+        0.53655564872253,
+        0.0059619806165546515
+      ],
+      "unseen_roc_auc": [
+        0.5579662178321347,
+        0.0205853012815066
+      ],
+      "unseen_pr_auc": [
+        0.8107538453977516,
+        0.010787468738411153
+      ],
+      "unseen_macro_f1": [
+        0.5371413684350139,
+        0.016561633442144272
+      ]
+    },
+    "PriorPairSignPersistence": {
+      "roc_auc": [
+        0.5906929607569981,
+        0.0
+      ],
+      "pr_auc": [
+        0.847178116826921,
+        0.0
+      ],
+      "macro_f1": [
+        0.5533531676037704,
+        0.0
+      ],
+      "trans_roc_auc": [
+        0.629622627349559,
+        0.0
+      ],
+      "trans_pr_auc": [
+        0.8903909511839305,
+        1.2412670766236366e-16
+      ],
+      "trans_macro_f1": [
+        0.576798435751223,
+        0.0
+      ],
+      "unseen_pair_trans_roc_auc": [
+        0.6235443311208246,
+        0.0
+      ],
+      "unseen_pair_trans_pr_auc": [
+        0.8893075841565874,
+        0.0
+      ],
+      "unseen_pair_trans_macro_f1": [
+        0.5741919746310525,
+        0.0
+      ],
+      "unseen_roc_auc": [
+        0.5755001974426999,
+        0.0
+      ],
+      "unseen_pr_auc": [
+        0.8290599253202767,
+        0.0
+      ],
+      "unseen_macro_f1": [
+        0.5437147213662532,
+        0.0
+      ]
+    },
+    "StandardGCN": {
+      "roc_auc": [
+        0.5602553640441892,
+        0.01606327419233097
+      ],
+      "pr_auc": [
+        0.8351431207130322,
+        0.005337501127840909
+      ],
+      "macro_f1": [
+        0.4798695559671189,
+        0.06538433525560874
+      ],
+      "trans_roc_auc": [
+        0.571727214473745,
+        0.030358935041250434
+      ],
+      "trans_pr_auc": [
+        0.8721223250311665,
+        0.0090853499107299
+      ],
+      "trans_macro_f1": [
+        0.5158706017594932,
+        0.02965518494603713
+      ],
+      "unseen_pair_trans_roc_auc": [
+        0.5667633386526052,
+        0.029443345416228072
+      ],
+      "unseen_pair_trans_pr_auc": [
+        0.87046360787069,
+        0.00876767694816164
+      ],
+      "unseen_pair_trans_macro_f1": [
+        0.513317769346786,
+        0.028294773360980477
+      ],
+      "unseen_roc_auc": [
+        0.5374113760365742,
+        0.02124351260882921
+      ],
+      "unseen_pr_auc": [
+        0.8016092672438717,
+        0.009482587349193664
+      ],
+      "unseen_macro_f1": [
+        0.42353440795472574,
+        0.13189745533506858
+      ]
+    },
+    "StandardGATv2": {
+      "roc_auc": [
+        0.5430031000599651,
+        0.017381980471184236
+      ],
+      "pr_auc": [
+        0.8317009111786964,
+        0.004626684207917476
+      ],
+      "macro_f1": [
+        0.48512882702288856,
+        0.07576066459001767
+      ],
+      "trans_roc_auc": [
+        0.5755085900337136,
+        0.0052212976169384705
+      ],
+      "trans_pr_auc": [
+        0.874759660166253,
+        0.0032693985900076497
+      ],
+      "trans_macro_f1": [
+        0.5138015295658807,
+        0.03298647491815992
+      ],
+      "unseen_pair_trans_roc_auc": [
+        0.5695480160657431,
+        0.006080089218291153
+      ],
+      "unseen_pair_trans_pr_auc": [
+        0.8730359586835696,
+        0.003756266853640016
+      ],
+      "unseen_pair_trans_macro_f1": [
+        0.5095118061764244,
+        0.030493233009813252
+      ],
+      "unseen_roc_auc": [
+        0.5096817891089495,
+        0.03247086063639516
+      ],
+      "unseen_pr_auc": [
+        0.7896403598355035,
+        0.012113989672583772
+      ],
+      "unseen_macro_f1": [
+        0.4378219030322047,
+        0.1433536715003692
+      ]
+    },
+    "SGCN": {
+      "roc_auc": [
+        0.5605438332865772,
+        0.019283989114958506
+      ],
+      "pr_auc": [
+        0.8350058312555259,
+        0.007741354298191432
+      ],
+      "macro_f1": [
+        0.5130408995608942,
+        0.061647110049468115
+      ],
+      "trans_roc_auc": [
+        0.6101259063409228,
+        0.007201741799395976
+      ],
+      "trans_pr_auc": [
+        0.8818512743578941,
+        0.0030645154859559143
+      ],
+      "trans_macro_f1": [
+        0.5494505414653288,
+        0.018300891410521134
+      ],
+      "unseen_pair_trans_roc_auc": [
+        0.6035401682123391,
+        0.006403352130916233
+      ],
+      "unseen_pair_trans_pr_auc": [
+        0.8793711805433377,
+        0.0028870285331853746
+      ],
+      "unseen_pair_trans_macro_f1": [
+        0.5464316290441109,
+        0.0189856416314616
+      ],
+      "unseen_roc_auc": [
+        0.5462107130740438,
+        0.008362868514092937
+      ],
+      "unseen_pr_auc": [
+        0.8092982242471196,
+        0.006175346414057172
+      ],
+      "unseen_macro_f1": [
+        0.4673176174111032,
+        0.12912443893257675
+      ]
+    },
+    "FAGCN": {
+      "roc_auc": [
+        0.5797112362964271,
+        0.01338956054741034
+      ],
+      "pr_auc": [
+        0.8437116768166282,
+        0.0076790823268128115
+      ],
+      "macro_f1": [
+        0.5327397924738295,
+        0.013328514533570323
+      ],
+      "trans_roc_auc": [
+        0.587134865838452,
+        0.010632305677929287
+      ],
+      "trans_pr_auc": [
+        0.8752604326360924,
+        0.005196200723271003
+      ],
+      "trans_macro_f1": [
+        0.5301650625431664,
+        0.02165851321621212
+      ],
+      "unseen_pair_trans_roc_auc": [
+        0.5803728115821365,
+        0.008797085030028365
+      ],
+      "unseen_pair_trans_pr_auc": [
+        0.8727425630170085,
+        0.00475753007915137
+      ],
+      "unseen_pair_trans_macro_f1": [
+        0.5261838688501695,
+        0.02058123816189136
+      ],
+      "unseen_roc_auc": [
+        0.5725803814259256,
+        0.01988203233197362
+      ],
+      "unseen_pr_auc": [
+        0.8226884293571992,
+        0.012060212641728392
+      ],
+      "unseen_macro_f1": [
+        0.5254856001503393,
+        0.028899040833085844
+      ]
+    },
+    "BiEdgeGATv2-Link": {
+      "roc_auc": [
+        0.5732257058679722,
+        0.02101006362865676
+      ],
+      "pr_auc": [
+        0.8411569769271123,
+        0.007564447234680367
+      ],
+      "macro_f1": [
+        0.5263528427623966,
+        0.024653243996236886
+      ],
+      "trans_roc_auc": [
+        0.5836057647900985,
+        0.0033650904846633883
+      ],
+      "trans_pr_auc": [
+        0.87522107694016,
+        0.0022646291789609114
+      ],
+      "trans_macro_f1": [
+        0.5374096816183604,
+        0.005467399909081612
+      ],
+      "unseen_pair_trans_roc_auc": [
+        0.5764912848739949,
+        0.0040799370802525855
+      ],
+      "unseen_pair_trans_pr_auc": [
+        0.8729882861279268,
+        0.0026043133551333915
+      ],
+      "unseen_pair_trans_macro_f1": [
+        0.530105277313897,
+        0.00397476393181533
+      ],
+      "unseen_roc_auc": [
+        0.558475119438929,
+        0.03466244238550855
+      ],
+      "unseen_pr_auc": [
+        0.8133796117805229,
+        0.018976639118562736
+      ],
+      "unseen_macro_f1": [
+        0.5134616601538348,
+        0.04552441588449585
+      ]
+    },
+    "SiGAT": {
+      "roc_auc": [
+        0.5731102611048959,
+        0.02002687617330916
+      ],
+      "pr_auc": [
+        0.8398200599275487,
+        0.008877858131374526
+      ],
+      "macro_f1": [
+        0.5357120296819182,
+        0.013568309100521429
+      ],
+      "trans_roc_auc": [
+        0.6006963526993949,
+        0.012534347887026466
+      ],
+      "trans_pr_auc": [
+        0.8769909438569699,
+        0.007212652933814205
+      ],
+      "trans_macro_f1": [
+        0.5471760619753774,
+        0.03065232617847793
+      ],
+      "unseen_pair_trans_roc_auc": [
+        0.5942533361086056,
+        0.012992790535064972
+      ],
+      "unseen_pair_trans_pr_auc": [
+        0.8746850841171797,
+        0.007283353348378414
+      ],
+      "unseen_pair_trans_macro_f1": [
+        0.5429784936819717,
+        0.03113114501898868
+      ],
+      "unseen_roc_auc": [
+        0.554166530403395,
+        0.017280889219135516
+      ],
+      "unseen_pr_auc": [
+        0.8159860339211381,
+        0.008179968901015184
+      ],
+      "unseen_macro_f1": [
+        0.525646651808823,
+        0.018413690845572196
+      ]
+    },
+    "SDGNN": {
+      "roc_auc": [
+        0.5744055022697478,
+        0.015586635760006172
+      ],
+      "pr_auc": [
+        0.844929774680201,
+        0.0052400984348908546
+      ],
+      "macro_f1": [
+        0.5329937889316293,
+        0.011436109662285253
+      ],
+      "trans_roc_auc": [
+        0.5985960375005773,
+        0.005310913948894582
+      ],
+      "trans_pr_auc": [
+        0.8814566809652342,
+        0.0025358018153095758
+      ],
+      "trans_macro_f1": [
+        0.5134109092096526,
+        0.05717579734341689
+      ],
+      "unseen_pair_trans_roc_auc": [
+        0.5933718787822722,
+        0.0061589311801857035
+      ],
+      "unseen_pair_trans_pr_auc": [
+        0.8795445789601158,
+        0.003119048205342188
+      ],
+      "unseen_pair_trans_macro_f1": [
+        0.511081805359973,
+        0.05759571328845401
+      ],
+      "unseen_roc_auc": [
+        0.5685632956801762,
+        0.023322928493489974
+      ],
+      "unseen_pr_auc": [
+        0.8250480790503616,
+        0.008756635246141198
+      ],
+      "unseen_macro_f1": [
+        0.5364327858476335,
+        0.01206765816200251
+      ]
+    },
+    "SBiFAGAT-Link": {
+      "roc_auc": [
+        0.5945744613585893,
+        0.01319223990249154
+      ],
+      "pr_auc": [
+        0.8486227794648056,
+        0.0047583848215370685
+      ],
+      "macro_f1": [
+        0.5194678058457942,
+        0.062022135647765
+      ],
+      "trans_roc_auc": [
+        0.5954071029418556,
+        0.013145626485019223
+      ],
+      "trans_pr_auc": [
+        0.8774591434927382,
+        0.004697752670172145
+      ],
+      "trans_macro_f1": [
+        0.5438145376020893,
+        0.013263347506598614
+      ],
+      "unseen_pair_trans_roc_auc": [
+        0.5869813517118034,
+        0.01265794200882347
+      ],
+      "unseen_pair_trans_pr_auc": [
+        0.8745768455525857,
+        0.004612103834358768
+      ],
+      "unseen_pair_trans_macro_f1": [
+        0.5375789234827912,
+        0.015572440542626471
+      ],
+      "unseen_roc_auc": [
+        0.588370814075718,
+        0.0174681528976859
+      ],
+      "unseen_pr_auc": [
+        0.8286493010875355,
+        0.007886262538396529
+      ],
+      "unseen_macro_f1": [
+        0.49322925110473737,
+        0.11802860266175229
+      ]
+    }
+  },
+  "p_values": {
+    "roc_auc": 0.0051382309642481055,
+    "pr_auc": 0.06039232665957392,
+    "macro_f1": 0.6466746008221494,
+    "trans_roc_auc": 0.5604139529767973,
+    "trans_pr_auc": 0.11591614093315716,
+    "trans_macro_f1": 0.2662070383974682,
+    "unseen_pair_trans_roc_auc": 0.29368474689031915,
+    "unseen_pair_trans_pr_auc": 0.07755536304477866,
+    "unseen_pair_trans_macro_f1": 0.3316829710138079,
+    "unseen_roc_auc": 0.02345363558558801,
+    "unseen_pr_auc": 0.13895202612313173,
+    "unseen_macro_f1": 0.4237225971459165
+  },
+  "adjusted_p_values": {
+    "roc_auc": 0.06165877157097727,
+    "pr_auc": 0.6039232665957392,
+    "macro_f1": 1.0,
+    "trans_roc_auc": 1.0,
+    "trans_pr_auc": 0.9273291274652573,
+    "trans_macro_f1": 1.0,
+    "unseen_pair_trans_roc_auc": 1.0,
+    "unseen_pair_trans_pr_auc": 0.6979982674030079,
+    "unseen_pair_trans_macro_f1": 1.0,
+    "unseen_roc_auc": 0.2579899914414681,
+    "unseen_pr_auc": 0.9726641828619221,
+    "unseen_macro_f1": 1.0
+  },
+  "bootstrap_p_values": {
+    "roc_auc": 0.0625,
+    "pr_auc": 0.0625,
+    "macro_f1": 0.9375,
+    "trans_roc_auc": 0.625,
+    "trans_pr_auc": 0.25,
+    "trans_macro_f1": 0.3125,
+    "unseen_pair_trans_roc_auc": 0.375,
+    "unseen_pair_trans_pr_auc": 0.125,
+    "unseen_pair_trans_macro_f1": 0.4375,
+    "unseen_roc_auc": 0.0625,
+    "unseen_pr_auc": 0.125,
+    "unseen_macro_f1": 0.8125
+  },
+  "adjusted_bootstrap_p_values": {
+    "roc_auc": 0.75,
+    "pr_auc": 0.75,
+    "macro_f1": 1.0,
+    "trans_roc_auc": 1.0,
+    "trans_pr_auc": 1.0,
+    "trans_macro_f1": 1.0,
+    "unseen_pair_trans_roc_auc": 1.0,
+    "unseen_pair_trans_pr_auc": 1.0,
+    "unseen_pair_trans_macro_f1": 1.0,
+    "unseen_roc_auc": 0.75,
+    "unseen_pr_auc": 1.0,
+    "unseen_macro_f1": 1.0
+  },
+  "nonparametric_test_label": "Exact Perm",
+  "wilcoxon_p_values": {
+    "roc_auc": 0.0625,
+    "pr_auc": 0.0625,
+    "macro_f1": 0.8125,
+    "trans_roc_auc": 0.625,
+    "trans_pr_auc": 0.3125,
+    "trans_macro_f1": 0.3125,
+    "unseen_pair_trans_roc_auc": 0.4375,
+    "unseen_pair_trans_pr_auc": 0.125,
+    "unseen_pair_trans_macro_f1": 0.625,
+    "unseen_roc_auc": 0.0625,
+    "unseen_pr_auc": 0.125,
+    "unseen_macro_f1": 1.0
+  },
+  "adjusted_wilcoxon_p_values": {
+    "roc_auc": 0.75,
+    "pr_auc": 0.75,
+    "macro_f1": 1.0,
+    "trans_roc_auc": 1.0,
+    "trans_pr_auc": 1.0,
+    "trans_macro_f1": 1.0,
+    "unseen_pair_trans_roc_auc": 1.0,
+    "unseen_pair_trans_pr_auc": 1.0,
+    "unseen_pair_trans_macro_f1": 1.0,
+    "unseen_roc_auc": 0.75,
+    "unseen_pr_auc": 1.0,
+    "unseen_macro_f1": 1.0
+  },
+  "cluster_paired_p_values": null,
+  "raw_results": {
+    "UserTextMLP": [
+      {
+        "roc_auc": 0.5848807192522604,
+        "pr_auc": 0.8439821073144806,
+        "macro_f1": 0.5491949599364483,
+        "trans_roc_auc": 0.5926199602826399,
+        "trans_pr_auc": 0.8753259415210566,
+        "trans_macro_f1": 0.5360854461853352,
+        "unseen_pair_trans_roc_auc": 0.5859918129466454,
+        "unseen_pair_trans_pr_auc": 0.8734507391825185,
+        "unseen_pair_trans_macro_f1": 0.5319834969109279,
+        "unseen_roc_auc": 0.5761967530408957,
+        "unseen_pr_auc": 0.8191253744026175,
+        "unseen_macro_f1": 0.5489534679580013
+      },
+      {
+        "roc_auc": 0.5784706530624077,
+        "pr_auc": 0.8409568905679262,
+        "macro_f1": 0.5486210084759414,
+        "trans_roc_auc": 0.5849882233408765,
+        "trans_pr_auc": 0.8724241233156071,
+        "trans_macro_f1": 0.5324450929196743,
+        "unseen_pair_trans_roc_auc": 0.5790320466862477,
+        "unseen_pair_trans_pr_auc": 0.8705388328250402,
+        "unseen_pair_trans_macro_f1": 0.5287257019438445,
+        "unseen_roc_auc": 0.5640183760755064,
+        "unseen_pr_auc": 0.8144050852379405,
+        "unseen_macro_f1": 0.5488065649979685
+      },
+      {
+        "roc_auc": 0.5717589924223039,
+        "pr_auc": 0.838165834271765,
+        "macro_f1": 0.5510625070579074,
+        "trans_roc_auc": 0.6014596707153743,
+        "trans_pr_auc": 0.8802035089099949,
+        "trans_macro_f1": 0.551560836311852,
+        "unseen_pair_trans_roc_auc": 0.5957962333387297,
+        "unseen_pair_trans_pr_auc": 0.8786238095015727,
+        "unseen_pair_trans_macro_f1": 0.5429111076769862,
+        "unseen_roc_auc": 0.5459032586388133,
+        "unseen_pr_auc": 0.7977800738178107,
+        "unseen_macro_f1": 0.5499195071538601
+      },
+      {
+        "roc_auc": 0.5547704081574423,
+        "pr_auc": 0.834449047525928,
+        "macro_f1": 0.5260033259529838,
+        "trans_roc_auc": 0.5830759594513463,
+        "trans_pr_auc": 0.873466327472523,
+        "trans_macro_f1": 0.5442845442845443,
+        "unseen_pair_trans_roc_auc": 0.576184308918646,
+        "unseen_pair_trans_pr_auc": 0.8710071398548184,
+        "unseen_pair_trans_macro_f1": 0.5403837755914613,
+        "unseen_roc_auc": 0.5283418706444418,
+        "unseen_pr_auc": 0.8009023693572226,
+        "unseen_macro_f1": 0.5182928190361392
+      },
+      {
+        "roc_auc": 0.5877232398126131,
+        "pr_auc": 0.8456652608452674,
+        "macro_f1": 0.5419686796046278,
+        "trans_roc_auc": 0.588630905648178,
+        "trans_pr_auc": 0.8734037575659137,
+        "trans_macro_f1": 0.5403195221389969,
+        "unseen_pair_trans_roc_auc": 0.5828233770438724,
+        "unseen_pair_trans_pr_auc": 0.8712785107005696,
+        "unseen_pair_trans_macro_f1": 0.5387741614894299,
+        "unseen_roc_auc": 0.5753708307610165,
+        "unseen_pr_auc": 0.8215563241731669,
+        "unseen_macro_f1": 0.519734483029101
+      }
+    ],
+    "PriorPairSignPersistence": [
+      {
+        "roc_auc": 0.5906929607569981,
+        "pr_auc": 0.847178116826921,
+        "macro_f1": 0.5533531676037704,
+        "trans_roc_auc": 0.629622627349559,
+        "trans_pr_auc": 0.8903909511839306,
+        "trans_macro_f1": 0.576798435751223,
+        "unseen_pair_trans_roc_auc": 0.6235443311208246,
+        "unseen_pair_trans_pr_auc": 0.8893075841565874,
+        "unseen_pair_trans_macro_f1": 0.5741919746310525,
+        "unseen_roc_auc": 0.5755001974426999,
+        "unseen_pr_auc": 0.8290599253202767,
+        "unseen_macro_f1": 0.5437147213662532
+      },
+      {
+        "roc_auc": 0.5906929607569981,
+        "pr_auc": 0.847178116826921,
+        "macro_f1": 0.5533531676037704,
+        "trans_roc_auc": 0.629622627349559,
+        "trans_pr_auc": 0.8903909511839306,
+        "trans_macro_f1": 0.576798435751223,
+        "unseen_pair_trans_roc_auc": 0.6235443311208246,
+        "unseen_pair_trans_pr_auc": 0.8893075841565874,
+        "unseen_pair_trans_macro_f1": 0.5741919746310525,
+        "unseen_roc_auc": 0.5755001974426999,
+        "unseen_pr_auc": 0.8290599253202767,
+        "unseen_macro_f1": 0.5437147213662532
+      },
+      {
+        "roc_auc": 0.5906929607569981,
+        "pr_auc": 0.847178116826921,
+        "macro_f1": 0.5533531676037704,
+        "trans_roc_auc": 0.629622627349559,
+        "trans_pr_auc": 0.8903909511839306,
+        "trans_macro_f1": 0.576798435751223,
+        "unseen_pair_trans_roc_auc": 0.6235443311208246,
+        "unseen_pair_trans_pr_auc": 0.8893075841565874,
+        "unseen_pair_trans_macro_f1": 0.5741919746310525,
+        "unseen_roc_auc": 0.5755001974426999,
+        "unseen_pr_auc": 0.8290599253202767,
+        "unseen_macro_f1": 0.5437147213662532
+      },
+      {
+        "roc_auc": 0.5906929607569981,
+        "pr_auc": 0.847178116826921,
+        "macro_f1": 0.5533531676037704,
+        "trans_roc_auc": 0.629622627349559,
+        "trans_pr_auc": 0.8903909511839306,
+        "trans_macro_f1": 0.576798435751223,
+        "unseen_pair_trans_roc_auc": 0.6235443311208246,
+        "unseen_pair_trans_pr_auc": 0.8893075841565874,
+        "unseen_pair_trans_macro_f1": 0.5741919746310525,
+        "unseen_roc_auc": 0.5755001974426999,
+        "unseen_pr_auc": 0.8290599253202767,
+        "unseen_macro_f1": 0.5437147213662532
+      },
+      {
+        "roc_auc": 0.5906929607569981,
+        "pr_auc": 0.847178116826921,
+        "macro_f1": 0.5533531676037704,
+        "trans_roc_auc": 0.629622627349559,
+        "trans_pr_auc": 0.8903909511839306,
+        "trans_macro_f1": 0.576798435751223,
+        "unseen_pair_trans_roc_auc": 0.6235443311208246,
+        "unseen_pair_trans_pr_auc": 0.8893075841565874,
+        "unseen_pair_trans_macro_f1": 0.5741919746310525,
+        "unseen_roc_auc": 0.5755001974426999,
+        "unseen_pr_auc": 0.8290599253202767,
+        "unseen_macro_f1": 0.5437147213662532
+      }
+    ],
+    "StandardGCN": [
+      {
+        "roc_auc": 0.5436402318893245,
+        "pr_auc": 0.829396387540754,
+        "macro_f1": 0.510800101150714,
+        "trans_roc_auc": 0.583025446820302,
+        "trans_pr_auc": 0.8738712308651309,
+        "trans_macro_f1": 0.5362008468078517,
+        "unseen_pair_trans_roc_auc": 0.5781809631736781,
+        "unseen_pair_trans_pr_auc": 0.8721443593643308,
+        "unseen_pair_trans_macro_f1": 0.5318922810691489,
+        "unseen_roc_auc": 0.515169161118805,
+        "unseen_pr_auc": 0.795191616125734,
+        "unseen_macro_f1": 0.49338182372477246
+      },
+      {
+        "roc_auc": 0.5699603253499351,
+        "pr_auc": 0.8369770751576023,
+        "macro_f1": 0.533670955081795,
+        "trans_roc_auc": 0.5305464312104559,
+        "trans_pr_auc": 0.8600149995541955,
+        "trans_macro_f1": 0.4799482519621337,
+        "unseen_pair_trans_roc_auc": 0.5254022217596768,
+        "unseen_pair_trans_pr_auc": 0.8581682606122336,
+        "unseen_pair_trans_macro_f1": 0.4780533804100498,
+        "unseen_roc_auc": 0.5645632066919171,
+        "unseen_pr_auc": 0.8164326116483529,
+        "unseen_macro_f1": 0.533051800818656
+      },
+      {
+        "roc_auc": 0.5588042981289388,
+        "pr_auc": 0.8350765916772324,
+        "macro_f1": 0.5118908765652952,
+        "trans_roc_auc": 0.5607796841084376,
+        "trans_pr_auc": 0.8706694805326406,
+        "trans_macro_f1": 0.49427310703373384,
+        "unseen_pair_trans_roc_auc": 0.5568838317259881,
+        "unseen_pair_trans_pr_auc": 0.8695334656253519,
+        "unseen_pair_trans_macro_f1": 0.4931996864740774,
+        "unseen_roc_auc": 0.5376687300819247,
+        "unseen_pr_auc": 0.7977727739407088,
+        "unseen_macro_f1": 0.46992738763811875
+      },
+      {
+        "roc_auc": 0.5821109009302462,
+        "pr_auc": 0.8430338537693832,
+        "macro_f1": 0.3694923052034411,
+        "trans_roc_auc": 0.6134701311596545,
+        "trans_pr_auc": 0.8853990015575303,
+        "trans_macro_f1": 0.5525761850948953,
+        "unseen_pair_trans_roc_auc": 0.6058581373297255,
+        "unseen_pair_trans_pr_auc": 0.8827927479569389,
+        "unseen_pair_trans_macro_f1": 0.548025690080113,
+        "unseen_roc_auc": 0.5515580175640576,
+        "unseen_pr_auc": 0.8053910743859973,
+        "unseen_macro_f1": 0.1986746314787441
+      },
+      {
+        "roc_auc": 0.5467610639225015,
+        "pr_auc": 0.8312316954201888,
+        "macro_f1": 0.473493541834349,
+        "trans_roc_auc": 0.5708143790698748,
+        "trans_pr_auc": 0.870656912646335,
+        "trans_macro_f1": 0.5163546178988515,
+        "unseen_pair_trans_roc_auc": 0.567491539273958,
+        "unseen_pair_trans_pr_auc": 0.8696792057945948,
+        "unseen_pair_trans_macro_f1": 0.5154178087005411,
+        "unseen_roc_auc": 0.5180977647261664,
+        "unseen_pr_auc": 0.793258260118566,
+        "unseen_macro_f1": 0.4226363961133373
+      }
+    ],
+    "StandardGATv2": [
+      {
+        "roc_auc": 0.5443211448468266,
+        "pr_auc": 0.8308382612155072,
+        "macro_f1": 0.5368820786881248,
+        "trans_roc_auc": 0.5774603980972614,
+        "trans_pr_auc": 0.8745858038641947,
+        "trans_macro_f1": 0.527605327328367,
+        "unseen_pair_trans_roc_auc": 0.572269633124417,
+        "unseen_pair_trans_pr_auc": 0.8732808161881325,
+        "unseen_pair_trans_macro_f1": 0.5258322342844344,
+        "unseen_roc_auc": 0.5081139494657924,
+        "unseen_pr_auc": 0.7859947400733902,
+        "unseen_macro_f1": 0.5315130020523774
+      },
+      {
+        "roc_auc": 0.5584509447068091,
+        "pr_auc": 0.8360822936939365,
+        "macro_f1": 0.5362380228033601,
+        "trans_roc_auc": 0.5802328199325728,
+        "trans_pr_auc": 0.8758419837619469,
+        "trans_macro_f1": 0.5337057094595932,
+        "unseen_pair_trans_roc_auc": 0.5748321345698714,
+        "unseen_pair_trans_pr_auc": 0.8744796341809705,
+        "unseen_pair_trans_macro_f1": 0.5260729468236764,
+        "unseen_roc_auc": 0.5389254667712278,
+        "unseen_pr_auc": 0.8026230878002937,
+        "unseen_macro_f1": 0.5366211607699048
+      },
+      {
+        "roc_auc": 0.5577866950566815,
+        "pr_auc": 0.8368588955516326,
+        "macro_f1": 0.5236486119375081,
+        "trans_roc_auc": 0.5699556643421235,
+        "trans_pr_auc": 0.8756669720013193,
+        "trans_macro_f1": 0.45544554455445546,
+        "unseen_pair_trans_roc_auc": 0.5645805869700964,
+        "unseen_pair_trans_pr_auc": 0.8738428567210881,
+        "unseen_pair_trans_macro_f1": 0.45545295732468183,
+        "unseen_roc_auc": 0.5395167937530243,
+        "unseen_pr_auc": 0.8004921166623173,
+        "unseen_macro_f1": 0.49350460201818935
+      },
+      {
+        "roc_auc": 0.5384515518903381,
+        "pr_auc": 0.8282100898085187,
+        "macro_f1": 0.3588053344699263,
+        "trans_roc_auc": 0.5698748441324528,
+        "trans_pr_auc": 0.8694312233227943,
+        "trans_macro_f1": 0.520809247874397,
+        "unseen_pair_trans_roc_auc": 0.5615771255887817,
+        "unseen_pair_trans_pr_auc": 0.8667618460404249,
+        "unseen_pair_trans_macro_f1": 0.5160927318462247,
+        "unseen_roc_auc": 0.5011241441832268,
+        "unseen_pr_auc": 0.7860111207623499,
+        "unseen_macro_f1": 0.1917388805376249
+      },
+      {
+        "roc_auc": 0.5160051637991702,
+        "pr_auc": 0.8265150156238875,
+        "macro_f1": 0.4700700872155237,
+        "trans_roc_auc": 0.5800192236641574,
+        "trans_pr_auc": 0.8782723178810091,
+        "trans_macro_f1": 0.5314418186125909,
+        "unseen_pair_trans_roc_auc": 0.5744806000755491,
+        "unseen_pair_trans_pr_auc": 0.8768146402872329,
+        "unseen_pair_trans_macro_f1": 0.5241081606031053,
+        "unseen_roc_auc": 0.4607285913714759,
+        "unseen_pr_auc": 0.7730807338791661,
+        "unseen_macro_f1": 0.43573186978292655
+      }
+    ],
+    "SGCN": [
+      {
+        "roc_auc": 0.5421799098492245,
+        "pr_auc": 0.8285928520033166,
+        "macro_f1": 0.525171269159468,
+        "trans_roc_auc": 0.6036793400452592,
+        "trans_pr_auc": 0.8809950555963748,
+        "trans_macro_f1": 0.5432900838917919,
+        "unseen_pair_trans_roc_auc": 0.5980580802824611,
+        "unseen_pair_trans_pr_auc": 0.8788650290112905,
+        "unseen_pair_trans_macro_f1": 0.5414274163451368,
+        "unseen_roc_auc": 0.5449937986306932,
+        "unseen_pr_auc": 0.8159612411264674,
+        "unseen_macro_f1": 0.5016348445620322
+      },
+      {
+        "roc_auc": 0.5847817095320738,
+        "pr_auc": 0.8436676136364011,
+        "macro_f1": 0.5587392720961977,
+        "trans_roc_auc": 0.6068876137255808,
+        "trans_pr_auc": 0.8796631429421076,
+        "trans_macro_f1": 0.5647139954641386,
+        "unseen_pair_trans_roc_auc": 0.6010291634866671,
+        "unseen_pair_trans_pr_auc": 0.8772677166158224,
+        "unseen_pair_trans_macro_f1": 0.5620438131660643,
+        "unseen_roc_auc": 0.5595057814559592,
+        "unseen_pr_auc": 0.8119840861042245,
+        "unseen_macro_f1": 0.5511642897429699
+      },
+      {
+        "roc_auc": 0.5656076069596015,
+        "pr_auc": 0.8353753891982221,
+        "macro_f1": 0.5473444684268094,
+        "trans_roc_auc": 0.6115073546390799,
+        "trans_pr_auc": 0.8811631045732546,
+        "trans_macro_f1": 0.5704578292651648,
+        "unseen_pair_trans_roc_auc": 0.6051936137900198,
+        "unseen_pair_trans_pr_auc": 0.8788274451187179,
+        "unseen_pair_trans_macro_f1": 0.567727646777946,
+        "unseen_roc_auc": 0.5362513695849254,
+        "unseen_pr_auc": 0.800361452646284,
+        "unseen_macro_f1": 0.5375755441490857
+      },
+      {
+        "roc_auc": 0.5396263150602288,
+        "pr_auc": 0.8259507805894275,
+        "macro_f1": 0.5283956744870817,
+        "trans_roc_auc": 0.6219923336258255,
+        "trans_pr_auc": 0.8872249950092574,
+        "trans_macro_f1": 0.525064121534971,
+        "unseen_pair_trans_roc_auc": 0.6139495979709676,
+        "unseen_pair_trans_pr_auc": 0.884367762857449,
+        "unseen_pair_trans_macro_f1": 0.5202184629570522,
+        "unseen_roc_auc": 0.544954643796684,
+        "unseen_pr_auc": 0.8123309329964161,
+        "unseen_macro_f1": 0.5068919385578039
+      },
+      {
+        "roc_auc": 0.5705236250317572,
+        "pr_auc": 0.8414425208502618,
+        "macro_f1": 0.40555381363491383,
+        "trans_roc_auc": 0.6065628896688681,
+        "trans_pr_auc": 0.8802100736684764,
+        "trans_macro_f1": 0.543726677170578,
+        "unseen_pair_trans_roc_auc": 0.5994703855315803,
+        "unseen_pair_trans_pr_auc": 0.8775279491134088,
+        "unseen_pair_trans_macro_f1": 0.5407408059743554,
+        "unseen_roc_auc": 0.5453479719019572,
+        "unseen_pr_auc": 0.8058534083622065,
+        "unseen_macro_f1": 0.23932147004362428
+      }
+    ],
+    "FAGCN": [
+      {
+        "roc_auc": 0.5927355854972617,
+        "pr_auc": 0.8500181285957806,
+        "macro_f1": 0.5095831917615239,
+        "trans_roc_auc": 0.6054285202974183,
+        "trans_pr_auc": 0.8810345108967539,
+        "trans_macro_f1": 0.5492371080595501,
+        "unseen_pair_trans_roc_auc": 0.5959396224087822,
+        "unseen_pair_trans_pr_auc": 0.8779263185705939,
+        "unseen_pair_trans_macro_f1": 0.5406528569078344,
+        "unseen_roc_auc": 0.5772142225485125,
+        "unseen_pr_auc": 0.827162500612499,
+        "unseen_macro_f1": 0.47962539186493663
+      },
+      {
+        "roc_auc": 0.566091527666911,
+        "pr_auc": 0.8341222542011258,
+        "macro_f1": 0.5437399139779068,
+        "trans_roc_auc": 0.5830846187595253,
+        "trans_pr_auc": 0.8684511015823995,
+        "trans_macro_f1": 0.5212154112617409,
+        "unseen_pair_trans_roc_auc": 0.5763539088939769,
+        "unseen_pair_trans_pr_auc": 0.8659510322083246,
+        "unseen_pair_trans_macro_f1": 0.5170312995613324,
+        "unseen_roc_auc": 0.5645600921028482,
+        "unseen_pr_auc": 0.817380684472758,
+        "unseen_macro_f1": 0.552653023212498
+      },
+      {
+        "roc_auc": 0.5660221352635987,
+        "pr_auc": 0.8371199548985546,
+        "macro_f1": 0.5367156753830162,
+        "trans_roc_auc": 0.5777201773426315,
+        "trans_pr_auc": 0.8714306782179805,
+        "trans_macro_f1": 0.5348288720400797,
+        "unseen_pair_trans_roc_auc": 0.574422010993162,
+        "unseen_pair_trans_pr_auc": 0.870006268140151,
+        "unseen_pair_trans_macro_f1": 0.5328538401522296,
+        "unseen_roc_auc": 0.5425537405658541,
+        "unseen_pr_auc": 0.8041260481286483,
+        "unseen_macro_f1": 0.5301766779528766
+      },
+      {
+        "roc_auc": 0.5808294811799356,
+        "pr_auc": 0.8462057380033593,
+        "macro_f1": 0.5353987195636217,
+        "trans_roc_auc": 0.5840775527640512,
+        "trans_pr_auc": 0.8767458691422011,
+        "trans_macro_f1": 0.49726256465061425,
+        "unseen_pair_trans_roc_auc": 0.577604323257553,
+        "unseen_pair_trans_pr_auc": 0.8743590014925111,
+        "unseen_pair_trans_macro_f1": 0.4948440465591112,
+        "unseen_roc_auc": 0.5935039683201798,
+        "unseen_pr_auc": 0.8317008994931592,
+        "unseen_macro_f1": 0.5462589000517951
+      },
+      {
+        "roc_auc": 0.5928774518744281,
+        "pr_auc": 0.8510923083843209,
+        "macro_f1": 0.5382614616830788,
+        "trans_roc_auc": 0.5853634600286335,
+        "trans_pr_auc": 0.8786400033411272,
+        "trans_macro_f1": 0.548281356703847,
+        "unseen_pair_trans_roc_auc": 0.5775441923572084,
+        "unseen_pair_trans_pr_auc": 0.8754701946734622,
+        "unseen_pair_trans_macro_f1": 0.5455373010703402,
+        "unseen_roc_auc": 0.5850698835922336,
+        "unseen_pr_auc": 0.833072014078931,
+        "unseen_macro_f1": 0.5187140076695899
+      }
+    ],
+    "BiEdgeGATv2-Link": [
+      {
+        "roc_auc": 0.5486937793134398,
+        "pr_auc": 0.8334148537414093,
+        "macro_f1": 0.5283729648909959,
+        "trans_roc_auc": 0.5866075139703505,
+        "trans_pr_auc": 0.8776704907549072,
+        "trans_macro_f1": 0.5332867550399888,
+        "unseen_pair_trans_roc_auc": 0.5810317845771951,
+        "unseen_pair_trans_pr_auc": 0.8760461610332089,
+        "unseen_pair_trans_macro_f1": 0.5266978414725808,
+        "unseen_roc_auc": 0.524597467171675,
+        "unseen_pr_auc": 0.7951536315958581,
+        "unseen_macro_f1": 0.5262460935430902
+      },
+      {
+        "roc_auc": 0.5947314730843074,
+        "pr_auc": 0.8502911332082255,
+        "macro_f1": 0.5470512897112483,
+        "trans_roc_auc": 0.5804983720500624,
+        "trans_pr_auc": 0.8725091472356856,
+        "trans_macro_f1": 0.5332210694137636,
+        "unseen_pair_trans_roc_auc": 0.5728154366813911,
+        "unseen_pair_trans_pr_auc": 0.8699514799149929,
+        "unseen_pair_trans_macro_f1": 0.5260746721957772,
+        "unseen_roc_auc": 0.5997462722262082,
+        "unseen_pr_auc": 0.8391562595859073,
+        "unseen_macro_f1": 0.553154406093421
+      },
+      {
+        "roc_auc": 0.5946353166701781,
+        "pr_auc": 0.8476096604773253,
+        "macro_f1": 0.551415221474021,
+        "trans_roc_auc": 0.5875152981111162,
+        "trans_pr_auc": 0.8744467521390242,
+        "trans_macro_f1": 0.5429969944182053,
+        "unseen_pair_trans_roc_auc": 0.5808359736965856,
+        "unseen_pair_trans_pr_auc": 0.872476138769434,
+        "unseen_pair_trans_macro_f1": 0.5332283035221941,
+        "unseen_roc_auc": 0.5902438834476278,
+        "unseen_pr_auc": 0.827332908456826,
+        "unseen_macro_f1": 0.5512461394814336
+      },
+      {
+        "roc_auc": 0.5579499612292772,
+        "pr_auc": 0.8346750042924944,
+        "macro_f1": 0.5131626222795083,
+        "trans_roc_auc": 0.5831372962176142,
+        "trans_pr_auc": 0.8740041454036735,
+        "trans_macro_f1": 0.5437766963754562,
+        "unseen_pair_trans_roc_auc": 0.573813763808907,
+        "unseen_pair_trans_pr_auc": 0.8712121767216467,
+        "unseen_pair_trans_macro_f1": 0.5351154700712389,
+        "unseen_roc_auc": 0.5294377610554007,
+        "unseen_pr_auc": 0.7996339133136792,
+        "unseen_macro_f1": 0.49124025639049607
+      },
+      {
+        "roc_auc": 0.5701179990426587,
+        "pr_auc": 0.8397942329161072,
+        "macro_f1": 0.4917621154562097,
+        "trans_roc_auc": 0.5802703436013485,
+        "trans_pr_auc": 0.8774748491675092,
+        "trans_macro_f1": 0.5337668928443885,
+        "unseen_pair_trans_roc_auc": 0.573959465605896,
+        "unseen_pair_trans_pr_auc": 0.8752554742003524,
+        "unseen_pair_trans_macro_f1": 0.529410099307694,
+        "unseen_roc_auc": 0.5483502132937336,
+        "unseen_pr_auc": 0.8056213459503445,
+        "unseen_macro_f1": 0.4454214052607332
+      }
+    ],
+    "SiGAT": [
+      {
+        "roc_auc": 0.5516264072790805,
+        "pr_auc": 0.8310257786106383,
+        "macro_f1": 0.5263421435062017,
+        "trans_roc_auc": 0.6063146561677366,
+        "trans_pr_auc": 0.8835104607123446,
+        "trans_macro_f1": 0.49847650125823184,
+        "unseen_pair_trans_roc_auc": 0.600508029017014,
+        "unseen_pair_trans_pr_auc": 0.8814531902168017,
+        "unseen_pair_trans_macro_f1": 0.49417833044515963,
+        "unseen_roc_auc": 0.5405432733218761,
+        "unseen_pr_auc": 0.8099157341594546,
+        "unseen_macro_f1": 0.5327538499737656
+      },
+      {
+        "roc_auc": 0.5783339226361444,
+        "pr_auc": 0.8398525089211133,
+        "macro_f1": 0.5473734120594024,
+        "trans_roc_auc": 0.6052813120583753,
+        "trans_pr_auc": 0.8712821251860244,
+        "trans_macro_f1": 0.5651007304214546,
+        "unseen_pair_trans_roc_auc": 0.5997217018586615,
+        "unseen_pair_trans_pr_auc": 0.8691386445732747,
+        "unseen_pair_trans_macro_f1": 0.5636235879141668,
+        "unseen_roc_auc": 0.5575992080044939,
+        "unseen_pr_auc": 0.8173099766312226,
+        "unseen_macro_f1": 0.539323495921406
+      },
+      {
+        "roc_auc": 0.5769730097790788,
+        "pr_auc": 0.8418207487031858,
+        "macro_f1": 0.5232808030365846,
+        "trans_roc_auc": 0.5906211033113195,
+        "trans_pr_auc": 0.8727251115848824,
+        "trans_macro_f1": 0.5569834530039921,
+        "unseen_pair_trans_roc_auc": 0.5836790860103147,
+        "unseen_pair_trans_pr_auc": 0.8700715067565848,
+        "unseen_pair_trans_macro_f1": 0.5552241344924271,
+        "unseen_roc_auc": 0.5556648257220563,
+        "unseen_pr_auc": 0.8162180251925644,
+        "unseen_macro_f1": 0.4946624444552196
+      },
+      {
+        "roc_auc": 0.5566849765218564,
+        "pr_auc": 0.8329277125307929,
+        "macro_f1": 0.5283990240966624,
+        "trans_roc_auc": 0.5852321271879184,
+        "trans_pr_auc": 0.8713419114818944,
+        "trans_macro_f1": 0.5383037221507245,
+        "unseen_pair_trans_roc_auc": 0.5779666504775781,
+        "unseen_pair_trans_pr_auc": 0.8690128285195493,
+        "unseen_pair_trans_macro_f1": 0.5310283560917597,
+        "unseen_roc_auc": 0.5366366887468785,
+        "unseen_pr_auc": 0.8077837084040043,
+        "unseen_macro_f1": 0.5234445113131249
+      },
+      {
+        "roc_auc": 0.6019329893083198,
+        "pr_auc": 0.8534735508720135,
+        "macro_f1": 0.5531647657107406,
+        "trans_roc_auc": 0.6160325647716252,
+        "trans_pr_auc": 0.8860951103197028,
+        "trans_macro_f1": 0.5770159030424843,
+        "unseen_pair_trans_roc_auc": 0.6093912131794599,
+        "unseen_pair_trans_pr_auc": 0.8837492505196882,
+        "unseen_pair_trans_macro_f1": 0.5708380594663447,
+        "unseen_roc_auc": 0.5803886562216698,
+        "unseen_pr_auc": 0.8287027252184441,
+        "unseen_macro_f1": 0.5380489573805984
+      }
+    ],
+    "SDGNN": [
+      {
+        "roc_auc": 0.5612153417473144,
+        "pr_auc": 0.8421710782152239,
+        "macro_f1": 0.5340829387663041,
+        "trans_roc_auc": 0.5973075324435413,
+        "trans_pr_auc": 0.8829219978041548,
+        "trans_macro_f1": 0.5427971133643921,
+        "unseen_pair_trans_roc_auc": 0.5928297755883962,
+        "unseen_pair_trans_pr_auc": 0.8815416952200885,
+        "unseen_pair_trans_macro_f1": 0.5408676510458186,
+        "unseen_roc_auc": 0.532396843141508,
+        "unseen_pr_auc": 0.8123586133106355,
+        "unseen_macro_f1": 0.5301650028325959
+      },
+      {
+        "roc_auc": 0.5574243822535321,
+        "pr_auc": 0.8378934717178468,
+        "macro_f1": 0.5153225139297793,
+        "trans_roc_auc": 0.5899326883110885,
+        "trans_pr_auc": 0.8773650680350564,
+        "trans_macro_f1": 0.41435021952209766,
+        "unseen_pair_trans_roc_auc": 0.5833953915061248,
+        "unseen_pair_trans_pr_auc": 0.8744529713555352,
+        "unseen_pair_trans_macro_f1": 0.41185119583781027,
+        "unseen_roc_auc": 0.5876439802223594,
+        "unseen_pr_auc": 0.8314569424909065,
+        "unseen_macro_f1": 0.5394570151913264
+      },
+      {
+        "roc_auc": 0.5743406637429029,
+        "pr_auc": 0.8445218102041299,
+        "macro_f1": 0.5296736354899818,
+        "trans_roc_auc": 0.6030919503071168,
+        "trans_pr_auc": 0.8839406558140966,
+        "trans_macro_f1": 0.542995698569583,
+        "unseen_pair_trans_roc_auc": 0.5994195055389809,
+        "unseen_pair_trans_pr_auc": 0.8825428392626296,
+        "unseen_pair_trans_macro_f1": 0.5405663472414688,
+        "unseen_roc_auc": 0.5579807451654347,
+        "unseen_pr_auc": 0.8201112209803596,
+        "unseen_macro_f1": 0.5203419478292224
+      },
+      {
+        "roc_auc": 0.5844089536287548,
+        "pr_auc": 0.8495323129253247,
+        "macro_f1": 0.5423951812532414,
+        "trans_roc_auc": 0.6020355147092782,
+        "trans_pr_auc": 0.8820990048115641,
+        "trans_macro_f1": 0.514470679730606,
+        "unseen_pair_trans_roc_auc": 0.5939738045129012,
+        "unseen_pair_trans_pr_auc": 0.8795347702817209,
+        "unseen_pair_trans_macro_f1": 0.5102363742296586,
+        "unseen_roc_auc": 0.5845179339150941,
+        "unseen_pr_auc": 0.833600471563259,
+        "unseen_macro_f1": 0.5527429481936967
+      },
+      {
+        "roc_auc": 0.5946381699762354,
+        "pr_auc": 0.8505302003384798,
+        "macro_f1": 0.5434946752188399,
+        "trans_roc_auc": 0.6006125017318616,
+        "trans_pr_auc": 0.8809566783612991,
+        "trans_macro_f1": 0.5524408348615841,
+        "unseen_pair_trans_roc_auc": 0.5972409167649575,
+        "unseen_pair_trans_pr_auc": 0.8796506186806055,
+        "unseen_pair_trans_macro_f1": 0.551887458445109,
+        "unseen_roc_auc": 0.5802769759564848,
+        "unseen_pr_auc": 0.8277131469066472,
+        "unseen_macro_f1": 0.5394570151913264
+      }
+    ],
+    "SBiFAGAT-Link": [
+      {
+        "roc_auc": 0.5748974008207934,
+        "pr_auc": 0.842276202538291,
+        "macro_f1": 0.5286137803575977,
+        "trans_roc_auc": 0.587099651318524,
+        "trans_pr_auc": 0.8754835214873185,
+        "trans_macro_f1": 0.5375854753097618,
+        "unseen_pair_trans_roc_auc": 0.5785186213063824,
+        "unseen_pair_trans_pr_auc": 0.8725030372160106,
+        "unseen_pair_trans_macro_f1": 0.5291973624470598,
+        "unseen_roc_auc": 0.5576430347221064,
+        "unseen_pr_auc": 0.8155236358057981,
+        "unseen_macro_f1": 0.5194559782799201
+      },
+      {
+        "roc_auc": 0.5883434344172168,
+        "pr_auc": 0.8460619178565193,
+        "macro_f1": 0.5515224248937716,
+        "trans_roc_auc": 0.5841396111393341,
+        "trans_pr_auc": 0.8718684071982963,
+        "trans_macro_f1": 0.5330102717031147,
+        "unseen_pair_trans_roc_auc": 0.5762814434499719,
+        "unseen_pair_trans_pr_auc": 0.8691734665397663,
+        "unseen_pair_trans_macro_f1": 0.5275296610989606,
+        "unseen_roc_auc": 0.5963580442605353,
+        "unseen_pr_auc": 0.8338246904544768,
+        "unseen_macro_f1": 0.5597356541021885
+      },
+      {
+        "roc_auc": 0.5977103816741968,
+        "pr_auc": 0.8485673224680739,
+        "macro_f1": 0.4101436760625091,
+        "trans_roc_auc": 0.5864978294000831,
+        "trans_pr_auc": 0.8754471367807954,
+        "trans_macro_f1": 0.5334319382593946,
+        "unseen_pair_trans_roc_auc": 0.5786373412891139,
+        "unseen_pair_trans_pr_auc": 0.8725932252291533,
+        "unseen_pair_trans_macro_f1": 0.5248249717359994,
+        "unseen_roc_auc": 0.596861495336459,
+        "unseen_pr_auc": 0.8312082163072939,
+        "unseen_macro_f1": 0.2839894796752266
+      },
+      {
+        "roc_auc": 0.6066706757518976,
+        "pr_auc": 0.8544387739598598,
+        "macro_f1": 0.5548824121754092,
+        "trans_roc_auc": 0.6119085692513739,
+        "trans_pr_auc": 0.8835123269518768,
+        "trans_macro_f1": 0.5518428332766672,
+        "unseen_pair_trans_roc_auc": 0.6025863996237965,
+        "unseen_pair_trans_pr_auc": 0.8805115398116051,
+        "unseen_pair_trans_macro_f1": 0.5445151863062311,
+        "unseen_roc_auc": 0.5999077859164957,
+        "unseen_pr_auc": 0.835128060269582,
+        "unseen_macro_f1": 0.5561666218401405
+      },
+      {
+        "roc_auc": 0.6052504141288412,
+        "pr_auc": 0.851769680501284,
+        "macro_f1": 0.5521767357396835,
+        "trans_roc_auc": 0.6073898535999631,
+        "trans_pr_auc": 0.8809843250454044,
+        "trans_macro_f1": 0.5632021694615086,
+        "unseen_pair_trans_roc_auc": 0.5988829528897524,
+        "unseen_pair_trans_pr_auc": 0.8781029589663928,
+        "unseen_pair_trans_macro_f1": 0.5618274358257053,
+        "unseen_roc_auc": 0.591083710142993,
+        "unseen_pr_auc": 0.8275619026005273,
+        "unseen_macro_f1": 0.5467985216262112
+      }
+    ]
+  },
+  "extra": {
+    "val_summary_stats": {
+      "UserTextMLP": {
+        "roc_auc": [
+          0.5737828976621505,
+          0.006817260968677734
+        ],
+        "pr_auc": [
+          0.8336745156482548,
+          0.002577585840493328
+        ],
+        "macro_f1": [
+          0.5521489801995599,
+          0.0054270440874813275
+        ],
+        "trans_roc_auc": [
+          0.6115543450986952,
+          0.004897444692817709
+        ],
+        "trans_pr_auc": [
+          0.8501526470561236,
+          0.0033612557105839507
+        ],
+        "trans_macro_f1": [
+          0.553012042337898,
+          0.019454546517635427
+        ],
+        "unseen_pair_trans_roc_auc": [
+          0.6128492876864723,
+          0.004629918153101952
+        ],
+        "unseen_pair_trans_pr_auc": [
+          0.8504157941349337,
+          0.004038186510699225
+        ],
+        "unseen_pair_trans_macro_f1": [
+          0.5523110160564343,
+          0.019794788995895683
+        ],
+        "unseen_roc_auc": [
+          0.5663431587231499,
+          0.023874369380117513
+        ],
+        "unseen_pr_auc": [
+          0.824008665461468,
+          0.01222470296164179
+        ],
+        "unseen_macro_f1": [
+          0.5480863427050787,
+          0.008605718520434
+        ]
+      },
+      "PriorPairSignPersistence": {
+        "roc_auc": [
+          0.5635422963009442,
+          0.0
+        ],
+        "pr_auc": [
+          0.8337213106805412,
+          0.0
+        ],
+        "macro_f1": [
+          0.5317692135812608,
+          0.0
+        ],
+        "trans_roc_auc": [
+          0.5994484986617598,
+          0.0
+        ],
+        "trans_pr_auc": [
+          0.8477321212404348,
+          1.2412670766236366e-16
+        ],
+        "trans_macro_f1": [
+          0.5593750858021471,
+          0.0
+        ],
+        "unseen_pair_trans_roc_auc": [
+          0.5973786145896405,
+          0.0
+        ],
+        "unseen_pair_trans_pr_auc": [
+          0.845058894075047,
+          0.0
+        ],
+        "unseen_pair_trans_macro_f1": [
+          0.5591738238877827,
+          0.0
+        ],
+        "unseen_roc_auc": [
+          0.545287857988924,
+          0.0
+        ],
+        "unseen_pr_auc": [
+          0.8278190208923892,
+          0.0
+        ],
+        "unseen_macro_f1": [
+          0.517305421185631,
+          0.0
+        ]
+      },
+      "StandardGCN": {
+        "roc_auc": [
+          0.5410183361539443,
+          0.01407090854763671
+        ],
+        "pr_auc": [
+          0.8223972309190284,
+          0.003543023239785477
+        ],
+        "macro_f1": [
+          0.4741007223736968,
+          0.05892040753139205
+        ],
+        "trans_roc_auc": [
+          0.5933052442288391,
+          0.011498658941350525
+        ],
+        "trans_pr_auc": [
+          0.8427634028374754,
+          0.004470873736416975
+        ],
+        "trans_macro_f1": [
+          0.5319959146972236,
+          0.03691959177103205
+        ],
+        "unseen_pair_trans_roc_auc": [
+          0.5941046248616392,
+          0.012447657966635503
+        ],
+        "unseen_pair_trans_pr_auc": [
+          0.8425307019887309,
+          0.005264048902339173
+        ],
+        "unseen_pair_trans_macro_f1": [
+          0.5303431139257879,
+          0.03755522008884662
+        ],
+        "unseen_roc_auc": [
+          0.5273610272553689,
+          0.0388432258066043
+        ],
+        "unseen_pr_auc": [
+          0.8104874596090724,
+          0.0157795206160498
+        ],
+        "unseen_macro_f1": [
+          0.4116674847079051,
+          0.1275033446920479
+        ]
+      },
+      "StandardGATv2": {
+        "roc_auc": [
+          0.5269916794606095,
+          0.01717114044775328
+        ],
+        "pr_auc": [
+          0.8199845684836113,
+          0.0051296556812770325
+        ],
+        "macro_f1": [
+          0.47878609181283344,
+          0.06811456870352163
+        ],
+        "trans_roc_auc": [
+          0.6052488290398126,
+          0.004172257221602519
+        ],
+        "trans_pr_auc": [
+          0.8484115543943449,
+          0.004141212317478008
+        ],
+        "trans_macro_f1": [
+          0.5302043128815006,
+          0.04679763821106664
+        ],
+        "unseen_pair_trans_roc_auc": [
+          0.6069993519843938,
+          0.004158183731690491
+        ],
+        "unseen_pair_trans_pr_auc": [
+          0.8486723728500483,
+          0.004412711469414178
+        ],
+        "unseen_pair_trans_macro_f1": [
+          0.5289211885310177,
+          0.04606545993132436
+        ],
+        "unseen_roc_auc": [
+          0.4948284787116554,
+          0.04273057752933301
+        ],
+        "unseen_pr_auc": [
+          0.7964590851516503,
+          0.017334693120632957
+        ],
+        "unseen_macro_f1": [
+          0.4246005914309493,
+          0.13948060794883232
+        ]
+      },
+      "SGCN": {
+        "roc_auc": [
+          0.5524419577824715,
+          0.007891456824874967
+        ],
+        "pr_auc": [
+          0.824672117666584,
+          0.0038106176941526512
+        ],
+        "macro_f1": [
+          0.5151334724735721,
+          0.06498958126964144
+        ],
+        "trans_roc_auc": [
+          0.6102673343927736,
+          0.005557398795931477
+        ],
+        "trans_pr_auc": [
+          0.848160825903641,
+          0.0037418952003017963
+        ],
+        "trans_macro_f1": [
+          0.5573416473852808,
+          0.008272378243636703
+        ],
+        "unseen_pair_trans_roc_auc": [
+          0.6105016580917451,
+          0.005828855045432099
+        ],
+        "unseen_pair_trans_pr_auc": [
+          0.847578536153948,
+          0.004256971918494402
+        ],
+        "unseen_pair_trans_macro_f1": [
+          0.5565564037152597,
+          0.008695139976020585
+        ],
+        "unseen_roc_auc": [
+          0.5356116062354629,
+          0.010705200717940894
+        ],
+        "unseen_pr_auc": [
+          0.8120429068515929,
+          0.004880636407570369
+        ],
+        "unseen_macro_f1": [
+          0.46158814313907126,
+          0.13368640982019137
+        ]
+      },
+      "FAGCN": {
+        "roc_auc": [
+          0.5876066644667556,
+          0.01640866133999068
+        ],
+        "pr_auc": [
+          0.8402223580034114,
+          0.008459193602150845
+        ],
+        "macro_f1": [
+          0.5429904310679607,
+          0.01833923165387818
+        ],
+        "trans_roc_auc": [
+          0.6090889511542322,
+          0.010225227795510163
+        ],
+        "trans_pr_auc": [
+          0.8477706716834318,
+          0.008204513203079087
+        ],
+        "trans_macro_f1": [
+          0.5506651125390734,
+          0.01016295400050347
+        ],
+        "unseen_pair_trans_roc_auc": [
+          0.6092090963931609,
+          0.010550700999288483
+        ],
+        "unseen_pair_trans_pr_auc": [
+          0.8475783297302171,
+          0.008402854013070536
+        ],
+        "unseen_pair_trans_macro_f1": [
+          0.5505172186310989,
+          0.00977729715291245
+        ],
+        "unseen_roc_auc": [
+          0.5809441205359959,
+          0.020622205003587513
+        ],
+        "unseen_pr_auc": [
+          0.8371657730236853,
+          0.00975480811600345
+        ],
+        "unseen_macro_f1": [
+          0.5321690539438648,
+          0.028744765914248398
+        ]
+      },
+      "BiEdgeGATv2-Link": {
+        "roc_auc": [
+          0.5715672809414415,
+          0.025738869373936456
+        ],
+        "pr_auc": [
+          0.8342351967317286,
+          0.00908724173764707
+        ],
+        "macro_f1": [
+          0.5293000749480683,
+          0.03146246511029228
+        ],
+        "trans_roc_auc": [
+          0.6179414101706258,
+          0.006024549299225088
+        ],
+        "trans_pr_auc": [
+          0.8506102142181039,
+          0.0025191704292370325
+        ],
+        "trans_macro_f1": [
+          0.5667416609551497,
+          0.007503239668273421
+        ],
+        "unseen_pair_trans_roc_auc": [
+          0.6189996161151072,
+          0.00561585803373119
+        ],
+        "unseen_pair_trans_pr_auc": [
+          0.8510953372921989,
+          0.002660962951010975
+        ],
+        "unseen_pair_trans_macro_f1": [
+          0.5653718213745474,
+          0.007777014226468126
+        ],
+        "unseen_roc_auc": [
+          0.5552636374468204,
+          0.03963157056071697
+        ],
+        "unseen_pr_auc": [
+          0.8228413627633918,
+          0.019596334068982785
+        ],
+        "unseen_macro_f1": [
+          0.5048592400546296,
+          0.051082386598111144
+        ]
+      },
+      "SiGAT": {
+        "roc_auc": [
+          0.5671573882931925,
+          0.015275445471767546
+        ],
+        "pr_auc": [
+          0.8330104574373365,
+          0.008033559555943218
+        ],
+        "macro_f1": [
+          0.5365711852779192,
+          0.013586335165211573
+        ],
+        "trans_roc_auc": [
+          0.6197042280026764,
+          0.007563138288396002
+        ],
+        "trans_pr_auc": [
+          0.8551166113252409,
+          0.004738629706998803
+        ],
+        "trans_macro_f1": [
+          0.5595029561334096,
+          0.009408640607288092
+        ],
+        "unseen_pair_trans_roc_auc": [
+          0.6199179180232278,
+          0.007192810584350047
+        ],
+        "unseen_pair_trans_pr_auc": [
+          0.8544651992395289,
+          0.00440634988685014
+        ],
+        "unseen_pair_trans_macro_f1": [
+          0.558915036891395,
+          0.008909794892402796
+        ],
+        "unseen_roc_auc": [
+          0.5430829275716679,
+          0.026180551671973643
+        ],
+        "unseen_pr_auc": [
+          0.8199153039308149,
+          0.01239105564970812
+        ],
+        "unseen_macro_f1": [
+          0.5192231231352779,
+          0.02221782707805764
+        ]
+      },
+      "SDGNN": {
+        "roc_auc": [
+          0.5829976625568054,
+          0.011682684136584789
+        ],
+        "pr_auc": [
+          0.8389969088810487,
+          0.003992650314546749
+        ],
+        "macro_f1": [
+          0.5471204540867387,
+          0.007311612161455256
+        ],
+        "trans_roc_auc": [
+          0.6163969973235195,
+          0.012897809213955995
+        ],
+        "trans_pr_auc": [
+          0.851967118663258,
+          0.006067470418935783
+        ],
+        "trans_macro_f1": [
+          0.5386083864859723,
+          0.05221510186503279
+        ],
+        "unseen_pair_trans_roc_auc": [
+          0.6178421416076383,
+          0.01361188197835918
+        ],
+        "unseen_pair_trans_pr_auc": [
+          0.8524646813403225,
+          0.007123950546671952
+        ],
+        "unseen_pair_trans_macro_f1": [
+          0.5382910944648728,
+          0.05178282620265578
+        ],
+        "unseen_roc_auc": [
+          0.5719363867837343,
+          0.02573043735873519
+        ],
+        "unseen_pr_auc": [
+          0.831226912667306,
+          0.013357811037809045
+        ],
+        "unseen_macro_f1": [
+          0.543609964385586,
+          0.011005506899099796
+        ]
+      },
+      "SBiFAGAT-Link": {
+        "roc_auc": [
+          0.5919222220065447,
+          0.01801728956039429
+        ],
+        "pr_auc": [
+          0.8384420471710923,
+          0.007885926254112875
+        ],
+        "macro_f1": [
+          0.5263415382804826,
+          0.06150854909533224
+        ],
+        "trans_roc_auc": [
+          0.613307230679157,
+          0.0027384219697835868
+        ],
+        "trans_pr_auc": [
+          0.8420255348749819,
+          0.004202351145951043
+        ],
+        "trans_macro_f1": [
+          0.5616475755430852,
+          0.012744869077999016
+        ],
+        "unseen_pair_trans_roc_auc": [
+          0.6148524281558864,
+          0.002855206038088282
+        ],
+        "unseen_pair_trans_pr_auc": [
+          0.8423715309929001,
+          0.0037587363081362526
+        ],
+        "unseen_pair_trans_macro_f1": [
+          0.5611325170710533,
+          0.012789831887877561
+        ],
+        "unseen_roc_auc": [
+          0.592852687238608,
+          0.022352352264791753
+        ],
+        "unseen_pr_auc": [
+          0.8403952120948597,
+          0.010552560445648592
+        ],
+        "unseen_macro_f1": [
+          0.49477824114468305,
+          0.11810306646493138
+        ]
+      }
+    },
+    "split_counts": {
+      "num_users": 10974,
+      "train_users": 8282,
+      "train_edges": 34789,
+      "val_edges": 7455,
+      "test_edges": 7455,
+      "test_transductive_edges": 2255,
+      "test_unseen_pair_transductive_edges": 2182,
+      "test_unseen_edges": 5200
+    },
+    "wilcoxon_p_values": {
+      "roc_auc": 0.0625,
+      "pr_auc": 0.0625,
+      "macro_f1": 0.8125,
+      "trans_roc_auc": 0.625,
+      "trans_pr_auc": 0.3125,
+      "trans_macro_f1": 0.3125,
+      "unseen_pair_trans_roc_auc": 0.4375,
+      "unseen_pair_trans_pr_auc": 0.125,
+      "unseen_pair_trans_macro_f1": 0.625,
+      "unseen_roc_auc": 0.0625,
+      "unseen_pr_auc": 0.125,
+      "unseen_macro_f1": 1.0
+    },
+    "adjusted_wilcoxon_p_values": {
+      "roc_auc": 0.75,
+      "pr_auc": 0.75,
+      "macro_f1": 1.0,
+      "trans_roc_auc": 1.0,
+      "trans_pr_auc": 1.0,
+      "trans_macro_f1": 1.0,
+      "unseen_pair_trans_roc_auc": 1.0,
+      "unseen_pair_trans_pr_auc": 1.0,
+      "unseen_pair_trans_macro_f1": 1.0,
+      "unseen_roc_auc": 0.75,
+      "unseen_pr_auc": 1.0,
+      "unseen_macro_f1": 1.0
+    },
+    "nonparametric_test_label": "Exact Perm",
+    "mp_graph_mode": "coalesced",
+    "edge_source": "teacher"
+  }
+}

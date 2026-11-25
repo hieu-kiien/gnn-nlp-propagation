@@ -515,7 +515,7 @@ def test_beta_nll_calibrated_confidence_task_loss_and_per_seed_bootstrap() -> No
         edge_index=torch.tensor([[0, 0, 1, 2], [1, 2, 3, 4]], dtype=torch.long),
         edge_index_td=torch.tensor([[0, 0, 1, 2], [1, 2, 3, 4]], dtype=torch.long),
         edge_index_bu=torch.tensor([[1, 2, 3, 4], [0, 0, 1, 2]], dtype=torch.long),
-        edge_attr=torch.tensor([[0.8, 0.1, 0.05, 0.9]] * 4, dtype=torch.float32),
+        edge_attr=torch.tensor([[0.8, 0.1]] * 4, dtype=torch.float32),
         cascade_stats=torch.rand((1, 8), dtype=torch.float32),
         root_index=torch.tensor([0], dtype=torch.long),
         y_size=torch.tensor([2.5]),
@@ -525,7 +525,7 @@ def test_beta_nll_calibrated_confidence_task_loss_and_per_seed_bootstrap() -> No
     from torch_geometric.loader import DataLoader as PyGDataLoader
 
     ldr = PyGDataLoader([g, g], batch_size=2)
-    sbi = SBiFAGAT(in_dim=770, hidden_dim=32, edge_dim=4, use_cascade_stats=True, predict_uncertainty=True)
+    sbi = SBiFAGAT(in_dim=770, hidden_dim=32, edge_dim=2, use_cascade_stats=True, predict_uncertainty=True)
     m0 = evaluate_loader(sbi, ldr, torch.device("cpu"), lambda_uncertainty=0.0)
     m5 = evaluate_loader(sbi, ldr, torch.device("cpu"), lambda_uncertainty=5.0)
     assert math.isclose(m0["task_loss"], m5["task_loss"], rel_tol=1e-6)
@@ -557,37 +557,39 @@ def test_beta_nll_calibrated_confidence_task_loss_and_per_seed_bootstrap() -> No
 
 
 def test_sign_symmetric_conv_4d_init_and_8_model_fair_parity() -> None:
-    # 1. Domain-aligned 4D edge attention init [+0.5, -0.25, -0.25, +0.25]
-    conv4 = StanceGuidedFAConv(hidden_dim=16, edge_dim=4, dropout=0.0)
-    expected_init = torch.tensor([0.5, -0.25, -0.25, 0.25], dtype=torch.float32)
-    assert torch.allclose(conv4.att[0, 32:].detach(), expected_init, atol=1e-6)
+    # 1. Unbiased symmetric 2D edge attention init (no hardcoded [0.6, -0.4] or 4D bias)
+    conv2 = StanceGuidedFAConv(hidden_dim=16, edge_dim=2, dropout=0.0)
+    edge_att = conv2.att[0, 32:].detach()
+    assert edge_att.shape == (2,)
+    assert torch.isfinite(edge_att).all()
+    assert not torch.allclose(edge_att, torch.tensor([0.6, -0.4], dtype=edge_att.dtype), atol=1e-4)
 
     # 2. Odd sign-symmetry verification f(-h, -h0, -h_r; ea) == -f(h, h0, h_r; ea)
     with torch.no_grad():
-        conv4.lin_root.bias.zero_()
-        conv4.norm.bias.zero_()
-        conv4.att[:, :32].zero_()
-    conv4.eval()
+        conv2.lin_root.bias.zero_()
+        conv2.norm.bias.zero_()
+        conv2.att[:, :32].zero_()
+    conv2.eval()
     h = torch.randn(5, 16)
     h0 = torch.randn(5, 16)
     hr = h0[0:1].expand(5, -1)
     ei = torch.tensor([[0, 0, 1, 2], [1, 2, 3, 4]], dtype=torch.long)
     ea = torch.tensor(
-        [[0.8, 0.05, 0.05, 0.9], [-0.8, 0.85, 0.75, 0.05], [-0.6, 0.1, 0.1, 0.8], [0.5, 0.1, 0.1, 0.8]],
+        [[0.8, 0.05], [-0.8, 0.85], [-0.6, 0.1], [0.5, 0.1]],
         dtype=torch.float32,
     )
-    out_pos, g_pos = conv4(h, h0, hr, ei, ea)
-    out_neg, g_neg = conv4(-h, -h0, -hr, ei, ea)
+    out_pos, g_pos = conv2(h, h0, hr, ei, ea)
+    out_neg, g_neg = conv2(-h, -h0, -hr, ei, ea)
     assert torch.allclose(g_pos, g_neg, atol=1e-5)
     assert torch.allclose(out_pos, -out_neg, atol=1e-5)
 
-    # 3. Verify all 8 models accept use_cascade_stats=True cleanly on batched graphs (including 0-edge graph)
+    # 3. Verify all 9 models (including BiEdgeGATv2) accept use_cascade_stats=True cleanly on batched graphs (including 0-edge graph)
     g1 = CascadeData(
         x=torch.randn(5, 770),
         edge_index=ei,
         edge_index_td=ei,
         edge_index_bu=ei[[1, 0]],
-        edge_attr=torch.tensor([[0.9, 0.05, 0.05, 0.9], [-0.9, 0.9, 0.8, 0.05], [-0.6, 0.1, 0.1, 0.8], [0.4, 0.2, 0.1, 0.7]]),
+        edge_attr=torch.tensor([[0.9, 0.05], [-0.9, 0.9], [-0.6, 0.1], [0.4, 0.2]]),
         cascade_stats=torch.rand((1, 8)),
         root_index=torch.tensor([0]),
     )
@@ -596,20 +598,23 @@ def test_sign_symmetric_conv_4d_init_and_8_model_fair_parity() -> None:
         edge_index=torch.empty((2, 0), dtype=torch.long),
         edge_index_td=torch.empty((2, 0), dtype=torch.long),
         edge_index_bu=torch.empty((2, 0), dtype=torch.long),
-        edge_attr=torch.empty((0, 4)),
+        edge_attr=torch.empty((0, 2)),
         cascade_stats=torch.rand((1, 8)),
         root_index=torch.tensor([0]),
     )
     batch = Batch.from_data_list([g1, g2])
+    from src.models.baselines import BiEdgeGATv2
+
     models = [
         TextMLP(in_dim=770, hidden_dim=32, use_cascade_stats=True),
-        TemporalStanceMLP(in_dim=770, hidden_dim=32, edge_dim=4, use_cascade_stats=True),
+        TemporalStanceMLP(in_dim=770, hidden_dim=32, edge_dim=2, use_cascade_stats=True),
         StandardGCN(in_dim=770, hidden_dim=32, use_cascade_stats=True),
         StandardGATv2(in_dim=770, hidden_dim=32, use_cascade_stats=True),
-        EdgeGATv2(in_dim=770, hidden_dim=32, edge_dim=4, use_cascade_stats=True),
+        EdgeGATv2(in_dim=770, hidden_dim=32, edge_dim=2, use_cascade_stats=True),
+        BiEdgeGATv2(in_dim=770, hidden_dim=32, edge_dim=2, use_cascade_stats=True),
         FAGCNBaseline(in_dim=770, hidden_dim=32, use_cascade_stats=True),
         BiGCN(in_dim=770, hidden_dim=32, use_cascade_stats=True),
-        SBiFAGAT(in_dim=770, hidden_dim=32, edge_dim=4, use_cascade_stats=True, predict_uncertainty=True),
+        SBiFAGAT(in_dim=770, hidden_dim=32, edge_dim=2, use_cascade_stats=True, predict_uncertainty=True),
     ]
     for mdl in models:
         out = mdl(batch)

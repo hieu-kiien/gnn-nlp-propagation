@@ -30,13 +30,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch_geometric.nn import MessagePassing, global_mean_pool
-from torch_geometric.utils import degree, scatter, softmax
+from torch_geometric.utils import degree, scatter
 
 from src.models.baselines import (
+    GlobalAttentionReadout,
     LatentConflictMLP,
     MultiTaskHead,
     TwoStreamNodeStem,
     broadcast_root_features,
+    prepare_edge_attr,
     resolve_root_indices,
 )
 
@@ -71,12 +73,7 @@ class StanceGuidedFAConv(MessagePassing):
         self.att = nn.Parameter(torch.empty(1, 2 * hidden_dim + edge_dim))
         self.cos_weight = nn.Parameter(torch.tensor(0.10))
 
-        if edge_dim >= 4:
-            basis_dim = edge_dim + 2
-        elif edge_dim == 2:
-            basis_dim = 4
-        else:
-            basis_dim = 2 * max(1, edge_dim)
+        basis_dim = 4 if edge_dim == 2 else 2 * max(1, edge_dim)
         self.edge_mlp = nn.Sequential(
             nn.Linear(basis_dim, 16),
             nn.GELU(),
@@ -93,27 +90,8 @@ class StanceGuidedFAConv(MessagePassing):
         nn.init.zeros_(self.lin_root.bias)
         node_att_dim = 2 * self.hidden_dim
         nn.init.xavier_uniform_(self.att[:, :node_att_dim], gain=0.2)
-        if self.edge_dim == 4:
-            with torch.no_grad():
-                self.att[:, node_att_dim:].copy_(
-                    torch.tensor(
-                        [[0.5, -0.25, -0.25, 0.25]],
-                        dtype=self.att.dtype,
-                        device=self.att.device,
-                    )
-                )
-        elif self.edge_dim == 2:
-            with torch.no_grad():
-                self.att[:, node_att_dim:].copy_(
-                    torch.tensor(
-                        [[0.6, -0.4]],
-                        dtype=self.att.dtype,
-                        device=self.att.device,
-                    )
-                )
-        elif self.edge_dim > 0:
-            edge_scale = 1.0 / math.sqrt(float(self.edge_dim))
-            nn.init.constant_(self.att[:, node_att_dim:], edge_scale)
+        if self.edge_dim > 0:
+            nn.init.xavier_uniform_(self.att[:, node_att_dim:], gain=0.2)
 
         with torch.no_grad():
             self.cos_weight.fill_(0.10)
@@ -125,15 +103,6 @@ class StanceGuidedFAConv(MessagePassing):
     def _edge_basis(self, edge_attr: Tensor) -> Tensor:
         if self.edge_dim == 0 or edge_attr.size(1) == 0:
             return edge_attr.new_zeros((edge_attr.size(0), 2))
-        if self.edge_dim >= 4 and edge_attr.size(1) >= 4:
-            s = edge_attr[:, 0:1]
-            h = edge_attr[:, 1:2]
-            r = edge_attr[:, 2:3]
-            c = edge_attr[:, 3:4]
-            parts = [s, h, r, c, s * h, s.abs()]
-            if edge_attr.size(1) > 4:
-                parts.append(edge_attr[:, 4:])
-            return torch.cat(parts, dim=-1)
         if self.edge_dim == 2 and edge_attr.size(1) >= 2:
             s = edge_attr[:, 0:1]
             h = edge_attr[:, 1:2]
@@ -262,23 +231,6 @@ def _propagate_root_aligned_edge_signal(
     return p_sign_all * edge_sig
 
 
-class GlobalAttentionReadout(nn.Module):
-    """Per-graph softmax attention readout over all early nodes in V_K."""
-
-    def __init__(self, hidden_dim: int) -> None:
-        super().__init__()
-        self.proj = nn.Linear(hidden_dim, hidden_dim)
-        self.query = nn.Linear(hidden_dim, 1, bias=False)
-
-    def forward(self, h: Tensor, batch_vec: Tensor, num_graphs: int) -> Tensor:
-        scores = self.query(torch.tanh(self.proj(h))).squeeze(-1)
-        attn = softmax(scores, batch_vec, num_nodes=num_graphs).unsqueeze(-1)
-        weighted = h * attn
-        out = h.new_zeros((num_graphs, h.size(-1)))
-        out.index_add_(0, batch_vec, weighted)
-        return out
-
-
 class SBiFAGAT(nn.Module):
     """Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network."""
 
@@ -295,8 +247,6 @@ class SBiFAGAT(nn.Module):
         use_bottom_up: bool = True,
         ablate_stance: bool = False,
         ablate_hostility: bool = False,
-        ablate_irrationality: bool = False,
-        ablate_constructive: bool = False,
         use_latent_edge_mlp: bool = False,
         readout_mode: Literal["attention", "mean"] = "attention",
         use_cascade_stats: bool = False,
@@ -306,6 +256,10 @@ class SBiFAGAT(nn.Module):
         use_camp_dipole: bool = True,
         use_dual_channel: bool = True,
         use_polar_persistence_anchor: bool | None = None,
+        mask_semantic_stats: bool = False,
+        mask_topology_stats: bool = False,
+        use_tier2_prior: bool = False,
+        tier2_prior_dim: int = 7,
     ) -> None:
         super().__init__()
         if readout_mode not in {"attention", "mean"}:
@@ -317,8 +271,6 @@ class SBiFAGAT(nn.Module):
         self.use_bottom_up = use_bottom_up
         self.ablate_stance = ablate_stance
         self.ablate_hostility = ablate_hostility
-        self.ablate_irrationality = ablate_irrationality
-        self.ablate_constructive = ablate_constructive
         self.use_latent_edge_mlp = use_latent_edge_mlp
         self.gate_mode = gate_mode
         self.readout_mode = readout_mode
@@ -328,8 +280,12 @@ class SBiFAGAT(nn.Module):
         self.use_dir_mix = bool(use_dir_mix)
         self.use_camp_dipole = bool(use_camp_dipole)
         self.use_dual_channel = bool(use_dual_channel)
+        self.mask_semantic_stats = bool(mask_semantic_stats)
+        self.mask_topology_stats = bool(mask_topology_stats)
+        self.use_tier2_prior = bool(use_tier2_prior)
+        self.tier2_prior_dim = int(tier2_prior_dim)
         self.use_polar_persistence_anchor = (
-            bool((not self.ablate_stance) and (not self.use_latent_edge_mlp))
+            bool(not self.use_latent_edge_mlp)
             if use_polar_persistence_anchor is None
             else bool(use_polar_persistence_anchor)
         )
@@ -337,6 +293,17 @@ class SBiFAGAT(nn.Module):
         self.input_proj = TwoStreamNodeStem(
             in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout
         )
+        if self.use_tier2_prior:
+            self.tier2_prior_proj: nn.Module | None = nn.Sequential(
+                nn.Linear(self.tier2_prior_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            self.tier2_prior_gate: nn.Parameter | None = nn.Parameter(torch.tensor(0.10))
+        else:
+            self.tier2_prior_proj = None
+            self.tier2_prior_gate = None
 
         self.latent_edge_mlp = (
             LatentConflictMLP(
@@ -420,7 +387,8 @@ class SBiFAGAT(nn.Module):
             dropout,
             cascade_feat_dim=self.cascade_feat_dim if self.use_cascade_stats else 0,
             predict_uncertainty=self.predict_uncertainty,
-            mask_semantic_stats=bool(self.ablate_stance or self.ablate_hostility),
+            mask_semantic_stats=self.mask_semantic_stats,
+            mask_topology_stats=self.mask_topology_stats,
             use_polar_persistence_anchor=self.use_polar_persistence_anchor,
         )
 
@@ -430,41 +398,19 @@ class SBiFAGAT(nn.Module):
         edge_index_td: Tensor,
         data: Any,
     ) -> Tensor:
-        num_edges = edge_index_td.size(1)
-        if self.latent_edge_mlp is not None:
-            edge_attr = self.latent_edge_mlp(x, edge_index_td)
-        else:
-            raw_attr = getattr(data, "edge_attr", None)
-            if raw_attr is None:
-                raw_attr = getattr(data, "edge_stance", None)
-
-            if raw_attr is None:
-                edge_attr = x.new_zeros((num_edges, self.edge_dim))
-            else:
-                edge_attr = raw_attr.float()
-                if edge_attr.dim() == 1:
-                    edge_attr = edge_attr.unsqueeze(-1)
-                if edge_attr.size(1) < self.edge_dim:
-                    edge_attr = F.pad(edge_attr, (0, self.edge_dim - edge_attr.size(1)))
-                elif edge_attr.size(1) > self.edge_dim:
-                    edge_attr = edge_attr[:, : self.edge_dim]
-
-        if (
-            self.ablate_stance
-            or self.ablate_hostility
-            or self.ablate_irrationality
-            or self.ablate_constructive
-        ):
+        edge_attr = prepare_edge_attr(
+            x,
+            edge_index_td,
+            data,
+            edge_dim=self.edge_dim,
+            latent_edge_mlp=self.latent_edge_mlp,
+        )
+        if self.ablate_stance or self.ablate_hostility:
             edge_attr = edge_attr.clone()
             if self.ablate_stance and edge_attr.size(1) >= 1:
                 edge_attr[:, 0] = 0.0
             if self.ablate_hostility and edge_attr.size(1) >= 2:
                 edge_attr[:, 1] = 0.0
-            if self.ablate_irrationality and edge_attr.size(1) >= 3:
-                edge_attr[:, 2] = 0.0
-            if self.ablate_constructive and edge_attr.size(1) >= 4:
-                edge_attr[:, 3] = 0.0
-
         return edge_attr
 
     def _encode_graphs(
@@ -484,6 +430,25 @@ class SBiFAGAT(nn.Module):
         edge_attr = self._prepare_edge_attr(x, edge_index_td, data)
 
         h0 = self.input_proj(x, data, root_idx)
+        if (
+            self.use_tier2_prior
+            and self.tier2_prior_proj is not None
+            and self.tier2_prior_gate is not None
+        ):
+            raw_prior = getattr(data, "tier2_user_prior", None)
+            if (
+                isinstance(raw_prior, Tensor)
+                and raw_prior.dim() == 2
+                and raw_prior.size(0) == num_nodes
+            ):
+                p_t = raw_prior.to(device=x.device, dtype=h0.dtype)
+                if p_t.size(1) < self.tier2_prior_dim:
+                    p_t = F.pad(p_t, (0, self.tier2_prior_dim - p_t.size(1)))
+                elif p_t.size(1) > self.tier2_prior_dim:
+                    p_t = p_t[:, : self.tier2_prior_dim]
+            else:
+                p_t = h0.new_zeros((num_nodes, self.tier2_prior_dim))
+            h0 = h0 + torch.tanh(self.tier2_prior_gate) * self.tier2_prior_proj(p_t)
         h_root_0 = broadcast_root_features(h0, root_idx, batch_vec)
 
         h_td = h0
@@ -566,19 +531,25 @@ class SBiFAGAT(nn.Module):
 
                 w_pos = F.relu(camp_sig).unsqueeze(-1)
                 w_neg = F.relu(-camp_sig).unsqueeze(-1)
-                sum_pos = scatter(w_pos, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+                sum_pos_edges = scatter(w_pos, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
                 sum_neg = scatter(w_neg, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
                 ones_e = x.new_ones((edge_index_td.size(1), 1), dtype=node_emb.dtype)
                 edge_cnt = scatter(ones_e, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
                 has_edges = edge_cnt > 0.0
 
+                # Include root_index (camp_root = +1, weight = 1.0) in the positive camp
+                h_root_camp = node_emb[root_idx]
+                sum_pos = sum_pos_edges + 1.0
                 has_pos = sum_pos > 1e-6
                 has_neg = sum_neg > 1e-6
                 both_camps = has_pos & has_neg
                 zero_camp = node_emb.new_zeros((num_graphs, self.hidden_dim))
                 mu_pos = torch.where(
                     has_pos,
-                    scatter(w_pos * h_dst, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+                    (
+                        scatter(w_pos * h_dst, edge_batch, dim=0, dim_size=num_graphs, reduce="sum")
+                        + h_root_camp
+                    )
                     / sum_pos.clamp(min=1e-6),
                     zero_camp,
                 )
@@ -589,11 +560,12 @@ class SBiFAGAT(nn.Module):
                     zero_camp,
                 )
                 denom_e = edge_cnt.clamp(min=1.0)
+                denom_camp = edge_cnt + 1.0
                 frac_pos = torch.where(
-                    has_edges, (sum_pos / denom_e).clamp(0.0, 1.0), torch.zeros_like(sum_pos)
+                    has_edges, (sum_pos / denom_camp).clamp(0.0, 1.0), torch.zeros_like(sum_pos)
                 )
                 frac_neg = torch.where(
-                    has_edges, (sum_neg / denom_e).clamp(0.0, 1.0), torch.zeros_like(sum_neg)
+                    has_edges, (sum_neg / denom_camp).clamp(0.0, 1.0), torch.zeros_like(sum_neg)
                 )
                 camp_balance = torch.where(
                     both_camps,
@@ -650,9 +622,11 @@ class SBiFAGAT(nn.Module):
         rumor_probs = torch.softmax(outputs["rumor_logits"].detach().cpu(), dim=-1)
 
         if "confidence_score" in outputs:
-            conf = outputs["confidence_score"].detach().cpu()
+            conf: Tensor | None = outputs["confidence_score"].detach().cpu()
+            uncertainty_available = True
         else:
-            conf = torch.full_like(y_polar, 0.75)
+            conf = None
+            uncertainty_available = False
 
         c_stats = getattr(data, "cascade_stats", None)
         if c_stats is not None and c_stats.numel() >= 8:
@@ -664,7 +638,9 @@ class SBiFAGAT(nn.Module):
             substantive_ratio = torch.ones_like(y_polar)
             one_sided_host = torch.zeros_like(y_polar)
 
-        low_signal = (substantive_ratio < 0.35) | (conf < 0.45)
+        low_signal = substantive_ratio < 0.35
+        if conf is not None:
+            low_signal = low_signal | (conf < 0.45)
 
         gamma_td = gamma_td_layers[-1].detach().cpu() if gamma_td_layers else torch.zeros(0)
         gamma_bu = gamma_bu_layers[-1].detach().cpu() if gamma_bu_layers else torch.zeros_like(gamma_td)
@@ -694,10 +670,6 @@ class SBiFAGAT(nn.Module):
                     item["s_uv"] = float(attr_cpu[e_i, 0].item())
                     if attr_cpu.size(1) >= 2:
                         item["h_uv"] = float(attr_cpu[e_i, 1].item())
-                    if attr_cpu.size(1) >= 3:
-                        item["r_uv"] = float(attr_cpu[e_i, 2].item())
-                    if attr_cpu.size(1) >= 4:
-                        item["c_uv"] = float(attr_cpu[e_i, 3].item())
                 top_edges.append(item)
 
         return {
@@ -706,6 +678,7 @@ class SBiFAGAT(nn.Module):
             "y_polar_pred": y_polar,
             "rumor_probs": rumor_probs,
             "confidence_score": conf,
+            "uncertainty_available": uncertainty_available,
             "substantive_text_ratio": substantive_ratio,
             "one_sided_hostility_index": one_sided_host,
             "low_signal_warning": low_signal,

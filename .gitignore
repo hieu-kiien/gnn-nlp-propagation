@@ -11,19 +11,16 @@ build/
 .coverage
 htmlcov/
 
-# Virtual environments, IDE & OS files
+# Virtual environments & IDE/OS files
 .venv/
 venv/
 env/
-.env
-.env.*
-*.secret
 .vscode/
 .idea/
 Thumbs.db
 .DS_Store
 
-# Datasets, checkpoints, weights & run logs (keep .gitkeep placeholders)
+# Datasets, checkpoints, outputs & run logs (keep .gitkeep placeholders)
 data/raw/*
 !data/raw/.gitkeep
 data/interim/*
@@ -32,32 +29,53 @@ data/processed/*
 !data/processed/.gitkeep
 checkpoints/
 outputs/
-results/
 logs/
+.ipynb_checkpoints/
+wandb/
+
+# Track clean non-binary experimental artifacts in results/; keep binaries/temp/secrets ignored
+results/*
+!results/*.json
+!results/*.md
+!results/*.tex
+!results/figures/
+results/figures/*
+!results/figures/*/
+results/figures/*/*
+!results/figures/*/*.svg
+!results/figures/*/*.pdf
+
+# Secrets, weights, datasets, archives & temp JSONs (placed AFTER !results/* so last-match wins)
+.env
+.env.*
+*.secret
 *.pt
 *.pth
 *.ckpt
 *.bin
 *.safetensors
 *.parquet
-
-# Archive bundles, runtime logs & double-blind audit answer keys (keep public repo clean)
 *.zip
 *.tar
 *.tar.gz
 *.tar.bz2
 *.7z
 runner_summary_*.json
+results/runner_summary_*.json
 *_machine_key.csv
 *.tmp.json
 *.jsonl
-.ipynb_checkpoints/
-wandb/
 
-# Temporary / smoke paper outputs (commit only final 5-seed verified tables/JSON)
+# Temporary / smoke outputs (commit only verified non-binary tables/JSON)
+results/*smoke*
+results/*draft*
+results/*debug*
 paper/*smoke*
 paper/*draft*
 paper/*debug*
+archive/docs_v1/paper/*smoke*
+archive/docs_v1/paper/*draft*
+archive/docs_v1/paper/*debug*
 
 # Backup, temp & LaTeX build artifacts
 *.bak
@@ -72,6 +90,10 @@ paper/*debug*
 paper/*.log
 paper/*.out
 paper/*.toc
+archive/docs_v1/paper/*.log
+archive/docs_v1/paper/*.out
+archive/docs_v1/paper/*.toc
 
 # Generated Word reports
 reports/*.docx
+archive/docs_v1/reports/*.docx

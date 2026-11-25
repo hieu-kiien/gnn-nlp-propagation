@@ -10,6 +10,11 @@ import pytest
 import torch
 
 from scripts.predict_live_thread import (
+    VN_POLAR_Q50,
+    VN_POLAR_Q75,
+    VN_POLAR_Q90,
+    _classify_calibrated_regime,
+    _format_report_vi,
     _make_demo_offline_thread,
     predict_live_cascade,
 )
@@ -61,3 +66,52 @@ def test_predict_live_empty_comments_rejected() -> None:
     post, _ = _make_demo_offline_thread()
     with pytest.raises(ValueError, match="không có đủ bình luận hợp lệ|insufficient valid comments"):
         predict_live_cascade(post, [], is_demo=True, allow_untrained=True)
+
+
+def test_predict_live_honest_confidence_none_and_clean_2d_report() -> None:
+    """When predict_uncertainty=False, confidence_score is None, report prints N/A, and 4D legacy strings are absent."""
+    post, comments = _make_demo_offline_thread()
+    res = predict_live_cascade(post, comments, is_demo=True, allow_untrained=False)
+    assert res["confidence_score"] is None
+    assert res["uncertainty_available"] is False
+    assert isinstance(res["early_y_polar"], float)
+    assert 0.0 <= res["early_y_polar"] <= 1.0
+    assert "irrational_fallacy" not in res["behavior_counts"]
+    assert set(res["behavior_counts"].keys()) == {
+        "support",
+        "neutral",
+        "constructive_oppose",
+        "hostile_conflict",
+    }
+    assert "flagged_hostile" in res
+    assert "flagged_irrational_or_hostile" not in res
+    assert res["actual_post_hoc_comparison"]["has_future_replies"] is True
+    assert res["actual_post_hoc_comparison"]["actual_full_polarization_mode"] == "future_only"
+    assert res["actual_post_hoc_comparison"]["actual_full_polarization"] is not None
+
+    report_txt = _format_report_vi(res)
+    assert "N/A (uncertainty disabled)" in report_txt
+    assert "5 NHOM HANH VI" not in report_txt
+    assert "vo_ly=" not in report_txt
+
+
+def test_predict_live_no_future_replies_sets_actual_polar_none() -> None:
+    """When total replies <= K, actual_full_polarization is None with mode 'no_future_replies'."""
+    post, comments = _make_demo_offline_thread()
+    res = predict_live_cascade(post, comments[:5], k_horizon=20, is_demo=True, allow_untrained=False)
+    assert res["k_observed"] == 5
+    act = res["actual_post_hoc_comparison"]
+    assert act["has_future_replies"] is False
+    assert act["actual_full_polarization"] is None
+    assert act["actual_full_polarization_mode"] == "no_future_replies"
+    report_txt = _format_report_vi(res)
+    assert "N/A (chua co binh luan t > K)" in report_txt
+
+
+def test_calibrated_regime_never_overridden_by_counts() -> None:
+    """Strict quantile regime classification ignores heavy conflict/oppose counts."""
+    counts = {"support": 0, "neutral": 0, "constructive_oppose": 10, "hostile_conflict": 10}
+    assert "< Q50" in _classify_calibrated_regime(VN_POLAR_Q50 - 0.01, counts)
+    assert "Q50-Q75" in _classify_calibrated_regime((VN_POLAR_Q50 + VN_POLAR_Q75) * 0.5, counts)
+    assert "Q75-Q90" in _classify_calibrated_regime((VN_POLAR_Q75 + VN_POLAR_Q90) * 0.5, counts)
+    assert ">= Q90" in _classify_calibrated_regime(VN_POLAR_Q90 + 0.01, counts)

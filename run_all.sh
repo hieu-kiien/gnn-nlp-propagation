@@ -44,8 +44,8 @@ run_dataset_suite() {
             --k-horizon "${k_val}" \
             --min-total-replies "${m_val}" \
             --polar-target-mode "${POLAR_MODE}" \
-            --output-table "paper/tables_loo_${ds_name}.tex" \
-            --output-json "paper/results_loo_${ds_name}.json" \
+            --output-table "results/tables_loo_${ds_name}.tex" \
+            --output-json "results/results_loo_${ds_name}.json" \
             --ckpt-out "checkpoints/best_sbifagat_${ds_name}_loo.pt" \
             --skip-figures \
             "${UNIFIED_FLAGS[@]}"
@@ -68,8 +68,8 @@ run_dataset_suite() {
         --k-horizon "${k_val}" \
         --min-total-replies "${m_val}" \
         --edge-dim 2 \
-        --output-table "paper/tables_dataset_eda_${ds_name}.tex" \
-        --output-json "paper/results_dataset_eda_${ds_name}.json"
+        --output-table "results/tables_dataset_eda_${ds_name}.tex" \
+        --output-json "results/results_dataset_eda_${ds_name}.json"
     "${PYTHON_BIN}" -m scripts.run_macro_signed_network \
         --data-dir "${ddir}" \
         --dataset-name "${ds_name}" \
@@ -78,8 +78,8 @@ run_dataset_suite() {
         --hidden-dim "${HIDDEN_DIM}" \
         --edge-dim 2 \
         --use-cascade-stats \
-        --output-table "paper/tables_efficiency_${ds_name}.tex" \
-        --output-json "paper/results_efficiency_${ds_name}.json"
+        --output-table "results/tables_efficiency_${ds_name}.tex" \
+        --output-json "results/results_efficiency_${ds_name}.json"
 }
 
 echo "[2/4] Discovering processed datasets..."
@@ -103,7 +103,7 @@ echo "[3/4] Running UPFD GossipCop (BERT) 5-seed structural transfer benchmark..
 "${PYTHON_BIN}" -m scripts.run_upfd_extension --upfd-root "${UPFD_ROOT}" --hidden-dim "${HIDDEN_DIM}" || \
     echo "[WARN] Optional UPFD benchmark failed (check network/GDrive mirror); continuing to paper assembly."
 
-echo "[4/4] Assembling unified paper tables & validating LaTeX syntax..."
-"${PYTHON_BIN}" -m scripts.assemble_paper_artifacts --paper-dir paper
+echo "[4/4] Assembling unified results tables & validating LaTeX syntax..."
+"${PYTHON_BIN}" -m scripts.assemble_paper_artifacts --paper-dir results
 
 echo "All tests and SBi-FAGAT Phase 3 experimental pipelines completed."

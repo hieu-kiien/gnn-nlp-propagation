@@ -10,12 +10,18 @@ Demonstrates step-by-step on a 13-node Vietnamese debate tree (root + K = 12 rep
 
 from __future__ import annotations
 
+import argparse
 import math
 import sys
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch_geometric.data import Batch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.pyg_dataset import (
     CascadeData,
@@ -209,5 +215,13 @@ def run_walkthrough() -> None:
     print("\n[Hoàn tất] Chạy xong demo cơ chế trong < 5 giây!")
 
 
-if __name__ == "__main__":
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="5-second CPU educational walkthrough explaining SBi-FAGAT without requiring GPU or datasets."
+    )
+    parser.parse_args()
     run_walkthrough()
+
+
+if __name__ == "__main__":
+    main()

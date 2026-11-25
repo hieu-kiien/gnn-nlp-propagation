@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import random
+from bisect import bisect_left
 from collections import deque
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, Sequence
@@ -49,6 +50,7 @@ TEMPORAL_DEPTH_DIM: int = 2
 TOTAL_NODE_FEATURE_DIM: int = NLP_NODE_DIM + TEMPORAL_DEPTH_DIM  # 770
 STRUCTURAL_NODE_DIM: int = 10
 CASCADE_STATS_DIM: int = 8
+TIER2_PRIOR_DIM: int = 7
 DEFAULT_FORECAST_MIN_REPLIES: int = 25
 
 
@@ -740,16 +742,17 @@ def _compute_full_tree_polarization(
     lambda_polar: float = 0.5,
     neutral_eps: float = 0.1,
 ) -> float:
-    """Compute continuous, finite-sample-unbiased symmetric bipolar polarization y_polar in [0, 1].
+    """Compute continuous, finite-sample-unbiased linear bipolar polarization y_polar in [0, 1].
 
-    Combines finite-sample-unbiased stance variance `min(1, s^2_{ddof=1})` with
-    continuous intensity-weighted bipolar balance
-    `min(1, (n / (n - 1)) * 4 * mean(max(s, 0)) * mean(max(-s, 0)))`.
-    Because `max(s_i, 0) * max(-s_i, 0) = 0` identically, the `n / (n - 1)` factor
-    removes finite-sample covariance bias for both terms, eliminating cascade-size
-    length bias while suppressing near-neutral noise (e.g. |s| ~ 0.11). Unanimous
-    support or unanimous opposition both yield 0.0, while an equal 50/50 extreme
-    split (+1 vs -1) attains the maximum 1.0.
+    Computes the linear dispersion formula:
+    ``lambda_polar * min(1, sqrt(s^2_{ddof=1})) + (1 - lambda_polar) * min(1, 2 * sqrt((n / (n - 1)) * m_+ * m_-))``,
+    where ``m_+ = mean(max(s, 0))`` and ``m_- = mean(max(-s, 0))``.
+    Taking the square root of the finite-sample-corrected terms avoids quadratic collapse
+    (Jensen caveat: ``E[sqrt(X)] <= sqrt(E[X])``, so finite-sample expectation is slightly
+    conservative relative to the quadratic variance scale). Because stances come from
+    NLP stance sensors on reply edges, ``y_polar`` is a silver-standard model-derived
+    construct validated against human audits and construct-validity companions (BC,
+    signed assortativity) rather than exhaustive human tree-level ground truth.
     """
     del oppose_flags, neutral_eps  # Retained in signature for backward compatibility
     n = len(stances)
@@ -769,7 +772,7 @@ def _compute_full_tree_polarization(
 
 
 _INVALID_AUTHOR_HASHES: frozenset[str] = frozenset(
-    {"", "none", "null", "[deleted]", "deleted", "unknown"}
+    {"", "none", "null", "[deleted]", "deleted", "[removed]", "removed", "automoderator", "bot", "unknown"}
 )
 
 
@@ -937,7 +940,7 @@ def compute_early_cascade_burst_stats(
 
     hashed_users = [str(n["user_id_hash"]).strip() for n in reply_nodes if _is_valid_author_hash(n.get("user_id_hash"))]
     if hashed_users:
-        unique_user_ratio = min(1.0, float(len(set(hashed_users))) / float(len(reply_nodes)))
+        unique_user_ratio = min(1.0, float(len(set(hashed_users))) / float(len(hashed_users)))
     else:
         unique_user_ratio = 0.5
 
@@ -993,11 +996,13 @@ class EarlyCascadeDataset(Dataset):
         edges_table: pa.Table | None = None,
         nlp_features: Mapping[str, Any] | None = None,
         min_total_replies: int = 0,
-        polar_target_mode: Literal["full", "future_only"] = "full",
+        polar_target_mode: Literal["full", "future_only"] = "future_only",
         polar_future_start_k: int | None = None,
         label_scheme: Literal["veracity4", "binary"] = "veracity4",
         custom_topic_splits: Mapping[str, set[str]] | None = None,
         edge_source: Literal["auto", "student", "teacher"] = "auto",
+        include_tier2_prior: bool = False,
+        tier2_prior_scope: Literal["causal_split", "causal_all"] = "causal_split",
     ) -> None:
         super().__init__()
         if k_horizon < 1:
@@ -1012,6 +1017,8 @@ class EarlyCascadeDataset(Dataset):
             raise ValueError(f"Unsupported label_scheme {label_scheme!r}")
         if edge_source not in {"auto", "student", "teacher"}:
             raise ValueError(f"Unsupported edge_source {edge_source!r}")
+        if tier2_prior_scope not in {"causal_split", "causal_all"}:
+            raise ValueError(f"Unsupported tier2_prior_scope {tier2_prior_scope!r}")
 
         self.root_dir = Path(root_dir)
         self.k_horizon = int(k_horizon)
@@ -1025,6 +1032,8 @@ class EarlyCascadeDataset(Dataset):
         )
         self.label_scheme = label_scheme
         self.edge_source = edge_source
+        self.include_tier2_prior = bool(include_tier2_prior)
+        self.tier2_prior_scope = tier2_prior_scope
 
         used_disk_tables = nodes_table is None or edges_table is None
         if used_disk_tables:
@@ -1067,12 +1076,6 @@ class EarlyCascadeDataset(Dataset):
             )
         )
 
-        self._all_cascades = self._build_all_cascades(
-            nodes_table=nodes_table,
-            edges_table=edges_table,
-            nlp_features=nlp_features,
-        )
-
         effective_custom_splits = custom_topic_splits
         canonical_splits_path = self.root_dir / "topic_splits.json"
         if (
@@ -1081,8 +1084,80 @@ class EarlyCascadeDataset(Dataset):
             and canonical_splits_path.is_file()
         ):
             disk_splits = load_topic_splits_json(canonical_splits_path)
+            effective_custom_splits = disk_splits
+
+        allowed_prior_topics: set[str] | None = None
+        if self.include_tier2_prior and self.tier2_prior_scope == "causal_split" and split != "all":
+            resolved_splits = effective_custom_splits
+            if resolved_splits is None:
+                label_map = (
+                    BINARY_RUMOR_LABEL_TO_IDX
+                    if self.label_scheme == "binary"
+                    else RUMOR_LABEL_TO_IDX
+                )
+                n_by_cid: dict[str, list[dict[str, Any]]] = {}
+                for row in nodes_table.to_pylist():
+                    n_by_cid.setdefault(str(row["cascade_id"]), []).append(row)
+                meta_items: list[dict[str, Any]] = []
+                for cid in sorted(n_by_cid.keys()):
+                    c_nodes = n_by_cid[cid]
+                    if len(c_nodes) - 1 < self.min_total_replies:
+                        continue
+                    r_row = next(n for n in c_nodes if bool(n["is_root"]))
+                    raw_lbl = r_row.get("rumor_label")
+                    y_rum = (
+                        label_map[str(raw_lbl)]
+                        if raw_lbl is not None and str(raw_lbl) in label_map
+                        else None
+                    )
+                    meta_items.append(
+                        {
+                            "cascade_id": cid,
+                            "topic_id": str(r_row["topic_id"]),
+                            "y_rumor": y_rum,
+                        }
+                    )
+                if meta_items:
+                    sp_idx = inductive_topic_split(
+                        meta_items,
+                        train_ratio=train_ratio,
+                        val_ratio=val_ratio,
+                        test_ratio=test_ratio,
+                        seed=self.split_seed,
+                    )
+                    resolved_splits = {
+                        sp_name: {meta_items[i]["topic_id"] for i in sp_idx[sp_name]}
+                        for sp_name in ("train", "val", "test")
+                    }
+            if resolved_splits is not None:
+                if split == "train":
+                    allowed_prior_topics = set(resolved_splits.get("train", ()))
+                elif split == "val":
+                    allowed_prior_topics = set(resolved_splits.get("train", ())) | set(
+                        resolved_splits.get("val", ())
+                    )
+                else:
+                    allowed_prior_topics = None
+
+        self._all_cascades = self._build_all_cascades(
+            nodes_table=nodes_table,
+            edges_table=edges_table,
+            nlp_features=nlp_features,
+            allowed_prior_topics=allowed_prior_topics,
+        )
+
+        if (
+            custom_topic_splits is None
+            and split != "all"
+            and canonical_splits_path.is_file()
+            and effective_custom_splits is not None
+        ):
             all_topics_present = {str(c.topic_id) for c in self._all_cascades}
-            covered = disk_splits["train"] | disk_splits["val"] | disk_splits["test"]
+            covered = (
+                effective_custom_splits["train"]
+                | effective_custom_splits["val"]
+                | effective_custom_splits["test"]
+            )
             if not all_topics_present.issubset(covered):
                 missing = sorted(all_topics_present - covered)
                 raise ValueError(
@@ -1090,7 +1165,6 @@ class EarlyCascadeDataset(Dataset):
                     f"{len(missing)} active topic_ids (e.g. {missing[:5]}). Refusing silent re-splitting "
                     "to prevent train/val/test leakage; regenerate topic_splits.json for this min_total_replies."
                 )
-            effective_custom_splits = disk_splits
 
         if split == "all":
             self.data_list: list[CascadeData] = list(self._all_cascades)
@@ -1125,46 +1199,197 @@ class EarlyCascadeDataset(Dataset):
     def __getitem__(self, idx: int) -> CascadeData:
         return self.data_list[idx]
 
+    @staticmethod
+    def _build_tier2_prior_index(
+        nodes_by_cascade: Mapping[str, list[dict[str, Any]]],
+        edges_by_cascade: Mapping[str, list[dict[str, Any]]],
+        stance_map: Mapping[Any, Any] | None,
+        hostility_map: Mapping[Any, Any] | None,
+        allowed_topics: set[str] | None,
+    ) -> dict[str, Any]:
+        user_posts_raw: dict[str, list[tuple[float, str]]] = {}
+        user_out_raw: dict[str, list[tuple[float, str, float, float, str]]] = {}
+        user_in_raw: dict[str, list[tuple[float, str, float, str]]] = {}
+        pair_edges_raw: dict[tuple[str, str], list[tuple[float, str, float]]] = {}
+
+        for cid, c_nodes in nodes_by_cascade.items():
+            if not c_nodes:
+                continue
+            root_row = next((n for n in c_nodes if bool(n.get("is_root"))), c_nodes[0])
+            tid = str(root_row["topic_id"])
+            if allowed_topics is not None and tid not in allowed_topics:
+                continue
+
+            node_author_map: dict[str, str] = {}
+            for n in c_nodes:
+                raw_u = n.get("user_id_hash")
+                if not _is_valid_author_hash(raw_u):
+                    continue
+                u_str = str(raw_u).strip()
+                node_author_map[str(n["node_id"])] = u_str
+                ts_sec = _to_unix_seconds(n.get("created_at_utc"))
+                user_posts_raw.setdefault(u_str, []).append((ts_sec, cid))
+
+            for e in edges_by_cascade.get(cid, ()):
+                src_id = str(e["source_id"])
+                dst_id = str(e["target_id"])
+                u_dst = node_author_map.get(dst_id)
+                u_src = node_author_map.get(src_id)
+                if u_dst is None or u_src is None or u_dst == u_src:
+                    continue
+                eid = str(e["edge_id"])
+                ts_sec = _to_unix_seconds(e.get("created_at_utc"))
+                s_uv = float(min(1.0, max(-1.0, _lookup_edge_scalar(stance_map, eid, src_id, dst_id, 0.0))))
+                h_uv = float(min(1.0, max(0.0, _lookup_edge_scalar(hostility_map, eid, src_id, dst_id, 0.0))))
+                user_out_raw.setdefault(u_dst, []).append((ts_sec, cid, s_uv, h_uv, u_src))
+                user_in_raw.setdefault(u_src, []).append((ts_sec, cid, s_uv, u_dst))
+                pair_key = (u_dst, u_src) if u_dst <= u_src else (u_src, u_dst)
+                pair_edges_raw.setdefault(pair_key, []).append((ts_sec, cid, s_uv))
+
+        def _index_sorted(
+            raw_dict: dict[Any, list[Any]],
+        ) -> dict[Any, tuple[list[float], list[Any]]]:
+            indexed: dict[Any, tuple[list[float], list[Any]]] = {}
+            for k, items in raw_dict.items():
+                items.sort(key=lambda row: row[0])
+                indexed[k] = ([row[0] for row in items], items)
+            return indexed
+
+        return {
+            "user_posts": _index_sorted(user_posts_raw),
+            "user_out": _index_sorted(user_out_raw),
+            "user_in": _index_sorted(user_in_raw),
+            "pair_edges": _index_sorted(pair_edges_raw),
+        }
+
+    @staticmethod
+    def _compute_cascade_tier2_prior(
+        prior_index: Mapping[str, Any],
+        kept_nodes: Sequence[Mapping[str, Any]],
+        *,
+        cid: str,
+        root_ts_sec: float,
+        op_hash: str | None,
+    ) -> torch.Tensor:
+        user_posts = prior_index["user_posts"]
+        user_out = prior_index["user_out"]
+        user_in = prior_index["user_in"]
+        pair_edges = prior_index["pair_edges"]
+        valid_op = _is_valid_author_hash(op_hash)
+        op_clean = str(op_hash).strip() if valid_op else ""
+
+        rows: list[list[float]] = []
+        for n in kept_nodes:
+            raw_u = n.get("user_id_hash")
+            if not _is_valid_author_hash(raw_u):
+                rows.append([0.0] * TIER2_PRIOR_DIM)
+                continue
+            u = str(raw_u).strip()
+
+            p_entry = user_posts.get(u)
+            if p_entry is not None:
+                p_ts, p_items = p_entry
+                p_cut = bisect_left(p_ts, root_ts_sec)
+                prior_p = [it for it in p_items[:p_cut] if it[1] != cid]
+                prior_posts = len(prior_p)
+                prior_cascades = len({it[1] for it in prior_p})
+            else:
+                prior_posts = 0
+                prior_cascades = 0
+
+            o_entry = user_out.get(u)
+            if o_entry is not None:
+                o_ts, o_items = o_entry
+                o_cut = bisect_left(o_ts, root_ts_sec)
+                prior_o = [it for it in o_items[:o_cut] if it[1] != cid]
+                out_cnt = len(prior_o)
+                if out_cnt > 0:
+                    out_opp = sum(1 for it in prior_o if it[2] <= -0.1) / float(out_cnt)
+                    mean_host = sum(it[3] for it in prior_o) / float(out_cnt)
+                else:
+                    out_opp = 0.0
+                    mean_host = 0.0
+            else:
+                out_cnt = 0
+                out_opp = 0.0
+                mean_host = 0.0
+
+            i_entry = user_in.get(u)
+            if i_entry is not None:
+                i_ts, i_items = i_entry
+                i_cut = bisect_left(i_ts, root_ts_sec)
+                prior_i = [it for it in i_items[:i_cut] if it[1] != cid]
+                in_cnt = len(prior_i)
+                in_opp = (
+                    sum(1 for it in prior_i if it[2] <= -0.1) / float(in_cnt)
+                    if in_cnt > 0
+                    else 0.0
+                )
+            else:
+                in_cnt = 0
+                in_opp = 0.0
+
+            if valid_op and u != op_clean:
+                pk = (u, op_clean) if u <= op_clean else (op_clean, u)
+                pk_entry = pair_edges.get(pk)
+                if pk_entry is not None:
+                    pk_ts, pk_items = pk_entry
+                    pk_cut = bisect_left(pk_ts, root_ts_sec)
+                    prior_pk = [it for it in pk_items[:pk_cut] if it[1] != cid]
+                    pair_cnt = len(prior_pk)
+                    total_int = out_cnt + in_cnt
+                    pair_hist_rate = (
+                        float(pair_cnt) / float(total_int) if total_int > 0 else 0.0
+                    )
+                    pair_mean_stance = (
+                        sum(it[2] for it in prior_pk) / float(pair_cnt)
+                        if pair_cnt > 0
+                        else 0.0
+                    )
+                else:
+                    pair_hist_rate = 0.0
+                    pair_mean_stance = 0.0
+            else:
+                pair_hist_rate = 0.0
+                pair_mean_stance = 0.0
+
+            rows.append(
+                [
+                    math.log1p(float(prior_posts)),
+                    math.log1p(float(prior_cascades)),
+                    float(out_opp),
+                    float(in_opp),
+                    float(mean_host),
+                    float(pair_hist_rate),
+                    float(pair_mean_stance),
+                ]
+            )
+        return torch.tensor(rows, dtype=torch.float32)
+
     def _build_all_cascades(
         self,
         nodes_table: pa.Table,
         edges_table: pa.Table,
         nlp_features: Mapping[str, Any],
+        *,
+        allowed_prior_topics: set[str] | None = None,
     ) -> list[CascadeData]:
         node_emb_map = _resolve_node_embeddings(nlp_features)
         if getattr(self, "_use_teacher_edges", False) and "teacher_edge_stance" in nlp_features:
             stance_map = nlp_features.get("teacher_edge_stance")
             hostility_map = nlp_features.get("teacher_edge_hostility", nlp_features.get("edge_hostility"))
-            irr_map = nlp_features.get("teacher_edge_irrationality", nlp_features.get("edge_irrationality"))
-            con_map = nlp_features.get("teacher_edge_constructive", nlp_features.get("edge_constructive"))
         else:
             stance_map = nlp_features.get("edge_stance")
             hostility_map = nlp_features.get("edge_hostility")
-            irr_map = nlp_features.get("edge_irrationality")
-            con_map = nlp_features.get("edge_constructive")
         # Ground-truth targets always prefer independent teacher maps when present
         target_stance_map = nlp_features.get("teacher_edge_stance") or stance_map
         target_hostility_map = nlp_features.get("teacher_edge_hostility") or hostility_map
-        target_irr_map = nlp_features.get("teacher_edge_irrationality") or irr_map
         root_stance_map = (
             nlp_features.get("teacher_node_root_stance") or nlp_features.get("node_root_stance")
             if getattr(self, "_use_teacher_edges", False)
             or "teacher_node_root_stance" in nlp_features
             else nlp_features.get("node_root_stance")
         )
-
-        raw_feat_edge_attr = nlp_features.get("edge_attr")
-        use_4d_edges = bool(
-            irr_map is not None
-            or con_map is not None
-            or int(nlp_features.get("edge_dim", 2)) == 4
-            or (
-                isinstance(raw_feat_edge_attr, torch.Tensor)
-                and raw_feat_edge_attr.ndim == 2
-                and raw_feat_edge_attr.size(1) == 4
-            )
-        )
-        active_edge_dim = 4 if use_4d_edges else 2
 
         nodes_by_cascade: dict[str, list[dict[str, Any]]] = {}
         for row in nodes_table.to_pylist():
@@ -1173,6 +1398,18 @@ class EarlyCascadeDataset(Dataset):
         edges_by_cascade: dict[str, list[dict[str, Any]]] = {}
         for row in edges_table.to_pylist():
             edges_by_cascade.setdefault(str(row["cascade_id"]), []).append(row)
+
+        prior_index = (
+            self._build_tier2_prior_index(
+                nodes_by_cascade=nodes_by_cascade,
+                edges_by_cascade=edges_by_cascade,
+                stance_map=stance_map,
+                hostility_map=hostility_map,
+                allowed_topics=allowed_prior_topics,
+            )
+            if self.include_tier2_prior
+            else None
+        )
 
         cascades: list[CascadeData] = []
         for cid in sorted(nodes_by_cascade.keys()):
@@ -1278,8 +1515,7 @@ class EarlyCascadeDataset(Dataset):
                 target_edge_pairs.append(pair)
                 eid_t = str(e["edge_id"])
                 h_t = max(0.0, min(1.0, _lookup_edge_scalar(target_hostility_map, eid_t, pair[0], pair[1], 0.0)))
-                r_t = max(0.0, min(1.0, _lookup_edge_scalar(target_irr_map, eid_t, pair[0], pair[1], 0.0)))
-                target_toxicity_scores.append(0.6 * h_t + 0.4 * r_t)
+                target_toxicity_scores.append(h_t)
             y_assortativity_val = compute_signed_assortativity(
                 target_edge_pairs,
                 target_node_orientations,
@@ -1316,7 +1552,7 @@ class EarlyCascadeDataset(Dataset):
 
             x = torch.stack(node_feature_rows, dim=0)  # [N_K, 770]
 
-            # 4. Bidirectional edges restricted to V_K
+            # 4. Bidirectional edges restricted to V_K (strictly 2D [s_uv, h_uv])
             td_src: list[int] = []
             td_dst: list[int] = []
             edge_attr_rows: list[list[float]] = []
@@ -1343,16 +1579,7 @@ class EarlyCascadeDataset(Dataset):
 
                 td_src.append(u_idx)
                 td_dst.append(v_idx)
-                if use_4d_edges:
-                    r_uv = float(
-                        min(1.0, max(0.0, _lookup_edge_scalar(irr_map, eid, src_id, dst_id, 0.05)))
-                    )
-                    c_uv = float(
-                        min(1.0, max(0.0, _lookup_edge_scalar(con_map, eid, src_id, dst_id, 0.50)))
-                    )
-                    edge_attr_rows.append([s_uv, h_uv, r_uv, c_uv])
-                else:
-                    edge_attr_rows.append([s_uv, h_uv])
+                edge_attr_rows.append([s_uv, h_uv])
                 edge_stance_rows.append([s_uv])
                 kept_edge_pairs.append((src_id, dst_id))
 
@@ -1364,7 +1591,7 @@ class EarlyCascadeDataset(Dataset):
             else:
                 edge_index_td = torch.empty((2, 0), dtype=torch.long)
                 edge_index_bu = torch.empty((2, 0), dtype=torch.long)
-                edge_attr = torch.empty((0, active_edge_dim), dtype=torch.float32)
+                edge_attr = torch.empty((0, 2), dtype=torch.float32)
                 edge_stance = torch.empty((0, 1), dtype=torch.float32)
 
             struct_x = compute_causal_structural_node_features(
@@ -1402,7 +1629,21 @@ class EarlyCascadeDataset(Dataset):
                 for nid in kept_ids
                 if nid != root_id
             ]
-            early_y_polar_val = _compute_full_tree_polarization(early_reply_stances)
+            early_y_polar_val = _compute_full_tree_polarization(
+                early_reply_stances,
+                lambda_polar=self.lambda_polar,
+            )
+
+            root_ts_sec = _to_unix_seconds(root_ts)
+            extra_kwargs: dict[str, Any] = {}
+            if prior_index is not None:
+                extra_kwargs["tier2_user_prior"] = self._compute_cascade_tier2_prior(
+                    prior_index,
+                    kept_nodes,
+                    cid=cid,
+                    root_ts_sec=root_ts_sec,
+                    op_hash=root_row.get("user_id_hash"),
+                )
 
             data = CascadeData(
                 x=x,
@@ -1418,7 +1659,7 @@ class EarlyCascadeDataset(Dataset):
                 y_size=torch.tensor([y_size_val], dtype=torch.float32),
                 y_polar=torch.tensor([y_polar_val], dtype=torch.float32),
                 early_y_polar=torch.tensor([early_y_polar_val], dtype=torch.float32),
-                root_ts=_to_unix_seconds(root_ts),
+                root_ts=root_ts_sec,
                 y_toxic_polar=torch.tensor([y_toxic_polar_val], dtype=torch.float32),
                 y_bimodality=torch.tensor([y_bimodality_val], dtype=torch.float32),
                 y_assortativity=torch.tensor([y_assortativity_val], dtype=torch.float32),
@@ -1429,6 +1670,7 @@ class EarlyCascadeDataset(Dataset):
                 node_ids=kept_ids,
                 node_texts=kept_texts,
                 edge_pairs=kept_edge_pairs,
+                **extra_kwargs,
             )
             cascades.append(data)
 

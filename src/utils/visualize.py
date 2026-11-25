@@ -1,6 +1,6 @@
 """Publication-quality vector figure exporters (.pdf and .svg) for SBi-FAGAT.
 
-Produces three camera-ready IEEE/Springer figures in `paper/figures/`:
+Produces three camera-ready IEEE/Springer figures in `results/figures/`:
   1. `fig1_umap_polarization.{pdf,svg}`: 2D UMAP node embedding comparison
      between `StandardGCN` and `SBiFAGAT`.
   2. `fig2_early_k_curve.{pdf,svg}`: Early horizon sensitivity curve across
@@ -103,7 +103,7 @@ def plot_umap_polarization(
     sbifagat_embeddings: np.ndarray | torch.Tensor,
     node_stances: np.ndarray | torch.Tensor,
     *,
-    output_dir: str | Path = "paper/figures",
+    output_dir: str | Path = "results/figures",
     stem: str = "fig1_umap_polarization",
 ) -> tuple[Path, Path]:
     """Generate Fig 1: UMAP 2D comparison of StandardGCN vs. SBi-FAGAT node embeddings."""
@@ -151,7 +151,7 @@ def plot_umap_polarization(
 def plot_early_k_curve(
     k_results: Mapping[int, Mapping[str, Mapping[str, tuple[float, float]]]],
     *,
-    output_dir: str | Path = "paper/figures",
+    output_dir: str | Path = "results/figures",
     stem: str = "fig2_early_k_curve",
     target_k: int | None = 20,
 ) -> tuple[Path, Path]:
@@ -265,7 +265,7 @@ def plot_cascade_heatmap(
     edge_importance: np.ndarray | torch.Tensor,
     signed_gamma: np.ndarray | torch.Tensor,
     *,
-    output_dir: str | Path = "paper/figures",
+    output_dir: str | Path = "results/figures",
     stem: str = "fig3_cascade_heatmap",
     top_k_comments: int = 5,
 ) -> tuple[Path, Path, Path]:
@@ -371,7 +371,7 @@ def plot_cascade_heatmap(
 def plot_counterfactual_interventions(
     interventions_summary: Mapping[str, Mapping[str, Any]],
     *,
-    output_dir: str | Path = "paper/figures",
+    output_dir: str | Path = "results/figures",
     stem: str = "fig4_counterfactual_interventions",
 ) -> tuple[Path, Path]:
     """Generate Fig 4: Counterfactual moderation impact on predicted size & polarization."""

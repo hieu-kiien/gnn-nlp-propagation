@@ -23,6 +23,10 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from scripts.compute_kappa import (
     evaluate_thread_level_audit_csv,
     format_human_audit_latex,

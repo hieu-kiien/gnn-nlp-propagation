@@ -1,0 +1,30 @@
+\begin{table*}[t]
+\centering
+\caption{Macro Temporal Signed Link Prediction on PHEME (opposing vs.\ supporting reply edges, mean $\pm$ std over 5 seeds; train batch pairs are masked; user features are aggregated strictly from pre-cutoff Train timestamps).}
+\label{tab:signed_link_pheme}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lcccccccccccc}
+\toprule
+Model & ROC-AUC $\uparrow$ & PR-AUC $\uparrow$ & Macro-F1 $\uparrow$ & Trans.\ ROC-AUC $\uparrow$ & Trans.\ PR-AUC $\uparrow$ & Trans.\ Macro-F1 $\uparrow$ & Unseen-Pair Trans.\ ROC-AUC $\uparrow$ & Unseen-Pair Trans.\ PR-AUC $\uparrow$ & Unseen-Pair Trans.\ Macro-F1 $\uparrow$ & Unseen ROC-AUC $\uparrow$ & Unseen PR-AUC $\uparrow$ & Unseen Macro-F1 $\uparrow$ \\
+\midrule
+UserTextMLP & 0.7254 $\pm$ 0.0116 & 0.5930 $\pm$ 0.0126 & \textbf{0.6526 $\pm$ 0.0049} & 0.9063 $\pm$ 0.0063 & 0.7170 $\pm$ 0.0227 & 0.7958 $\pm$ 0.0204 & 0.8811 $\pm$ 0.0044 & 0.6429 $\pm$ 0.0356 & 0.7548 $\pm$ 0.0241 & 0.7130 $\pm$ 0.0130 & 0.5888 $\pm$ 0.0152 & \textbf{0.6407 $\pm$ 0.0049} \\
+PriorPairSignPersistence & 0.7178 $\pm$ 0.0000 & 0.5909 $\pm$ 0.0000 & 0.6450 $\pm$ 0.0000 & 0.8880 $\pm$ 0.0000 & \textbf{0.7543 $\pm$ 0.0000} & 0.7886 $\pm$ 0.0000 & 0.8655 $\pm$ 0.0000 & \textbf{0.6742 $\pm$ 0.0000} & 0.7586 $\pm$ 0.0000 & 0.7041 $\pm$ 0.0000 & 0.5855 $\pm$ 0.0000 & 0.6325 $\pm$ 0.0000 \\
+StandardGCN & 0.7239 $\pm$ 0.0040 & 0.5958 $\pm$ 0.0062 & 0.5969 $\pm$ 0.0736 & 0.9100 $\pm$ 0.0034 & 0.7340 $\pm$ 0.0211 & 0.7783 $\pm$ 0.0104 & 0.8811 $\pm$ 0.0041 & 0.6288 $\pm$ 0.0220 & 0.7340 $\pm$ 0.0118 & 0.7132 $\pm$ 0.0042 & 0.5935 $\pm$ 0.0056 & 0.5847 $\pm$ 0.0753 \\
+StandardGATv2 & 0.7187 $\pm$ 0.0168 & 0.5846 $\pm$ 0.0183 & 0.5830 $\pm$ 0.0615 & 0.9108 $\pm$ 0.0032 & 0.7060 $\pm$ 0.0286 & 0.7861 $\pm$ 0.0188 & 0.8884 $\pm$ 0.0046 & 0.6391 $\pm$ 0.0258 & 0.7432 $\pm$ 0.0227 & 0.7065 $\pm$ 0.0191 & 0.5818 $\pm$ 0.0196 & 0.5707 $\pm$ 0.0620 \\
+SGCN & 0.7219 $\pm$ 0.0118 & 0.5905 $\pm$ 0.0091 & 0.6126 $\pm$ 0.0528 & 0.9119 $\pm$ 0.0036 & 0.7090 $\pm$ 0.0208 & 0.7832 $\pm$ 0.0211 & 0.8857 $\pm$ 0.0018 & 0.6363 $\pm$ 0.0273 & 0.7395 $\pm$ 0.0244 & 0.7096 $\pm$ 0.0133 & 0.5877 $\pm$ 0.0119 & 0.6010 $\pm$ 0.0530 \\
+FAGCN & 0.7096 $\pm$ 0.0153 & 0.5767 $\pm$ 0.0153 & 0.6513 $\pm$ 0.0049 & 0.9108 $\pm$ 0.0020 & 0.7333 $\pm$ 0.0206 & 0.7893 $\pm$ 0.0141 & 0.8816 $\pm$ 0.0068 & 0.6378 $\pm$ 0.0401 & 0.7464 $\pm$ 0.0173 & 0.6961 $\pm$ 0.0164 & 0.5731 $\pm$ 0.0156 & 0.6397 $\pm$ 0.0052 \\
+BiEdgeGATv2-Link & \textbf{0.7332 $\pm$ 0.0042} & \textbf{0.6011 $\pm$ 0.0039} & 0.6127 $\pm$ 0.0565 & 0.9105 $\pm$ 0.0045 & 0.7198 $\pm$ 0.0210 & 0.8063 $\pm$ 0.0077 & 0.8848 $\pm$ 0.0012 & 0.6329 $\pm$ 0.0227 & 0.7677 $\pm$ 0.0101 & \textbf{0.7217 $\pm$ 0.0062} & \textbf{0.5982 $\pm$ 0.0055} & 0.5999 $\pm$ 0.0567 \\
+SiGAT & 0.7179 $\pm$ 0.0124 & 0.5799 $\pm$ 0.0109 & 0.5681 $\pm$ 0.1141 & \textbf{0.9178 $\pm$ 0.0020} & 0.7324 $\pm$ 0.0239 & \textbf{0.8112 $\pm$ 0.0089} & \textbf{0.8926 $\pm$ 0.0015} & 0.6546 $\pm$ 0.0089 & \textbf{0.7743 $\pm$ 0.0109} & 0.7046 $\pm$ 0.0139 & 0.5744 $\pm$ 0.0119 & 0.5520 $\pm$ 0.1181 \\
+SDGNN & 0.7176 $\pm$ 0.0123 & 0.5880 $\pm$ 0.0087 & 0.6017 $\pm$ 0.0631 & 0.9103 $\pm$ 0.0094 & 0.7234 $\pm$ 0.0330 & 0.7803 $\pm$ 0.0163 & 0.8837 $\pm$ 0.0151 & 0.6502 $\pm$ 0.0476 & 0.7347 $\pm$ 0.0199 & 0.7061 $\pm$ 0.0148 & 0.5848 $\pm$ 0.0099 & 0.5895 $\pm$ 0.0641 \\
+SBiFAGAT-Link & 0.7124 $\pm$ 0.0153 & 0.5781 $\pm$ 0.0156 & 0.6257 $\pm$ 0.0576 & 0.9106 $\pm$ 0.0037 & 0.7418 $\pm$ 0.0281 & 0.7950 $\pm$ 0.0244 & 0.8839 $\pm$ 0.0068 & 0.6554 $\pm$ 0.0549 & 0.7543 $\pm$ 0.0293 & 0.6985 $\pm$ 0.0186 & 0.5736 $\pm$ 0.0187 & 0.6132 $\pm$ 0.0579 \\
+\midrule
+$p$-value (SBiFAGAT-Link vs. BiEdgeGATv2-Link) & 4.76e-02 & 3.65e-02 & 6.30e-01 & 9.49e-01 & 2.37e-01 & 4.50e-01 & 8.00e-01 & 4.88e-01 & 4.68e-01 & 5.05e-02 & 3.44e-02 & 6.28e-01 \\
+Wilcoxon $p$ (SBiFAGAT-Link vs. BiEdgeGATv2-Link) & 6.25e-02 & 6.25e-02 & 1.00e+00 & 1.00e+00 & 3.12e-01 & 6.25e-01 & 1.00e+00 & 4.38e-01 & 6.25e-01 & 6.25e-02 & 6.25e-02 & 1.00e+00 \\
+Exact Perm $p$ (SBiFAGAT-Link vs. BiEdgeGATv2-Link) & 6.25e-02 & 6.25e-02 & 8.12e-01 & 9.38e-01 & 2.50e-01 & 5.00e-01 & 8.75e-01 & 5.00e-01 & 5.00e-01 & 6.25e-02 & 6.25e-02 & 8.12e-01 \\
+Holm-Bonferroni $p$ (SBiFAGAT-Link vs. BiEdgeGATv2-Link) & 4.76e-01 & 4.13e-01 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 4.76e-01 & 4.13e-01 & 1.00e+00 \\
+Holm-Bonf Wilcoxon $p$ (SBiFAGAT-Link vs. BiEdgeGATv2-Link) & 7.50e-01 & 7.50e-01 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 7.50e-01 & 7.50e-01 & 1.00e+00 \\
+Holm-Bonf Exact Perm $p$ (SBiFAGAT-Link vs. BiEdgeGATv2-Link) & 7.50e-01 & 7.50e-01 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 7.50e-01 & 7.50e-01 & 1.00e+00 \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}

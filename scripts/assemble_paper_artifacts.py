@@ -240,7 +240,7 @@ def find_unescaped_underscores_in_latex(tex_content: str) -> list[tuple[int, str
 
 
 def assemble_paper_artifacts(
-    paper_dir: Path = Path("paper"),
+    paper_dir: Path = Path("results"),
     *,
     strict_latex_check: bool = True,
 ) -> dict[str, Any]:
@@ -414,7 +414,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Assemble unified paper LaTeX tables from PHEME/VN outputs and validate LaTeX syntax."
     )
-    parser.add_argument("--paper-dir", type=Path, default=Path("paper"))
+    parser.add_argument("--paper-dir", type=Path, default=Path("results"))
     parser.add_argument("--no-strict", action="store_true")
     args = parser.parse_args()
 

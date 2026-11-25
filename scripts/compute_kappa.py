@@ -25,8 +25,13 @@ from sklearn.metrics import (
     cohen_kappa_score,
     confusion_matrix,
     f1_score,
+    precision_recall_fscore_support,
     roc_auc_score,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.nlp.discourse_labels import DISCOURSE_BEHAVIOR_LABELS, _LABEL_SYNONYMS
 
@@ -155,6 +160,7 @@ def evaluate_machine_vs_human(
     machine_key_csv: Path,
     *,
     strict_adjudication: bool = False,
+    hostility_threshold: float = 0.5,
 ) -> dict[str, Any]:
     """Compare hidden teacher predictions (`machine_key_csv`) against adjudicated human gold."""
     audit_path = Path(audit_csv)
@@ -250,7 +256,7 @@ def evaluate_machine_vs_human(
                 gh_lbl = _normalize_label(raw_gh, _HOSTILITY_SYNONYMS, "hostility")
                 h_uv = float(key_row.get("h_uv", 0.0))
                 host_gold_bin.append("clean" if gh_lbl == "clean" else "uncivil")
-                host_pred_bin.append("uncivil" if h_uv >= 0.5 else "clean")
+                host_pred_bin.append("uncivil" if h_uv >= float(hostility_threshold) else "clean")
                 host_gold_num.append(_HOSTILITY_TO_NUM[gh_lbl])
                 host_pred_h.append(h_uv)
                 try:
@@ -344,26 +350,54 @@ def evaluate_machine_vs_human(
         pr_h, sr_h = _safe_corr_pair(host_gold_num, host_pred_h)
         hw_arr = np.asarray(host_weights, dtype=np.float64) if len(host_weights) == len(host_gold_bin) else None
         y_bin_true = np.asarray([1 if lbl == "uncivil" else 0 for lbl in host_gold_bin], dtype=np.int64)
+        y_bin_pred = np.asarray([1 if lbl == "uncivil" else 0 for lbl in host_pred_bin], dtype=np.int64)
         y_bin_score = np.asarray(host_pred_h, dtype=np.float64)
-        roc_auc_v = (
+        has_both_cls = np.unique(y_bin_true).size >= 2
+        has_pos = int(y_bin_true.sum()) >= 1
+        unweighted_roc_auc = (
+            float(roc_auc_score(y_bin_true, y_bin_score)) if has_both_cls else float("nan")
+        )
+        unweighted_pr_auc = (
+            float(average_precision_score(y_bin_true, y_bin_score)) if has_pos else float("nan")
+        )
+        weighted_roc_auc = (
             float(roc_auc_score(y_bin_true, y_bin_score, sample_weight=hw_arr))
-            if np.unique(y_bin_true).size >= 2
+            if has_both_cls
             else float("nan")
         )
-        pr_auc_v = (
+        weighted_pr_auc = (
             float(average_precision_score(y_bin_true, y_bin_score, sample_weight=hw_arr))
-            if int(y_bin_true.sum()) >= 1
+            if has_pos
             else float("nan")
         )
+        prev_unw = float(y_bin_true.mean()) if y_bin_true.size > 0 else 0.0
+        if hw_arr is not None and float(hw_arr.sum()) > 0.0:
+            prev_w = float(np.average(y_bin_true, weights=hw_arr))
+        else:
+            prev_w = prev_unw
+
+        u_prec, u_rec, u_f1, _ = precision_recall_fscore_support(
+            y_bin_true, y_bin_pred, pos_label=1, average="binary", zero_division=0
+        )
+        w_prec, w_rec, w_f1, _ = precision_recall_fscore_support(
+            y_bin_true, y_bin_pred, pos_label=1, average="binary", sample_weight=hw_arr, zero_division=0
+        )
+
         result["hostility"] = {
             "num_samples": len(host_gold_bin),
             "total_matched_rows": matched_counts["hostility"],
             "unadjudicated_disagreements": unadj_counts["hostility"],
             "adjudication_coverage": float(len(host_gold_bin) / max(1, matched_counts["hostility"])),
+            "hostility_threshold": float(hostility_threshold),
+            "positive_prevalence_unweighted": prev_unw,
+            "positive_prevalence_weighted": prev_w,
             "macro_f1": float(
                 f1_score(host_gold_bin, host_pred_bin, labels=h_labels, average="macro", zero_division=0)
             ),
             "accuracy": float(accuracy_score(host_gold_bin, host_pred_bin)),
+            "uncivil_precision": float(u_prec),
+            "uncivil_recall": float(u_rec),
+            "uncivil_f1": float(u_f1),
             "weighted_macro_f1": float(
                 f1_score(
                     host_gold_bin,
@@ -375,8 +409,20 @@ def evaluate_machine_vs_human(
                 )
             ),
             "weighted_accuracy": float(accuracy_score(host_gold_bin, host_pred_bin, sample_weight=hw_arr)),
-            "roc_auc": roc_auc_v if math.isfinite(roc_auc_v) else None,
-            "pr_auc": pr_auc_v if math.isfinite(pr_auc_v) else None,
+            "weighted_uncivil_precision": float(w_prec),
+            "weighted_uncivil_recall": float(w_rec),
+            "weighted_uncivil_f1": float(w_f1),
+            "roc_auc": weighted_roc_auc if math.isfinite(weighted_roc_auc) else None,
+            "pr_auc": weighted_pr_auc if math.isfinite(weighted_pr_auc) else None,
+            "weighted_roc_auc": weighted_roc_auc if math.isfinite(weighted_roc_auc) else None,
+            "weighted_pr_auc": weighted_pr_auc if math.isfinite(weighted_pr_auc) else None,
+            "unweighted_roc_auc": unweighted_roc_auc if math.isfinite(unweighted_roc_auc) else None,
+            "unweighted_pr_auc": unweighted_pr_auc if math.isfinite(unweighted_pr_auc) else None,
+            "roc_pr_auc_weighting_note": (
+                "roc_auc/pr_auc/weighted_* use inverse-propensity sampling_weight reflecting natural "
+                "population prevalence (where rare positives yield lower PR-AUC despite high ROC-AUC); "
+                "unweighted_* reflect the stratified audit sample."
+            ),
             "cohen_kappa_unweighted": h_kappa,
             "pearson_r": pr_h,
             "spearman_r": sr_h,
@@ -484,6 +530,7 @@ def evaluate_audit_csv(
     machine_key_csv: Path | None = None,
     strict_adjudication: bool = False,
     allow_single_gold: bool = False,
+    hostility_threshold: float = 0.5,
 ) -> dict[str, Any]:
     """Read dual-annotated audit CSV and compute Cohen's Kappa (+ optional machine-vs-gold)."""
     path = Path(csv_path)
@@ -575,6 +622,7 @@ def evaluate_audit_csv(
             path,
             machine_key_csv,
             strict_adjudication=strict_adjudication,
+            hostility_threshold=hostility_threshold,
         )
         if (
             report["annotation_protocol"] == "single_verified_gold"
@@ -928,6 +976,7 @@ def main() -> None:
     parser.add_argument("--output-table", type=Path, default=None)
     parser.add_argument("--strict-adjudication", action="store_true")
     parser.add_argument("--allow-single-gold", action="store_true")
+    parser.add_argument("--hostility-threshold", type=float, default=0.5)
     args = parser.parse_args()
 
     resolved_input = args.input
@@ -961,6 +1010,7 @@ def main() -> None:
                 machine_key_csv=resolved_key,
                 strict_adjudication=bool(args.strict_adjudication),
                 allow_single_gold=bool(args.allow_single_gold),
+                hostility_threshold=float(args.hostility_threshold),
             )
         )
         if args.rumoureval_json is not None:

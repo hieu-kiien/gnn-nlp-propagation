@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.pyg_dataset import (
     DEFAULT_FORECAST_MIN_REPLIES,
@@ -30,6 +35,19 @@ from src.data.pyg_dataset import (
 from src.data.schema import load_cascade_parquet
 from src.training.metrics import evaluate_predictions
 from src.training.reporting import _sanitize_json_value
+
+
+def _resolve_single_root_idx(d: Any, num_nodes: int | None = None) -> int:
+    rt = getattr(d, "root_index", None)
+    if isinstance(rt, torch.Tensor) and rt.dtype != torch.bool and rt.numel() > 0:
+        r_idx = int(rt.view(-1)[0].item())
+    elif isinstance(rt, (int, np.integer)) and not isinstance(rt, bool):
+        r_idx = int(rt)
+    else:
+        r_idx = 0
+    if num_nodes is not None and num_nodes > 0 and not (0 <= r_idx < num_nodes):
+        return 0
+    return r_idx if r_idx >= 0 else 0
 
 
 def compute_early_k_persistence_metrics(
@@ -91,15 +109,27 @@ def compute_early_k_persistence_metrics(
 
         early_rs = getattr(d, "early_node_root_stance", None)
         if early_rs is not None and early_rs.numel() > 1:
-            aligned = [float(v) for v in early_rs.view(-1)[1:].detach().cpu().tolist()]
+            flat_rs = early_rs.view(-1)
+            r_idx = _resolve_single_root_idx(d, int(flat_rs.numel()))
+            aligned = [
+                float(v)
+                for idx_i, v in enumerate(flat_rs.detach().cpu().tolist())
+                if idx_i != r_idx
+            ]
         else:
             edge_index_td = getattr(d, "edge_index_td", getattr(d, "edge_index", None))
             raw_attr = getattr(d, "edge_attr", None)
             if raw_attr is None:
                 raw_attr = getattr(d, "edge_stance", None)
 
-            root_tensor = getattr(d, "root_index", None)
-            root_id = str(int(root_tensor.view(-1)[0].item())) if root_tensor is not None else "0"
+            raw_nn = getattr(d, "num_nodes", None)
+            if raw_nn is not None:
+                num_nodes_d = int(raw_nn)
+            elif getattr(d, "x", None) is not None:
+                num_nodes_d = int(d.x.size(0))
+            else:
+                num_nodes_d = 0
+            root_id = str(_resolve_single_root_idx(d, num_nodes_d if num_nodes_d > 0 else None))
 
             children_adj: dict[str, list[str]] = {}
             stance_map: dict[tuple[str, str], float] = {}
@@ -468,12 +498,12 @@ def main() -> None:
     parser.add_argument(
         "--output-table",
         type=Path,
-        default=Path("paper/tables_dataset_eda.tex"),
+        default=Path("results/tables_dataset_eda.tex"),
     )
     parser.add_argument(
         "--output-json",
         type=Path,
-        default=Path("paper/results_dataset_eda.json"),
+        default=Path("results/results_dataset_eda.json"),
     )
     args = parser.parse_args()
 

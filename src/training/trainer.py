@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.stats import spearmanr, ttest_rel
+from scipy.stats import spearmanr, ttest_rel, wilcoxon
 from sklearn.metrics import f1_score, roc_auc_score
 from torch_geometric.loader import DataLoader
 
@@ -106,28 +106,39 @@ class _ModelEMA:
                     b.copy_(self.buffers[name])
 
 
-def _estimate_train_target_stats(loader: DataLoader) -> dict[str, Any]:
-    """Compute target means and 2:1 constant-mean baseline-normalized loss scales strictly from `train_loader`."""
+def _estimate_train_target_stats(
+    loader: DataLoader,
+    *,
+    num_rumor_classes: int | None = None,
+    class_weights: Tensor | None = None,
+) -> dict[str, Any]:
+    """Compute target means and constant-baseline normalized loss scales strictly from `train_loader`."""
     size_vals: list[np.ndarray] = []
     polar_vals: list[np.ndarray] = []
     early_polar_vals: list[np.ndarray] = []
+    rumor_vals: list[np.ndarray] = []
     for batch in loader:
         ys = getattr(batch, "y_size", None)
         yp = getattr(batch, "y_polar", None)
         ep = getattr(batch, "early_y_polar", None)
+        yr = getattr(batch, "y_rumor", getattr(batch, "y", None))
         if ys is not None:
             size_vals.append(ys.view(-1).detach().cpu().numpy())
         if yp is not None:
             polar_vals.append(yp.view(-1).detach().cpu().numpy())
         if ep is not None:
             early_polar_vals.append(ep.view(-1).detach().cpu().numpy())
+        if yr is not None:
+            rumor_vals.append(yr.view(-1).detach().cpu().numpy())
 
     size_arr = np.concatenate(size_vals) if size_vals else np.array([], dtype=np.float64)
     polar_arr = np.concatenate(polar_vals) if polar_vals else np.array([], dtype=np.float64)
     ep_arr = np.concatenate(early_polar_vals) if early_polar_vals else np.array([], dtype=np.float64)
+    rumor_arr = np.concatenate(rumor_vals).astype(np.int64) if rumor_vals else np.array([], dtype=np.int64)
     size_arr = size_arr[np.isfinite(size_arr)] if size_arr.size > 0 else size_arr
     polar_arr = polar_arr[np.isfinite(polar_arr)] if polar_arr.size > 0 else polar_arr
     ep_arr = ep_arr[np.isfinite(ep_arr)] if ep_arr.size > 0 else ep_arr
+    rumor_arr = rumor_arr[rumor_arr >= 0] if rumor_arr.size > 0 else rumor_arr
 
     mean_size = float(np.mean(size_arr)) if size_arr.size > 0 else None
     std_size = float(np.std(size_arr)) if size_arr.size >= 2 else 0.0
@@ -166,6 +177,31 @@ def _estimate_train_target_stats(loader: DataLoader) -> dict[str, Any]:
     else:
         polar_scale = 1.0
 
+    n_cls = (
+        int(num_rumor_classes)
+        if num_rumor_classes is not None and int(num_rumor_classes) >= 2
+        else (int(rumor_arr.max()) + 1 if rumor_arr.size > 0 and int(rumor_arr.max()) >= 1 else 4)
+    )
+    rumor_valid = rumor_arr[rumor_arr < n_cls] if rumor_arr.size > 0 else rumor_arr
+    if rumor_valid.size >= 2 and np.unique(rumor_valid).size >= 2:
+        counts = np.bincount(rumor_valid, minlength=n_cls).astype(np.float64)
+        probs = np.clip(counts / max(1.0, float(counts.sum())), 1e-6, 1.0)
+        const_r_logits = (
+            torch.log(torch.from_numpy(probs).float())
+            .unsqueeze(0)
+            .expand(rumor_valid.size, -1)
+        )
+        y_r_t = torch.from_numpy(rumor_valid).long()
+        ce_w = (
+            class_weights.detach().float().cpu()
+            if class_weights is not None and class_weights.numel() == n_cls
+            else None
+        )
+        base_rumor_loss = float(F.cross_entropy(const_r_logits, y_r_t, weight=ce_w).item())
+    else:
+        base_rumor_loss = math.log(float(max(2, n_cls)))
+    rumor_scale = float(np.clip(0.5 / max(base_rumor_loss, 1e-4), 0.1, 2.0))
+
     return {
         "count": int(min(size_arr.size, polar_arr.size)) if size_vals and polar_vals else int(size_arr.size),
         "mean_size": mean_size,
@@ -176,8 +212,10 @@ def _estimate_train_target_stats(loader: DataLoader) -> dict[str, Any]:
         "mean_early_polar_logit": mean_early_polar_logit,
         "base_size_loss": base_size_loss,
         "base_polar_loss": base_polar_loss,
+        "base_rumor_loss": base_rumor_loss,
         "size_loss_scale": size_scale,
         "polar_loss_scale": polar_scale,
+        "rumor_loss_scale": rumor_scale,
     }
 
 
@@ -245,6 +283,7 @@ def evaluate_loader(
     alpha_rumor: float = 1.0,
     size_loss_scale: float = 1.0,
     polar_loss_scale: float = 1.0,
+    rumor_loss_scale: float | None = None,
     lambda_uncertainty: float = 0.0,
     class_weights: Tensor | None = None,
     classification_only: bool = False,
@@ -277,6 +316,7 @@ def evaluate_loader(
             alpha_rumor=alpha_rumor,
             size_loss_scale=size_loss_scale,
             polar_loss_scale=polar_loss_scale,
+            rumor_loss_scale=rumor_loss_scale,
             lambda_uncertainty=lambda_uncertainty,
             class_weights=class_weights,
             classification_only=classification_only,
@@ -290,6 +330,7 @@ def evaluate_loader(
                 alpha_rumor=alpha_rumor,
                 size_loss_scale=size_loss_scale,
                 polar_loss_scale=polar_loss_scale,
+                rumor_loss_scale=rumor_loss_scale,
                 lambda_uncertainty=0.0,
                 class_weights=class_weights,
                 classification_only=classification_only,
@@ -399,25 +440,30 @@ def train_and_evaluate_single_seed(
     )
 
     model = model_fn().to(target_device)
+    num_cls = None
+    if hasattr(model, "head") and hasattr(model.head, "rumor_head"):
+        last_layer = model.head.rumor_head[-1]
+        if hasattr(last_layer, "out_features"):
+            num_cls = int(last_layer.out_features)
     class_weights: Tensor | None = None
-    if use_class_weights:
-        num_cls = None
-        if hasattr(model, "head") and hasattr(model.head, "rumor_head"):
-            last_layer = model.head.rumor_head[-1]
-            if hasattr(last_layer, "out_features"):
-                num_cls = int(last_layer.out_features)
-        if num_cls is not None:
-            class_weights = _estimate_balanced_class_weights(train_loader, num_cls)
+    if use_class_weights and num_cls is not None:
+        class_weights = _estimate_balanced_class_weights(train_loader, num_cls)
 
     s_scale = 1.0
     p_scale = 1.0
+    r_scale: float | None = None
     if not classification_only:
-        train_stats = _estimate_train_target_stats(train_loader)
+        train_stats = _estimate_train_target_stats(
+            train_loader,
+            num_rumor_classes=num_cls,
+            class_weights=class_weights,
+        )
         if use_bias_init and train_stats["count"] > 0:
             _init_multitask_head_biases(model, train_stats)
         if use_target_scaling:
             s_scale = float(train_stats["size_loss_scale"])
             p_scale = float(train_stats["polar_loss_scale"])
+            r_scale = float(train_stats["rumor_loss_scale"])
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     warmup_epochs = min(5, max(1, epochs // 10)) if epochs >= 10 else 0
@@ -475,6 +521,7 @@ def train_and_evaluate_single_seed(
                 alpha_rumor=alpha_rumor,
                 size_loss_scale=s_scale,
                 polar_loss_scale=p_scale,
+                rumor_loss_scale=r_scale,
                 lambda_uncertainty=lambda_uncertainty,
                 class_weights=class_weights,
                 classification_only=classification_only,
@@ -494,6 +541,7 @@ def train_and_evaluate_single_seed(
             alpha_rumor=alpha_rumor,
             size_loss_scale=s_scale,
             polar_loss_scale=p_scale,
+            rumor_loss_scale=r_scale,
             lambda_uncertainty=lambda_uncertainty,
             class_weights=class_weights,
             classification_only=classification_only,
@@ -513,6 +561,7 @@ def train_and_evaluate_single_seed(
                 alpha_rumor=alpha_rumor,
                 size_loss_scale=s_scale,
                 polar_loss_scale=p_scale,
+                rumor_loss_scale=r_scale,
                 lambda_uncertainty=lambda_uncertainty,
                 class_weights=class_weights,
                 classification_only=classification_only,
@@ -538,6 +587,7 @@ def train_and_evaluate_single_seed(
         alpha_rumor=alpha_rumor,
         size_loss_scale=s_scale,
         polar_loss_scale=p_scale,
+        rumor_loss_scale=r_scale,
         lambda_uncertainty=lambda_uncertainty,
         class_weights=class_weights,
         classification_only=classification_only,
@@ -552,6 +602,7 @@ def train_and_evaluate_single_seed(
         alpha_rumor=alpha_rumor,
         size_loss_scale=s_scale,
         polar_loss_scale=p_scale,
+        rumor_loss_scale=r_scale,
         lambda_uncertainty=lambda_uncertainty,
         class_weights=class_weights,
         classification_only=classification_only,
@@ -573,15 +624,40 @@ def compute_paired_ttest(
     """Run two-sided paired Student's t-test (`scipy.stats.ttest_rel`) across seeds."""
     arr_a = np.asarray(model_a_scores, dtype=np.float64)
     arr_b = np.asarray(model_b_scores, dtype=np.float64)
-    valid = ~(np.isnan(arr_a) | np.isnan(arr_b))
+    valid = np.isfinite(arr_a) & np.isfinite(arr_b)
     arr_a, arr_b = arr_a[valid], arr_b[valid]
     if arr_a.size < 2:
         return float("nan")
-    if np.allclose(arr_a - arr_b, 0.0):
+    diffs = arr_a - arr_b
+    if np.allclose(diffs, 0.0):
         return 1.0
+    if float(np.std(diffs)) <= max(1e-12, 1e-10 * float(np.mean(np.abs(diffs)))):
+        return compute_paired_bootstrap_pvalue(arr_a, arr_b)
     res = ttest_rel(arr_a, arr_b)
     p_val = float(res.pvalue)
     return 1.0 if np.isnan(p_val) else p_val
+
+
+def compute_paired_wilcoxon(
+    scores_a: Sequence[float],
+    scores_b: Sequence[float],
+) -> float:
+    """Run two-sided Wilcoxon signed-rank test on paired scores."""
+    arr_a = np.asarray(scores_a, dtype=np.float64)
+    arr_b = np.asarray(scores_b, dtype=np.float64)
+    valid = np.isfinite(arr_a) & np.isfinite(arr_b)
+    arr_a, arr_b = arr_a[valid], arr_b[valid]
+    if arr_a.size < 2:
+        return float("nan")
+    diffs = arr_a - arr_b
+    if np.allclose(diffs, 0.0):
+        return 1.0
+    try:
+        res = wilcoxon(arr_a, arr_b, zero_method="wilcox", alternative="two-sided")
+        p_val = float(res.pvalue)
+        return 1.0 if math.isnan(p_val) else p_val
+    except ValueError:
+        return 1.0
 
 
 def compute_paired_bootstrap_pvalue(
@@ -594,7 +670,7 @@ def compute_paired_bootstrap_pvalue(
     """Two-sided paired test: exact sign-flip permutation for n < 6, +1-smoothed bootstrap for n >= 6."""
     arr_a = np.asarray(scores_a, dtype=np.float64)
     arr_b = np.asarray(scores_b, dtype=np.float64)
-    valid = ~(np.isnan(arr_a) | np.isnan(arr_b))
+    valid = np.isfinite(arr_a) & np.isfinite(arr_b)
     arr_a, arr_b = arr_a[valid], arr_b[valid]
     n_obs = int(arr_a.size)
     if n_obs < 2:
@@ -653,14 +729,22 @@ _COMPARATOR_TIE_PRIORITY: dict[str, int] = {
 }
 
 
-def holm_bonferroni_adjust(p_values: Mapping[str, float]) -> dict[str, float]:
+def holm_bonferroni_adjust(p_values: Mapping[str, float | None]) -> dict[str, float]:
     """Apply Holm-Bonferroni step-down family-wise error adjustment to p-values."""
-    adjusted: dict[str, float] = {k: float(v) for k, v in p_values.items()}
-    valid = [
-        (k, float(v))
-        for k, v in p_values.items()
-        if v is not None and not math.isnan(float(v)) and math.isfinite(float(v))
-    ]
+    adjusted: dict[str, float] = {}
+    valid: list[tuple[str, float]] = []
+    for k, v in p_values.items():
+        if v is None or isinstance(v, bool):
+            adjusted[k] = float("nan")
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            adjusted[k] = float("nan")
+            continue
+        adjusted[k] = fv
+        if math.isfinite(fv):
+            valid.append((k, fv))
     if not valid:
         return adjusted
     m = len(valid)
@@ -677,7 +761,7 @@ _NON_LEARNED_BASELINES: frozenset[str] = frozenset({"Early-K Persistence"})
 
 
 def select_best_comparator(
-    summary_stats: Mapping[str, Mapping[str, tuple[float, float]]],
+    summary_stats: Mapping[str, Mapping[str, Sequence[float | None]]],
     *,
     reference_model: str = "SBiFAGAT",
     metric_keys: Sequence[str] | None = None,
@@ -704,8 +788,18 @@ def select_best_comparator(
         scored: list[tuple[str, float]] = []
         for c in candidates:
             stat = summary_stats.get(c, {}).get(metric)
-            if stat is not None and not math.isnan(float(stat[0])):
-                scored.append((c, float(stat[0])))
+            if (
+                stat is not None
+                and len(stat) >= 1
+                and stat[0] is not None
+                and not isinstance(stat[0], bool)
+            ):
+                try:
+                    val = float(stat[0])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(val):
+                    scored.append((c, val))
         if len(scored) < 2:
             continue
         reverse = metric not in _LOWER_IS_BETTER
@@ -729,7 +823,7 @@ def select_best_comparator(
 
 def _boot_pvalue_from_diffs(diffs: np.ndarray) -> float:
     arr = np.asarray(diffs, dtype=np.float64)
-    arr = arr[~np.isnan(arr)]
+    arr = arr[np.isfinite(arr)]
     if arr.size < 2:
         return float("nan")
     if np.allclose(arr, 0.0):
@@ -813,13 +907,16 @@ def _compute_sample_level_bootstrap_pvalues(
 
     rng = np.random.default_rng(seed)
     raw_tids = preds_ref[0].get("topic_ids")
+    has_topic_groups = isinstance(raw_tids, (list, tuple)) and len(raw_tids) == n_total
     topic_groups: list[np.ndarray] | None = None
-    if isinstance(raw_tids, (list, tuple)) and len(raw_tids) == n_total:
+    if has_topic_groups:
         group_map: dict[str, list[int]] = {}
         for idx_i, tid in enumerate(raw_tids):
             group_map.setdefault(str(tid), []).append(idx_i)
-        if len(group_map) >= 6:
-            topic_groups = [np.asarray(idxs, dtype=np.int64) for idxs in group_map.values()]
+        if len(group_map) < 6:
+            # Never fall back to IID cascade-level resampling when < 6 event clusters exist
+            return {k: float("nan") for k in metric_keys}
+        topic_groups = [np.asarray(idxs, dtype=np.int64) for idxs in group_map.values()]
 
     cluster_draws: list[np.ndarray] | None = None
     n_draws = max(2, int(n_resamples))
@@ -840,14 +937,16 @@ def _compute_sample_level_bootstrap_pvalues(
         ref_polar_seeds = [np.asarray(p["y_polar_pred"], dtype=np.float64).reshape(-1) for p in preds_ref]
         cmp_polar_seeds = [np.asarray(p["y_polar_pred"], dtype=np.float64).reshape(-1) for p in preds_cmp]
 
-        se_ref_size_s = [(yp - y_size_true) ** 2 for yp in ref_size_seeds]
-        se_cmp_size_s = [(yp - y_size_true) ** 2 for yp in cmp_size_seeds]
-        se_ref_polar_s = [(yp - y_polar_true) ** 2 for yp in ref_polar_seeds]
-        se_cmp_polar_s = [(yp - y_polar_true) ** 2 for yp in cmp_polar_seeds]
-        ae_ref_size_s = [np.abs(yp - y_size_true) for yp in ref_size_seeds]
-        ae_cmp_size_s = [np.abs(yp - y_size_true) for yp in cmp_size_seeds]
-        ae_ref_polar_s = [np.abs(yp - y_polar_true) for yp in ref_polar_seeds]
-        ae_cmp_polar_s = [np.abs(yp - y_polar_true) for yp in cmp_polar_seeds]
+        size_finite = bool(
+            np.all(np.isfinite(y_size_true))
+            and all(arr.size == n_reg and np.all(np.isfinite(arr)) for arr in ref_size_seeds)
+            and all(arr.size == n_reg and np.all(np.isfinite(arr)) for arr in cmp_size_seeds)
+        )
+        polar_finite = bool(
+            np.all(np.isfinite(y_polar_true))
+            and all(arr.size == n_reg and np.all(np.isfinite(arr)) for arr in ref_polar_seeds)
+            and all(arr.size == n_reg and np.all(np.isfinite(arr)) for arr in cmp_polar_seeds)
+        )
 
         def _safe_sp(yt_arr: np.ndarray, yp_arr: np.ndarray) -> float:
             if yt_arr.size < 2 or np.std(yt_arr) <= 1e-12 or np.std(yp_arr) <= 1e-12:
@@ -874,120 +973,146 @@ def _compute_sample_level_bootstrap_pvalues(
             return float(np.sum(yt_c * yp_c) / denom)
 
         if cluster_draws is not None:
-            msle_d, rmses_d, mae_d, rmsep_d, maep_d = [], [], [], [], []
-            r2s_d, r2p_d, pr_d, sps_d, spp_d = [], [], [], [], []
-            for b_pos, b_idx in enumerate(cluster_draws):
-                msle_d.append(
-                    float(np.mean([se[b_idx].mean() for se in se_ref_size_s]))
-                    - float(np.mean([se[b_idx].mean() for se in se_cmp_size_s]))
-                )
-                rmses_d.append(
-                    float(np.mean([math.sqrt(float(se[b_idx].mean())) for se in se_ref_size_s]))
-                    - float(np.mean([math.sqrt(float(se[b_idx].mean())) for se in se_cmp_size_s]))
-                )
-                mae_d.append(
-                    float(np.mean([ae[b_idx].mean() for ae in ae_ref_size_s]))
-                    - float(np.mean([ae[b_idx].mean() for ae in ae_cmp_size_s]))
-                )
-                rmsep_d.append(
-                    float(np.mean([math.sqrt(float(se[b_idx].mean())) for se in se_ref_polar_s]))
-                    - float(np.mean([math.sqrt(float(se[b_idx].mean())) for se in se_cmp_polar_s]))
-                )
-                maep_d.append(
-                    float(np.mean([ae[b_idx].mean() for ae in ae_ref_polar_s]))
-                    - float(np.mean([ae[b_idx].mean() for ae in ae_cmp_polar_s]))
-                )
-                if b_pos < n_stat_draws:
-                    yt_s = y_size_true[b_idx]
-                    yt_p = y_polar_true[b_idx]
-                    r2s_d.append(
-                        float(np.mean([_safe_r2_1d(yt_s, yp[b_idx]) for yp in ref_size_seeds]))
-                        - float(np.mean([_safe_r2_1d(yt_s, yp[b_idx]) for yp in cmp_size_seeds]))
+            if size_finite:
+                se_ref_size_s = [(yp - y_size_true) ** 2 for yp in ref_size_seeds]
+                se_cmp_size_s = [(yp - y_size_true) ** 2 for yp in cmp_size_seeds]
+                ae_ref_size_s = [np.abs(yp - y_size_true) for yp in ref_size_seeds]
+                ae_cmp_size_s = [np.abs(yp - y_size_true) for yp in cmp_size_seeds]
+                msle_d, rmses_d, mae_d, r2s_d, sps_d = [], [], [], [], []
+                for b_pos, b_idx in enumerate(cluster_draws):
+                    msle_d.append(
+                        float(np.mean([se[b_idx].mean() for se in se_ref_size_s]))
+                        - float(np.mean([se[b_idx].mean() for se in se_cmp_size_s]))
                     )
-                    r2p_d.append(
-                        float(np.mean([_safe_r2_1d(yt_p, yp[b_idx]) for yp in ref_polar_seeds]))
-                        - float(np.mean([_safe_r2_1d(yt_p, yp[b_idx]) for yp in cmp_polar_seeds]))
+                    rmses_d.append(
+                        float(np.mean([math.sqrt(float(se[b_idx].mean())) for se in se_ref_size_s]))
+                        - float(np.mean([math.sqrt(float(se[b_idx].mean())) for se in se_cmp_size_s]))
                     )
-                    pr_d.append(
-                        float(np.mean([_safe_pr_1d(yt_p, yp[b_idx]) for yp in ref_polar_seeds]))
-                        - float(np.mean([_safe_pr_1d(yt_p, yp[b_idx]) for yp in cmp_polar_seeds]))
+                    mae_d.append(
+                        float(np.mean([ae[b_idx].mean() for ae in ae_ref_size_s]))
+                        - float(np.mean([ae[b_idx].mean() for ae in ae_cmp_size_s]))
                     )
-                    if "spearman_size" in metric_keys:
-                        sps_d.append(
-                            float(np.mean([_safe_sp(yt_s, yp[b_idx]) for yp in ref_size_seeds]))
-                            - float(np.mean([_safe_sp(yt_s, yp[b_idx]) for yp in cmp_size_seeds]))
+                    if b_pos < n_stat_draws:
+                        yt_s = y_size_true[b_idx]
+                        r2s_d.append(
+                            float(np.mean([_safe_r2_1d(yt_s, yp[b_idx]) for yp in ref_size_seeds]))
+                            - float(np.mean([_safe_r2_1d(yt_s, yp[b_idx]) for yp in cmp_size_seeds]))
                         )
-                    if "spearman_polar" in metric_keys:
-                        spp_d.append(
-                            float(np.mean([_safe_sp(yt_p, yp[b_idx]) for yp in ref_polar_seeds]))
-                            - float(np.mean([_safe_sp(yt_p, yp[b_idx]) for yp in cmp_polar_seeds]))
+                        if "spearman_size" in metric_keys:
+                            sps_d.append(
+                                float(np.mean([_safe_sp(yt_s, yp[b_idx]) for yp in ref_size_seeds]))
+                                - float(np.mean([_safe_sp(yt_s, yp[b_idx]) for yp in cmp_size_seeds]))
+                            )
+                out["msle"] = _boot_pvalue_from_diffs(np.asarray(msle_d, dtype=np.float64))
+                out["rmse_size"] = _boot_pvalue_from_diffs(np.asarray(rmses_d, dtype=np.float64))
+                out["mae"] = _boot_pvalue_from_diffs(np.asarray(mae_d, dtype=np.float64))
+                out["r2_size"] = _boot_pvalue_from_diffs(np.asarray(r2s_d, dtype=np.float64))
+                if sps_d:
+                    out["spearman_size"] = _boot_pvalue_from_diffs(np.asarray(sps_d, dtype=np.float64))
+
+            if polar_finite:
+                se_ref_polar_s = [(yp - y_polar_true) ** 2 for yp in ref_polar_seeds]
+                se_cmp_polar_s = [(yp - y_polar_true) ** 2 for yp in cmp_polar_seeds]
+                ae_ref_polar_s = [np.abs(yp - y_polar_true) for yp in ref_polar_seeds]
+                ae_cmp_polar_s = [np.abs(yp - y_polar_true) for yp in cmp_polar_seeds]
+                rmsep_d, maep_d, r2p_d, pr_d, spp_d = [], [], [], [], []
+                for b_pos, b_idx in enumerate(cluster_draws):
+                    rmsep_d.append(
+                        float(np.mean([math.sqrt(float(se[b_idx].mean())) for se in se_ref_polar_s]))
+                        - float(np.mean([math.sqrt(float(se[b_idx].mean())) for se in se_cmp_polar_s]))
+                    )
+                    maep_d.append(
+                        float(np.mean([ae[b_idx].mean() for ae in ae_ref_polar_s]))
+                        - float(np.mean([ae[b_idx].mean() for ae in ae_cmp_polar_s]))
+                    )
+                    if b_pos < n_stat_draws:
+                        yt_p = y_polar_true[b_idx]
+                        r2p_d.append(
+                            float(np.mean([_safe_r2_1d(yt_p, yp[b_idx]) for yp in ref_polar_seeds]))
+                            - float(np.mean([_safe_r2_1d(yt_p, yp[b_idx]) for yp in cmp_polar_seeds]))
                         )
-            out["msle"] = _boot_pvalue_from_diffs(np.asarray(msle_d, dtype=np.float64))
-            out["rmse_size"] = _boot_pvalue_from_diffs(np.asarray(rmses_d, dtype=np.float64))
-            out["mae"] = _boot_pvalue_from_diffs(np.asarray(mae_d, dtype=np.float64))
-            out["rmse"] = _boot_pvalue_from_diffs(np.asarray(rmsep_d, dtype=np.float64))
-            out["mae_polar"] = _boot_pvalue_from_diffs(np.asarray(maep_d, dtype=np.float64))
-            out["r2_size"] = _boot_pvalue_from_diffs(np.asarray(r2s_d, dtype=np.float64))
-            out["r2_polar"] = _boot_pvalue_from_diffs(np.asarray(r2p_d, dtype=np.float64))
-            out["pearson_r"] = _boot_pvalue_from_diffs(np.asarray(pr_d, dtype=np.float64))
-            if sps_d:
-                out["spearman_size"] = _boot_pvalue_from_diffs(np.asarray(sps_d, dtype=np.float64))
-            if spp_d:
-                out["spearman_polar"] = _boot_pvalue_from_diffs(np.asarray(spp_d, dtype=np.float64))
+                        pr_d.append(
+                            float(np.mean([_safe_pr_1d(yt_p, yp[b_idx]) for yp in ref_polar_seeds]))
+                            - float(np.mean([_safe_pr_1d(yt_p, yp[b_idx]) for yp in cmp_polar_seeds]))
+                        )
+                        if "spearman_polar" in metric_keys:
+                            spp_d.append(
+                                float(np.mean([_safe_sp(yt_p, yp[b_idx]) for yp in ref_polar_seeds]))
+                                - float(np.mean([_safe_sp(yt_p, yp[b_idx]) for yp in cmp_polar_seeds]))
+                            )
+                out["rmse"] = _boot_pvalue_from_diffs(np.asarray(rmsep_d, dtype=np.float64))
+                out["mae_polar"] = _boot_pvalue_from_diffs(np.asarray(maep_d, dtype=np.float64))
+                out["r2_polar"] = _boot_pvalue_from_diffs(np.asarray(r2p_d, dtype=np.float64))
+                out["pearson_r"] = _boot_pvalue_from_diffs(np.asarray(pr_d, dtype=np.float64))
+                if spp_d:
+                    out["spearman_polar"] = _boot_pvalue_from_diffs(np.asarray(spp_d, dtype=np.float64))
         else:
             idx_fast = rng.integers(0, n_reg, size=(n_draws, n_reg))
             idx_stat = idx_fast[:n_stat_draws]
 
-            ref_msle_b = np.mean([se[idx_fast].mean(axis=1) for se in se_ref_size_s], axis=0)
-            cmp_msle_b = np.mean([se[idx_fast].mean(axis=1) for se in se_cmp_size_s], axis=0)
-            out["msle"] = _boot_pvalue_from_diffs(ref_msle_b - cmp_msle_b)
+            if size_finite:
+                se_ref_size_s = [(yp - y_size_true) ** 2 for yp in ref_size_seeds]
+                se_cmp_size_s = [(yp - y_size_true) ** 2 for yp in cmp_size_seeds]
+                ae_ref_size_s = [np.abs(yp - y_size_true) for yp in ref_size_seeds]
+                ae_cmp_size_s = [np.abs(yp - y_size_true) for yp in cmp_size_seeds]
 
-            ref_rmses_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_ref_size_s], axis=0)
-            cmp_rmses_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_cmp_size_s], axis=0)
-            out["rmse_size"] = _boot_pvalue_from_diffs(ref_rmses_b - cmp_rmses_b)
+                ref_msle_b = np.mean([se[idx_fast].mean(axis=1) for se in se_ref_size_s], axis=0)
+                cmp_msle_b = np.mean([se[idx_fast].mean(axis=1) for se in se_cmp_size_s], axis=0)
+                out["msle"] = _boot_pvalue_from_diffs(ref_msle_b - cmp_msle_b)
 
-            ae_ref_size = np.mean(ae_ref_size_s, axis=0)
-            ae_cmp_size = np.mean(ae_cmp_size_s, axis=0)
-            out["mae"] = compute_paired_bootstrap_pvalue(ae_ref_size, ae_cmp_size, n_resamples=n_draws, seed=seed + 1)
+                ref_rmses_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_ref_size_s], axis=0)
+                cmp_rmses_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_cmp_size_s], axis=0)
+                out["rmse_size"] = _boot_pvalue_from_diffs(ref_rmses_b - cmp_rmses_b)
 
-            ref_rmsep_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_ref_polar_s], axis=0)
-            cmp_rmsep_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_cmp_polar_s], axis=0)
-            out["rmse"] = _boot_pvalue_from_diffs(ref_rmsep_b - cmp_rmsep_b)
+                ae_ref_size = np.mean(ae_ref_size_s, axis=0)
+                ae_cmp_size = np.mean(ae_cmp_size_s, axis=0)
+                out["mae"] = compute_paired_bootstrap_pvalue(ae_ref_size, ae_cmp_size, n_resamples=n_draws, seed=seed + 1)
 
-            ae_ref_polar = np.mean(ae_ref_polar_s, axis=0)
-            ae_cmp_polar = np.mean(ae_cmp_polar_s, axis=0)
-            out["mae_polar"] = compute_paired_bootstrap_pvalue(ae_ref_polar, ae_cmp_polar, n_resamples=n_draws, seed=seed + 3)
+                out["r2_size"] = _boot_pvalue_from_diffs(
+                    np.mean([_vec_r2(y_size_true, yp, idx_stat) for yp in ref_size_seeds], axis=0)
+                    - np.mean([_vec_r2(y_size_true, yp, idx_stat) for yp in cmp_size_seeds], axis=0)
+                )
 
-            out["r2_size"] = _boot_pvalue_from_diffs(
-                np.mean([_vec_r2(y_size_true, yp, idx_stat) for yp in ref_size_seeds], axis=0)
-                - np.mean([_vec_r2(y_size_true, yp, idx_stat) for yp in cmp_size_seeds], axis=0)
-            )
-            out["r2_polar"] = _boot_pvalue_from_diffs(
-                np.mean([_vec_r2(y_polar_true, yp, idx_stat) for yp in ref_polar_seeds], axis=0)
-                - np.mean([_vec_r2(y_polar_true, yp, idx_stat) for yp in cmp_polar_seeds], axis=0)
-            )
-            out["pearson_r"] = _boot_pvalue_from_diffs(
-                np.mean([_vec_pearson(y_polar_true, yp, idx_stat) for yp in ref_polar_seeds], axis=0)
-                - np.mean([_vec_pearson(y_polar_true, yp, idx_stat) for yp in cmp_polar_seeds], axis=0)
-            )
+                if "spearman_size" in metric_keys:
+                    sp_size_diffs: list[float] = []
+                    for b_idx in idx_stat:
+                        yt = y_size_true[b_idx]
+                        sr = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in ref_size_seeds]))
+                        sc = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in cmp_size_seeds]))
+                        sp_size_diffs.append(sr - sc)
+                    out["spearman_size"] = _boot_pvalue_from_diffs(np.asarray(sp_size_diffs, dtype=np.float64))
 
-            if "spearman_size" in metric_keys:
-                sp_size_diffs: list[float] = []
-                for b_idx in idx_stat:
-                    yt = y_size_true[b_idx]
-                    sr = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in ref_size_seeds]))
-                    sc = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in cmp_size_seeds]))
-                    sp_size_diffs.append(sr - sc)
-                out["spearman_size"] = _boot_pvalue_from_diffs(np.asarray(sp_size_diffs, dtype=np.float64))
+            if polar_finite:
+                se_ref_polar_s = [(yp - y_polar_true) ** 2 for yp in ref_polar_seeds]
+                se_cmp_polar_s = [(yp - y_polar_true) ** 2 for yp in cmp_polar_seeds]
+                ae_ref_polar_s = [np.abs(yp - y_polar_true) for yp in ref_polar_seeds]
+                ae_cmp_polar_s = [np.abs(yp - y_polar_true) for yp in cmp_polar_seeds]
 
-            if "spearman_polar" in metric_keys:
-                sp_polar_diffs: list[float] = []
-                for b_idx in idx_stat:
-                    yt = y_polar_true[b_idx]
-                    sr = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in ref_polar_seeds]))
-                    sc = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in cmp_polar_seeds]))
-                    sp_polar_diffs.append(sr - sc)
-                out["spearman_polar"] = _boot_pvalue_from_diffs(np.asarray(sp_polar_diffs, dtype=np.float64))
+                ref_rmsep_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_ref_polar_s], axis=0)
+                cmp_rmsep_b = np.mean([np.sqrt(se[idx_fast].mean(axis=1)) for se in se_cmp_polar_s], axis=0)
+                out["rmse"] = _boot_pvalue_from_diffs(ref_rmsep_b - cmp_rmsep_b)
+
+                ae_ref_polar = np.mean(ae_ref_polar_s, axis=0)
+                ae_cmp_polar = np.mean(ae_cmp_polar_s, axis=0)
+                out["mae_polar"] = compute_paired_bootstrap_pvalue(ae_ref_polar, ae_cmp_polar, n_resamples=n_draws, seed=seed + 3)
+
+                out["r2_polar"] = _boot_pvalue_from_diffs(
+                    np.mean([_vec_r2(y_polar_true, yp, idx_stat) for yp in ref_polar_seeds], axis=0)
+                    - np.mean([_vec_r2(y_polar_true, yp, idx_stat) for yp in cmp_polar_seeds], axis=0)
+                )
+                out["pearson_r"] = _boot_pvalue_from_diffs(
+                    np.mean([_vec_pearson(y_polar_true, yp, idx_stat) for yp in ref_polar_seeds], axis=0)
+                    - np.mean([_vec_pearson(y_polar_true, yp, idx_stat) for yp in cmp_polar_seeds], axis=0)
+                )
+
+                if "spearman_polar" in metric_keys:
+                    sp_polar_diffs: list[float] = []
+                    for b_idx in idx_stat:
+                        yt = y_polar_true[b_idx]
+                        sr = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in ref_polar_seeds]))
+                        sc = float(np.mean([_safe_sp(yt, yp[b_idx]) for yp in cmp_polar_seeds]))
+                        sp_polar_diffs.append(sr - sc)
+                    out["spearman_polar"] = _boot_pvalue_from_diffs(np.asarray(sp_polar_diffs, dtype=np.float64))
 
     ref_logits_list = [p["rumor_logits"] for p in preds_ref if p.get("rumor_logits") is not None]
     cmp_logits_list = [p["rumor_logits"] for p in preds_cmp if p.get("rumor_logits") is not None]
@@ -995,15 +1120,38 @@ def _compute_sample_level_bootstrap_pvalues(
         y_rumor_arr = np.asarray(y_rumor_raw, dtype=np.int64).reshape(-1)
         valid = y_rumor_arr >= 0
         n_cls_samples = int(np.sum(valid))
-        if n_cls_samples >= 2:
+        ref_logits_arrs = [np.asarray(lg, dtype=np.float64) for lg in ref_logits_list]
+        cmp_logits_arrs = [np.asarray(lg, dtype=np.float64) for lg in cmp_logits_list]
+        logits_finite = (
+            n_cls_samples >= 2
+            and all(
+                arr.ndim == 2
+                and arr.shape[0] == y_rumor_arr.size
+                and arr.shape[1] >= 2
+                and np.all(np.isfinite(arr[valid]))
+                for arr in ref_logits_arrs
+            )
+            and all(
+                arr.ndim == 2
+                and arr.shape[0] == y_rumor_arr.size
+                and arr.shape[1] >= 2
+                and np.all(np.isfinite(arr[valid]))
+                for arr in cmp_logits_arrs
+            )
+        )
+        if logits_finite:
             if cluster_draws is not None and y_rumor_arr.size == n_total:
                 # Apply the same topic-cluster draws to classification metrics (filtered by valid labels)
-                ref_probs_full = [
-                    torch.softmax(torch.as_tensor(lg), dim=-1).numpy() for lg in ref_logits_list
-                ]
-                cmp_probs_full = [
-                    torch.softmax(torch.as_tensor(lg), dim=-1).numpy() for lg in cmp_logits_list
-                ]
+                ref_probs_full: list[np.ndarray] = []
+                for arr in ref_logits_arrs:
+                    pr = np.zeros_like(arr, dtype=np.float64)
+                    pr[valid] = torch.softmax(torch.as_tensor(arr[valid], dtype=torch.float64), dim=-1).numpy()
+                    ref_probs_full.append(pr)
+                cmp_probs_full: list[np.ndarray] = []
+                for arr in cmp_logits_arrs:
+                    pr = np.zeros_like(arr, dtype=np.float64)
+                    pr[valid] = torch.softmax(torch.as_tensor(arr[valid], dtype=torch.float64), dim=-1).numpy()
+                    cmp_probs_full.append(pr)
                 ref_cls_full = [np.argmax(pr, axis=-1) for pr in ref_probs_full]
                 cmp_cls_full = [np.argmax(pr, axis=-1) for pr in cmp_probs_full]
                 acc_diffs_c: list[float] = []
@@ -1049,10 +1197,12 @@ def _compute_sample_level_bootstrap_pvalues(
             else:
                 truth_v = y_rumor_arr[valid]
                 ref_probs_seeds = [
-                    torch.softmax(torch.as_tensor(lg), dim=-1).numpy()[valid] for lg in ref_logits_list
+                    torch.softmax(torch.as_tensor(arr[valid], dtype=torch.float64), dim=-1).numpy()
+                    for arr in ref_logits_arrs
                 ]
                 cmp_probs_seeds = [
-                    torch.softmax(torch.as_tensor(lg), dim=-1).numpy()[valid] for lg in cmp_logits_list
+                    torch.softmax(torch.as_tensor(arr[valid], dtype=torch.float64), dim=-1).numpy()
+                    for arr in cmp_logits_arrs
                 ]
                 ref_cls_seeds = [np.argmax(pr, axis=-1) for pr in ref_probs_seeds]
                 cmp_cls_seeds = [np.argmax(pr, axis=-1) for pr in cmp_probs_seeds]
@@ -1093,6 +1243,185 @@ def _compute_sample_level_bootstrap_pvalues(
     for k in metric_keys:
         out.setdefault(k, float("nan"))
     return out
+
+
+def compute_cluster_paired_tests(
+    preds_ref: Sequence[dict[str, Any]],
+    preds_cmp: Sequence[dict[str, Any]],
+    *,
+    metric_keys: Sequence[str],
+    seed: int = 42,
+) -> dict[str, dict[str, float]]:
+    """Aggregate per-cascade predictions within topic clusters (>=6) and run paired t-test + Wilcoxon."""
+    del seed
+    empty: dict[str, dict[str, float]] = {
+        "ttest": {k: float("nan") for k in metric_keys},
+        "wilcoxon": {k: float("nan") for k in metric_keys},
+    }
+    if not preds_ref or not preds_cmp:
+        return empty
+
+    y_size_true = np.asarray(preds_ref[0]["y_size_true"], dtype=np.float64).reshape(-1)
+    y_polar_true = np.asarray(preds_ref[0]["y_polar_true"], dtype=np.float64).reshape(-1)
+    y_rumor_raw = preds_ref[0].get("y_rumor_true")
+    y_rumor_arr = (
+        np.asarray(y_rumor_raw, dtype=np.int64).reshape(-1)
+        if y_rumor_raw is not None
+        else np.array([], dtype=np.int64)
+    )
+    n_reg = int(y_size_true.size)
+    n_total = n_reg if n_reg >= 2 else int(y_rumor_arr.size)
+    if n_total < 2:
+        return empty
+
+    raw_tids = preds_ref[0].get("topic_ids")
+    if not isinstance(raw_tids, (list, tuple)) or len(raw_tids) != n_total:
+        return empty
+    group_map: dict[str, list[int]] = {}
+    for idx_i, tid in enumerate(raw_tids):
+        group_map.setdefault(str(tid), []).append(idx_i)
+    if len(group_map) < 6:
+        return empty
+
+    clusters = [np.asarray(idxs, dtype=np.int64) for idxs in group_map.values()]
+    ref_size_s = [np.asarray(p["y_size_pred"], dtype=np.float64).reshape(-1) for p in preds_ref]
+    cmp_size_s = [np.asarray(p["y_size_pred"], dtype=np.float64).reshape(-1) for p in preds_cmp]
+    ref_polar_s = [np.asarray(p["y_polar_pred"], dtype=np.float64).reshape(-1) for p in preds_ref]
+    cmp_polar_s = [np.asarray(p["y_polar_pred"], dtype=np.float64).reshape(-1) for p in preds_cmp]
+    ref_logits_s = [np.asarray(p["rumor_logits"], dtype=np.float64) for p in preds_ref if p.get("rumor_logits") is not None]
+    cmp_logits_s = [np.asarray(p["rumor_logits"], dtype=np.float64) for p in preds_cmp if p.get("rumor_logits") is not None]
+
+    size_finite = bool(
+        n_reg >= 2
+        and np.all(np.isfinite(y_size_true))
+        and all(arr.size == n_reg and np.all(np.isfinite(arr)) for arr in ref_size_s)
+        and all(arr.size == n_reg and np.all(np.isfinite(arr)) for arr in cmp_size_s)
+    )
+    polar_finite = bool(
+        n_reg >= 2
+        and np.all(np.isfinite(y_polar_true))
+        and all(arr.size == n_reg and np.all(np.isfinite(arr)) for arr in ref_polar_s)
+        and all(arr.size == n_reg and np.all(np.isfinite(arr)) for arr in cmp_polar_s)
+    )
+    valid_cls_all = y_rumor_arr >= 0
+    logits_finite = bool(
+        ref_logits_s
+        and cmp_logits_s
+        and y_rumor_arr.size == n_total
+        and np.any(valid_cls_all)
+        and all(
+            arr.ndim == 2
+            and arr.shape[0] == n_total
+            and arr.shape[1] >= 2
+            and np.all(np.isfinite(arr[valid_cls_all]))
+            for arr in ref_logits_s + cmp_logits_s
+        )
+    )
+
+    def _cluster_metric(model_s: list[np.ndarray], y_t: np.ndarray, c_idx: np.ndarray, kind: str) -> float:
+        vals: list[float] = []
+        for yp in model_s:
+            yt_c, yp_c = y_t[c_idx], yp[c_idx]
+            if not (np.all(np.isfinite(yt_c)) and np.all(np.isfinite(yp_c))):
+                return float("nan")
+            if kind == "mse":
+                vals.append(float(np.mean((yp_c - yt_c) ** 2)))
+            elif kind == "rmse":
+                vals.append(float(np.sqrt(np.mean((yp_c - yt_c) ** 2))))
+            elif kind == "mae":
+                vals.append(float(np.mean(np.abs(yp_c - yt_c))))
+            elif kind == "r2":
+                if yt_c.size < 2 or np.std(yt_c) <= 1e-12:
+                    continue
+                ss_tot = float(np.sum((yt_c - np.mean(yt_c)) ** 2))
+                vals.append(float(1.0 - np.sum((yt_c - yp_c) ** 2) / ss_tot))
+            elif kind == "pearson":
+                if yt_c.size < 2 or np.std(yt_c) <= 1e-12 or np.std(yp_c) <= 1e-12:
+                    continue
+                vals.append(float(np.corrcoef(yt_c, yp_c)[0, 1]))
+            elif kind == "spearman":
+                if yt_c.size < 2 or np.std(yt_c) <= 1e-12 or np.std(yp_c) <= 1e-12:
+                    continue
+                sp = float(spearmanr(yt_c, yp_c).statistic)
+                if not math.isnan(sp):
+                    vals.append(sp)
+        return float(np.mean(vals)) if vals else float("nan")
+
+    ttest_out: dict[str, float] = {}
+    wilcox_out: dict[str, float] = {}
+    for key in metric_keys:
+        if key in {"msle", "rmse_size", "mae", "r2_size", "spearman_size"} and not size_finite:
+            ttest_out[key] = float("nan")
+            wilcox_out[key] = float("nan")
+            continue
+        if key in {"rmse", "mae_polar", "r2_polar", "pearson_r", "spearman_polar"} and not polar_finite:
+            ttest_out[key] = float("nan")
+            wilcox_out[key] = float("nan")
+            continue
+        if key in {"accuracy", "macro_f1"} and not logits_finite:
+            ttest_out[key] = float("nan")
+            wilcox_out[key] = float("nan")
+            continue
+        ref_c_vals: list[float] = []
+        cmp_c_vals: list[float] = []
+        for c_idx in clusters:
+            if key == "msle" and size_finite:
+                rv = _cluster_metric(ref_size_s, y_size_true, c_idx, "mse")
+                cv = _cluster_metric(cmp_size_s, y_size_true, c_idx, "mse")
+            elif key == "rmse_size" and size_finite:
+                rv = _cluster_metric(ref_size_s, y_size_true, c_idx, "rmse")
+                cv = _cluster_metric(cmp_size_s, y_size_true, c_idx, "rmse")
+            elif key == "mae" and size_finite:
+                rv = _cluster_metric(ref_size_s, y_size_true, c_idx, "mae")
+                cv = _cluster_metric(cmp_size_s, y_size_true, c_idx, "mae")
+            elif key == "r2_size" and size_finite:
+                rv = _cluster_metric(ref_size_s, y_size_true, c_idx, "r2")
+                cv = _cluster_metric(cmp_size_s, y_size_true, c_idx, "r2")
+            elif key == "spearman_size" and size_finite:
+                rv = _cluster_metric(ref_size_s, y_size_true, c_idx, "spearman")
+                cv = _cluster_metric(cmp_size_s, y_size_true, c_idx, "spearman")
+            elif key == "rmse" and polar_finite:
+                rv = _cluster_metric(ref_polar_s, y_polar_true, c_idx, "rmse")
+                cv = _cluster_metric(cmp_polar_s, y_polar_true, c_idx, "rmse")
+            elif key == "mae_polar" and polar_finite:
+                rv = _cluster_metric(ref_polar_s, y_polar_true, c_idx, "mae")
+                cv = _cluster_metric(cmp_polar_s, y_polar_true, c_idx, "mae")
+            elif key == "r2_polar" and polar_finite:
+                rv = _cluster_metric(ref_polar_s, y_polar_true, c_idx, "r2")
+                cv = _cluster_metric(cmp_polar_s, y_polar_true, c_idx, "r2")
+            elif key == "pearson_r" and polar_finite:
+                rv = _cluster_metric(ref_polar_s, y_polar_true, c_idx, "pearson")
+                cv = _cluster_metric(cmp_polar_s, y_polar_true, c_idx, "pearson")
+            elif key == "spearman_polar" and polar_finite:
+                rv = _cluster_metric(ref_polar_s, y_polar_true, c_idx, "spearman")
+                cv = _cluster_metric(cmp_polar_s, y_polar_true, c_idx, "spearman")
+            elif key in {"accuracy", "macro_f1"} and logits_finite:
+                valid_c = c_idx[y_rumor_arr[c_idx] >= 0]
+                if valid_c.size == 0:
+                    continue
+                if any(
+                    lg.ndim != 2
+                    or lg.shape[0] != n_total
+                    or not np.all(np.isfinite(lg[valid_c]))
+                    for lg in ref_logits_s + cmp_logits_s
+                ):
+                    continue
+                tb = y_rumor_arr[valid_c]
+                if key == "accuracy":
+                    rv = float(np.mean([(np.argmax(lg[valid_c], axis=-1) == tb).mean() for lg in ref_logits_s]))
+                    cv = float(np.mean([(np.argmax(lg[valid_c], axis=-1) == tb).mean() for lg in cmp_logits_s]))
+                else:
+                    rv = float(np.mean([f1_score(tb, np.argmax(lg[valid_c], axis=-1), average="macro", zero_division=0) for lg in ref_logits_s]))
+                    cv = float(np.mean([f1_score(tb, np.argmax(lg[valid_c], axis=-1), average="macro", zero_division=0) for lg in cmp_logits_s]))
+            else:
+                continue
+            if math.isfinite(rv) and math.isfinite(cv):
+                ref_c_vals.append(rv)
+                cmp_c_vals.append(cv)
+        ttest_out[key] = compute_paired_ttest(ref_c_vals, cmp_c_vals)
+        wilcox_out[key] = compute_paired_wilcoxon(ref_c_vals, cmp_c_vals)
+
+    return {"ttest": ttest_out, "wilcoxon": wilcox_out}
 
 
 def run_multi_seed_benchmark(
@@ -1147,47 +1476,210 @@ def run_multi_seed_benchmark(
         "task_loss",
     )
 
+    def _evaluate_tabular_split(
+        preds_np: dict[str, np.ndarray],
+        cascades: Sequence[Any],
+        *,
+        s_scale: float,
+        p_scale: float,
+        r_scale: float | None,
+        class_weights: Tensor | None,
+        include_preds: bool = False,
+    ) -> dict[str, Any]:
+        y_size_true = np.array([float(d.y_size.view(-1)[0].item()) for d in cascades], dtype=np.float64)
+        y_polar_true = np.array([float(d.y_polar.view(-1)[0].item()) for d in cascades], dtype=np.float64)
+        y_bimod = [float(d.y_bimodality.view(-1)[0].item()) for d in cascades if hasattr(d, "y_bimodality") and d.y_bimodality is not None]
+        y_assort = [float(d.y_assortativity.view(-1)[0].item()) for d in cascades if hasattr(d, "y_assortativity") and d.y_assortativity is not None]
+        y_rumor_list = [
+            int(getattr(d, "y_rumor", getattr(d, "y", -1)).view(-1)[0].item())
+            if getattr(d, "y_rumor", getattr(d, "y", None)) is not None
+            else -1
+            for d in cascades
+        ]
+        y_rumor_true = np.asarray(y_rumor_list, dtype=np.int64)
+        has_rumor = any(
+            getattr(d, "y_rumor", getattr(d, "y", None)) is not None for d in cascades
+        )
+        tids = [str(getattr(d, "topic_id", "")) for d in cascades if hasattr(d, "topic_id")]
+
+        y_size_pred = np.asarray(preds_np["y_size_pred"], dtype=np.float64).reshape(-1)
+        y_polar_pred = np.asarray(preds_np["y_polar_pred"], dtype=np.float64).reshape(-1)
+        rumor_logits = np.asarray(preds_np["rumor_logits"], dtype=np.float64)
+
+        metrics_out: dict[str, Any] = evaluate_predictions(
+            y_size_true=y_size_true,
+            y_size_pred=y_size_pred,
+            y_polar_true=y_polar_true,
+            y_polar_pred=y_polar_pred,
+            y_rumor_true=y_rumor_true if has_rumor else None,
+            rumor_logits=rumor_logits if has_rumor else None,
+            y_bimodality_true=np.asarray(y_bimod, dtype=np.float64) if len(y_bimod) == len(cascades) else None,
+            y_assortativity_true=np.asarray(y_assort, dtype=np.float64) if len(y_assort) == len(cascades) else None,
+        )
+
+        if len(cascades) > 0:
+            p_clamped = np.clip(y_polar_pred, 1e-4, 1.0 - 1e-4)
+            p_logits = np.log(p_clamped / (1.0 - p_clamped))
+            out_t = {
+                "y_size_pred": torch.tensor(y_size_pred, dtype=torch.float32),
+                "y_polar_logit": torch.tensor(p_logits, dtype=torch.float32),
+                "y_polar_pred": torch.tensor(y_polar_pred, dtype=torch.float32),
+                "rumor_logits": torch.tensor(rumor_logits, dtype=torch.float32),
+            }
+            dummy_batch = type(
+                "_TabBatch",
+                (),
+                {
+                    "y_size": torch.tensor(y_size_true, dtype=torch.float32),
+                    "y_polar": torch.tensor(y_polar_true, dtype=torch.float32),
+                    "y_rumor": torch.tensor(y_rumor_true, dtype=torch.long) if has_rumor else None,
+                },
+            )()
+            t_loss = float(
+                compute_multitask_loss(
+                    out_t,
+                    dummy_batch,
+                    alpha_size=alpha_size,
+                    alpha_polar=alpha_polar,
+                    alpha_rumor=alpha_rumor,
+                    size_loss_scale=s_scale,
+                    polar_loss_scale=p_scale,
+                    rumor_loss_scale=r_scale,
+                    lambda_uncertainty=0.0,
+                    class_weights=class_weights,
+                    classification_only=classification_only,
+                ).item()
+            )
+        else:
+            t_loss = float("nan")
+        metrics_out["loss"] = t_loss
+        metrics_out["task_loss"] = t_loss
+        if include_preds:
+            metrics_out["_predictions"] = {
+                "y_size_true": y_size_true,
+                "y_size_pred": y_size_pred,
+                "y_polar_true": y_polar_true,
+                "y_polar_pred": y_polar_pred,
+                "y_rumor_true": y_rumor_true if has_rumor else None,
+                "rumor_logits": rumor_logits if has_rumor else None,
+                "topic_ids": tids if len(tids) == len(cascades) else None,
+            }
+        return metrics_out
+
     for model_name, factory in model_factories.items():
         seed_runs: list[dict[str, float]] = []
         val_seed_runs: list[dict[str, float]] = []
         pred_runs: list[dict[str, Any]] = []
-        for seed in seeds:
-            model, test_metrics = train_and_evaluate_single_seed(
-                factory,
-                train_loader,
-                val_loader,
-                test_loader,
-                seed=seed,
-                epochs=epochs,
-                lr=lr,
-                weight_decay=weight_decay,
-                patience=patience,
-                alpha_size=alpha_size,
-                alpha_polar=alpha_polar,
-                alpha_rumor=alpha_rumor,
-                lambda_uncertainty=lambda_uncertainty,
-                use_class_weights=use_class_weights,
-                classification_only=classification_only,
-                device=device,
-                return_predictions=True,
-            )
-            preds_blob = test_metrics.pop("_predictions", None)
-            if preds_blob is not None:
-                pred_runs.append(preds_blob)
-            val_blob = test_metrics.pop("_val_metrics", None)
-            if isinstance(val_blob, Mapping):
-                val_seed_runs.append({str(k): float(v) for k, v in val_blob.items() if isinstance(v, (int, float))})
-            seed_runs.append(test_metrics)
+        seed_list = list(seeds)
+        if not seed_list:
+            raw_results[model_name] = seed_runs
+            model_predictions[model_name] = pred_runs
+            summary_stats[model_name] = {k: (float("nan"), float("nan")) for k in metric_keys}
+            continue
+        seed_everything(seed_list[0])
+        probe_model = factory()
+        is_tabular = hasattr(probe_model, "fit_dataset") and hasattr(probe_model, "predict_dataset")
 
-            val_score = float(test_metrics.get("val_task_loss", float("nan")))
-            prev_best = best_val_scores.get(model_name, float("inf"))
-            if model_name not in best_val_models or (
-                math.isfinite(val_score) and val_score < prev_best
-            ):
-                best_val_models[model_name] = model
-                if math.isfinite(val_score):
-                    best_val_scores[model_name] = val_score
-                best_seed_by_model[model_name] = int(seed)
+        if is_tabular:
+            train_cascades = list(train_loader.dataset)
+            val_cascades = list(val_loader.dataset)
+            test_cascades = list(test_loader.dataset)
+            num_cls_tab = int(getattr(probe_model, "num_rumor_classes", 4))
+            cls_w_tab = (
+                _estimate_balanced_class_weights(train_loader, num_cls_tab)
+                if use_class_weights
+                else None
+            )
+            if not classification_only:
+                t_stats = _estimate_train_target_stats(
+                    train_loader,
+                    num_rumor_classes=num_cls_tab,
+                    class_weights=cls_w_tab,
+                )
+                s_sc = float(t_stats["size_loss_scale"])
+                p_sc = float(t_stats["polar_loss_scale"])
+                r_sc: float | None = float(t_stats["rumor_loss_scale"])
+            else:
+                s_sc, p_sc, r_sc = 1.0, 1.0, None
+
+            for seed_idx, seed in enumerate(seed_list):
+                seed_everything(seed)
+                model = probe_model if seed_idx == 0 else factory()
+                model.fit_dataset(train_cascades, val_cascades, seed=seed)
+                val_metrics = _evaluate_tabular_split(
+                    model.predict_dataset(val_cascades),
+                    val_cascades,
+                    s_scale=s_sc,
+                    p_scale=p_sc,
+                    r_scale=r_sc,
+                    class_weights=cls_w_tab,
+                    include_preds=False,
+                )
+                test_metrics = _evaluate_tabular_split(
+                    model.predict_dataset(test_cascades),
+                    test_cascades,
+                    s_scale=s_sc,
+                    p_scale=p_sc,
+                    r_scale=r_sc,
+                    class_weights=cls_w_tab,
+                    include_preds=True,
+                )
+                test_metrics["val_task_loss"] = float(val_metrics.get("task_loss", float("nan")))
+                preds_blob = test_metrics.pop("_predictions", None)
+                if preds_blob is not None:
+                    pred_runs.append(preds_blob)
+                val_seed_runs.append(
+                    {str(k): float(v) for k, v in val_metrics.items() if isinstance(v, (int, float))}
+                )
+                seed_runs.append(test_metrics)
+                val_score = float(test_metrics.get("val_task_loss", float("nan")))
+                prev_best = best_val_scores.get(model_name, float("inf"))
+                if model_name not in best_val_models or (
+                    math.isfinite(val_score) and val_score < prev_best
+                ):
+                    best_val_models[model_name] = model
+                    if math.isfinite(val_score):
+                        best_val_scores[model_name] = val_score
+                    best_seed_by_model[model_name] = int(seed)
+        else:
+            for seed_idx, seed in enumerate(seed_list):
+                active_factory = (lambda m=probe_model: m) if seed_idx == 0 else factory
+                model, test_metrics = train_and_evaluate_single_seed(
+                    active_factory,
+                    train_loader,
+                    val_loader,
+                    test_loader,
+                    seed=seed,
+                    epochs=epochs,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    patience=patience,
+                    alpha_size=alpha_size,
+                    alpha_polar=alpha_polar,
+                    alpha_rumor=alpha_rumor,
+                    lambda_uncertainty=lambda_uncertainty,
+                    use_class_weights=use_class_weights,
+                    classification_only=classification_only,
+                    device=device,
+                    return_predictions=True,
+                )
+                preds_blob = test_metrics.pop("_predictions", None)
+                if preds_blob is not None:
+                    pred_runs.append(preds_blob)
+                val_blob = test_metrics.pop("_val_metrics", None)
+                if isinstance(val_blob, Mapping):
+                    val_seed_runs.append({str(k): float(v) for k, v in val_blob.items() if isinstance(v, (int, float))})
+                seed_runs.append(test_metrics)
+
+                val_score = float(test_metrics.get("val_task_loss", float("nan")))
+                prev_best = best_val_scores.get(model_name, float("inf"))
+                if model_name not in best_val_models or (
+                    math.isfinite(val_score) and val_score < prev_best
+                ):
+                    best_val_models[model_name] = model
+                    if math.isfinite(val_score):
+                        best_val_scores[model_name] = val_score
+                    best_seed_by_model[model_name] = int(seed)
 
         raw_results[model_name] = seed_runs
         model_predictions[model_name] = pred_runs
@@ -1195,7 +1687,7 @@ def run_multi_seed_benchmark(
         val_agg: dict[str, tuple[float, float]] = {}
         for key in metric_keys:
             vals = np.asarray([r.get(key, float("nan")) for r in seed_runs], dtype=np.float64)
-            vals = vals[~np.isnan(vals)]
+            vals = vals[np.isfinite(vals)]
             if vals.size == 0:
                 agg[key] = (float("nan"), float("nan"))
             else:
@@ -1205,7 +1697,7 @@ def run_multi_seed_benchmark(
 
             if val_seed_runs:
                 v_vals = np.asarray([r.get(key, float("nan")) for r in val_seed_runs], dtype=np.float64)
-                v_vals = v_vals[~np.isnan(v_vals)]
+                v_vals = v_vals[np.isfinite(v_vals)]
                 if v_vals.size == 0:
                     val_agg[key] = (float("nan"), float("nan"))
                 else:
@@ -1249,28 +1741,56 @@ def run_multi_seed_benchmark(
     )
 
     p_values: dict[str, float] = {}
+    wilcoxon_p_values: dict[str, float] = {}
     bootstrap_p_values: dict[str, float] = {}
+    cluster_paired_p_values: dict[str, dict[str, float]] = {}
+    nonparametric_label = "Bootstrap"
     if reference_model in raw_results and effective_comparator in raw_results:
         for key in metric_keys:
             ref_scores = [r.get(key, float("nan")) for r in raw_results[reference_model]]
             cmp_scores = [r.get(key, float("nan")) for r in raw_results[effective_comparator]]
             p_values[key] = compute_paired_ttest(ref_scores, cmp_scores)
+            wilcoxon_p_values[key] = compute_paired_wilcoxon(ref_scores, cmp_scores)
+
+        ref_preds_list = model_predictions.get(reference_model, [])
+        cmp_preds_list = model_predictions.get(effective_comparator, [])
+        has_insufficient_clusters = False
+        if ref_preds_list:
+            raw_tids_ref = ref_preds_list[0].get("topic_ids")
+            if isinstance(raw_tids_ref, (list, tuple)) and len(raw_tids_ref) > 0:
+                if len({str(t) for t in raw_tids_ref}) < 6:
+                    has_insufficient_clusters = True
+        if has_insufficient_clusters:
+            nonparametric_label = "Cluster-Insufficient (<6 events)"
+
         if compute_bootstrap:
             bootstrap_p_values = _compute_sample_level_bootstrap_pvalues(
-                model_predictions.get(reference_model, []),
-                model_predictions.get(effective_comparator, []),
+                ref_preds_list,
+                cmp_preds_list,
                 metric_keys=metric_keys,
             )
+            if not has_insufficient_clusters:
+                cluster_paired_p_values = compute_cluster_paired_tests(
+                    ref_preds_list,
+                    cmp_preds_list,
+                    metric_keys=metric_keys,
+                )
         else:
             bootstrap_p_values = {key: float("nan") for key in metric_keys}
 
     adjusted_p_values: dict[str, float] = {}
+    adjusted_wilcoxon_p_values: dict[str, float] = {}
     adjusted_bootstrap_p_values: dict[str, float] = {}
     if p_values:
         scoped_p = holm_bonferroni_adjust(
             {k: p_values[k] for k in hypothesis_keys if k in p_values}
         )
         adjusted_p_values = {k: scoped_p.get(k, float("nan")) for k in p_values}
+    if wilcoxon_p_values:
+        scoped_w = holm_bonferroni_adjust(
+            {k: wilcoxon_p_values[k] for k in hypothesis_keys if k in wilcoxon_p_values}
+        )
+        adjusted_wilcoxon_p_values = {k: scoped_w.get(k, float("nan")) for k in wilcoxon_p_values}
     if bootstrap_p_values:
         scoped_boot = holm_bonferroni_adjust(
             {k: bootstrap_p_values[k] for k in hypothesis_keys if k in bootstrap_p_values}
@@ -1286,11 +1806,14 @@ def run_multi_seed_benchmark(
         "val_summary_stats": val_summary_stats,
         "p_values": p_values,
         "adjusted_p_values": adjusted_p_values,
+        "wilcoxon_p_values": wilcoxon_p_values,
+        "adjusted_wilcoxon_p_values": adjusted_wilcoxon_p_values,
         "bootstrap_p_values": bootstrap_p_values,
         "adjusted_bootstrap_p_values": adjusted_bootstrap_p_values,
+        "cluster_paired_p_values": cluster_paired_p_values,
         "reference_model": reference_model,
         "comparator_model": effective_comparator,
-        "nonparametric_test_label": "Bootstrap",
+        "nonparametric_test_label": nonparametric_label,
         "best_seed_by_model": best_seed_by_model,
         "models": best_val_models,
     }

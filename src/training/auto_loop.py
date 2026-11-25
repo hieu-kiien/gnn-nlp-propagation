@@ -24,10 +24,10 @@ from src.models.sbi_fagat import SBiFAGAT
 from src.training.trainer import evaluate_loader, train_and_evaluate_single_seed
 
 DEFAULT_V2_CANDIDATES: tuple[dict[str, Any], ...] = (
-    {"hidden_dim": 64, "lr": 1e-3, "eps": 0.5, "dropout": 0.10, "lambda_uncertainty": 0.0},
-    {"hidden_dim": 64, "lr": 5e-4, "eps": 0.4, "dropout": 0.15, "lambda_uncertainty": 0.0},
-    {"hidden_dim": 64, "lr": 1e-3, "eps": 0.6, "dropout": 0.20, "lambda_uncertainty": 0.0},
-    {"hidden_dim": 64, "lr": 5e-4, "eps": 0.5, "dropout": 0.10, "lambda_uncertainty": 0.0},
+    {"hidden_dim": 64, "lr": 1e-3, "eps": 0.5, "dropout": 0.10, "lambda_uncertainty": None},
+    {"hidden_dim": 64, "lr": 5e-4, "eps": 0.4, "dropout": 0.15, "lambda_uncertainty": None},
+    {"hidden_dim": 64, "lr": 1e-3, "eps": 0.6, "dropout": 0.20, "lambda_uncertainty": None},
+    {"hidden_dim": 64, "lr": 5e-4, "eps": 0.5, "dropout": 0.10, "lambda_uncertainty": None},
 )
 DEFAULT_CANDIDATES = DEFAULT_V2_CANDIDATES
 
@@ -39,12 +39,16 @@ def _compute_regime_metrics(records: Sequence[Mapping[str, Any]]) -> dict[str, A
     polar_sq_errs = np.asarray(
         [(r["y_polar_pred"] - r["y_polar_true"]) ** 2 for r in records], dtype=np.float64
     )
-    confs = np.asarray([r["confidence_score"] for r in records], dtype=np.float64)
+    confs = np.asarray(
+        [float(r["confidence_score"]) for r in records if r.get("confidence_score") is not None],
+        dtype=np.float64,
+    )
+    mean_conf = float(np.mean(confs)) if confs.size > 0 else None
     return {
         "count": len(records),
         "size_mae": float(np.mean(size_errs)),
         "polar_rmse": float(np.sqrt(np.mean(polar_sq_errs))),
-        "mean_confidence": float(np.mean(confs)),
+        "mean_confidence": mean_conf,
     }
 
 
@@ -91,7 +95,10 @@ def run_self_auditing_validation_loop(
         lr = float(cfg.get("lr", 1e-3))
         eps = float(cfg.get("eps", 0.5))
         dropout = float(cfg.get("dropout", 0.1))
-        lam_unc = float(cfg.get("lambda_uncertainty", 0.05 if predict_uncertainty else 0.0))
+        raw_lam_unc = cfg.get("lambda_uncertainty")
+        lam_unc = float(
+            raw_lam_unc if raw_lam_unc is not None else (0.05 if predict_uncertainty else 0.0)
+        )
 
         def _factory(
             _h: int = h_dim,
@@ -169,7 +176,12 @@ def run_self_auditing_validation_loop(
             y_polar_true = float(item.y_polar.view(-1)[0].item())
             y_size_pred = float(diag["y_size_pred"].view(-1)[0].item())
             y_polar_pred = float(diag["y_polar_pred"].view(-1)[0].item())
-            conf = float(diag["confidence_score"].view(-1)[0].item())
+            raw_conf = diag.get("confidence_score")
+            conf = (
+                float(raw_conf.view(-1)[0].item())
+                if isinstance(raw_conf, torch.Tensor)
+                else (float(raw_conf) if raw_conf is not None else None)
+            )
             sub_ratio = float(diag["substantive_text_ratio"].view(-1)[0].item())
 
             c_stats = getattr(item, "cascade_stats", None)
@@ -188,6 +200,13 @@ def run_self_auditing_validation_loop(
             err_score = abs(y_size_pred - y_size_true) + 4.0 * abs(y_polar_pred - y_polar_true)
             node_texts = list(getattr(item, "node_texts", []) or [])
 
+            raw_low = diag.get("low_signal_warning")
+            low_warn = (
+                bool(raw_low.view(-1)[0].item())
+                if isinstance(raw_low, torch.Tensor)
+                else bool(raw_low)
+            )
+
             sample_records.append(
                 {
                     "cascade_id": str(getattr(item, "cascade_id", f"val_{idx}")),
@@ -202,7 +221,7 @@ def run_self_auditing_validation_loop(
                     "burst_acceleration": burst_accel,
                     "one_sided_hostility_index": one_sided_host,
                     "mean_early_stance": mean_early_stance,
-                    "low_signal_warning": bool(diag["low_signal_warning"].view(-1)[0].item()),
+                    "low_signal_warning": low_warn,
                     "root_snippet": node_texts[0][:240] if node_texts else "",
                     "early_replies_sample": [t[:160] for t in node_texts[1:4]],
                 }

@@ -10,8 +10,8 @@ Serves a hardened localhost (`127.0.0.1`) pure-stdlib HTTP server powering:
       * Live Sandbox demonstrating Path Contraction (`junk_mode="contract"`)
         preserving short Vietnamese stances while collapsing mid-chain junk.
   - Tab 2 (Macro / Signed Social Network):
-      * Live reads of `paper/results_macro_network_{vn,pheme}.json`,
-        `paper/results_signed_link_{vn,pheme}.json`, and static `fig5_*.svg`.
+      * Live reads of `results/results_macro_network_{vn,pheme}.json`,
+        `results/results_signed_link_{vn,pheme}.json`, and static `fig5_*.svg`.
 """
 
 from __future__ import annotations
@@ -55,7 +55,18 @@ from src.data.pyg_dataset import (  # noqa: E402
     load_topic_splits_json,
 )
 from src.models.sbi_fagat import SBiFAGAT  # noqa: E402
-from src.nlp.discourse_labels import DISCOURSE_BEHAVIOR_LABELS  # noqa: E402
+
+_DEMO_2D_BEHAVIOR_KEYS: tuple[str, ...] = (
+    "support",
+    "neutral",
+    "constructive_oppose",
+    "hostile_conflict",
+)
+_REDACTED_MARKER_RE = re.compile(r"\[redacted", re.IGNORECASE)
+_NSFW_MARKER_RE = re.compile(
+    r"(?:\bnsfw\b|\b18\+\b|\bjav\b|\bporn\b|\bhentai\b|\bse\*?x\b|quan\s*h[ệe]\s*t[ìi]nh\s*d[ụu]c)",
+    re.IGNORECASE,
+)
 
 ALLOWED_LOCAL_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
 _REQUIRED_VN_FILES: tuple[str, ...] = (
@@ -318,6 +329,7 @@ def _make_synthetic_polarized_preset() -> tuple[dict[str, Any], list[dict[str, A
             "text": body,
             "created_utc": base_ts + dt,
             "author": author,
+            "author_raw": author,
             "author_hash": hash_author_sha256(author),
         }
         for cid, pid, dt, author, body in rows
@@ -397,6 +409,7 @@ def build_sandbox_preset(preset_id: str) -> tuple[dict[str, Any], list[dict[str,
             "text": body,
             "created_utc": base_ts + dt,
             "author": None if author in {"[deleted]", "[removed]"} else author,
+            "author_raw": None if author in {"[deleted]", "[removed]"} else author,
             "author_hash": hash_author_sha256(None if author in {"[deleted]", "[removed]"} else author),
         }
         for cid, pid, dt, author, body in spec
@@ -475,6 +488,7 @@ def parse_sandbox_raw_text(raw_text: str, post_id: str, base_ts: float) -> list[
                 "text": body,
                 "created_utc": base_ts + idx * 45.0,
                 "author": author,
+                "author_raw": author,
                 "author_hash": hash_author_sha256(author),
             }
         )
@@ -615,7 +629,20 @@ def _format_live_result_payload(
     title = str(post.get("title") or _clean_title_snippet(root_full_text, 120))
     act_comp = res.get("actual_post_hoc_comparison") or {}
     act_replies = int(act_comp.get("actual_total_replies", max(0, len(tree_nodes) - 1)))
-    act_polar = float(act_comp.get("actual_full_polarization", 0.0))
+    raw_act_polar = act_comp.get("actual_full_polarization")
+    act_polar: float | None = round(float(raw_act_polar), 4) if raw_act_polar is not None else None
+    raw_early_polar = res.get("early_y_polar")
+    early_polar: float | None = round(float(raw_early_polar), 4) if raw_early_polar is not None else None
+    raw_conf = res.get("confidence_score")
+    conf_val: float | None = round(float(raw_conf), 4) if raw_conf is not None else None
+    unc_avail = bool(res.get("uncertainty_available", raw_conf is not None))
+    raw_bc = res.get("behavior_counts") or {}
+    behavior_counts = {k: int(raw_bc.get(k, 0)) for k in _DEMO_2D_BEHAVIOR_KEYS}
+    has_future = bool(act_comp.get("has_future_replies", False))
+    act_mode = str(
+        act_comp.get("actual_full_polarization_mode")
+        or ("future_only" if has_future else "no_future_replies")
+    )
     user_graph = _build_thread_user_graph(tree_nodes, tree_edges)
     kept_texts_short = [n["text"] for n in tree_nodes[1:] if len(n["text"].split()) <= 3]
 
@@ -636,14 +663,16 @@ def _format_live_result_payload(
             "k_observed": int(res.get("k_observed", max(0, len(tree_nodes) - 1))),
             "predicted_total_replies": round(float(res.get("predicted_total_replies", 0.0)), 1),
             "actual_total_replies": act_replies,
-            "has_future_replies": bool(act_comp.get("has_future_replies", False)),
+            "has_future_replies": has_future,
             "predicted_polarization_score": round(float(res.get("predicted_polarization_score", 0.0)), 4),
-            "actual_y_polar": round(act_polar, 4),
-            "early_y_polar": round(float(res.get("early_y_polar", act_polar)), 4),
+            "actual_y_polar": act_polar,
+            "actual_full_polarization_mode": act_mode,
+            "early_y_polar": early_polar,
             "predicted_regime": str(res.get("predicted_regime") or ""),
-            "confidence_score": round(float(res.get("confidence_score", 0.0)), 4),
+            "confidence_score": conf_val,
+            "uncertainty_available": unc_avail,
             "low_signal_warning": bool(res.get("low_signal_warning", False)),
-            "behavior_counts": dict(res.get("behavior_counts") or {}),
+            "behavior_counts": behavior_counts,
             "stance_counts": {
                 "support": support_cnt,
                 "oppose": oppose_cnt,
@@ -665,16 +694,39 @@ def _format_live_result_payload(
     }
 
 
-def _select_diverse_indices(cascades: Sequence[Any], count: int = 10) -> list[int]:
-    """Select `count` deterministic diverse VN Test cascades spanning low->high polarization and large reach."""
-    n = len(cascades)
-    if n <= count:
-        return list(range(n))
+def _cascade_safety_flags(d: Any) -> tuple[bool, bool]:
+    """Return `(has_redacted, has_nsfw)` by inspecting cascade node texts."""
+    texts: list[str] = [str(t) for t in (getattr(d, "node_texts", None) or ()) if t is not None]
+    for attr in ("root_text", "text", "cascade_id"):
+        val = getattr(d, attr, None)
+        if val is not None:
+            texts.append(str(val))
+    joined = "\n".join(texts)
+    has_redacted = bool(_REDACTED_MARKER_RE.search(joined))
+    has_nsfw = bool(_NSFW_MARKER_RE.search(joined))
+    return has_redacted, has_nsfw
 
+
+def _select_diverse_indices(cascades: Sequence[Any], count: int = 10) -> list[int]:
+    """Select `count` deterministic diverse clean VN Test cascades spanning low->high polarization."""
     import torch
 
-    meta_rows = []
+    clean_indices: list[int] = []
+    non_redacted_indices: list[int] = []
     for idx, d in enumerate(cascades):
+        has_redacted, has_nsfw = _cascade_safety_flags(d)
+        if not has_redacted:
+            non_redacted_indices.append(idx)
+            if not has_nsfw:
+                clean_indices.append(idx)
+
+    eligible_indices = clean_indices if clean_indices else non_redacted_indices
+    if not eligible_indices:
+        return []
+
+    meta_rows = []
+    for idx in eligible_indices:
+        d = cascades[idx]
         y_pol = float(d.y_polar.view(-1)[0].item())
         n_rep = int(round(float(torch.expm1(d.y_size.view(-1)[0]).item())))
         s_vals = d.edge_attr[:, 0] if d.edge_attr.numel() > 0 else torch.zeros(0)
@@ -693,6 +745,13 @@ def _select_diverse_indices(cascades: Sequence[Any], count: int = 10) -> list[in
                 "unc": unc,
             }
         )
+
+    meta_by_idx = {int(r["idx"]): r for r in meta_rows}
+    if len(eligible_indices) <= count:
+        return [
+            int(r["idx"])
+            for r in sorted(meta_rows, key=lambda r: (r["y_polar"], r["n_rep"], r["cid"]))
+        ]
 
     by_polar = sorted(meta_rows, key=lambda r: (r["y_polar"], r["n_rep"], r["cid"]))
     by_size = sorted(meta_rows, key=lambda r: (-r["n_rep"], -r["y_polar"], r["cid"]))
@@ -718,11 +777,12 @@ def _select_diverse_indices(cascades: Sequence[Any], count: int = 10) -> list[in
     _pick(by_polar)
 
     # 4. Quantile sweep filling remaining slots evenly across polarization distribution
+    n_el = len(meta_rows)
     quantiles = (0.12, 0.25, 0.40, 0.55, 0.72, 0.85, 0.93, 0.33, 0.65)
     for q in quantiles:
         if len(chosen) >= count:
             break
-        target_pos = min(n - 1, max(0, int(round(q * (n - 1)))))
+        target_pos = min(n_el - 1, max(0, int(round(q * (n_el - 1)))))
         window = sorted(
             by_polar,
             key=lambda r: (
@@ -737,7 +797,7 @@ def _select_diverse_indices(cascades: Sequence[Any], count: int = 10) -> list[in
         _pick(by_polar)
 
     # Order cleanly from low -> high polarization for intuitive browsing
-    chosen.sort(key=lambda idx_i: (meta_rows[idx_i]["y_polar"], meta_rows[idx_i]["n_rep"], meta_rows[idx_i]["cid"]))
+    chosen.sort(key=lambda idx_i: (meta_by_idx[idx_i]["y_polar"], meta_by_idx[idx_i]["n_rep"], meta_by_idx[idx_i]["cid"]))
     return chosen[:count]
 
 
@@ -750,7 +810,7 @@ class DemoBackend:
         data_dir: Path = Path("data/processed/vn"),
         ckpt_path: Path = Path("checkpoints/best_sbifagat_vn.pt"),
         ce_dir: Path = Path("checkpoints/dual_ce_vn"),
-        paper_dir: Path = Path("paper"),
+        paper_dir: Path = Path("results"),
         web_dir: Path = Path("web_demo"),
         preload: bool = False,
     ) -> None:
@@ -921,7 +981,7 @@ class DemoBackend:
             # Compute exact BFS depth within kept V_K
             children_adj: dict[str, list[str]] = defaultdict(list)
             edge_info_by_dst: dict[str, dict[str, Any]] = {}
-            behavior_counts = {lbl: 0 for lbl in DISCOURSE_BEHAVIOR_LABELS}
+            behavior_counts = {lbl: 0 for lbl in _DEMO_2D_BEHAVIOR_KEYS}
             support_cnt = oppose_cnt = neutral_cnt = 0
 
             for e_i, (src_id, dst_id) in enumerate(edge_pairs):
@@ -1062,10 +1122,17 @@ class DemoBackend:
 
             pred_polar = float(diag["y_polar_pred"].view(-1)[0].item())
             pred_replies = float(diag["predicted_total_replies"].view(-1)[0].item())
-            conf_score = float(diag["confidence_score"].view(-1)[0].item())
+            raw_conf_t = diag.get("confidence_score")
+            conf_score: float | None = (
+                round(float(raw_conf_t.view(-1)[0].item()), 4)
+                if raw_conf_t is not None
+                else None
+            )
+            unc_avail = bool(diag.get("uncertainty_available", raw_conf_t is not None))
             act_replies = int(round(float(torch.expm1(d.y_size.view(-1)[0]).item())))
             act_polar = float(d.y_polar.view(-1)[0].item())
             early_polar = float(d.early_y_polar.view(-1)[0].item())
+            has_future = act_replies > (len(tree_nodes) - 1)
             regime = _classify_calibrated_regime(pred_polar, behavior_counts)
             stats_vec = d.cascade_stats.view(-1).tolist()
 
@@ -1079,11 +1146,15 @@ class DemoBackend:
                 "title_snippet": title_snip,
                 "k_observed": len(tree_nodes) - 1,
                 "actual_total_replies": act_replies,
+                "has_future_replies": has_future,
                 "actual_y_polar": round(act_polar, 4),
+                "actual_full_polarization_mode": "future_only",
+                "early_y_polar": round(early_polar, 4),
                 "predicted_total_replies": round(pred_replies, 1),
                 "predicted_polarization_score": round(pred_polar, 4),
                 "predicted_regime": regime,
-                "confidence_score": round(conf_score, 4),
+                "confidence_score": conf_score,
+                "uncertainty_available": unc_avail,
                 "support_count": support_cnt,
                 "oppose_count": oppose_cnt,
                 "neutral_count": neutral_cnt,
@@ -1107,12 +1178,14 @@ class DemoBackend:
                     "k_observed": len(tree_nodes) - 1,
                     "predicted_total_replies": round(pred_replies, 1),
                     "actual_total_replies": act_replies,
-                    "has_future_replies": act_replies > (len(tree_nodes) - 1),
+                    "has_future_replies": has_future,
                     "predicted_polarization_score": round(pred_polar, 4),
                     "actual_y_polar": round(act_polar, 4),
+                    "actual_full_polarization_mode": "future_only",
                     "early_y_polar": round(early_polar, 4),
                     "predicted_regime": regime,
-                    "confidence_score": round(conf_score, 4),
+                    "confidence_score": conf_score,
+                    "uncertainty_available": unc_avail,
                     "low_signal_warning": bool(diag["low_signal_warning"].view(-1)[0].item()),
                     "behavior_counts": behavior_counts,
                     "stance_counts": {
@@ -1183,11 +1256,15 @@ class DemoBackend:
                     "title_snippet": _clean_title_snippet(f"[Mẫu tổng hợp] {payload['meta']['root_title']}", 120),
                     "k_observed": payload["forecast"]["k_observed"],
                     "actual_total_replies": payload["forecast"]["actual_total_replies"],
+                    "has_future_replies": payload["forecast"]["has_future_replies"],
                     "actual_y_polar": payload["forecast"]["actual_y_polar"],
+                    "actual_full_polarization_mode": payload["forecast"]["actual_full_polarization_mode"],
+                    "early_y_polar": payload["forecast"]["early_y_polar"],
                     "predicted_total_replies": payload["forecast"]["predicted_total_replies"],
                     "predicted_polarization_score": payload["forecast"]["predicted_polarization_score"],
                     "predicted_regime": payload["forecast"]["predicted_regime"],
                     "confidence_score": payload["forecast"]["confidence_score"],
+                    "uncertainty_available": payload["forecast"]["uncertainty_available"],
                     "support_count": sc["support"],
                     "oppose_count": sc["oppose"],
                     "neutral_count": sc["neutral"],
@@ -1283,11 +1360,30 @@ class DemoBackend:
                     else:
                         pid = f"t1_{raw_p}"
                     body = str(c.get("text") or c.get("body") or "")
-                    author = c.get("author")
+                    author = c.get("author_raw") if c.get("author_raw") is not None else c.get("author")
                     author_str = str(author) if author is not None else (
                         None if body.strip().lower() in {"[deleted]", "[removed]"} else f"custom_u_{idx}"
                     )
-                    delay = float(c.get("time_delay_sec") if c.get("time_delay_sec") is not None else idx * 45.0)
+                    is_bot = bool(c.get("author_is_bot")) or (
+                        isinstance(author_str, str) and author_str.strip().lower() == "automoderator"
+                    )
+                    raw_delay = c.get("time_delay_sec")
+                    if raw_delay is None:
+                        delay = float(idx * 45.0)
+                    else:
+                        if isinstance(raw_delay, bool):
+                            raise ValueError(f"Giá trị time_delay_sec không hợp lệ: {raw_delay!r}")
+                        try:
+                            delay = float(raw_delay)
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(
+                                f"Giá trị time_delay_sec không hợp lệ: {raw_delay!r}"
+                            ) from exc
+                        if not math.isfinite(delay) or delay < 0.0 or delay > 3650.0 * 86400.0:
+                            raise ValueError(
+                                f"Giá trị time_delay_sec không hợp lệ ({raw_delay!r}): "
+                                "phải hữu hạn và nằm trong [0, 315360000] giây."
+                            )
                     comments.append(
                         {
                             "fullname": f"t1_{cid}",
@@ -1296,8 +1392,10 @@ class DemoBackend:
                             "parent_id": pid,
                             "body": body,
                             "text": body,
-                            "created_utc": base_ts + max(0.0, delay),
+                            "created_utc": base_ts + delay,
                             "author": author_str,
+                            "author_raw": author_str,
+                            "author_is_bot": is_bot,
                             "author_hash": hash_author_sha256(author_str),
                         }
                     )
@@ -1353,6 +1451,15 @@ class DemoBackend:
         link_vn = _read_json("results_signed_link_vn.json")
         link_pheme = _read_json("results_signed_link_pheme.json")
 
+        def _round_opt(val: Any) -> float | None:
+            if val is None or isinstance(val, bool):
+                return None
+            try:
+                fv = float(val)
+            except (TypeError, ValueError):
+                return None
+            return round(fv, 4) if math.isfinite(fv) else None
+
         def _format_link_rows(link_json: Mapping[str, Any]) -> list[dict[str, Any]]:
             stats = link_json.get("summary_stats") or {}
             rows: list[dict[str, Any]] = []
@@ -1366,8 +1473,11 @@ class DemoBackend:
                     "trans_pr_auc",
                     "trans_macro_f1",
                 ):
-                    pair = metrics.get(key) or [0.0, 0.0]
-                    row[key] = {"mean": round(float(pair[0]), 4), "std": round(float(pair[1]), 4)}
+                    pair = metrics.get(key)
+                    if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                        row[key] = {"mean": _round_opt(pair[0]), "std": _round_opt(pair[1])}
+                    else:
+                        row[key] = {"mean": None, "std": None}
                 rows.append(row)
             return rows
 
@@ -1400,14 +1510,16 @@ class DemoBackend:
             },
             "caveats": [
                 (
-                    "Tập kiểm tra xuyên thời gian PHEME (Transductive) chỉ có n = 212 cạnh với 21,7% cặp (u, v) "
-                    "lặp lại giữa train và test; vì vậy mức Trans. ROC-AUC 0.9181 của SBiFAGAT-Link phản ánh độ "
-                    "khớp tốt trên các cặp tương tác lặp lại theo sự kiện chứ không phải tổng quát hóa người dùng mới (0.7328)."
+                    "Tập kiểm tra xuyên thời gian PHEME (Transductive) chỉ có n = 212 cạnh (trong đó 166 cạnh là cặp mới, "
+                    "21,7% là cặp (u, v) lặp lại giữa train và test); mức Trans. ROC-AUC 0.9106 của SBiFAGAT-Link "
+                    "(SiGAT = 0.9178) phản ánh độ khớp trên các nút đã xuất hiện theo sự kiện chứ không phải tổng quát hóa "
+                    "người dùng mới (Unseen ROC-AUC = 0.6985; BiEdgeGATv2-Link dẫn đầu 0.7217)."
                 ),
                 (
-                    "Trên đồ thị r/vozforums (VN), SGCN dẫn đầu Trans. ROC-AUC (0.6149) và Trans. PR-AUC (0.8848), "
-                    "trong khi SBiFAGAT-Link dẫn đầu Trans. Macro-F1 (0.5526) và PR-AUC tổng thể (0.8455); "
-                    "sai khác không đạt ý nghĩa thống kê sau hiệu chỉnh Holm-Bonferroni (p >= 0.29)."
+                    "Trên đồ thị r/vozforums (VN), PriorPairSignPersistence dẫn đầu Trans. ROC-AUC (0.6296) và SGCN dẫn đầu "
+                    "nhóm GNN (0.6101), trong khi SBiFAGAT-Link dẫn đầu ROC-AUC tổng thể (0.5946), PR-AUC (0.8486) và "
+                    "Unseen ROC-AUC (0.5884) với Trans. ROC-AUC = 0.5954; sai khác so với SDGNN chưa đạt ý nghĩa thống kê "
+                    "sau hiệu chỉnh Holm-Bonferroni (p >= 0.0617)."
                 ),
                 (
                     "Cả hai mạng lưới đều phản cân bằng cấu trúc mạnh (anti-balanced): VN z = -15.17 (3.535/5.143 tam giác "
@@ -1415,7 +1527,7 @@ class DemoBackend:
                 ),
                 (
                     "Thành phần liên thông lớn nhất có dấu của PHEME rất thưa (10.364 nút trên 16.028 cặp mạnh, "
-                    "bậc trung bình WCC <= 3,09), nên độ phân cực Q_signed = 0.8232 và RWC = 0.6218 chủ yếu phản ánh "
+                    "bậc trung bình WCC <= 3,09), nên độ phân cực Gómez Q_signed = 0.4000 và RWC = 0.3181 chủ yếu phản ánh "
                     "phân tách giữa các cụm sự kiện tin đồn (+54,5 điểm phần trăm đối đầu liên phe so với trong phe)."
                 ),
             ],
@@ -1476,7 +1588,17 @@ def make_handler(backend: DemoBackend):
                 return True
             return any(
                 clean_path.startswith(prefix)
-                for prefix in ("/paper", "/src", "/data", "/checkpoints", "/scripts", "/.env", "/.git")
+                for prefix in (
+                    "/paper",
+                    "/results",
+                    "/archive",
+                    "/src",
+                    "/data",
+                    "/checkpoints",
+                    "/scripts",
+                    "/.env",
+                    "/.git",
+                )
             )
 
         def do_GET(self) -> None:
@@ -1572,7 +1694,7 @@ def create_server(
     data_dir: Path = Path("data/processed/vn"),
     ckpt_path: Path = Path("checkpoints/best_sbifagat_vn.pt"),
     ce_dir: Path = Path("checkpoints/dual_ce_vn"),
-    paper_dir: Path = Path("paper"),
+    paper_dir: Path = Path("results"),
     web_dir: Path = Path("web_demo"),
     preload: bool = False,
 ) -> ThreadingHTTPServer:
@@ -1603,7 +1725,7 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed/vn"))
     parser.add_argument("--ckpt-path", type=Path, default=Path("checkpoints/best_sbifagat_vn.pt"))
     parser.add_argument("--ce-dir", type=Path, default=Path("checkpoints/dual_ce_vn"))
-    parser.add_argument("--paper-dir", type=Path, default=Path("paper"))
+    parser.add_argument("--paper-dir", type=Path, default=Path("results"))
     parser.add_argument("--web-dir", type=Path, default=Path("web_demo"))
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open browser tab")
     args = parser.parse_args()

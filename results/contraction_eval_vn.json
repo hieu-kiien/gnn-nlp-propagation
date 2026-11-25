@@ -1,0 +1,22 @@
+{
+  "threads_evaluated": 1500,
+  "kept_in_prune": 1499,
+  "kept_in_contract": 1490,
+  "rescued_by_contract": 0,
+  "mean_replies_prune": 57.56837891927952,
+  "mean_replies_contract": 57.43087248322148,
+  "mean_depth_prune": 6.1154102735156775,
+  "mean_depth_contract": 6.113422818791946,
+  "total_contracted_nodes": 34,
+  "total_relinked_edges": 35,
+  "total_truncated_orphans": 0,
+  "total_stance_inversion_risk_edges": 0,
+  "opaque_deleted_relink_rate": 0.0,
+  "early_k_jaccard_node_overlap": 0.9922077475097609,
+  "early_k_parent_mismatch_rate": 0.00033698399326032014,
+  "dataset": "vn",
+  "source_parquet": "data/processed/vn/nodes.parquet",
+  "elapsed_sec": 30.044,
+  "is_real_data": true,
+  "post_crawl_parquet_caveat": "Raw pre-filter Arctic Shift crawl_checkpoint.jsonl is not stored on disk; this evaluation reconstructs threads from post-crawl data/processed/vn/nodes.parquet. Consequently, [deleted]/[removed]/AutoModerator/spam nodes were already pruned at crawl time, leaving short filler comments (evaluated here via 34 contracted bridge nodes / 35 relinked edges) and yielding total_stance_inversion_risk_edges=0 on the post-crawl parquet."
+}

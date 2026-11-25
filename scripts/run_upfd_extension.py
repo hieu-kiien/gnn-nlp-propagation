@@ -11,6 +11,10 @@ import torch
 from torch_geometric.datasets import UPFD
 from torch_geometric.loader import DataLoader
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from src.data.pyg_dataset import UPFDAdapterTransform
 from src.models.baselines import BiGCN, EdgeGATv2, FAGCNBaseline, StandardGATv2, StandardGCN
 from src.models.sbi_fagat import SBiFAGAT
@@ -72,8 +76,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--output-table", type=Path, default=Path("paper/tables_upfd.tex"))
-    parser.add_argument("--output-json", type=Path, default=Path("paper/results_upfd.json"))
+    parser.add_argument("--output-table", type=Path, default=Path("results/tables_upfd.tex"))
+    parser.add_argument("--output-json", type=Path, default=Path("results/results_upfd.json"))
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

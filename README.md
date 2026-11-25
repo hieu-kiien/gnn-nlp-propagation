@@ -3,23 +3,25 @@
 Kho mã nguồn nghiên cứu cho đề tài khoa học:  
 **"Mạng nơ-ron đồ thị và xử lý ngôn ngữ tự nhiên trong mô hình hóa sự phân cực quan điểm và lan truyền thông tin trên mạng xã hội"**.
 
-Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network* + *Macro Signed User-Interaction Social Network*): **Tầng 1 (Early Cascade)** (`hidden_dim = 64`, VN `K = 20, min_total_replies = 25` và PHEME reduced-horizon `K = 10, min_total_replies = 15`) dự đoán đồng thời quy mô lan truyền cuối kỳ ($y_{\text{size}}$), mức độ phân cực cộng đồng ($y_{\text{polar}}$) và phân loại tin đồn (PHEME) chỉ từ bài đăng gốc và $K$ phản hồi sớm nhất; **Tầng 2 (Macro Social Network)** chiếu mọi tương tác $(u, v)$ xuyên chủ đề lên đồ thị người dùng có dấu (`13,718` người dùng VN, $Q_{\text{signed}} = 0.4280$; `50,062` tổng người dùng PHEME / `36,606` người dùng tham gia cặp hợp lệ, $Q_{\text{signed}} = 0.8232$, RWC $= 0.6218$) và chạy Temporal Signed Link Prediction chống rò rỉ.
+Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional Frequency-Adaptive Graph Attention Network* + *Macro Signed User-Interaction Social Network*): **Tầng 1 (Early Cascade)** (`hidden_dim = 64`, VN `K = 20, min_total_replies = 25` và PHEME reduced-horizon `K = 10, min_total_replies = 15`, `polar_target_mode = "future_only"`) dự đoán đồng thời quy mô lan truyền cuối kỳ ($y_{\text{size}}$), mức độ phân cực cộng đồng ($y_{\text{polar}}$) và phân loại tin đồn (PHEME) chỉ từ bài đăng gốc và $K$ phản hồi sớm nhất; **Tầng 2 (Macro Social Network)** chiếu mọi tương tác $(u, v)$ xuyên chủ đề lên đồ thị người dùng có dấu (`13,718` người dùng VN, Gómez $Q_{\text{signed}} = 0.1988$, cân bằng yếu `0.9405`; `50,062` tổng / `36,606` người dùng tham gia cặp hợp lệ trên PHEME sau lọc `24,354` hàng vector 0, Gómez $Q_{\text{signed}} = 0.4000$, RWC $= 0.3181$, cân bằng yếu `0.8774`) và chạy Temporal Signed Link Prediction công bằng trên 10 mô hình qua 5 hạt giống.
 
-> **Bộ Sản phẩm Bàn giao Đề tài (Đã hoàn tất — Xem chi tiết tại [TODO_ROADMAP.md](docs/project-management/TODO_ROADMAP.md)):**
-> - **Báo cáo Kỹ thuật Mở rộng Tiếng Anh (`paper/`):** [paper/main.pdf](paper/main.pdf) (`20` trang `IEEEtran`, vượt qua kiểm toán Gate 1 `0` Blocker) tích hợp đủ Track 1 VN, PHEME reduced-horizon (`K=10, N>=15`), kiểm định VN Verified Gold (`120` cặp + `30` cây) kèm phân tích *Target-Misattributed Profanity* (`57.1%` câu `support+uncivil` chửi bên thứ 3 bị NLI gán nhầm `oppose`), `RumourEval --context-mode root` (`Macro-F1 = 0.3311`), và Tầng 2 Macro 5-seed Signed Link Prediction (`SBiFAGAT-Link` dẫn đầu `Trans. ROC-AUC = 0.9181` trên PHEME).
-> - **Báo cáo Đề tài Tiếng Việt & Bộ Bảo vệ (`reports/`):** [bao_cao_de_tai_vn.md](reports/bao_cao_de_tai_vn.md) + PDF xuất bản [bao_cao_de_tai_vn.pdf](reports/bao_cao_de_tai_vn.pdf) (`40` trang `Times New Roman`, đồng bộ 100% số liệu với `paper/main.tex`), kèm dàn ý 14 slide & 15 câu Hỏi–Đáp phản biện tại [slide_outline_va_hoi_dap_bao_ve.md](reports/slide_outline_va_hoi_dap_bao_ve.md).
-> - **Giao diện Demo Web MVP Offline-First (`scripts/demo_web_app.py`, `web_demo/`):** Khởi chạy cục bộ `http://127.0.0.1:8765/` (0 dependency ngoài, 0 CDN), hỗ trợ bài Test VN thật từ `data/processed/vn/` + fallback ngoại tuyến trên CI, **Path Contraction** bảo toàn nhánh con (`junk_mode="contract"`), sơ đồ cây 3 màu lập trường tách bạch chỉ báo công kích, chuyển đổi Đồ thị Người dùng của từng Thread và bản đồ 2 phe Tầng 2.
+> **Tài sản Dự án & Kết quả Thực nghiệm (`results/` & `archive/docs_v1/`):**
+> - **Kết quả Thực nghiệm đã Kiểm chứng (`results/`):** Chứa các tệp JSON, bảng LaTeX/Markdown và biểu đồ vector sạch (`fig5_macro_signed_network.{svg,pdf}`) từ pipeline chuẩn hóa (10 mô hình Tầng 2 VN/PHEME 5 seeds, benchmark Tầng 1 các split, kiểm định người chấm VN và đo hiệu năng đầu-cuối).
+> - **Tài liệu v1 Lưu trữ Nguyên trạng (`archive/docs_v1/`):** Toàn bộ bản thảo tiếng Anh ([archive/docs_v1/paper/](archive/docs_v1/paper/)), báo cáo tiếng Việt 4 chương & bộ slide bảo vệ ([archive/docs_v1/reports/](archive/docs_v1/reports/)), cùng tài liệu hướng dẫn v1 ([archive/docs_v1/docs/](archive/docs_v1/docs/)) được lưu trữ nguyên vẹn (R4) để phục vụ cập nhật ở giai đoạn sau.
+> - **Giao diện Demo Web MVP Offline-First (`scripts/demo_web_app.py`, `web_demo/`):** Khởi chạy cục bộ `http://127.0.0.1:8765/` (0 dependency ngoài, 0 CDN), đọc trực tiếp số liệu Tầng 2 từ `results/`, hỗ trợ bài Test VN thật từ `data/processed/vn/` + fallback ngoại tuyến trên CI, **Path Contraction** (`junk_mode="contract"`), sơ đồ cây 3 màu lập trường tách bạch chỉ báo công kích và bản đồ 2 phe Tầng 2.
 
 > **Mới bắt đầu hoặc muốn chạy trên GPU miễn phí (Google Colab / Kaggle `T4 x 2`)?**  
+> - **Hướng dẫn thực thi Cloud trọn gói:** Đọc [notebooks/CLOUD_EXECUTION_GUIDE.md](notebooks/CLOUD_EXECUTION_GUIDE.md).
 > - **Chạy benchmark GNN Tầng 1 nhanh trên Colab / Kaggle T4:** Dùng [notebooks/colab_gpu_v3_gnn_benchmarks.ipynb](notebooks/colab_gpu_v3_gnn_benchmarks.ipynb) (Temporal Holdout VN, Ablation/$K$-Curve và PHEME $K=10, N \ge 15$).
 > - **Chạy benchmark Tầng 2 Macro Signed Network trên GPU:** Dùng [notebooks/kaggle_macro_signed_gnn_t4.ipynb](notebooks/kaggle_macro_signed_gnn_t4.ipynb).
-> - **Chạy full pipeline 2 người trên Kaggle `GPU T4 x 2`:** Đọc [Hướng dẫn Chạy Song Song trên Kaggle T4 x 2](docs/huong_dan_chay_song_song_kaggle_t4x2.md) và mở `kaggle_member1_nlp_and_vn_t4x2.ipynb`, `kaggle_member2_gnn_and_en_t4x2.ipynb`.
-> - Đọc [Hướng dẫn Nghiên cứu Dễ hiểu từ Con số 0](docs/huong_dan_nghien_cuu_de_hieu.md) và chạy thử minh họa trên máy CPU (<5 giây):
+> - **Chạy full pipeline 2 người trên Kaggle `GPU T4 x 2`:** Đọc [Hướng dẫn Chạy Song Song trên Kaggle T4 x 2](archive/docs_v1/docs/huong_dan_chay_song_song_kaggle_t4x2.md) và mở `kaggle_member1_nlp_and_vn_t4x2.ipynb`, `kaggle_member2_gnn_and_en_t4x2.ipynb`.
+> - Đọc [Hướng dẫn Nghiên cứu Dễ hiểu từ Con số 0](archive/docs_v1/docs/huong_dan_nghien_cuu_de_hieu.md) và chạy thử minh họa/kiểm chứng trên máy CPU:
 > ```bash
 > python -m scripts.demo_research_walkthrough
 > python -m scripts.predict_live_thread --demo-offline
 > python -m scripts.benchmark_efficiency --use-cascade-stats --hidden-dim 64 --edge-dim 2
 > python -m scripts.run_macro_signed_network --smoke-test
+> python -m scripts.run_m5_local_audits --validate-results
 > ```
 
 ---
@@ -27,10 +29,10 @@ Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional
 ## 1. Quản trị Dự án & Năm Luật Thép
 
 - **Bảng điều phối Scrum (Jira):** [`SBIF` Board — SBi-FAGAT Research](https://sbifagat-research.atlassian.net/jira/software/projects/SBIF/boards/2)
-- **Tài liệu quy chuẩn bắt buộc:** Xem chi tiết trong [GEMINI.md](GEMINI.md) và hồ sơ [docs/project-management/](docs/project-management/PROJECT_CONTEXT.md). Mọi đóng góp mã nguồn và thực nghiệm phải tuân thủ tuyệt đối **5 Luật Thép**:
+- **Tài liệu quy chuẩn bắt buộc:** Xem chi tiết trong [GEMINI.md](GEMINI.md) và hồ sơ [archive/docs_v1/docs/project-management/](archive/docs_v1/docs/project-management/PROJECT_CONTEXT.md). Mọi đóng góp mã nguồn và thực nghiệm phải tuân thủ tuyệt đối **5 Luật Thép**:
   1. **Cấm dữ liệu giả trong báo cáo:** Không dùng dữ liệu sinh ngẫu nhiên (mock/synthetic) để xuất bảng hay biểu đồ kết quả thực nghiệm (tensor giả lập chỉ được dùng trong `tests/`).
   2. **Chống rò rỉ dữ liệu (Zero Data Leakage):** Chia tập Train / Val / Test (`70/15/15`) nhất quán bằng `topic_splits.json` (`min_total_replies = 25`) theo sự kiện/chủ đề gốc (*Inductive Split*, giữ nguyên cho mọi $K \in \{10, 20, 30, 50\}$; LOO dùng `edge_source="teacher"`); đầu vào chỉ giữ bài gốc + tối đa $K = 20$ bình luận sớm nhất theo `timestamp`; nhãn mục tiêu không lọt vào đặc trưng nút/cạnh.
-  3. **Chống ảo giác tài liệu tham khảo:** Mọi công trình trích dẫn trong `docs/` và `paper/references.bib` phải được xác minh tác giả, năm, hội nghị/tạp chí và DOI/arXiv thật.
+  3. **Chống ảo giác tài liệu tham khảo:** Mọi công trình trích dẫn trong `archive/docs_v1/docs/` và `archive/docs_v1/paper/references.bib` phải được xác minh tác giả, năm, hội nghị/tạp chí và DOI/arXiv thật.
   4. **Tối ưu hạ tầng GPU 16GB VRAM / Kaggle `T4 x 2`:** Tách rời trích xuất NLP ngoại tuyến (nhúng nút 768 chiều từ *Ancestor-Conditioned SpanPool* đóng băng + đặc trưng cấu trúc nhân quả 10 chiều `struct_x` + thống kê cụm 8 chiều `cascade_stats` + cạnh 2D `[s_uv, h_uv]` chưng cất cô lập phân đoạn ra `.pt`) khỏi huấn luyện GNN (`hidden_dim = 64`); bật Mixed Precision (`torch.amp`); chạy lặp lại trên đúng 5 hạt giống `[42, 100, 2024, 777, 999]` với Early Stopping theo `task_loss` và chọn checkpoint tốt nhất theo Validation.
   5. **Kiểm thử trước khi bàn giao (Test-Gated):** Mọi thay đổi mã nguồn phải có unit test tương ứng và vượt qua toàn bộ `pytest` trước khi commit/merge.
 
@@ -43,32 +45,21 @@ Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional
 ├── .github/                    # GitHub Actions CI & mẫu Pull Request kiểm tra 5 Luật Thép
 ├── GEMINI.md                   # Quy tắc hệ thống, 5 Luật Thép & ADRs dự án
 ├── pyproject.toml              # Khai báo package (sbi-fagat) & cấu hình pytest
-├── requirements.txt            # Thư viện Python (>=3.10), PyTorch, PyG, Transformers, tzdata (Windows)
+├── requirements.txt            # Thư viện Python (>=3.10), PyTorch, PyG, Transformers, LightGBM, tzdata
 ├── run_all.sh                  # Pipeline kiểm thử + thực nghiệm Giai đoạn 3 & UPFD (2D thống nhất)
+├── archive/
+│   └── docs_v1/                # Tài liệu v1 lưu trữ nguyên trạng (R4): paper/, reports/, docs/
 ├── data/                       # Dữ liệu local (raw/interim/processed bị ignore trên Git)
-├── docs/
-│   ├── project-management/     # Hồ sơ quản trị dự án, kiểm toán kỹ thuật & lộ trình
-│   ├── huong_dan_chay_song_song_kaggle_t4x2.md # Hướng dẫn chia 2 người chạy Kaggle T4x2
-│   ├── huong_dan_nghien_cuu_de_hieu.md  # Giải thích đề tài, ký hiệu & code từ con số 0
-│   ├── literature_review.md    # Tổng quan công trình nền tảng đã xác minh
-│   └── math_spec.md            # Đặc tả toán học SBi-FAGAT & Hợp đồng dữ liệu
 ├── notebooks/
+│   ├── CLOUD_EXECUTION_GUIDE.md             # Hướng dẫn thực thi Colab / Kaggle T4 x 2 trọn gói
 │   ├── colab_gpu_v3_gnn_benchmarks.ipynb    # Sổ tay Colab/Kaggle T4 GPU cho Temporal, Ablation & PHEME K=10/N>=15
 │   ├── kaggle_macro_signed_gnn_t4.ipynb     # Sổ tay Tầng 2 Macro Signed Network + Temporal Signed Link GNN (T4 GPU)
 │   ├── kaggle_member1_nlp_and_vn_t4x2.ipynb # Sổ tay Track VN (`member1_vn`)
 │   └── kaggle_member2_gnn_and_en_t4x2.ipynb # Sổ tay Track EN (`member2_en`, PHEME + RumourEval SDQC)
-├── paper/
-│   ├── main.tex                # Bản thảo Báo cáo Kỹ thuật Mở rộng chuẩn IEEEtran hai tầng Micro + Macro
-│   ├── main.pdf                # PDF bài báo đã biên dịch trực tiếp bằng Tectonic (20 trang)
-│   ├── references.bib          # Thư viện trích dẫn chuẩn BibTeX (24 tài liệu đã xác minh)
-│   └── figures/                # Thư mục xuất biểu đồ vector phục vụ bài báo
-├── reports/
-│   ├── bao_cao_de_tai_vn.md    # Báo cáo tổng kết đề tài NCKH tiếng Việt 4 chương (100% đồng bộ paper)
-│   ├── bao_cao_de_tai_vn.pdf   # Bản PDF tiếng Việt biên dịch qua XeLaTeX/Tectonic (40 trang)
-│   ├── slide_outline_va_hoi_dap_bao_ve.md # Khung 14 Slide thuyết trình & 15 Câu Hỏi–Đáp phản biện
-│   └── figures/                # Ảnh chụp kiểm chứng Gate 2 từ Demo Web cục bộ
+├── results/                    # Kết quả thực nghiệm sạch không nhị phân (JSON/MD/LaTeX & figures SVG/PDF)
 ├── scripts/
 │   ├── demo_web_app.py         # Máy chủ HTTP cục bộ (127.0.0.1, stdlib) cho Giao diện Demo Web MVP 2 Tab
+│   ├── run_m5_local_audits.py  # Kiểm chứng định lượng dữ liệu thật (RWC/Gómez/Davis/zero-rows) & validate results/
 │   ├── kaggle_parallel_runner.py # Điều phối chạy song song 4 role (kiểm tra cohort min_total_replies_extracted)
 │   ├── export_dataset_stats.py # Xuất Bảng 1 EDA LaTeX động theo cohort & Early-K Persistence Baseline
 │   ├── predict_live_thread.py  # Dự báo trực tiếp từ URL/ID bài viết thật trên mạng
@@ -80,19 +71,19 @@ Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional
 │   ├── human_audit_ui.py       # Phòng chấm tay Web UI tiếng Việt chạy cục bộ (--lock-role, hỗ trợ VN 20/120/30 & EN)
 │   ├── analyze_mechanisms.py   # Phân tầng xung đột & phân tích độ nhạy nhiễu đặc trưng cạnh (không khẳng định nhân quả)
 │   ├── assemble_paper_artifacts.py # Gộp bảng EDA/Macro/Efficiency từ 2 track Kaggle & kiểm tra cú pháp LaTeX
-│   ├── benchmark_efficiency.py # Đo #Params, tốc độ suy luận/huấn luyện & RAM/VRAM 8 mô hình (LaTeX/JSON)
+│   ├── benchmark_efficiency.py # Đo #Params, tốc độ suy luận/huấn luyện, VRAM & độ trễ E2E (LaTeX/JSON)
 │   ├── demo_research_walkthrough.py # Demo minh họa cơ chế GCN vs SBi-FAGAT trên CPU (<5s)
-│   ├── run_experiments.py      # Huấn luyện công bằng 8 mô hình (`hidden_dim=64`) + Early-K Persistence qua 5 seeds
+│   ├── run_experiments.py      # Huấn luyện công bằng mô hình nền + SOTA Tầng 1 (`hidden_dim=64`) qua 5 seeds
 │   ├── run_ablation.py         # Thực nghiệm cắt bỏ thành phần (+ BiEdgeGATv2) & quét K cửa sổ tương lai cố định
 │   └── run_upfd_extension.py   # Thực nghiệm chuyển giao cấu trúc phi văn bản trên UPFD (Accuracy, Macro-F1, ROC-AUC)
 ├── src/
 │   ├── data/                   # schema.py, pheme_loader.py, arctic_shift_vn.py, pyg_dataset.py, user_network.py
 │   ├── nlp/                    # discourse_labels.py, dual_edge_scorer.py, extract_features.py
-│   ├── models/                 # baselines.py (TwoStreamNodeStem, MultiTaskHead, 7 baselines), sbi_fagat.py
+│   ├── models/                 # baselines.py, sbi_fagat.py, sota_cascades.py, signed_gnns.py
 │   ├── training/               # metrics.py (KL-calibrated BCE + Smooth-L1 & Huber), trainer.py, auto_loop.py, reporting.py
 │   └── utils/                  # seed.py, text.py, visualize.py (lazy UMAP import)
-└── web_demo/                   # Giao diện Demo Web MVP thuần HTML/CSS/SVG/JS (0 CDN, Path Contraction)
-└── tests/                      # Bộ unit test kiểm chứng toàn diện (23 test modules)
+├── web_demo/                   # Giao diện Demo Web MVP thuần HTML/CSS/SVG/JS (0 CDN, Path Contraction)
+└── tests/                      # Bộ kiểm thử đơn vị, hồi quy & E2E 4 tầng (`tests/e2e/`)
 ```
 
 ---
@@ -153,12 +144,12 @@ python -m scripts.human_audit_ui
 python -m scripts.human_audit_ui --lock-role annotator_1 --port 8765
 
 # Nếu dùng quy trình 2 người chấm độc lập + hòa giải:
-python -m scripts.compute_kappa --input data/interim/human_audit_vi_120.csv --strict-adjudication --output-json paper/results_human_audit_vi.json
-python -m scripts.audit_vn_50_trees --evaluate --strict-adjudication --audit-csv data/interim/human_audit_vn_30_trees.csv --output-json paper/results_human_audit_vn_30_trees.json
+python -m scripts.compute_kappa --input data/interim/human_audit_vi_120.csv --strict-adjudication --output-json results/results_human_audit_vi.json
+python -m scripts.audit_vn_50_trees --evaluate --strict-adjudication --audit-csv data/interim/human_audit_vn_30_trees.csv --output-json results/results_human_audit_vn_30_trees.json
 
 # Nếu dùng quy trình tiền chú thích AI + tác giả duyệt vàng đơn lẻ:
-python -m scripts.compute_kappa --input data/interim/human_audit_vi_120.csv --allow-single-gold --output-json paper/results_human_audit_vi.json
-python -m scripts.audit_vn_50_trees --evaluate --allow-single-gold --audit-csv data/interim/human_audit_vn_30_trees.csv --output-json paper/results_human_audit_vn_30_trees.json
+python -m scripts.compute_kappa --input data/interim/human_audit_vi_120.csv --allow-single-gold --output-json results/results_human_audit_vi.json
+python -m scripts.audit_vn_50_trees --evaluate --allow-single-gold --audit-csv data/interim/human_audit_vn_30_trees.csv --output-json results/results_human_audit_vn_30_trees.json
 ```
 
 ---
@@ -167,4 +158,4 @@ python -m scripts.audit_vn_50_trees --evaluate --allow-single-gold --audit-csv d
 
 1. **Tạo nhánh theo mã việc Jira:** Nhánh `main` được bảo vệ bằng Ruleset & GitHub Actions CI. Tạo nhánh mới theo định dạng `<type>/<MA-JIRA>-<mo-ta-ngan>`.
 2. **Kiểm thử & Review chéo (Test-Gated):** Mọi Pull Request vào `main` phải vượt qua toàn bộ `pytest` và kiểm tra tệp cấm trên CI.
-3. **Bảo mật & Dữ liệu Public:** Kho đang ở chế độ **Public**. Không commit `.parquet`, trọng số `.pt`/`.pth`/`.ckpt`/`.bin`/`.safetensors`, `checkpoints/`/`outputs/`/`results/`/`logs/`, `*.zip`, đáp án chấm mù `*_machine_key.csv`, hoặc muối/khóa bí mật (`.env`, `*.secret`, `HF_TOKEN`).
+3. **Bảo mật & Dữ liệu Public:** Kho đang ở chế độ **Public**. Chỉ theo dõi các kết quả thực nghiệm không nhị phân trong `results/` (`*.json`, `*.md`, `*.tex`, `results/figures/*/*.{svg,pdf}`); tuyệt đối không commit `.parquet`, trọng số `.pt`/`.pth`/`.ckpt`/`.bin`/`.safetensors`, `checkpoints/`/`outputs/`/`logs/`, `*.zip`, `runner_summary_*.json`, `*.tmp.json`, đáp án chấm mù `*_machine_key.csv`, hoặc muối/khóa bí mật (`.env`, `*.secret`, `HF_TOKEN`).

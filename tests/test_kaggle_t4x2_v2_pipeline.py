@@ -451,7 +451,7 @@ def test_cascade_stats_zero_leakage_and_sbi_fagat_v2(tmp_path: Path) -> None:
     for da, db in zip(ds_a, ds_b):
         assert torch.allclose(da.x, db.x, atol=1e-7)
         assert torch.allclose(da.edge_attr, db.edge_attr, atol=1e-7)
-        assert da.edge_attr.shape[1] == 4
+        assert da.edge_attr.shape[1] == 2
         assert da.cascade_stats.shape == (1, CASCADE_STATS_DIM)
         assert torch.allclose(da.cascade_stats, db.cascade_stats, atol=1e-7)
 
@@ -466,7 +466,7 @@ def test_cascade_stats_zero_leakage_and_sbi_fagat_v2(tmp_path: Path) -> None:
     model_v2 = SBiFAGAT(
         in_dim=TOTAL_NODE_FEATURE_DIM,
         hidden_dim=256,
-        edge_dim=4,
+        edge_dim=2,
         use_cascade_stats=True,
         predict_uncertainty=True,
     )
@@ -479,16 +479,16 @@ def test_cascade_stats_zero_leakage_and_sbi_fagat_v2(tmp_path: Path) -> None:
     assert torch.isfinite(loss)
     loss.backward()
 
-    # Verify ablate_irrationality & ablate_constructive zero exact edge_attr columns
+    # Verify ablate_stance & ablate_hostility zero exact 2D edge_attr columns
     model_abl = SBiFAGAT(
         in_dim=TOTAL_NODE_FEATURE_DIM,
         hidden_dim=64,
-        edge_dim=4,
-        ablate_irrationality=True,
-        ablate_constructive=True,
+        edge_dim=2,
+        ablate_stance=True,
+        ablate_hostility=True,
     )
     ea_abl = model_abl._prepare_edge_attr(batch.x, batch.edge_index_td, batch)
-    assert torch.allclose(ea_abl[:, 2:], torch.zeros_like(ea_abl[:, 2:]))
+    assert torch.allclose(ea_abl, torch.zeros_like(ea_abl))
 
     diag = model_v2.predict_with_diagnostics(ds_a[0], top_k_edges=3)
     assert len(diag["top_trigger_edges"]) == 3
@@ -512,7 +512,12 @@ def test_auto_loop_live_predictor_smoke_runner_and_notebooks(tmp_path: Path) -> 
     live_res = predict_live_cascade(post, comments, k_horizon=20)
     assert live_res["k_observed"] == 20
     assert live_res["actual_post_hoc_comparison"]["actual_total_replies"] == 24
-    assert live_res["behavior_counts"]["irrational_fallacy"] >= 1
+    assert "irrational_fallacy" not in live_res["behavior_counts"]
+    assert (
+        live_res["behavior_counts"]["constructive_oppose"]
+        + live_res["behavior_counts"]["hostile_conflict"]
+        >= 1
+    )
     assert live_res["behavior_counts"]["hostile_conflict"] >= 1
 
     # 3. Auto-loop direct API test with temporary loaders (unified 2D)

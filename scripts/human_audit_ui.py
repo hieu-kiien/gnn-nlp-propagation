@@ -58,7 +58,7 @@ ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
         subtitle="Chấm mù độc lập Thái độ (stance) + Khiếm nhã/Công kích nhị phân (clean vs. uncivil) trên tập Test VN.",
         kappa_command=(
             "python -m scripts.compute_kappa --input data/interim/human_audit_vi_120.csv "
-            "--strict-adjudication --output-json paper/results_human_audit_vi.json"
+            "--strict-adjudication --output-json results/results_human_audit_vi.json"
         ),
     ),
     DatasetSpec(
@@ -69,7 +69,7 @@ ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
         kappa_command=(
             "python -m scripts.audit_vn_50_trees --evaluate --strict-adjudication "
             "--audit-csv data/interim/human_audit_vn_30_trees.csv "
-            "--output-json paper/results_human_audit_vn_30_trees.json"
+            "--output-json results/results_human_audit_vn_30_trees.json"
         ),
     ),
     DatasetSpec(
@@ -86,7 +86,7 @@ ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
         subtitle="Bộ kiểm định cũ 300 cặp (giữ tương thích kiểm thử cũ).",
         kappa_command=(
             "python -m scripts.compute_kappa --input data/interim/human_audit_vi_300.csv "
-            "--strict-adjudication --output-json paper/results_human_audit_vi.json"
+            "--strict-adjudication --output-json results/results_human_audit_vi.json"
         ),
     ),
     DatasetSpec(
@@ -97,7 +97,7 @@ ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
         kappa_command=(
             "python -m scripts.audit_vn_50_trees --evaluate --strict-adjudication "
             "--audit-csv data/interim/human_audit_vn_50_trees.csv "
-            "--output-json paper/results_human_audit_vn_50_trees.json"
+            "--output-json results/results_human_audit_vn_50_trees.json"
         ),
     ),
     DatasetSpec(
@@ -114,7 +114,7 @@ ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
         subtitle="Tùy chọn: 120 cặp tiếng Anh PHEME (clean vs. uncivil + 3-class stance).",
         kappa_command=(
             "python -m scripts.compute_kappa --input data/interim/human_audit_en_120.csv "
-            "--strict-adjudication --output-json paper/results_human_audit_en.json"
+            "--strict-adjudication --output-json results/results_human_audit_en.json"
         ),
     ),
     DatasetSpec(
@@ -131,7 +131,7 @@ ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
         subtitle="Tuỳ chọn: 300 cặp tiếng Anh PHEME (tương thích ngược).",
         kappa_command=(
             "python -m scripts.compute_kappa --input data/interim/human_audit_en_300.csv "
-            "--strict-adjudication --output-json paper/results_human_audit_en.json"
+            "--strict-adjudication --output-json results/results_human_audit_en.json"
         ),
     ),
 )

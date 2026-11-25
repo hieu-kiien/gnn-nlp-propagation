@@ -7,10 +7,10 @@ Accepts:
   - `--demo-offline` (self-contained realistic 24-reply Vietnamese debate for testing)
 
 Strictly truncates model inputs to the first `K` (default 20) chronological comments,
-labels each reply across the 5 behavioral categories (`support`, `neutral`,
-`constructive_oppose`, `irrational_fallacy`, `hostile_conflict`), runs `SBiFAGAT`,
+labels each reply across the unified 2D `[s_uv, h_uv]` behavioral categories
+(`support`, `neutral`, `constructive_oppose`, `hostile_conflict`), runs `SBiFAGAT`,
 and if the live thread already has `> K` replies, compares the early forecast against
-the true full-thread outcome WITHOUT ever leaking post-K data into the model.
+the true future (`t > K`, `future_only`) outcome WITHOUT ever leaking post-K data into the model.
 """
 
 from __future__ import annotations
@@ -31,6 +31,10 @@ import requests
 import torch
 from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerFast
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from src.data.arctic_shift_vn import (
     ARCTIC_SHIFT_API_BASE,
     build_vn_cascade_from_thread,
@@ -47,11 +51,7 @@ from src.data.pyg_dataset import (
     compute_early_cascade_burst_stats,
 )
 from src.models.sbi_fagat import SBiFAGAT
-from src.nlp.discourse_labels import (
-    BEHAVIOR_LABEL_VI,
-    DISCOURSE_BEHAVIOR_LABELS,
-    _heuristic_behavior_fallback,
-)
+from src.nlp.discourse_labels import _heuristic_behavior_fallback
 from src.nlp.dual_edge_scorer import (
     DualHeadCrossEncoder,
     STANCE_LABELS,
@@ -72,6 +72,18 @@ _REQUIRED_CE_FILES: tuple[str, ...] = (
     "dual_head_meta.json",
     "config.json",
 )
+_UNIFIED_BEHAVIOR_LABELS: tuple[str, ...] = (
+    "support",
+    "neutral",
+    "constructive_oppose",
+    "hostile_conflict",
+)
+_BEHAVIOR_LABEL_VI_2D: dict[str, str] = {
+    "support": "Tán thành / Ủng hộ",
+    "neutral": "Trung lập / Hỏi thông tin",
+    "constructive_oppose": "Phản biện ôn hòa",
+    "hostile_conflict": "Xung đột / Gay gắt cao",
+}
 
 # Empirical future_only y_polar quantiles computed strictly on the VN Train split
 # (N = 1,050 cascades, K = 20, min_total_replies = 25; data/processed/vn/nodes.parquet
@@ -530,18 +542,27 @@ def _resolve_nlp_backends(
     return None, None, None, None, False, "heuristic_hash_sandbox"
 
 
+def _classify_2d_behavior_label(s_uv: float, h_uv: float) -> str:
+    """Map unified 2D `[s_uv, h_uv]` edge scores to the 4 clean behavioral categories."""
+    if s_uv > 0.1:
+        return "support"
+    if h_uv > 0.6:
+        return "hostile_conflict"
+    if s_uv < -0.1:
+        return "constructive_oppose"
+    return "neutral"
+
+
 def _classify_calibrated_regime(
     pred_polar: float,
-    behavior_counts: Mapping[str, int],
+    behavior_counts: Mapping[str, int] | None = None,
 ) -> str:
     """Classify cascade polarization regime calibrated strictly against VN Train quantiles."""
-    hostile_or_irr = int(behavior_counts.get("hostile_conflict", 0)) + int(
-        behavior_counts.get("irrational_fallacy", 0)
-    )
-    if pred_polar >= VN_POLAR_Q90 or hostile_or_irr >= 3:
+    del behavior_counts  # Retained for signature compatibility; counts never override quantiles.
+    if pred_polar >= VN_POLAR_Q90:
         return "Phân cực xung đột gay gắt (>= Q90 VN Train)"
-    if pred_polar >= VN_POLAR_Q75 or int(behavior_counts.get("constructive_oppose", 0)) >= 2:
-        return "Tranh luận đa chiều văn minh (Q75-Q90 VN Train)"
+    if pred_polar >= VN_POLAR_Q75:
+        return "Phân hóa khá cao (Q75-Q90 VN Train)"
     if pred_polar >= VN_POLAR_Q50:
         return "Phân hóa trung bình (Q50-Q75 VN Train)"
     return "Tương đối đồng thuận / ít chia rẽ (< Q50 VN Train)"
@@ -561,6 +582,9 @@ def predict_live_cascade(
     is_demo: bool = False,
 ) -> dict[str, Any]:
     """Build cascade graph, score early behavior, run SBiFAGAT, and emit live forecast report."""
+    if isinstance(k_horizon, bool) or int(k_horizon) < 1:
+        raise ValueError(f"k_horizon must be >= 1, got {k_horizon!r}")
+    k_horizon = int(k_horizon)
     junk_stats: dict[str, Any] = {}
     built = build_vn_cascade_from_thread(
         post,
@@ -634,22 +658,18 @@ def predict_live_cascade(
         for pos, eid in enumerate(all_edge_ids):
             s_v = float(ce_out["s_uv"][pos])
             h_v = float(ce_out["h_uv"][pos])
-            r_v = float(ce_out["r_uv"][pos]) if "r_uv" in ce_out else 0.10
-            c_v = float(ce_out["c_uv"][pos]) if "c_uv" in ce_out else 0.50
-            if "behavior_label" in ce_out:
-                blbl = str(ce_out["behavior_label"][pos])
-            else:
-                blbl = "support" if s_v > 0.1 else ("hostile_conflict" if h_v > 0.6 else ("constructive_oppose" if s_v < -0.1 else "neutral"))
-            edge_scores[eid] = {"s_uv": s_v, "h_uv": h_v, "r_uv": r_v, "c_uv": c_v, "behavior_label": blbl}
+            raw_blbl = str(ce_out["behavior_label"][pos]) if "behavior_label" in ce_out else ""
+            blbl = raw_blbl if raw_blbl in _UNIFIED_BEHAVIOR_LABELS else _classify_2d_behavior_label(s_v, h_v)
+            edge_scores[eid] = {"s_uv": s_v, "h_uv": h_v, "behavior_label": blbl}
     else:
         for eid, r_txt in zip(all_edge_ids, all_reply_texts):
             heur = _heuristic_behavior_fallback(r_txt)
+            s_v = float(heur["s_uv"])
+            h_v = float(heur["h_uv"])
             edge_scores[eid] = {
-                "s_uv": float(heur["s_uv"]),
-                "h_uv": float(heur["h_uv"]),
-                "r_uv": float(heur["r_uv"]),
-                "c_uv": float(heur["c_uv"]),
-                "behavior_label": str(heur["label"]),
+                "s_uv": s_v,
+                "h_uv": h_v,
+                "behavior_label": _classify_2d_behavior_label(s_v, h_v),
             }
 
     # Build early PyG CascadeData restricted strictly to V_K
@@ -708,7 +728,7 @@ def predict_live_cascade(
         sc = edge_scores[eid]
         td_src.append(kept_id_to_idx[src_id])
         td_dst.append(kept_id_to_idx[dst_id])
-        edge_attr_rows.append([sc["s_uv"], sc["h_uv"], sc["r_uv"], sc["c_uv"]])
+        edge_attr_rows.append([sc["s_uv"], sc["h_uv"]])
         kept_pairs.append((src_id, dst_id))
         kept_edge_details.append(
             {
@@ -722,7 +742,7 @@ def predict_live_cascade(
 
     edge_index_td = torch.tensor([td_src, td_dst], dtype=torch.long) if td_src else torch.empty((2, 0), dtype=torch.long)
     edge_index_bu = edge_index_td[[1, 0], :] if edge_index_td.numel() > 0 else edge_index_td
-    edge_attr = torch.tensor(edge_attr_rows, dtype=torch.float32) if edge_attr_rows else torch.empty((0, 4), dtype=torch.float32)
+    edge_attr = torch.tensor(edge_attr_rows, dtype=torch.float32) if edge_attr_rows else torch.empty((0, 2), dtype=torch.float32)
     struct_x = compute_causal_structural_node_features(
         kept_nodes=kept_nodes,
         delays_k=delays_k,
@@ -753,7 +773,7 @@ def predict_live_cascade(
         edge_lookup=early_edge_lookup,
         stance_map=early_stance_map,
     )
-    early_y_polar_val = _compute_full_tree_polarization(early_aligned) if early_aligned else 0.0
+    early_y_polar_val = _compute_full_tree_polarization(early_aligned, lambda_polar=0.5) if early_aligned else 0.0
 
     data = CascadeData(
         x=x,
@@ -827,23 +847,52 @@ def predict_live_cascade(
 
     diag = gnn_model.predict_with_diagnostics(data, top_k_edges=5)
 
-    behavior_counts = {lbl: 0 for lbl in DISCOURSE_BEHAVIOR_LABELS}
+    behavior_counts = {lbl: 0 for lbl in _UNIFIED_BEHAVIOR_LABELS}
     for d in kept_edge_details:
-        behavior_counts[d["behavior_label"]] = behavior_counts.get(d["behavior_label"], 0) + 1
+        lbl_d = d["behavior_label"]
+        if lbl_d in behavior_counts:
+            behavior_counts[lbl_d] += 1
+        else:
+            mapped_lbl = _classify_2d_behavior_label(float(d["s_uv"]), float(d["h_uv"]))
+            behavior_counts[mapped_lbl] += 1
+
+    total_early_edges = max(1, len(kept_edge_details))
+    early_behavior_summary = {
+        lbl: {
+            "count": int(behavior_counts[lbl]),
+            "ratio": round(float(behavior_counts[lbl]) / float(total_early_edges), 4),
+        }
+        for lbl in _UNIFIED_BEHAVIOR_LABELS
+    }
 
     # Combine model prediction with interpretable early polarization indicator when checkpoint isn't loaded
     raw_pred_polar = float(diag["y_polar_pred"].view(-1)[0].item())
     raw_pred_replies = float(diag["predicted_total_replies"].view(-1)[0].item())
+    raw_conf = diag.get("confidence_score")
+    conf_score: float | None = float(raw_conf.view(-1)[0].item()) if raw_conf is not None else None
+    uncertainty_available = bool(diag.get("uncertainty_available", conf_score is not None))
 
     actual_total_replies = len(non_roots)
+    has_future = actual_total_replies > (len(kept_nodes) - 1)
+    kept_pair_set = {(str(d_e["parent_id"]), str(d_e["node_id"])) for d_e in kept_edge_details}
     stance_map = {eid: sc["s_uv"] for eid, sc in edge_scores.items()}
-    actual_aligned = _compute_root_aligned_stances(
-        root_id=root_id,
-        children_adj=children_adj,
-        edge_lookup=edge_lookup,
-        stance_map=stance_map,
-    )
-    actual_full_polar = _compute_full_tree_polarization(actual_aligned) if actual_aligned else 0.0
+    if has_future:
+        actual_aligned = _compute_root_aligned_stances(
+            root_id=root_id,
+            children_adj=children_adj,
+            edge_lookup=edge_lookup,
+            stance_map=stance_map,
+            excluded_pairs=kept_pair_set,
+        )
+        actual_full_polar: float | None = (
+            _compute_full_tree_polarization(actual_aligned, lambda_polar=0.5)
+            if actual_aligned
+            else 0.0
+        )
+        actual_polar_mode = "future_only"
+    else:
+        actual_full_polar = None
+        actual_polar_mode = "no_future_replies"
 
     stats_vec = cascade_stats.view(-1).tolist()
     regimes_polar = _classify_calibrated_regime(raw_pred_polar, behavior_counts)
@@ -904,6 +953,8 @@ def predict_live_cascade(
             "one_sided_hostility_index": stats_vec[7],
         },
         "behavior_counts": behavior_counts,
+        "early_behavior_summary": early_behavior_summary,
+        "early_y_polar": float(early_y_polar_val),
         "predicted_total_replies": raw_pred_replies,
         "predicted_polarization_score": raw_pred_polar,
         "predicted_regime": regimes_polar,
@@ -913,22 +964,23 @@ def predict_live_cascade(
             "q90": VN_POLAR_Q90,
         },
         "note": VN_QUANTILE_CALIBRATION_NOTE,
-        "confidence_score": float(diag["confidence_score"].view(-1)[0].item()),
+        "confidence_score": conf_score,
+        "uncertainty_available": uncertainty_available,
         "low_signal_warning": bool(diag["low_signal_warning"].view(-1)[0].item()),
         "top_trigger_edges": diag["top_trigger_edges"],
-        "flagged_irrational_or_hostile": [
-            d for d in kept_edge_details if d["behavior_label"] in {"irrational_fallacy", "hostile_conflict"}
+        "flagged_hostile": [
+            d for d in kept_edge_details if d["behavior_label"] == "hostile_conflict"
         ],
         "actual_post_hoc_comparison": {
-            "has_future_replies": actual_total_replies > (len(kept_nodes) - 1),
+            "has_future_replies": has_future,
             "actual_total_replies": actual_total_replies,
             "actual_full_polarization": actual_full_polar,
+            "actual_full_polarization_mode": actual_polar_mode,
         },
     }
 
 
 def _format_report_vi(result: Mapping[str, Any]) -> str:
-    is_2d = int(result.get("edge_dim", 2)) == 2 and bool(result.get("checkpoint_loaded"))
     lines = [
         "=" * 78,
         "BAO CAO DU BAO SOM & PHAN TICH HANH VI TRANH LUAN (SBi-FAGAT Unified 2D)",
@@ -942,33 +994,30 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
         [
             f"Bai goc      : {result['root_title']}",
             f"Cua so quan sat (V_K): {result['k_observed']} binh luan dau tien",
-            f"Trang thai GNN       : {'Da nap checkpoint huan luyen (2D [s_uv, h_uv])' if is_2d else ('Da nap checkpoint huan luyen' if result['checkpoint_loaded'] else 'CHE DO KIEM THU CAU TRUC (CHUA NAP CHECKPOINT - KHONG CO GIA TRI DU BAO)')}",
+            f"Trang thai GNN       : {'Da nap checkpoint huan luyen (2D [s_uv, h_uv])' if result['checkpoint_loaded'] else 'CHE DO KIEM THU CAU TRUC (CHUA NAP CHECKPOINT - KHONG CO GIA TRI DU BAO)'}",
             f"Backend NLP          : {result.get('nlp_backend', 'unknown')} (cross_encoder_loaded={result.get('cross_encoder_loaded', False)})",
             f"Che do loc rac       : {result.get('junk_mode', 'prune')}",
             "",
-            (
-                "[1] PHAN BO LAP TRUONG & GAY GAT 2D [s_uv, h_uv] TRONG 20 BINH LUAN DAU:"
-                if is_2d
-                else "[1] PHAN LOAI 5 NHOM HANH VI TRONG 20 BINH LUAN DAU:"
-            ),
+            "[1] PHAN BO LAP TRUONG & GAY GAT 2D [s_uv, h_uv] TRONG 20 BINH LUAN DAU:",
         ]
     )
-    if is_2d:
-        bc = result["behavior_counts"]
-        lines.append(f"  - Ung ho / dong tinh (s > 0.1)           : {bc.get('support', 0)} binh luan")
-        lines.append(f"  - Trung lap / hoi dap                    : {bc.get('neutral', 0)} binh luan")
-        lines.append(f"  - Phan bien on hoa (s < -0.1, h <= 0.6)  : {bc.get('constructive_oppose', 0)} binh luan")
-        lines.append(f"  - Xung dot / gay gat cao (h > 0.6)       : {bc.get('hostile_conflict', 0)} binh luan")
-    else:
-        for lbl in DISCOURSE_BEHAVIOR_LABELS:
-            cnt = result["behavior_counts"].get(lbl, 0)
-            lines.append(f"  - {BEHAVIOR_LABEL_VI.get(lbl, lbl):38s}: {cnt} binh luan")
+    bc = result["behavior_counts"]
+    lines.append(f"  - {_BEHAVIOR_LABEL_VI_2D['support']} (s > 0.1)           : {bc.get('support', 0)} binh luan")
+    lines.append(f"  - {_BEHAVIOR_LABEL_VI_2D['neutral']}                    : {bc.get('neutral', 0)} binh luan")
+    lines.append(f"  - {_BEHAVIOR_LABEL_VI_2D['constructive_oppose']} (s < -0.1, h <= 0.6)  : {bc.get('constructive_oppose', 0)} binh luan")
+    lines.append(f"  - {_BEHAVIOR_LABEL_VI_2D['hostile_conflict']} (h > 0.6)       : {bc.get('hostile_conflict', 0)} binh luan")
 
     bm = result["early_burst_metrics"]
     sec3_header = (
         "[3] DU BAO TUONG LAI & DO TU TIN:"
         if result["checkpoint_loaded"]
         else "[3] DU BAO TUONG LAI: [CANH BAO: CHUA NAP CHECKPOINT - CAC CHI SO BEN DUOI LA NGAU NHIEN]"
+    )
+    conf_val = result.get("confidence_score")
+    conf_str = (
+        f"{float(conf_val):.1%}"
+        if conf_val is not None
+        else "N/A (uncertainty disabled)"
     )
     lines.extend(
         [
@@ -982,42 +1031,36 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
             f"  - Quy mo binh luan cuoi ky du kien         : ~{result['predicted_total_replies']:.1f} binh luan",
             f"  - Chi so phan cuc du kien [0..1]           : {result['predicted_polarization_score']:.4f}",
             f"  - Danh gia cuc dien                        : {result['predicted_regime']}",
-            f"  - Do tu tin du bao                         : {result['confidence_score']:.1%}",
+            f"  - Do tu tin du bao                         : {conf_str}",
         ]
     )
     if result["low_signal_warning"]:
         lines.append("  [!] CANH BAO TIN HIEU THAP: Binh luan dau nhat/thieu du kien -> Khuyen nghi cho them den moc K=35-50.")
 
-    flagged = result.get("flagged_irrational_or_hostile") or []
+    flagged = result.get("flagged_hostile") or []
     lines.append("")
-    if is_2d:
-        lines.append(f"[4] DIEM MAT BINH LUAN GAY GAT / XUNG DOT CAO ({len(flagged)} cau):")
-        for idx, item in enumerate(flagged[:5], start=1):
-            lines.append(
-                f"  {idx}. [Xung dot gay gat] (s_uv={item['s_uv']:+.2f}, h_uv={item['h_uv']:.2f})"
-            )
-            lines.append(f"     \"{item['reply_text'][:160]}\"")
-    else:
-        lines.append(f"[4] DIEM MAT BINH LUAN VO LY / CHONG DOI NGUY HIEM NHAT ({len(flagged)} cau):")
-        for idx, item in enumerate(flagged[:5], start=1):
-            lbl_vi = BEHAVIOR_LABEL_VI.get(item["behavior_label"], item["behavior_label"])
-            lines.append(
-                f"  {idx}. [{lbl_vi}] (s={item['s_uv']:+.2f}, gay_gat={item['h_uv']:.2f}, vo_ly={item['r_uv']:.2f})"
-            )
-            lines.append(f"     \"{item['reply_text'][:160]}\"")
+    lines.append(f"[4] DIEM MAT BINH LUAN GAY GAT / XUNG DOT CAO ({len(flagged)} cau):")
+    for idx, item in enumerate(flagged[:5], start=1):
+        lines.append(
+            f"  {idx}. [Xung dot gay gat] (s_uv={item['s_uv']:+.2f}, h_uv={item['h_uv']:.2f})"
+        )
+        lines.append(f"     \"{item['reply_text'][:160]}\"")
 
     act = result["actual_post_hoc_comparison"]
-    polar_note = (
-        "(toan bo cay chua nhieu binh luan hon K)"
-        if act.get("has_future_replies")
-        else "(do so binh luan thuc te <= K nen E[y_polar | stances quan sat])"
-    )
+    early_pol = result.get("early_y_polar")
+    early_pol_str = f"{float(early_pol):.4f}" if early_pol is not None else "N/A"
+    act_pol = act.get("actual_full_polarization")
+    if act.get("has_future_replies") and act_pol is not None:
+        act_pol_str = f"{float(act_pol):.4f} (future_only, t > K)"
+    else:
+        act_pol_str = "N/A (chua co binh luan t > K)"
     lines.extend(
         [
             "",
             "[5] DOI CHIEU THUC TE (KHONG LOT VAO DAU VAO MO HINH):",
             f"  - Tong so binh luan thuc te toan bai       : {act['actual_total_replies']} binh luan",
-            f"  - Do phan cuc quan sat/cuoi ky thuc te     : {act['actual_full_polarization']:.4f} {polar_note}",
+            f"  - Do phan cuc quan sat som (1..K)          : {early_pol_str}",
+            f"  - Do phan cuc tuong lai thuc te (t > K)    : {act_pol_str}",
             "=" * 78,
         ]
     )
@@ -1045,6 +1088,15 @@ def main() -> None:
     parser.add_argument("--junk-mode", choices=["prune", "contract"], default="prune")
     parser.add_argument("--output-json", type=Path, default=None)
     args = parser.parse_args()
+
+    if args.k_horizon < 1:
+        raise ValueError(f"k_horizon must be >= 1, got {args.k_horizon}")
+    if (args.reddit_url or args.thread_id) and args.gnn_ckpt is None and not args.allow_untrained:
+        raise RuntimeError(
+            "Không tìm thấy checkpoint mô hình GNN (--gnn-ckpt). "
+            "Không chạy suy luận trên bài đăng thật bằng trọng số khởi tạo ngẫu nhiên; "
+            "hãy truyền --gnn-ckpt hoặc --allow-untrained."
+        )
 
     if args.demo_offline:
         post, comments = _make_demo_offline_thread()

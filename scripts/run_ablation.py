@@ -11,6 +11,10 @@ from pathlib import Path
 import torch
 from torch_geometric.loader import DataLoader
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from src.data.pyg_dataset import (
     DEFAULT_FORECAST_MIN_REPLIES,
     EarlyCascadeDataset,
@@ -52,7 +56,7 @@ def main() -> None:
     parser.add_argument("--k-horizon", type=int, default=20)
     parser.add_argument("--horizons", type=int, nargs="+", default=list(SUPPORTED_HORIZONS))
     parser.add_argument("--hidden-dim", type=int, default=64)
-    parser.add_argument("--edge-dim", type=int, choices=[2, 4], default=None)
+    parser.add_argument("--edge-dim", type=int, choices=[2], default=None)
     parser.add_argument("--eps", type=float, default=0.5)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--v2", action="store_true")
@@ -81,9 +85,9 @@ def main() -> None:
 
     ds_name = args.data_dir.name.lower() if args.data_dir.name.lower() in {"pheme", "vn"} else ""
     suffix = f"_{ds_name}" if ds_name else ""
-    out_table = args.output_table or Path(f"paper/tables_ablation{suffix}.tex")
-    out_json = args.output_json or Path(f"paper/results_ablation{suffix}.json")
-    fig_dir = args.figures_dir or (Path("paper/figures") / ds_name if ds_name else Path("paper/figures"))
+    out_table = args.output_table or Path(f"results/tables_ablation{suffix}.tex")
+    out_json = args.output_json or Path(f"results/results_ablation{suffix}.json")
+    fig_dir = args.figures_dir or (Path("results/figures") / ds_name if ds_name else Path("results/figures"))
 
     for fname in ("nodes.parquet", "edges.parquet", "nlp_features.pt"):
         if not (args.data_dir / fname).exists():
@@ -99,11 +103,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     in_dim = TOTAL_NODE_FEATURE_DIM
     h_dim = args.hidden_dim
-    edge_dim = args.edge_dim or int(
-        nlp_features.get("edge_dim", nlp_features["edge_attr"].size(1) if nlp_features["edge_attr"].ndim == 2 else 2)
-    )
-    if edge_dim not in {2, 4}:
-        edge_dim = 2
+    edge_dim = 2
     use_stats = bool(args.use_cascade_stats or args.v2)
     use_unc = bool(args.predict_uncertainty or args.v2)
     lam_unc = (
@@ -184,8 +184,6 @@ def main() -> None:
             dropout=args.dropout,
             ablate_stance=True,
             ablate_hostility=True,
-            ablate_irrationality=(edge_dim == 4),
-            ablate_constructive=(edge_dim == 4),
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
         ),
@@ -276,29 +274,6 @@ def main() -> None:
             predict_uncertainty=use_unc,
         ),
     }
-    if edge_dim == 4:
-        ablation_factories["w/o Irrationality (r_uv=0)"] = lambda: SBiFAGAT(
-            in_dim=in_dim,
-            hidden_dim=h_dim,
-            edge_dim=edge_dim,
-            num_rumor_classes=num_cls,
-            eps=args.eps,
-            dropout=args.dropout,
-            ablate_irrationality=True,
-            use_cascade_stats=use_stats,
-            predict_uncertainty=use_unc,
-        )
-        ablation_factories["w/o Constructive (c_uv=0)"] = lambda: SBiFAGAT(
-            in_dim=in_dim,
-            hidden_dim=h_dim,
-            edge_dim=edge_dim,
-            num_rumor_classes=num_cls,
-            eps=args.eps,
-            dropout=args.dropout,
-            ablate_constructive=True,
-            use_cascade_stats=use_stats,
-            predict_uncertainty=use_unc,
-        )
     if use_stats:
         ablation_factories["w/o Burst Stats"] = lambda: SBiFAGAT(
             in_dim=in_dim,
@@ -399,6 +374,11 @@ def main() -> None:
         )
 
     k_curve_results: dict[int, dict[str, dict[str, tuple[float, float]]]] = {}
+    k_cmp = (
+        args.comparator_model
+        if args.comparator_model in {"StandardGCN", "BiGCN"}
+        else "auto"
+    )
     for k in active_horizons:
         k_train = EarlyCascadeDataset(k_horizon=k, split="train", **k_common_kwargs)
         k_val = EarlyCascadeDataset(k_horizon=k, split="val", **k_common_kwargs)
@@ -412,6 +392,7 @@ def main() -> None:
                     num_rumor_classes=num_cls,
                     dropout=args.dropout,
                     use_cascade_stats=use_stats,
+                    predict_uncertainty=use_unc,
                 ),
                 "BiGCN": lambda: BiGCN(
                     in_dim=in_dim,
@@ -419,6 +400,7 @@ def main() -> None:
                     num_rumor_classes=num_cls,
                     dropout=args.dropout,
                     use_cascade_stats=use_stats,
+                    predict_uncertainty=use_unc,
                 ),
                 "SBiFAGAT": lambda: SBiFAGAT(
                     in_dim=in_dim,
@@ -440,7 +422,7 @@ def main() -> None:
             patience=args.patience,
             lambda_uncertainty=lam_unc,
             reference_model="SBiFAGAT",
-            comparator_model=args.comparator_model,
+            comparator_model=k_cmp,
             primary_hypothesis_keys=active_keys,
             device=device,
         )
