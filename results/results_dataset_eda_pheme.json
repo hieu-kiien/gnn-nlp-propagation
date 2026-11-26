@@ -1,0 +1,73 @@
+{
+  "datasets": [
+    {
+      "name": "pheme",
+      "data_dir": "data/processed/pheme",
+      "k_horizon": 10,
+      "min_total_replies": 15,
+      "polar_target_mode": "future_only",
+      "total_nodes": 101342,
+      "total_edges": 94917,
+      "raw_cascades": 6425,
+      "eligible_cascades": 2664,
+      "raw_topics": 9,
+      "eligible_topics": 9,
+      "median_replies": 20.0,
+      "mean_replies": 27.8993993993994,
+      "p90_replies": 45.0,
+      "median_duration_hours": 5.093055555555555,
+      "mean_duration_hours": 22.106880839172504,
+      "raw_median_replies": 11.0,
+      "raw_mean_replies": 14.77307392996109,
+      "raw_median_duration_hours": 2.5258333333333334,
+      "languages": {
+        "en": 101342
+      },
+      "source_datasets": {
+        "pheme": 101342
+      },
+      "rumor_label_counts": {
+        "true": 414,
+        "unverified": 270,
+        "false": 162,
+        "non-rumor": 1818
+      },
+      "raw_rumor_label_counts": {
+        "true": 1067,
+        "unverified": 697,
+        "false": 638,
+        "non-rumor": 4023
+      },
+      "split_cascade_counts": {
+        "train": 1786,
+        "val": 544,
+        "test": 334
+      },
+      "topic_splits_source": "data/processed/pheme/topic_splits.json",
+      "early_k_persistence": {
+        "num_cascades": 334,
+        "msle": 0.11662524458233726,
+        "mae": 0.2820540634326042,
+        "rmse_size": 0.3415043844262285,
+        "r2_size": -0.09992380512176324,
+        "spearman_size": 0.0,
+        "rmse": 0.05617020648387089,
+        "mae_polar": 0.039006295451085075,
+        "r2_polar": -0.3021697544258959,
+        "pearson_r": 0.3310323364852895,
+        "spearman_polar": 0.3951028157480924,
+        "mean_true_polar": 0.07038029311587309,
+        "mean_early_polar": 0.057217298005585567
+      },
+      "target_stats": {
+        "num_cascades": 2664,
+        "y_size_mean": 3.227251837292949,
+        "y_size_std": 0.446669006025958,
+        "y_polar_mean": 0.0718904995510156,
+        "y_polar_std": 0.04644334238610654,
+        "y_bimodality_mean": 0.42968583065882193,
+        "y_assortativity_mean": 0.00196198931134258
+      }
+    }
+  ]
+}

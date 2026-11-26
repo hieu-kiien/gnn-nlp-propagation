@@ -1,0 +1,99 @@
+{
+  "models": [
+    {
+      "model": "TextMLP",
+      "params": 71110,
+      "infer_ms_per_cascade": 0.044571846871122034,
+      "train_ms_per_batch": 5.0069541999619105,
+      "peak_mem_mb": 21.08251953125,
+      "mem_label": "Peak VRAM (MB)"
+    },
+    {
+      "model": "TemporalStanceMLP",
+      "params": 88903,
+      "infer_ms_per_cascade": 0.06990697187347905,
+      "train_ms_per_batch": 6.02743620002002,
+      "peak_mem_mb": 21.34375,
+      "mem_label": "Peak VRAM (MB)"
+    },
+    {
+      "model": "StandardGCN",
+      "params": 75398,
+      "infer_ms_per_cascade": 0.10371792812406966,
+      "train_ms_per_batch": 7.288224799958698,
+      "peak_mem_mb": 21.50927734375,
+      "mem_label": "Peak VRAM (MB)"
+    },
+    {
+      "model": "StandardGATv2",
+      "params": 83974,
+      "infer_ms_per_cascade": 0.11821664687658995,
+      "train_ms_per_batch": 9.412312300082704,
+      "peak_mem_mb": 23.43603515625,
+      "mem_label": "Peak VRAM (MB)"
+    },
+    {
+      "model": "EdgeGATv2",
+      "params": 84231,
+      "infer_ms_per_cascade": 0.1386630468743988,
+      "train_ms_per_batch": 10.126519299956271,
+      "peak_mem_mb": 23.47509765625,
+      "mem_label": "Peak VRAM (MB)"
+    },
+    {
+      "model": "BiEdgeGATv2",
+      "params": 114247,
+      "infer_ms_per_cascade": 0.23835879375155855,
+      "train_ms_per_batch": 20.01312610009336,
+      "peak_mem_mb": 25.2734375,
+      "mem_label": "Peak VRAM (MB)"
+    },
+    {
+      "model": "FAGCN",
+      "params": 67334,
+      "infer_ms_per_cascade": 0.11395571562502482,
+      "train_ms_per_batch": 8.32312410002487,
+      "peak_mem_mb": 22.27490234375,
+      "mem_label": "Peak VRAM (MB)"
+    },
+    {
+      "model": "BiGCN",
+      "params": 116998,
+      "infer_ms_per_cascade": 0.167612143752649,
+      "train_ms_per_batch": 11.82823510007438,
+      "peak_mem_mb": 23.1728515625,
+      "mem_label": "Peak VRAM (MB)"
+    },
+    {
+      "model": "SBiFAGAT",
+      "params": 137086,
+      "infer_ms_per_cascade": 0.49355333437688387,
+      "train_ms_per_batch": 41.40594439995766,
+      "peak_mem_mb": 27.09912109375,
+      "mem_label": "Peak VRAM (MB)"
+    }
+  ],
+  "e2e_raw_text_profile": {
+    "num_nodes": 11,
+    "num_edges": 10,
+    "k_horizon": 10,
+    "device": "cuda",
+    "spanpool_loaded": true,
+    "spanpool_status": "real_local_transformer_spanpool",
+    "cross_encoder_loaded": true,
+    "edge_scorer_status": "real_dual_head_cross_encoder",
+    "is_partial_without_dual_ce": false,
+    "gnn_checkpoint_loaded": true,
+    "gnn_hidden_dim": 64,
+    "graph_and_stats_ms": 2.2164,
+    "spanpool_node_encoding_ms": 45.3074,
+    "edge_scoring_ms": 41.5269,
+    "cross_encoder_ms": 41.5269,
+    "heuristic_edge_ms": null,
+    "gnn_forward_ms": 15.816,
+    "e2e_total_ms": 104.8668,
+    "peak_alloc_mem_mb": 561.696,
+    "total_model_weights_mb": 476.02,
+    "process_rss_mb": 2080.87
+  }
+}

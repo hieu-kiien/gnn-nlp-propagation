@@ -1,0 +1,22 @@
+\begin{table}[t]
+\centering
+\caption{Computational efficiency benchmark (parameters, per-cascade latency, and peak memory).}
+\label{tab:efficiency_pheme}
+\resizebox{\columnwidth}{!}{
+\begin{tabular}{lcccc}
+\toprule
+Model & \#Params & Infer (ms/cascade)$\downarrow$ & Train Step (ms/batch)$\downarrow$ & Peak VRAM (MB)$\downarrow$ \\
+\midrule
+TextMLP & 71,110 & 0.0446 & 5.01 & 21.08 \\
+TemporalStanceMLP & 88,903 & 0.0699 & 6.03 & 21.34 \\
+StandardGCN & 75,398 & 0.1037 & 7.29 & 21.51 \\
+StandardGATv2 & 83,974 & 0.1182 & 9.41 & 23.44 \\
+EdgeGATv2 & 84,231 & 0.1387 & 10.13 & 23.48 \\
+BiEdgeGATv2 & 114,247 & 0.2384 & 20.01 & 25.27 \\
+FAGCN & 67,334 & 0.1140 & 8.32 & 22.27 \\
+BiGCN & 116,998 & 0.1676 & 11.83 & 23.17 \\
+SBiFAGAT & 137,086 & 0.4936 & 41.41 & 27.10 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
