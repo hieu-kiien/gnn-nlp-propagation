@@ -220,6 +220,20 @@
           "Sử dụng nhúng ViSoBERT SpanPool và đặc trưng cạnh 2D [s_uv, h_uv] từ Student DualHeadCrossEncoder trích xuất sẵn trên GPU + trọng số SBi-FAGAT đã huấn luyện (tách chủ đề độc lập, zero Test leakage)."
         )
       );
+    } else if (ceLoaded && !isSynth && state.tier1Mode === "sandbox") {
+      banner.dataset.tone = "verified";
+      textEl.appendChild(
+        el(
+          "strong",
+          {},
+          "Sandbox Suy luận Cục bộ Thật (cross_encoder_loaded = true): "
+        )
+      );
+      textEl.appendChild(
+        document.createTextNode(
+          "Đang chạy trực tiếp Student DualHeadCrossEncoder + encoder ViSoBERT cục bộ và trọng số GNN best_sbifagat_vn.pt trên ngữ cảnh Sandbox/tùy chỉnh."
+        )
+      );
     } else {
       banner.dataset.tone = "warning";
       const prefix = isSynth && state.tier1Mode === "real"
@@ -262,7 +276,12 @@
     $("bar-neutral").style.width = `${((sc.neutral || 0) / total) * 100}%`;
     $("bar-oppose").style.width = `${((sc.oppose || 0) / total) * 100}%`;
 
-    $("kpi-k-obs").textContent = `K=${fc.k_observed ?? 0}`;
+    const kObsVal = fc.k_observed ?? 0;
+    const gnnKVal = fc.gnn_k_horizon ?? kObsVal;
+    $("kpi-k-obs").textContent =
+      meta.analysis_mode === "full" && kObsVal !== gnnKVal
+        ? `GNN K=${gnnKVal} · Hiển thị N=${kObsVal}`
+        : `GNN K=${gnnKVal}`;
     $("kpi-stance-counts").textContent =
       `Tán thành: ${sc.support || 0} · Trung lập: ${sc.neutral || 0} · Phản đối: ${sc.oppose || 0}`;
 
@@ -982,7 +1001,7 @@
       topics.forEach((item) => {
         const score = Math.max(0, Math.min(1, Number(item.score ?? item.confidence ?? 0)));
         const labelText = item.label || item.topic || item.id || "Chủ đề";
-        const row = createNode("div", "topic-bar-row");
+        const row = createNode("li", "topic-bar-row");
         const head = createNode("div", "topic-bar-head");
         head.appendChild(createNode("span", "topic-bar-name", labelText));
         head.appendChild(createNode("span", "topic-bar-pct tabular-nums", `${Math.round(score * 100)}%`));
@@ -1056,17 +1075,16 @@
       svg.appendChild(lbl);
     });
 
-    const maxK = Math.max(
-      1,
-      ...points.map((p) => Number(p.k ?? p.milestone_k ?? p.n_replies ?? 1))
-    );
+    const kVals = points.map((p, idx) => Number(p.k ?? p.milestone_k ?? p.n_replies ?? idx + 1));
+    const minK = Math.min(...kVals);
+    const maxK = Math.max(minK + 1, ...kVals);
     const coords = points.map((p, idx) => {
-      const kVal = Number(p.k ?? p.milestone_k ?? p.n_replies ?? idx + 1);
+      const kVal = kVals[idx];
       const yVal = Math.max(0, Math.min(1, Number(p.y_polar ?? p.polar ?? 0)));
       const x =
         points.length === 1
           ? padL + plotW / 2
-          : padL + (idx / Math.max(1, points.length - 1)) * plotW;
+          : padL + ((kVal - minK) / Math.max(1, maxK - minK)) * plotW;
       const y = padT + (1 - yVal) * plotH;
       return { x, y, kVal, yVal, label: p.label || `K=${kVal}` };
     });
@@ -1339,7 +1357,7 @@
   }
 
   // =========================================================================
-  // Tab 2: Macro Network & 6-Model Signed Link Table
+  // Tab 2: Macro Network & 10-Model Signed Link Table
   // =========================================================================
   async function loadTier2Macro() {
     const data = await apiGet("/api/tier2/macro");
@@ -1376,15 +1394,25 @@
       `WCC: ${fmtInt(m.largest_signed_wcc_nodes)} / ${fmtInt(activeUsers)} active (${fmtPct(wccRatioActive, 1)})`;
 
     $("t2-q-signed").textContent = fmtNum(pol.signed_modularity, 4);
-    $("t2-q-sub").textContent = `Q+: ${fmtNum(pol.q_pos, 4)} · Q-: ${fmtNum(pol.q_neg, 4)}`;
+    const qZ = pol.q_signed_z_score;
+    const qP = pol.q_signed_p_value;
+    const nullTag =
+      qZ !== undefined && qP !== undefined
+        ? ` · z=${fmtSigned(qZ, 2)} (p=${Number(qP).toFixed(3)})`
+        : "";
+    $("t2-q-sub").textContent = `Q+: ${fmtNum(pol.q_pos, 4)} · Q-: ${fmtNum(pol.q_neg, 4)}${nullTag}`;
 
     $("t2-rwc").textContent = fmtNum(pol.rwc, 4);
     const camps = m.camp_sizes || [0, 0];
     $("t2-camps").textContent = `Phe 0: ${fmtInt(camps[0])} · Phe 1: ${fmtInt(camps[1])}`;
 
     $("t2-z-score").textContent = fmtSigned(sb.balance_z_score, 2);
+    const weakTag =
+      sb.weak_balance_ratio !== undefined
+        ? ` · Davis yếu: ${fmtPct(sb.weak_balance_ratio, 1)}`
+        : "";
     $("t2-triads").textContent =
-      `Cân bằng: ${fmtPct(sb.balanced_ratio, 1)} vs Null: ${fmtPct(sb.null_balanced_mean, 1)} (${fmtInt(sb.num_triangles)} tam giác)`;
+      `Cân bằng: ${fmtPct(sb.balanced_ratio, 1)} vs Null: ${fmtPct(sb.null_balanced_mean, 1)} (${fmtInt(sb.num_triangles)} tam giác)${weakTag}`;
 
     const withinNeg = Number(pol.within_camp_neg_rate || 0);
     const crossNeg = Number(pol.cross_camp_neg_rate || 0);
@@ -1563,11 +1591,37 @@
             root_text: current.meta?.root_text || root.text || "",
             reply_snippets: snippets,
             custom_topics: rawTopics,
-            lang: current.dataset === "pheme" ? "en" : "vi",
+            lang: current.meta?.lang || "vi",
           });
           const topicPayload = resp.topic_analysis || resp;
-          state.currentPayload = { ...current, topic_analysis: topicPayload };
+          const updatedLarge = current.large_thread_analysis
+            ? {
+                ...current.large_thread_analysis,
+                semantic_understanding: {
+                  ...(current.large_thread_analysis.semantic_understanding || {}),
+                },
+              }
+            : null;
+          if (updatedLarge?.semantic_understanding) {
+            const pTopic = topicPayload.primary_topic || "Chưa xác định";
+            const pPct = `${(Number(topicPayload.primary_confidence ?? 0) * 100).toFixed(1)}%`;
+            const curSum = updatedLarge.semantic_understanding.summary_vi || "";
+            if (curSum) {
+              updatedLarge.semantic_understanding.summary_vi = curSum.replace(
+                /Chủ đề chính:\s*[^.(]+\s*\(độ tin cậy\s*[0-9.,]+%\)/,
+                `Chủ đề chính: ${pTopic} (độ tin cậy ${pPct})`
+              );
+              updatedLarge.semantic_understanding.summary =
+                updatedLarge.semantic_understanding.summary_vi;
+            }
+          }
+          state.currentPayload = {
+            ...current,
+            topic_analysis: topicPayload,
+            ...(updatedLarge ? { large_thread_analysis: updatedLarge } : {}),
+          };
           renderTopicAnalysis(state.currentPayload);
+          if (updatedLarge) renderLargePostUnderstanding(state.currentPayload);
           announce(`Đã phân loại lại chủ đề: ${topicPayload.primary_topic || "Hoàn tất"}.`);
         } catch (err) {
           showError(err.message);

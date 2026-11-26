@@ -711,6 +711,7 @@ def _format_live_result_payload(
         "meta": {
             "cascade_id": cascade_id,
             "topic_id": topic_id,
+            "lang": str(res.get("lang") or "vi"),
             "root_title": title,
             "root_text": root_full_text,
             "analysis_mode": str(res.get("analysis_mode") or "early"),
@@ -887,13 +888,17 @@ class DemoBackend:
         self.web_dir = Path(web_dir)
 
         self._lock = threading.Lock()
+        self._ce_lock = threading.Lock()
         self._gnn_model: SBiFAGAT | None = None
         self._gnn_ckpt_loaded = False
+        self._ce_model: Any = None
+        self._ce_tok: Any = None
+        self._ce_load_attempted = False
         self._threads_ready = False
         self._is_synthetic_fallback = False
         self._thread_summaries: list[dict[str, Any]] = []
         self._threads_by_id: dict[str, dict[str, Any]] = {}
-        self._sandbox_preset_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self._sandbox_preset_cache: dict[tuple[str, ...], dict[str, Any]] = {}
         self._macro_cache: dict[str, Any] | None = None
 
         self._try_load_gnn_checkpoint()
@@ -946,6 +951,25 @@ class DemoBackend:
         except Exception:
             self._gnn_model = None
             self._gnn_ckpt_loaded = False
+
+    def _get_cached_cross_encoder(self) -> tuple[Any, Any] | None:
+        """Load and cache `DualHeadCrossEncoder` once per backend instance."""
+        with self._ce_lock:
+            if self._ce_load_attempted:
+                return (self._ce_model, self._ce_tok) if (self._ce_model is not None and self._ce_tok is not None) else None
+            self._ce_load_attempted = True
+            if not self.live_cross_encoder_available:
+                return None
+            try:
+                from src.nlp.dual_edge_scorer import DualHeadCrossEncoder
+
+                ce_model, ce_tok = DualHeadCrossEncoder.load_checkpoint(self.ce_dir, map_location="cpu")
+                ce_model.eval()
+                self._ce_model = ce_model
+                self._ce_tok = ce_tok
+                return (ce_model, ce_tok)
+            except Exception:
+                return None
 
     def get_health(self) -> dict[str, Any]:
         real_avail = self.real_vn_data_available
@@ -1005,6 +1029,7 @@ class DemoBackend:
         cids_test = pc.unique(nt_test["cascade_id"])
         et_test = edges_tbl.filter(pc.is_in(edges_tbl["cascade_id"], value_set=cids_test))
 
+        nlp_pt = torch.load(self.data_dir / "nlp_features.pt", map_location="cpu", weights_only=False)
         dataset = EarlyCascadeDataset(
             self.data_dir,
             k_horizon=20,
@@ -1013,6 +1038,7 @@ class DemoBackend:
             polar_target_mode="future_only",
             nodes_table=nt_test,
             edges_table=et_test,
+            nlp_features=nlp_pt,
             custom_topic_splits=splits,
             edge_source="auto",
         )
@@ -1031,10 +1057,14 @@ class DemoBackend:
             if cid in selected_cids:
                 edge_meta_by_cascade[cid].append(row)
 
-        nlp_pt = torch.load(self.data_dir / "nlp_features.pt", map_location="cpu", weights_only=False)
         pt_stance = nlp_pt.get("edge_stance") or nlp_pt.get("teacher_edge_stance") or {}
         pt_hostility = nlp_pt.get("edge_hostility") or nlp_pt.get("teacher_edge_hostility") or {}
         del nlp_pt
+
+        cached_ce = self._get_cached_cross_encoder()
+        topic_enc = cached_ce[0].encoder if cached_ce is not None else None
+        topic_tok = cached_ce[1] if cached_ce is not None else None
+        topic_backend_choice: Literal["embedding", "lexical"] = "embedding" if cached_ce is not None else "lexical"
 
         summaries: list[dict[str, Any]] = []
         threads_by_id: dict[str, dict[str, Any]] = {}
@@ -1218,14 +1248,16 @@ class DemoBackend:
             user_graph = _build_thread_user_graph(tree_nodes, tree_edges)
 
             # Classify topic strictly on root + early replies in V_K (zero future leakage).
-            # Use instant lexical scorer during bulk startup cache warmup so /api/tier1/threads never blocks;
-            # /api/tier1/classify_topic and sandbox use backend="auto" (mDeBERTa NLI / encoder).
+            # Reuse cached Transformer encoder (and NLI if locally cached) instead of dropping to lexical.
             topic_analysis = classify_post_topics(
                 title_snip,
                 root_full_text,
                 reply_snippets=[n["text"] for n in tree_nodes[1:6]],
                 lang="vi",
-                backend="lexical",
+                backend=topic_backend_choice,
+                node_encoder=topic_enc,
+                node_tokenizer=topic_tok,
+                allow_nli_download=False,
             )
 
             # Analyze full-thread trajectory across all real replies of the Test cascade
@@ -1393,6 +1425,8 @@ class DemoBackend:
                     "cascade_id": cid,
                     "topic_id": tid,
                     "title_snippet": _clean_title_snippet(f"[Mẫu tổng hợp] {payload['meta']['root_title']}", 120),
+                    "primary_topic": payload["topic_analysis"].get("primary_topic", ""),
+                    "scale_tier": payload["large_thread_analysis"].get("scale_tier", "medium"),
                     "k_observed": payload["forecast"]["k_observed"],
                     "actual_total_replies": payload["forecast"]["actual_total_replies"],
                     "has_future_replies": payload["forecast"]["has_future_replies"],
@@ -1498,6 +1532,7 @@ class DemoBackend:
                 str(k_horizon),
                 str(max_full_comments),
                 topics_cache_key,
+                lang_val,
             )
             with self._lock:
                 cached = self._sandbox_preset_cache.get(cache_key)
@@ -1588,6 +1623,7 @@ class DemoBackend:
             raise ValueError(f"Chế độ sandbox không hợp lệ: {mode!r}")
 
         ce_ckpt = self.ce_dir if self.live_cross_encoder_available else None
+        cached_ce = self._get_cached_cross_encoder()
         gnn_ckpt = self.ckpt_path if self.ckpt_path.is_file() else None
         res = predict_live_cascade(
             post,
@@ -1597,6 +1633,7 @@ class DemoBackend:
             max_full_comments=max_full_comments,
             custom_topics=custom_topics,
             cross_encoder_ckpt=ce_ckpt,
+            preloaded_ce=cached_ce,
             gnn_ckpt=gnn_ckpt,
             lang=lang_val,
             junk_mode=junk_mode,
@@ -1620,6 +1657,7 @@ class DemoBackend:
                 str(k_horizon),
                 str(max_full_comments),
                 topics_cache_key,
+                lang_val,
             )
             with self._lock:
                 self._sandbox_preset_cache[cache_key] = out
@@ -1641,6 +1679,8 @@ class DemoBackend:
         if backend_raw not in {"auto", "nli", "embedding", "lexical"}:
             raise ValueError(f"topic_backend không hợp lệ: {backend_raw!r}")
         backend_lit: Literal["auto", "nli", "embedding", "lexical"] = backend_raw  # type: ignore[assignment]
+        cached_ce = self._get_cached_cross_encoder()
+        allow_nli_dl = bool(payload.get("allow_nli_download", False))
         return classify_post_topics(
             title,
             root_text,
@@ -1648,6 +1688,9 @@ class DemoBackend:
             custom_topics=custom_topics,
             lang=lang_lit,
             backend=backend_lit,
+            node_encoder=cached_ce[0].encoder if cached_ce is not None else None,
+            node_tokenizer=cached_ce[1] if cached_ce is not None else None,
+            allow_nli_download=allow_nli_dl,
         )
 
     def get_tier2_macro(self) -> dict[str, Any]:
@@ -1687,6 +1730,10 @@ class DemoBackend:
                     "trans_roc_auc",
                     "trans_pr_auc",
                     "trans_macro_f1",
+                    "unseen_pair_trans_roc_auc",
+                    "unseen_roc_auc",
+                    "unseen_pr_auc",
+                    "unseen_macro_f1",
                 ):
                     pair = metrics.get(key)
                     if isinstance(pair, (list, tuple)) and len(pair) >= 2:
@@ -1738,12 +1785,13 @@ class DemoBackend:
                 ),
                 (
                     "Cả hai mạng lưới đều phản cân bằng cấu trúc mạnh (anti-balanced): VN z = -15.17 (3.535/5.143 tam giác "
-                    "thuần dấu âm (---)), PHEME z = -4.30 (111/212 tam giác (---)), cho thấy tranh luận đa chiều xung đột dây chuyền."
+                    "thuần dấu âm (---)), PHEME z = -4.30 (111/212 tam giác (---)), nhưng đạt Cân bằng yếu Davis cao "
+                    "(VN 94.05%, PHEME 87.74%) — cho thấy cấu trúc đa phe tranh cãi dây chuyền (k >= 3)."
                 ),
                 (
-                    "Thành phần liên thông lớn nhất có dấu của PHEME rất thưa (10.364 nút trên 16.028 cặp mạnh, "
-                    "bậc trung bình WCC <= 3,09), nên độ phân cực Gómez Q_signed = 0.4000 và RWC = 0.3181 chủ yếu phản ánh "
-                    "phân tách giữa các cụm sự kiện tin đồn (+54,5 điểm phần trăm đối đầu liên phe so với trong phe)."
+                    "Kiểm định hoán vị Null-Graph cho thấy Gómez Q_signed trên VN (0.1988 vs Null 0.1977, z = +0.28, "
+                    "p = 0.333) không vượt ngẫu nhiên kèm RWC âm (-0.0925), trong khi PHEME (10.364 nút WCC, bậc <= 3.09) "
+                    "có Q_signed = 0.4000 thấp hơn Null (0.4716, z = -39.72, p = 1.00) với RWC = 0.3181 phản ánh tách cụm sự kiện."
                 ),
             ],
         }

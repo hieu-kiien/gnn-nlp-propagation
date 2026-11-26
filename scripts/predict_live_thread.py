@@ -65,11 +65,15 @@ from src.nlp.extract_features import (
     encode_node_embeddings,
 )
 from src.nlp.topic_post_analyzer import (
+    PHEME_POLAR_Q50,
+    PHEME_POLAR_Q75,
+    PHEME_POLAR_Q90,
     VN_POLAR_Q50,
     VN_POLAR_Q75,
     VN_POLAR_Q90,
     analyze_large_thread_dynamics,
     classify_post_topics,
+    get_polar_quantiles,
 )
 
 _REDDIT_POST_ID_RE = re.compile(r"/comments/([^/?#]+)")
@@ -95,6 +99,10 @@ _BEHAVIOR_LABEL_VI_2D: dict[str, str] = {
 VN_QUANTILE_CALIBRATION_NOTE: str = (
     "Regime thresholds calibrated strictly on VN Train split "
     "(N=1,050 cascades, K=20, min_total_replies=25, UTC 2025-06-15 to 2026-06-04); zero Val/Test leakage."
+)
+PHEME_QUANTILE_CALIBRATION_NOTE: str = (
+    "Regime thresholds calibrated strictly on PHEME Train split "
+    "(N=1,786 cascades, K=10, min_total_replies=15, 6 Train events); zero Val/Test leakage."
 )
 
 
@@ -486,29 +494,37 @@ def _resolve_nlp_backends(
     node_backbone: str | None,
     lang: str,
     is_demo: bool,
+    preloaded_ce: tuple[DualHeadCrossEncoder, Any] | None = None,
 ) -> tuple[DualHeadCrossEncoder | None, Any | None, Any | None, Any | None, bool, str]:
     """Load available Cross-Encoder & SpanPool backends without unwanted offline downloads."""
     ce_dir = Path(cross_encoder_ckpt) if cross_encoder_ckpt is not None else None
     ce_model: DualHeadCrossEncoder | None = None
     ce_tok: Any | None = None
 
-    has_all_ce_files = bool(
-        ce_dir is not None
-        and ce_dir.is_dir()
-        and all((ce_dir / fname).is_file() for fname in _REQUIRED_CE_FILES)
-    )
-    if has_all_ce_files and ce_dir is not None:
-        try:
-            ce_model, ce_tok = DualHeadCrossEncoder.load_checkpoint(ce_dir, map_location="cpu")
+    if preloaded_ce is not None:
+        ce_model, ce_tok = preloaded_ce
+        if ce_model is not None:
             ce_model.eval()
-        except Exception:
-            ce_model = None
-            ce_tok = None
+    else:
+        has_all_ce_files = bool(
+            ce_dir is not None
+            and ce_dir.is_dir()
+            and all((ce_dir / fname).is_file() for fname in _REQUIRED_CE_FILES)
+        )
+        if has_all_ce_files and ce_dir is not None:
+            try:
+                ce_model, ce_tok = DualHeadCrossEncoder.load_checkpoint(ce_dir, map_location="cpu")
+                ce_model.eval()
+            except Exception:
+                ce_model = None
+                ce_tok = None
 
     backbone_id = node_backbone or (
         VISOBERT_MODEL_NAME if lang == "vi" else TWITTER_ROBERTA_MODEL_NAME
     )
-    allow_net = bool(ce_model is not None and not is_demo)
+    # Only allow network backbone download when explicitly requested via --node-backbone in live mode;
+    # otherwise prefer local HF cache and fall back seamlessly to local ce_model.encoder.
+    allow_net = bool(ce_model is not None and not is_demo and node_backbone is not None)
     frozen_node_encoder = _load_local_model_from_pretrained(backbone_id, allow_network=allow_net)
     frozen_node_tok: Any | None = None
 
@@ -557,16 +573,21 @@ def _classify_2d_behavior_label(s_uv: float, h_uv: float) -> str:
 def _classify_calibrated_regime(
     pred_polar: float,
     behavior_counts: Mapping[str, int] | None = None,
+    *,
+    lang: str = "vi",
 ) -> str:
-    """Classify cascade polarization regime calibrated strictly against VN Train quantiles."""
+    """Classify cascade polarization regime calibrated strictly against Train quantiles."""
     del behavior_counts  # Retained for signature compatibility; counts never override quantiles.
-    if pred_polar >= VN_POLAR_Q90:
-        return "Phân cực xung đột gay gắt (>= Q90 VN Train)"
-    if pred_polar >= VN_POLAR_Q75:
-        return "Phân hóa khá cao (Q75-Q90 VN Train)"
-    if pred_polar >= VN_POLAR_Q50:
-        return "Phân hóa trung bình (Q50-Q75 VN Train)"
-    return "Tương đối đồng thuận / ít chia rẽ (< Q50 VN Train)"
+    lang_norm: Literal["vi", "en"] = "en" if str(lang).lower() == "en" else "vi"
+    q50, q75, q90 = get_polar_quantiles(lang_norm)
+    tag = "PHEME Train" if lang_norm == "en" else "VN Train"
+    if pred_polar >= q90:
+        return f"Phân cực xung đột gay gắt (>= Q90 {tag})"
+    if pred_polar >= q75:
+        return f"Phân hóa khá cao (Q75-Q90 {tag})"
+    if pred_polar >= q50:
+        return f"Phân hóa trung bình (Q50-Q75 {tag})"
+    return f"Tương đối đồng thuận / ít chia rẽ (< Q50 {tag})"
 
 
 def predict_live_cascade(
@@ -580,6 +601,7 @@ def predict_live_cascade(
     topic_backend: Literal["auto", "nli", "embedding", "lexical"] = "auto",
     allow_nli_topic_download: bool = False,
     cross_encoder_ckpt: Path | None = None,
+    preloaded_ce: tuple[DualHeadCrossEncoder, Any] | None = None,
     gnn_ckpt: Path | None = None,
     node_backbone: str | None = None,
     lang: str = "vi",
@@ -650,6 +672,7 @@ def predict_live_cascade(
             node_backbone=node_backbone,
             lang=lang,
             is_demo=is_demo,
+            preloaded_ce=preloaded_ce,
         )
     )
 
@@ -932,7 +955,10 @@ def predict_live_cascade(
         actual_polar_mode = "no_future_replies"
 
     stats_vec = cascade_stats.view(-1).tolist()
-    regimes_polar = _classify_calibrated_regime(raw_pred_polar, behavior_counts)
+    lang_lit: Literal["vi", "en"] = "en" if str(lang).lower() == "en" else "vi"
+    regimes_polar = _classify_calibrated_regime(raw_pred_polar, behavior_counts, lang=lang_lit)
+    q50_ref, q75_ref, q90_ref = get_polar_quantiles(lang_lit)
+    calib_note = PHEME_QUANTILE_CALIBRATION_NOTE if lang_lit == "en" else VN_QUANTILE_CALIBRATION_NOTE
 
     relinked_pair_set: set[tuple[str, str]] = set()
     for item in junk_stats.get("relinked_edge_ids", []):
@@ -974,7 +1000,6 @@ def predict_live_cascade(
         if isinstance(pair, (list, tuple)) and len(pair) == 2:
             imp_by_target[str(pair[1])] = float(trig.get("importance", 0.0))
 
-    lang_lit: Literal["vi", "en"] = "en" if str(lang).lower() == "en" else "vi"
     topic_snippets = [
         str(n.get("text") or "")
         for n in (display_nodes[1:12] if analysis_mode == "full" else gnn_nodes[1:6])
@@ -1026,6 +1051,7 @@ def predict_live_cascade(
 
     return {
         "root_title": str(post.get("title") or root_row["text"][:120]),
+        "lang": lang_lit,
         "analysis_mode": analysis_mode,
         "gnn_k_horizon": len(gnn_nodes) - 1,
         "forecast_scope": "early_k_in_distribution",
@@ -1055,11 +1081,11 @@ def predict_live_cascade(
         "predicted_polarization_score": raw_pred_polar,
         "predicted_regime": regimes_polar,
         "regime_thresholds": {
-            "q50": VN_POLAR_Q50,
-            "q75": VN_POLAR_Q75,
-            "q90": VN_POLAR_Q90,
+            "q50": q50_ref,
+            "q75": q75_ref,
+            "q90": q90_ref,
         },
-        "note": VN_QUANTILE_CALIBRATION_NOTE,
+        "note": calib_note,
         "confidence_score": conf_score,
         "uncertainty_available": uncertainty_available,
         "low_signal_warning": bool(diag["low_signal_warning"].view(-1)[0].item()),
@@ -1183,7 +1209,7 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
                 f"{large_info.get('scale_label_vi', '')} ({large_info.get('total_replies_analyzed', 0)} binh luan, {large_info.get('unique_authors_total', 0)} tac gia)",
                 f"  - Tinh chat thao luan                    : {large_info.get('post_archetype_label_vi', '')}",
                 f"  - Xu huong tien hoa                      : {large_info.get('evolution_trend_label_vi', '')}",
-                f"  - Tom tat AI                             : {sem_info.get('summary_vi', '')}",
+                f"  - Tong hop trich xuat (Extractive)       : {sem_info.get('summary_vi', '')}",
             ]
         )
     lines.append("=" * 78)
@@ -1211,6 +1237,11 @@ def main() -> None:
     parser.add_argument("--max-full-comments", type=int, default=500)
     parser.add_argument("--topics", type=str, default=None, help="Danh sach chu de tuy chinh (ngan cach bang dau phay).")
     parser.add_argument("--topic-backend", choices=["auto", "nli", "embedding", "lexical"], default="auto")
+    parser.add_argument(
+        "--allow-nli-topic-download",
+        action="store_true",
+        help="Cho phep tai mDeBERTa-v3-xnli tu HuggingFace neu chua co trong cache cuc bo.",
+    )
     parser.add_argument("--lang", choices=["vi", "en"], default="vi")
     parser.add_argument("--junk-mode", choices=["prune", "contract"], default="prune")
     parser.add_argument("--output-json", type=Path, default=None)
@@ -1247,6 +1278,7 @@ def main() -> None:
         max_full_comments=args.max_full_comments,
         custom_topics=args.topics,
         topic_backend=args.topic_backend,
+        allow_nli_topic_download=args.allow_nli_topic_download,
         cross_encoder_ckpt=args.cross_encoder_ckpt,
         gnn_ckpt=args.gnn_ckpt,
         node_backbone=args.node_backbone,

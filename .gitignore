@@ -97,3 +97,7 @@ archive/docs_v1/paper/*.toc
 # Generated Word reports
 reports/*.docx
 archive/docs_v1/reports/*.docx
+
+# Private defense notes / instructor grading transcripts (never push to public repo)
+*thầy chấm*.txt
+*_notes.txt

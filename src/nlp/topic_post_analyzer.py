@@ -34,11 +34,23 @@ from src.nlp.dual_edge_scorer import MDEBERTA_NLI_MODEL_NAME
 from src.nlp.extract_features import compute_masked_mean_pooling
 from src.utils.text import normalize_nfc
 
-# Canonical empirical future_only y_polar quantiles computed strictly on the VN Train split
-# (N = 1,050 cascades, K = 20, min_total_replies = 25, topic_splits.json train split only).
+# Canonical empirical future_only y_polar quantiles computed strictly on Train splits
+# (zero Val/Test leakage).
+# VN: N = 1,050 cascades, K = 20, min_total_replies = 25, topic_splits.json train split only.
 VN_POLAR_Q50: float = 0.0927623026072979
 VN_POLAR_Q75: float = 0.12019770219922066
 VN_POLAR_Q90: float = 0.15035123974084857
+# PHEME: N = 1,786 cascades, K = 10, min_total_replies = 15, topic_splits.json train split only.
+PHEME_POLAR_Q50: float = 0.06384398415684700
+PHEME_POLAR_Q75: float = 0.09671241976320744
+PHEME_POLAR_Q90: float = 0.13436114042997360
+
+
+def get_polar_quantiles(lang: Literal["vi", "en"] = "vi") -> tuple[float, float, float]:
+    """Return Train-calibrated `(q50, q75, q90)` polarization thresholds for `vi` or `en`."""
+    if str(lang).lower() == "en":
+        return (PHEME_POLAR_Q50, PHEME_POLAR_Q75, PHEME_POLAR_Q90)
+    return (VN_POLAR_Q50, VN_POLAR_Q75, VN_POLAR_Q90)
 
 DEFAULT_TOPICS_VI: tuple[dict[str, str], ...] = (
     {
@@ -133,6 +145,13 @@ _SCALE_LABELS_VI: dict[str, str] = {
     "mega": "Bài rất lớn / Bùng nổ",
 }
 
+_SCALE_LABELS_EN: dict[str, str] = {
+    "small": "Small / Early Thread",
+    "medium": "Medium Thread",
+    "large": "Large Thread",
+    "mega": "Mega / Viral Thread",
+}
+
 _ARCHETYPE_LABELS_VI: dict[str, str] = {
     "hostile_flamewar": "Xung đột gay gắt / Bùng nổ",
     "bipolar_debate": "Phân cực lưỡng cực rõ rệt",
@@ -141,11 +160,26 @@ _ARCHETYPE_LABELS_VI: dict[str, str] = {
     "exploratory_neutral": "Thảo luận trung lập / Trao đổi thông tin",
 }
 
+_ARCHETYPE_LABELS_EN: dict[str, str] = {
+    "hostile_flamewar": "High-Hostility Flamewar",
+    "bipolar_debate": "Bipolar Debate",
+    "consensus_support": "Supportive Consensus",
+    "constructive_critique": "Constructive Critique",
+    "exploratory_neutral": "Exploratory / Neutral Exchange",
+}
+
 _TREND_LABELS_VI: dict[str, str] = {
     "escalating": "Gia tăng phân cực theo thời gian",
     "de_escalating": "Hạ nhiệt / Hội tụ dần",
     "stable": "Ổn định quanh ngưỡng ban đầu",
     "single_window": "Chưa đủ bình luận hậu K để đo xu hướng",
+}
+
+_TREND_LABELS_EN: dict[str, str] = {
+    "escalating": "Escalating polarization over time",
+    "de_escalating": "De-escalating / Converging",
+    "stable": "Stable around early baseline",
+    "single_window": "Insufficient post-K replies for trend",
 }
 
 _SPLIT_CUSTOM_TOPICS_RE = re.compile(r"[,;\r\n]+")
@@ -197,6 +231,8 @@ _VI_STOPWORDS: frozenset[str] = frozenset(
 
 _NLI_LOCK = threading.Lock()
 _NLI_CACHE: dict[str, tuple[Any, Any, int, int] | None] = {}
+_ENC_CAND_LOCK = threading.Lock()
+_ENC_CAND_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
 
 
 def _strip_accents(text: str) -> str:
@@ -290,6 +326,21 @@ def _get_cached_nli_model(
             return _NLI_CACHE[model_name]
 
         local_only = not allow_download
+        if local_only and not Path(model_name).exists():
+            import os
+
+            hf_hub_env = os.environ.get("HF_HUB_CACHE")
+            hf_home_env = os.environ.get("HF_HOME")
+            if hf_hub_env:
+                hf_hub = Path(hf_hub_env)
+            elif hf_home_env:
+                hf_hub = Path(hf_home_env) / "hub"
+            else:
+                hf_hub = Path.home() / ".cache" / "huggingface" / "hub"
+            snap_dir = hf_hub / f"models--{model_name.replace('/', '--')}" / "snapshots"
+            if not snap_dir.is_dir() or not any(snap_dir.iterdir()):
+                _NLI_CACHE[model_name] = None
+                return None
         try:
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
@@ -321,16 +372,16 @@ def _score_topics_with_nli(
     model, tok, ent_idx, con_idx = nli_bundle
     model = model.to(device)
     if lang == "en":
-        hypotheses = [f"This discussion thread is about {c['description']}." for c in candidates]
+        hypotheses = [f"This text is about {c['label']}." for c in candidates]
     else:
-        hypotheses = [f"Bài thảo luận này nói về chủ đề {c['description']}." for c in candidates]
+        hypotheses = [f"Văn bản này nói về {c['label']}." for c in candidates]
 
     enc = tok(
         [context_text] * len(candidates),
         hypotheses,
         padding=True,
         truncation=True,
-        max_length=320,
+        max_length=192,
         return_tensors="pt",
     )
     enc = {k: v.to(device) for k, v in enc.items()}
@@ -350,23 +401,53 @@ def _score_topics_with_encoder(
     node_tokenizer: Any,
     device: torch.device,
 ) -> tuple[list[float], list[float]]:
-    all_texts = [context_text] + [f"{c['label']}: {c['description']}" for c in candidates]
-    enc = node_tokenizer(
-        all_texts,
-        padding=True,
-        truncation=True,
-        max_length=256,
-        return_tensors="pt",
-    )
-    enc = {k: v.to(device) for k, v in enc.items()}
+    try:
+        target_dev = next(node_encoder.parameters()).device
+    except StopIteration:
+        target_dev = device
+
+    cand_texts = [f"{c['label']}: {c['description']}" for c in candidates]
+    cache_key = (id(node_encoder), str(target_dev), tuple(cand_texts))
+    with _ENC_CAND_LOCK:
+        cached_cand_vecs = _ENC_CAND_CACHE.get(cache_key)
+
     node_encoder.eval()
-    with torch.no_grad():
-        out = node_encoder(**enc)
-        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
-        pooled = compute_masked_mean_pooling(hidden, enc["attention_mask"])
-        pooled = F.normalize(pooled, p=2, dim=-1)
-    ctx_vec = pooled[0:1]
-    cand_vecs = pooled[1:]
+    if cached_cand_vecs is not None:
+        enc_ctx = node_tokenizer(
+            [context_text],
+            padding=True,
+            truncation=True,
+            max_length=256,
+            return_tensors="pt",
+        )
+        enc_ctx = {k: v.to(target_dev) for k, v in enc_ctx.items()}
+        with torch.no_grad():
+            out = node_encoder(**enc_ctx)
+            hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+            ctx_vec = F.normalize(compute_masked_mean_pooling(hidden, enc_ctx["attention_mask"]), p=2, dim=-1)
+        cand_vecs = cached_cand_vecs.to(target_dev)
+    else:
+        all_texts = [context_text] + cand_texts
+        enc = node_tokenizer(
+            all_texts,
+            padding=True,
+            truncation=True,
+            max_length=256,
+            return_tensors="pt",
+        )
+        enc = {k: v.to(target_dev) for k, v in enc.items()}
+        with torch.no_grad():
+            out = node_encoder(**enc)
+            hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+            pooled = compute_masked_mean_pooling(hidden, enc["attention_mask"])
+            pooled = F.normalize(pooled, p=2, dim=-1)
+        ctx_vec = pooled[0:1]
+        cand_vecs = pooled[1:]
+        with _ENC_CAND_LOCK:
+            if len(_ENC_CAND_CACHE) >= 64:
+                _ENC_CAND_CACHE.clear()
+            _ENC_CAND_CACHE[cache_key] = cand_vecs.detach().cpu()
+
     sims = torch.matmul(cand_vecs, ctx_vec.squeeze(0))
     relevances = ((sims + 1.0) * 0.5).clamp(0.0, 1.0).detach().cpu().tolist()
     scores = F.softmax(sims / 0.08, dim=0).detach().cpu().tolist()
@@ -414,8 +495,9 @@ def _score_topics_lexical(
             dot = sum(val * cand_w[k] for k, val in ctx_w.items() if k in cand_w)
             sim = dot / (ctx_norm * cand_norm)
         label_ascii = _strip_accents(c["label"].lower()).strip()
-        if label_ascii and len(label_ascii) >= 2 and label_ascii in ctx_ascii:
-            sim += 0.35
+        if label_ascii and len(label_ascii) >= 2:
+            if re.search(rf"(?<![a-z0-9]){re.escape(label_ascii)}(?![a-z0-9])", ctx_ascii):
+                sim += 0.35
         sims.append(float(sim))
 
     max_sim = max(sims) if sims else 0.0
@@ -551,18 +633,23 @@ def _classify_post_archetype(
     oppose_ratio: float,
     hostile_ratio: float,
     total_replies: int,
-) -> tuple[str, str]:
+    lang: Literal["vi", "en"] = "vi",
+) -> tuple[str, str, str]:
+    _, q75, q90 = get_polar_quantiles(lang)
+    q50, _, _ = get_polar_quantiles(lang)
     if total_replies == 0:
-        return "exploratory_neutral", _ARCHETYPE_LABELS_VI["exploratory_neutral"]
-    if hostile_ratio >= 0.20 or (full_polar >= VN_POLAR_Q90 and hostile_ratio >= 0.12):
-        return "hostile_flamewar", _ARCHETYPE_LABELS_VI["hostile_flamewar"]
-    if full_polar >= VN_POLAR_Q75 or (support_ratio >= 0.20 and oppose_ratio >= 0.20):
-        return "bipolar_debate", _ARCHETYPE_LABELS_VI["bipolar_debate"]
-    if support_ratio >= 0.45 and oppose_ratio <= 0.15 and hostile_ratio < 0.10:
-        return "consensus_support", _ARCHETYPE_LABELS_VI["consensus_support"]
-    if oppose_ratio >= 0.25 or full_polar >= VN_POLAR_Q50:
-        return "constructive_critique", _ARCHETYPE_LABELS_VI["constructive_critique"]
-    return "exploratory_neutral", _ARCHETYPE_LABELS_VI["exploratory_neutral"]
+        key = "exploratory_neutral"
+    elif hostile_ratio >= 0.20 or (full_polar >= q90 and hostile_ratio >= 0.12):
+        key = "hostile_flamewar"
+    elif full_polar >= q75 or (support_ratio >= 0.20 and oppose_ratio >= 0.20):
+        key = "bipolar_debate"
+    elif support_ratio >= 0.45 and oppose_ratio <= 0.15 and hostile_ratio < 0.10:
+        key = "consensus_support"
+    elif oppose_ratio >= 0.25 or full_polar >= q50:
+        key = "constructive_critique"
+    else:
+        key = "exploratory_neutral"
+    return key, _ARCHETYPE_LABELS_VI[key], _ARCHETYPE_LABELS_EN[key]
 
 
 def analyze_large_thread_dynamics(
@@ -578,8 +665,8 @@ def analyze_large_thread_dynamics(
     lang: Literal["vi", "en"] = "vi",
     scope: Literal["early_post_hoc", "full_analysis"] = "full_analysis",
 ) -> dict[str, Any]:
-    """Compute multi-milestone polarization trajectory and semantic understanding for a full post."""
-    del lang  # Output descriptions follow Vietnamese academic reporting conventions.
+    """Compute multi-milestone polarization trajectory and extractive discourse summary for a full post."""
+    lang_norm: Literal["vi", "en"] = "en" if str(lang).lower() == "en" else "vi"
     root_id = str(root_node["node_id"])
     non_roots = [n for n in all_nodes if str(n["node_id"]) != root_id]
 
@@ -598,6 +685,7 @@ def analyze_large_thread_dynamics(
     non_roots.sort(key=_sort_key)
     total_replies = len(non_roots)
     scale_tier, scale_label_vi = _classify_scale_tier(total_replies)
+    scale_label_en = _SCALE_LABELS_EN[scale_tier]
 
     children_adj: dict[str, list[str]] = {root_id: []}
     edge_lookup: dict[tuple[str, str], dict[str, str]] = {}
@@ -645,7 +733,7 @@ def analyze_large_thread_dynamics(
             if src in prefix_ids and dst in prefix_ids:
                 pref_adj.setdefault(src, []).append(dst)
                 pref_lookup[(src, dst)] = e_row
-        pref_aligned, _ = _compute_root_aligned_stances_and_orientations(
+        pref_aligned, pref_orientations = _compute_root_aligned_stances_and_orientations(
             root_id=root_id,
             children_adj=pref_adj,
             edge_lookup=pref_lookup,
@@ -661,7 +749,7 @@ def analyze_large_thread_dynamics(
         authors_k: set[str] = set()
         for idx_n, n in enumerate(prefix_nodes):
             nid = str(n["node_id"])
-            ori = float(node_orientations.get(nid, 0.0))
+            ori = float(pref_orientations.get(nid, 0.0))
             _, h_uv = edge_score_by_target.get(nid, (0.0, 0.0))
             if ori > 0.1:
                 sup_c += 1
@@ -701,10 +789,12 @@ def analyze_large_thread_dynamics(
 
     if total_replies <= k_early_ref or len(trajectory) < 2:
         evolution_trend = "single_window"
-        early_ref_polar = trajectory[0]["y_polar"] if trajectory else full_y_polar
+        ref_k = int(trajectory[0]["k"]) if trajectory else int(total_replies)
+        early_ref_polar = float(trajectory[0]["y_polar"]) if trajectory else full_y_polar
         polar_delta = 0.0
     else:
         ref_pt = next((pt for pt in trajectory if pt["k"] >= k_early_ref), trajectory[0])
+        ref_k = int(ref_pt["k"])
         early_ref_polar = float(ref_pt["y_polar"])
         polar_delta = full_y_polar - early_ref_polar
         if polar_delta >= 0.025:
@@ -714,12 +804,13 @@ def analyze_large_thread_dynamics(
         else:
             evolution_trend = "stable"
 
-    archetype, archetype_label_vi = _classify_post_archetype(
+    archetype, archetype_label_vi, archetype_label_en = _classify_post_archetype(
         full_y_polar,
         support_ratio=float(final_pt["support_ratio"]),
         oppose_ratio=float(final_pt["oppose_ratio"]),
         hostile_ratio=float(final_pt["hostile_ratio"]),
         total_replies=total_replies,
+        lang=lang_norm,
     )
 
     pro_candidates: list[tuple[float, dict[str, Any]]] = []
@@ -773,38 +864,60 @@ def analyze_large_thread_dynamics(
 
     if total_replies == 0:
         summary_vi = (
-            f"Bài viết thuộc chủ đề \"{primary_topic}\" hiện chưa có bình luận phản hồi hợp lệ."
+            f"Tổng hợp trích xuất: Bài viết thuộc chủ đề \"{primary_topic}\" hiện chưa có bình luận phản hồi hợp lệ."
+        )
+        summary_en = (
+            f"Extractive synthesis: Post under topic \"{primary_topic}\" currently has no valid replies."
         )
     else:
-        trend_phrase = (
+        trend_phrase_vi = (
             f"xu hướng {(_TREND_LABELS_VI.get(evolution_trend, evolution_trend)).lower()} "
-            f"(y_polar từ {early_ref_polar:.3f} ở K={min(total_replies, k_early_ref)} "
+            f"(y_polar từ {early_ref_polar:.3f} ở K={ref_k} "
             f"đến {full_y_polar:.3f} toàn cây)"
             if evolution_trend != "single_window"
             else f"độ phân cực quan sát y_polar = {full_y_polar:.3f}"
         )
         summary_vi = (
-            f"Chủ đề chính: {primary_topic} (độ tin cậy {primary_conf:.1%}). "
+            f"Tổng hợp trích xuất — Chủ đề chính: {primary_topic} (độ tin cậy {primary_conf:.1%}). "
             f"Cấu trúc quy mô \"{scale_label_vi}\" gồm {total_replies} bình luận từ {len(all_authors)} tác giả "
-            f"(độ sâu tối đa {max_depth} tầng), mang tính chất \"{archetype_label_vi}\" "
+            f"(độ sâu tối đa {max_depth} tầng), hình thái \"{archetype_label_vi}\" "
             f"(Tán thành {final_pt['support_ratio']:.0%}, Phản đối {final_pt['oppose_ratio']:.0%}, "
-            f"Gay gắt {final_pt['hostile_ratio']:.0%}) với {trend_phrase}."
+            f"Gay gắt {final_pt['hostile_ratio']:.0%}) với {trend_phrase_vi}."
+        )
+        trend_phrase_en = (
+            f"{_TREND_LABELS_EN.get(evolution_trend, evolution_trend).lower()} "
+            f"(y_polar from {early_ref_polar:.3f} at K={ref_k} "
+            f"to {full_y_polar:.3f} full-tree)"
+            if evolution_trend != "single_window"
+            else f"observed y_polar = {full_y_polar:.3f}"
+        )
+        summary_en = (
+            f"Extractive synthesis — Primary topic: {primary_topic} ({primary_conf:.1%} confidence). "
+            f"\"{scale_label_en}\" with {total_replies} replies from {len(all_authors)} authors "
+            f"(max depth {max_depth}), pattern \"{archetype_label_en}\" "
+            f"(Support {final_pt['support_ratio']:.0%}, Oppose {final_pt['oppose_ratio']:.0%}, "
+            f"Hostile {final_pt['hostile_ratio']:.0%}), {trend_phrase_en}."
         )
 
     return {
+        "lang": lang_norm,
         "scope": scope,
         "total_replies_analyzed": total_replies,
         "unique_authors_total": len(all_authors),
         "max_depth": max_depth,
         "scale_tier": scale_tier,
         "scale_label_vi": scale_label_vi,
+        "scale_label_en": scale_label_en,
         "full_y_polar": round(full_y_polar, 4),
+        "early_ref_k": ref_k,
         "early_ref_y_polar": round(float(early_ref_polar), 4),
         "polar_delta": round(float(polar_delta), 4),
         "evolution_trend": evolution_trend,
         "evolution_trend_label_vi": _TREND_LABELS_VI[evolution_trend],
+        "evolution_trend_label_en": _TREND_LABELS_EN[evolution_trend],
         "post_archetype": archetype,
         "post_archetype_label_vi": archetype_label_vi,
+        "post_archetype_label_en": archetype_label_en,
         "stance_ratios_full": {
             "support": float(final_pt["support_ratio"]),
             "oppose": float(final_pt["oppose_ratio"]),
@@ -813,7 +926,10 @@ def analyze_large_thread_dynamics(
         },
         "polarization_trajectory": trajectory,
         "semantic_understanding": {
+            "synthesis_method": "extractive_quantitative",
+            "summary": summary_en if lang_norm == "en" else summary_vi,
             "summary_vi": summary_vi,
+            "summary_en": summary_en,
             "top_pro_arguments": [item[1] for item in pro_candidates[:3]],
             "top_anti_arguments": [item[1] for item in anti_candidates[:3]],
             "flashpoint_comments": [item[1] for item in flash_candidates[:3]],

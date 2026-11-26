@@ -422,3 +422,6 @@ def test_static_web_assets_are_offline_and_clean() -> None:
     assert "active_graph_users" in js
     assert "largest_signed_wcc_ratio_active" in js
     assert "N/A (disabled)" in js
+    assert 'createNode("div", "topic-bar-row")' not in js
+    assert 'createNode("li", "topic-bar-row")' in js
+    assert 'state.tier1Mode === "sandbox"' in js

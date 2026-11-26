@@ -286,6 +286,68 @@ def test_analyze_large_thread_dynamics_120_comments_and_empty_case():
     assert empty["polarization_trajectory"] == []
 
 
+def test_lexical_custom_topic_ai_no_false_substring_match_and_en_quantiles():
+    """Step 1 regressions: 'AI' must not match 'bài'/'phải'/'sai'; EN uses PHEME quantiles; prefix orientations stay causal."""
+    res_sub = classify_post_topics(
+        "Bài viết này phải xem lại vì có nhiều lỗi sai về tài chính ngân hàng",
+        "Hỏi về lãi suất vay mua nhà và quy trình giải ngân.",
+        custom_topics="AI, Tài chính ngân hàng",
+        lang="vi",
+        backend="lexical",
+        allow_nli_download=False,
+    )
+    scores_by_lbl = {t["label"]: t["score"] for t in res_sub["topics"]}
+    assert res_sub["primary_topic"] == "Tài chính ngân hàng"
+    assert scores_by_lbl["Tài chính ngân hàng"] > scores_by_lbl["AI"]
+
+    # English thread uses PHEME Train quantiles and produces summary_en
+    root_en = {
+        "node_id": "root",
+        "author_hash": "u0",
+        "text": "Breaking report on downtown security lockdown",
+        "created_at_utc": 1_700_000_000.0,
+    }
+    nodes_en = [root_en]
+    edges_en = []
+    scores_en: dict[str, dict[str, float]] = {}
+    depths_en = {"root": 0}
+    for i in range(1, 26):
+        nid = f"e_{i:02d}"
+        # c1..c20: only child c1 opposes root; c2..c20 oppose c1 -> causal orientation under root->c1->c_i
+        pid = "root" if i == 1 else ("e_01" if i <= 20 else "root")
+        s_uv = -0.8 if i <= 20 else 0.7
+        nodes_en.append(
+            {
+                "node_id": nid,
+                "parent_id": pid,
+                "author_hash": f"eu_{i}",
+                "text": f"Comment body with enough words number {i} for analysis.",
+                "created_at_utc": float(1_700_000_000 + i * 30),
+            }
+        )
+        eid = f"{pid}->{nid}"
+        edges_en.append({"edge_id": eid, "source_id": pid, "target_id": nid})
+        scores_en[eid] = {"s_uv": s_uv, "h_uv": 0.05}
+        depths_en[nid] = 1 if pid == "root" else 2
+
+    dyn_en = analyze_large_thread_dynamics(
+        root_node=root_en,
+        all_nodes=nodes_en,
+        all_edges=edges_en,
+        edge_scores=scores_en,
+        depth_map=depths_en,
+        topic_analysis={"primary_topic": "Breaking News & Rumors", "primary_confidence": 0.8},
+        k_early_ref=15,
+        lang="en",
+        scope="full_analysis",
+    )
+    assert dyn_en["lang"] == "en"
+    assert dyn_en["early_ref_k"] == 20
+    assert "at K=20" in dyn_en["semantic_understanding"]["summary_en"]
+    assert "ở K=20" in dyn_en["semantic_understanding"]["summary_vi"]
+    assert dyn_en["semantic_understanding"]["summary"] == dyn_en["semantic_understanding"]["summary_en"]
+
+
 def test_predict_live_cascade_early_vs_full_mode_and_report(tmp_path: Path):
     post = {
         "id": "post_large_test",
@@ -435,3 +497,112 @@ def test_demo_web_server_large_preset_and_classify_topic_endpoint(tmp_path: Path
         server.shutdown()
         server.server_close()
         thread.join(timeout=2.0)
+
+
+def test_get_cached_nli_model_respects_hf_home(tmp_path: Path, monkeypatch):
+    import sys
+    import types
+    import src.nlp.topic_post_analyzer as tpa
+
+    model_id = "org/fake-nli-model"
+    snap = tmp_path / "hub" / f"models--{model_id.replace('/', '--')}" / "snapshots" / "rev1"
+    snap.mkdir(parents=True, exist_ok=True)
+    (snap / "config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.setattr(tpa, "_NLI_CACHE", {})
+
+    seen_calls: list[tuple[str, bool]] = []
+
+    class _DummyCfg:
+        label2id = {"entailment": 0, "neutral": 1, "contradiction": 2}
+
+    class _DummyModel:
+        config = _DummyCfg()
+
+        def eval(self):
+            return self
+
+        def parameters(self):
+            return []
+
+    class _FakeTok:
+        @classmethod
+        def from_pretrained(cls, name, local_files_only=False):
+            seen_calls.append(("tok", bool(local_files_only)))
+            return object()
+
+    class _FakeModel:
+        @classmethod
+        def from_pretrained(cls, name, local_files_only=False):
+            seen_calls.append(("model", bool(local_files_only)))
+            return _DummyModel()
+
+    fake_tf = types.SimpleNamespace(
+        AutoTokenizer=_FakeTok,
+        AutoModelForSequenceClassification=_FakeModel,
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_tf)
+
+    bundle = tpa._get_cached_nli_model(model_id, allow_download=False)
+    assert bundle is not None
+    assert seen_calls == [("tok", True), ("model", True)]
+    assert bundle[2:] == (0, 2)
+
+
+def test_score_topics_with_nli_uses_concise_short_label_hypotheses():
+    import src.nlp.topic_post_analyzer as tpa
+
+    captured: dict[str, Any] = {}
+
+    class _FakeTok:
+        def __call__(self, premises, hypotheses, **kwargs):
+            captured["premises"] = list(premises)
+            captured["hypotheses"] = list(hypotheses)
+            captured["max_length"] = kwargs.get("max_length")
+            n = len(hypotheses)
+            return {"input_ids": torch.ones((n, 4), dtype=torch.long)}
+
+    class _FakeModel:
+        def to(self, dev):
+            return self
+
+        def __call__(self, **enc):
+            n = enc["input_ids"].shape[0]
+            logits = torch.tensor([[3.0, 0.0, -2.0] if i == 0 else [-2.0, 0.0, 2.0] for i in range(n)])
+            return type("Out", (), {"logits": logits})()
+
+    cands = [
+        {"id": "t1", "label": "Giao thông đô thị", "description": "mạng xã hội ùn tắc đường sắt dài dòng"},
+        {"id": "t2", "label": "Tài chính", "description": "lãi suất ngân hàng dài dòng"},
+    ]
+    sc_vi, _ = tpa._score_topics_with_nli(
+        "Đề xuất mở rộng tuyến metro.",
+        cands,
+        nli_bundle=(_FakeModel(), _FakeTok(), 0, 2),
+        lang="vi",
+        device=torch.device("cpu"),
+    )
+    assert sc_vi[0] > sc_vi[1]
+    assert captured["hypotheses"] == [
+        "Văn bản này nói về Giao thông đô thị.",
+        "Văn bản này nói về Tài chính.",
+    ]
+    assert captured["max_length"] == 192
+
+    cands_en = [
+        {"id": "e1", "label": "Paris Satirical Newspaper Attack", "description": "long keyword bag"},
+        {"id": "e2", "label": "Australian Cafe Hostage Standoff", "description": "another bag"},
+    ]
+    tpa._score_topics_with_nli(
+        "Gunman attack in Paris.",
+        cands_en,
+        nli_bundle=(_FakeModel(), _FakeTok(), 0, 2),
+        lang="en",
+        device=torch.device("cpu"),
+    )
+    assert captured["hypotheses"] == [
+        "This text is about Paris Satirical Newspaper Attack.",
+        "This text is about Australian Cafe Hostage Standoff.",
+    ]
