@@ -1,0 +1,821 @@
+"""Zero-shot AI topic classification and full-thread large-post discourse analyzer.
+
+Extends SBi-FAGAT beyond the fixed early-horizon (`K=20` / `K=10`) snapshot so both
+research evaluations and the interactive Demo Web MVP can:
+  1. Classify arbitrary posts and discussions under either standard Vietnamese/English
+     topic taxonomies or user-specified custom topics (`mDeBERTa` zero-shot NLI when
+     available, Transformer cosine embedding over `ViSoBERT`/`Twitter-RoBERTa`, or an
+     honest deterministic lexical n-gram fallback offline).
+  2. Analyze full large discussion trees (`N >> 20`, up to hundreds of replies): track
+     how polarization `y_polar` evolves across milestones (`K=5, 10, 20, ..., N`),
+     assign quantitative discourse archetypes grounded in VN-Train quantiles, and surface
+     key arguments on both sides plus top conflict flashpoints without violating the
+     frozen Tier-1 early-horizon evaluation benchmark.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+import threading
+import unicodedata
+from collections import Counter
+from pathlib import Path
+from typing import Any, Literal, Mapping, Sequence
+
+import torch
+import torch.nn.functional as F
+
+from src.data.pyg_dataset import (
+    _compute_full_tree_polarization,
+    _compute_root_aligned_stances_and_orientations,
+)
+from src.nlp.dual_edge_scorer import MDEBERTA_NLI_MODEL_NAME
+from src.nlp.extract_features import compute_masked_mean_pooling
+from src.utils.text import normalize_nfc
+
+# Canonical empirical future_only y_polar quantiles computed strictly on the VN Train split
+# (N = 1,050 cascades, K = 20, min_total_replies = 25, topic_splits.json train split only).
+VN_POLAR_Q50: float = 0.0927623026072979
+VN_POLAR_Q75: float = 0.12019770219922066
+VN_POLAR_Q90: float = 0.15035123974084857
+
+DEFAULT_TOPICS_VI: tuple[dict[str, str], ...] = (
+    {
+        "id": "policy_traffic",
+        "label": "Chính sách & Giao thông",
+        "description": "Chính sách công, pháp luật, quy định nhà nước, thuế phí và giao thông đô thị đường bộ xe cộ phạt nguội",
+    },
+    {
+        "id": "economy_finance",
+        "label": "Kinh tế & Tài chính",
+        "description": "Kinh tế, tài chính cá nhân, đầu tư, chứng khoán, ngân hàng, lương giá cả và bất động sản",
+    },
+    {
+        "id": "tech_ai",
+        "label": "Công nghệ & AI",
+        "description": "Công nghệ thông tin, lập trình phần mềm, trí tuệ nhân tạo AI, dữ liệu, bảo mật và thiết bị số",
+    },
+    {
+        "id": "education_career",
+        "label": "Giáo dục & Nghề nghiệp",
+        "description": "Giáo dục, đại học, sinh viên, tuyển dụng, việc làm IT, môi trường công sở, hybrid WFH và lương thưởng",
+    },
+    {
+        "id": "society_life",
+        "label": "Đời sống & Xã hội",
+        "description": "Đời sống xã hội, gia đình, tâm lý, ứng xử cộng đồng, văn hóa tranh luận và các mối quan hệ",
+    },
+    {
+        "id": "health_lifestyle",
+        "label": "Sức khỏe & Lối sống",
+        "description": "Sức khỏe, y tế, bệnh viện, dinh dưỡng, luyện tập thể thao và thói quen sinh hoạt",
+    },
+    {
+        "id": "entertainment_media",
+        "label": "Giải trí & Truyền thông",
+        "description": "Giải trí, phim ảnh, âm nhạc, trò chơi điện tử, mạng xã hội và văn hóa đại chúng",
+    },
+    {
+        "id": "news_controversy",
+        "label": "Thời sự & Tranh cãi",
+        "description": "Tin tức thời sự nóng, sự kiện dư luận, tin đồn kiểm chứng và tranh cãi đa chiều trên mạng",
+    },
+)
+
+DEFAULT_TOPICS_EN: tuple[dict[str, str], ...] = (
+    {
+        "id": "policy_traffic",
+        "label": "Policy, Law & Governance",
+        "description": "Public policy, law, government regulation, policing, civic infrastructure and urban transit",
+    },
+    {
+        "id": "economy_finance",
+        "label": "Economy & Finance",
+        "description": "Economics, personal finance, markets, inflation, taxation, business and housing",
+    },
+    {
+        "id": "tech_ai",
+        "label": "Technology & AI",
+        "description": "Software engineering, artificial intelligence, computing hardware, cybersecurity and digital platforms",
+    },
+    {
+        "id": "education_career",
+        "label": "Education & Career",
+        "description": "Universities, learning, hiring, workplace culture, remote work, engineering teams and careers",
+    },
+    {
+        "id": "society_life",
+        "label": "Society & Community",
+        "description": "Social norms, family, daily life, interpersonal ethics and community discourse",
+    },
+    {
+        "id": "health_lifestyle",
+        "label": "Health & Lifestyle",
+        "description": "Public health, medicine, nutrition, mental wellbeing and fitness",
+    },
+    {
+        "id": "entertainment_media",
+        "label": "Entertainment & Media",
+        "description": "Movies, music, gaming, social media trends and pop culture",
+    },
+    {
+        "id": "news_controversy",
+        "label": "Breaking News & Rumors",
+        "description": "Breaking news, crisis events, rumor verification, misinformation and public controversy",
+    },
+)
+
+_SCALE_LABELS_VI: dict[str, str] = {
+    "small": "Bài nhỏ / Khởi phát",
+    "medium": "Bài trung bình",
+    "large": "Bài lớn",
+    "mega": "Bài rất lớn / Bùng nổ",
+}
+
+_ARCHETYPE_LABELS_VI: dict[str, str] = {
+    "hostile_flamewar": "Xung đột gay gắt / Bùng nổ",
+    "bipolar_debate": "Phân cực lưỡng cực rõ rệt",
+    "consensus_support": "Đồng thuận tích cực",
+    "constructive_critique": "Phản biện ôn hòa / Đa chiều",
+    "exploratory_neutral": "Thảo luận trung lập / Trao đổi thông tin",
+}
+
+_TREND_LABELS_VI: dict[str, str] = {
+    "escalating": "Gia tăng phân cực theo thời gian",
+    "de_escalating": "Hạ nhiệt / Hội tụ dần",
+    "stable": "Ổn định quanh ngưỡng ban đầu",
+    "single_window": "Chưa đủ bình luận hậu K để đo xu hướng",
+}
+
+_SPLIT_CUSTOM_TOPICS_RE = re.compile(r"[,;\r\n]+")
+_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+_JUNK_LIKE_RE = re.compile(r"^[\W_0-9]+$", re.UNICODE)
+_VI_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "và",
+        "là",
+        "của",
+        "có",
+        "cho",
+        "với",
+        "trong",
+        "trên",
+        "này",
+        "kia",
+        "đó",
+        "thì",
+        "mà",
+        "nhưng",
+        "nên",
+        "vì",
+        "nếu",
+        "như",
+        "khi",
+        "đã",
+        "đang",
+        "sẽ",
+        "bị",
+        "được",
+        "còn",
+        "cũng",
+        "các",
+        "những",
+        "một",
+        "không",
+        "the",
+        "and",
+        "for",
+        "with",
+        "that",
+        "this",
+        "from",
+        "about",
+        "into",
+    }
+)
+
+_NLI_LOCK = threading.Lock()
+_NLI_CACHE: dict[str, tuple[Any, Any, int, int] | None] = {}
+
+
+def _strip_accents(text: str) -> str:
+    norm = unicodedata.normalize("NFD", text.replace("đ", "d").replace("Đ", "D"))
+    return "".join(ch for ch in norm if unicodedata.category(ch) != "Mn")
+
+
+def _slugify_topic_id(label: str, idx: int) -> str:
+    ascii_str = _strip_accents(label).lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", ascii_str).strip("_")
+    return slug[:40] if slug else f"custom_topic_{idx}"
+
+
+def parse_custom_topics(raw_topics: str | Sequence[str] | None) -> list[dict[str, str]]:
+    """Parse user-defined custom topics from comma/newline string or list, deduplicated <= 16."""
+    if raw_topics is None:
+        return []
+    if isinstance(raw_topics, str):
+        raw_items = _SPLIT_CUSTOM_TOPICS_RE.split(raw_topics)
+    elif isinstance(raw_topics, Sequence):
+        raw_items = []
+        for item in raw_topics:
+            if item is not None:
+                raw_items.extend(_SPLIT_CUSTOM_TOPICS_RE.split(str(item)))
+    else:
+        raise ValueError(f"Unsupported custom_topics type: {type(raw_topics).__name__}")
+
+    topics: list[dict[str, str]] = []
+    seen_low: set[str] = set()
+    used_ids: set[str] = set()
+    for item in raw_items:
+        cleaned = " ".join(normalize_nfc(str(item)).split()).strip()
+        if not cleaned or len(cleaned) > 120:
+            continue
+        low = cleaned.lower()
+        if low in seen_low:
+            continue
+        seen_low.add(low)
+        tid = _slugify_topic_id(cleaned, len(topics) + 1)
+        if tid in used_ids:
+            tid = f"{tid}_{len(topics) + 1}"
+        used_ids.add(tid)
+        topics.append({"id": tid, "label": cleaned, "description": cleaned})
+        if len(topics) >= 16:
+            break
+    return topics
+
+
+def _build_topic_context_text(
+    title: str,
+    body: str,
+    reply_snippets: Sequence[str],
+    *,
+    max_chars: int = 1200,
+) -> str:
+    clean_title = " ".join(normalize_nfc(title or "").split())
+    clean_body = " ".join(normalize_nfc(body or "").split())
+    parts: list[str] = []
+    if clean_title:
+        parts.append(clean_title)
+    if clean_body and clean_body.lower() != clean_title.lower():
+        parts.append(clean_body)
+    valid_replies = [
+        " ".join(normalize_nfc(str(r)).split())
+        for r in reply_snippets
+        if r and len(" ".join(str(r).split())) >= 8
+    ]
+    if valid_replies:
+        parts.append(" | ".join(valid_replies[:5]))
+    joined = ". ".join(parts).strip()
+    return joined[:max_chars] if len(joined) > max_chars else joined
+
+
+def _resolve_nli_indices(config: Any) -> tuple[int, int]:
+    """Extract `(entailment_idx, contradiction_idx)` from HF NLI `config.label2id`."""
+    label2id = getattr(config, "label2id", None) or {}
+    norm_map = {str(k).strip().lower(): int(v) for k, v in label2id.items()}
+    ent_idx = norm_map.get("entailment", 0)
+    con_idx = norm_map.get("contradiction", 2)
+    return int(ent_idx), int(con_idx)
+
+
+def _get_cached_nli_model(
+    model_name: str = MDEBERTA_NLI_MODEL_NAME,
+    *,
+    allow_download: bool = False,
+) -> tuple[Any, Any, int, int] | None:
+    """Lazy-load NLI classifier strictly from local cache unless `allow_download=True`."""
+    with _NLI_LOCK:
+        if model_name in _NLI_CACHE and (_NLI_CACHE[model_name] is not None or not allow_download):
+            return _NLI_CACHE[model_name]
+
+        local_only = not allow_download
+        try:
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+            tok = AutoTokenizer.from_pretrained(model_name, local_files_only=local_only)
+            model = AutoModelForSequenceClassification.from_pretrained(
+                model_name, local_files_only=local_only
+            )
+            model.eval()
+            for p in model.parameters():
+                p.requires_grad_(False)
+            ent_idx, con_idx = _resolve_nli_indices(model.config)
+            bundle = (model, tok, ent_idx, con_idx)
+            _NLI_CACHE[model_name] = bundle
+            return bundle
+        except Exception:
+            if not allow_download:
+                _NLI_CACHE[model_name] = None
+            return None
+
+
+def _score_topics_with_nli(
+    context_text: str,
+    candidates: Sequence[Mapping[str, str]],
+    *,
+    nli_bundle: tuple[Any, Any, int, int],
+    lang: str,
+    device: torch.device,
+) -> tuple[list[float], list[float]]:
+    model, tok, ent_idx, con_idx = nli_bundle
+    model = model.to(device)
+    if lang == "en":
+        hypotheses = [f"This discussion thread is about {c['description']}." for c in candidates]
+    else:
+        hypotheses = [f"Bài thảo luận này nói về chủ đề {c['description']}." for c in candidates]
+
+    enc = tok(
+        [context_text] * len(candidates),
+        hypotheses,
+        padding=True,
+        truncation=True,
+        max_length=320,
+        return_tensors="pt",
+    )
+    enc = {k: v.to(device) for k, v in enc.items()}
+    with torch.no_grad():
+        logits = model(**enc).logits.float()
+    diff = logits[:, ent_idx] - logits[:, con_idx]
+    relevances = torch.sigmoid(diff).detach().cpu().tolist()
+    scores = F.softmax(diff / 1.5, dim=0).detach().cpu().tolist()
+    return [float(s) for s in scores], [float(r) for r in relevances]
+
+
+def _score_topics_with_encoder(
+    context_text: str,
+    candidates: Sequence[Mapping[str, str]],
+    *,
+    node_encoder: Any,
+    node_tokenizer: Any,
+    device: torch.device,
+) -> tuple[list[float], list[float]]:
+    all_texts = [context_text] + [f"{c['label']}: {c['description']}" for c in candidates]
+    enc = node_tokenizer(
+        all_texts,
+        padding=True,
+        truncation=True,
+        max_length=256,
+        return_tensors="pt",
+    )
+    enc = {k: v.to(device) for k, v in enc.items()}
+    node_encoder.eval()
+    with torch.no_grad():
+        out = node_encoder(**enc)
+        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+        pooled = compute_masked_mean_pooling(hidden, enc["attention_mask"])
+        pooled = F.normalize(pooled, p=2, dim=-1)
+    ctx_vec = pooled[0:1]
+    cand_vecs = pooled[1:]
+    sims = torch.matmul(cand_vecs, ctx_vec.squeeze(0))
+    relevances = ((sims + 1.0) * 0.5).clamp(0.0, 1.0).detach().cpu().tolist()
+    scores = F.softmax(sims / 0.08, dim=0).detach().cpu().tolist()
+    return [float(s) for s in scores], [float(r) for r in relevances]
+
+
+def _lexical_feature_weights(text: str) -> Counter[str]:
+    norm = normalize_nfc(text).lower()
+    raw_tokens = [t for t in _WORD_RE.findall(norm) if len(t) >= 2 and t not in _VI_STOPWORDS]
+    ascii_tokens = [_strip_accents(t) for t in raw_tokens]
+
+    weights: Counter[str] = Counter()
+    for t in raw_tokens:
+        weights[f"w:{t}"] += 2.2
+    for t in ascii_tokens:
+        weights[f"a:{t}"] += 1.4
+    for a, b in zip(ascii_tokens, ascii_tokens[1:]):
+        weights[f"bi:{a}_{b}"] += 2.5
+
+    compact = " ".join(ascii_tokens)
+    for n in (3, 4):
+        if len(compact) >= n:
+            for i in range(len(compact) - n + 1):
+                gram = compact[i : i + n]
+                if " " not in gram:
+                    weights[f"c{n}:{gram}"] += 0.35
+    return weights
+
+
+def _score_topics_lexical(
+    context_text: str,
+    candidates: Sequence[Mapping[str, str]],
+) -> tuple[list[float], list[float]]:
+    ctx_w = _lexical_feature_weights(context_text)
+    ctx_norm = math.sqrt(sum(v * v for v in ctx_w.values()))
+    ctx_ascii = _strip_accents(context_text.lower())
+    sims: list[float] = []
+    for c in candidates:
+        c_desc = f"{c['label']} {c['description']}"
+        cand_w = _lexical_feature_weights(c_desc)
+        cand_norm = math.sqrt(sum(v * v for v in cand_w.values()))
+        if ctx_norm <= 1e-8 or cand_norm <= 1e-8:
+            sim = 0.0
+        else:
+            dot = sum(val * cand_w[k] for k, val in ctx_w.items() if k in cand_w)
+            sim = dot / (ctx_norm * cand_norm)
+        label_ascii = _strip_accents(c["label"].lower()).strip()
+        if label_ascii and len(label_ascii) >= 2 and label_ascii in ctx_ascii:
+            sim += 0.35
+        sims.append(float(sim))
+
+    max_sim = max(sims) if sims else 0.0
+    logits = [10.0 * (s - max_sim) for s in sims]
+    exps = [math.exp(max(-30.0, min(0.0, lg))) for lg in logits]
+    total = sum(exps) or 1.0
+    scores = [e / total for e in exps]
+    relevances = [min(1.0, max(0.0, s / 0.45)) for s in sims]
+    return scores, relevances
+
+
+def classify_post_topics(
+    title: str,
+    body: str = "",
+    *,
+    reply_snippets: Sequence[str] = (),
+    custom_topics: str | Sequence[str] | None = None,
+    lang: Literal["vi", "en"] = "vi",
+    backend: Literal["auto", "nli", "embedding", "lexical"] = "auto",
+    node_encoder: Any = None,
+    node_tokenizer: Any = None,
+    allow_nli_download: bool = False,
+    device: torch.device | None = None,
+) -> dict[str, Any]:
+    """Classify post & early replies across default or arbitrary user-defined topics.
+
+    Explicitly records `topic_backend` and `transformer_topic_loaded` so callers and
+    the UI never misrepresent offline lexical fallback as Transformer inference.
+    """
+    if lang not in {"vi", "en"}:
+        raise ValueError(f"Unsupported lang={lang!r}; expected 'vi' or 'en'")
+    if backend not in {"auto", "nli", "embedding", "lexical"}:
+        raise ValueError(f"Unsupported topic backend={backend!r}")
+
+    parsed_custom = parse_custom_topics(custom_topics)
+    is_custom = len(parsed_custom) > 0
+    candidates: list[dict[str, str]] = (
+        parsed_custom
+        if is_custom
+        else [dict(t) for t in (DEFAULT_TOPICS_VI if lang == "vi" else DEFAULT_TOPICS_EN)]
+    )
+
+    context_text = _build_topic_context_text(title, body, reply_snippets)
+    target_device = device or torch.device("cpu")
+
+    used_backend = "lexical_ngram_fallback"
+    scores: list[float] | None = None
+    relevances: list[float] | None = None
+
+    if context_text and backend in {"auto", "nli"}:
+        nli_bundle = _get_cached_nli_model(
+            MDEBERTA_NLI_MODEL_NAME,
+            allow_download=bool(allow_nli_download and backend in {"auto", "nli"}),
+        )
+        if nli_bundle is not None:
+            try:
+                scores, relevances = _score_topics_with_nli(
+                    context_text,
+                    candidates,
+                    nli_bundle=nli_bundle,
+                    lang=lang,
+                    device=target_device,
+                )
+                used_backend = "mdeberta_zero_shot_nli"
+            except Exception:
+                scores = None
+
+    if scores is None and context_text and backend in {"auto", "embedding"}:
+        if node_encoder is not None and node_tokenizer is not None:
+            try:
+                scores, relevances = _score_topics_with_encoder(
+                    context_text,
+                    candidates,
+                    node_encoder=node_encoder,
+                    node_tokenizer=node_tokenizer,
+                    device=target_device,
+                )
+                used_backend = "transformer_cosine_embedding"
+            except Exception:
+                scores = None
+
+    if scores is None or relevances is None:
+        if context_text:
+            scores, relevances = _score_topics_lexical(context_text, candidates)
+        else:
+            uniform = 1.0 / float(len(candidates))
+            scores = [uniform] * len(candidates)
+            relevances = [0.0] * len(candidates)
+        used_backend = "lexical_ngram_fallback"
+
+    ranked: list[dict[str, Any]] = []
+    for cand, sc, rel in zip(candidates, scores, relevances):
+        ranked.append(
+            {
+                "id": cand["id"],
+                "label": cand["label"],
+                "description": cand["description"],
+                "score": round(float(sc), 4),
+                "relevance": round(float(rel), 4),
+            }
+        )
+    ranked.sort(key=lambda item: (-item["score"], -item["relevance"], item["label"]))
+
+    top = ranked[0]
+    secondary = [item["label"] for item in ranked[1:3] if item["score"] >= 0.15]
+
+    return {
+        "primary_topic": top["label"],
+        "primary_topic_id": top["id"],
+        "primary_confidence": round(float(top["score"]), 4),
+        "secondary_topics": secondary,
+        "is_custom_taxonomy": is_custom,
+        "topic_backend": used_backend,
+        "transformer_topic_loaded": used_backend != "lexical_ngram_fallback",
+        "topics": ranked,
+    }
+
+
+def _classify_scale_tier(total_replies: int) -> tuple[str, str]:
+    if total_replies >= 300:
+        return "mega", _SCALE_LABELS_VI["mega"]
+    if total_replies >= 100:
+        return "large", _SCALE_LABELS_VI["large"]
+    if total_replies >= 25:
+        return "medium", _SCALE_LABELS_VI["medium"]
+    return "small", _SCALE_LABELS_VI["small"]
+
+
+def _classify_post_archetype(
+    full_polar: float,
+    *,
+    support_ratio: float,
+    oppose_ratio: float,
+    hostile_ratio: float,
+    total_replies: int,
+) -> tuple[str, str]:
+    if total_replies == 0:
+        return "exploratory_neutral", _ARCHETYPE_LABELS_VI["exploratory_neutral"]
+    if hostile_ratio >= 0.20 or (full_polar >= VN_POLAR_Q90 and hostile_ratio >= 0.12):
+        return "hostile_flamewar", _ARCHETYPE_LABELS_VI["hostile_flamewar"]
+    if full_polar >= VN_POLAR_Q75 or (support_ratio >= 0.20 and oppose_ratio >= 0.20):
+        return "bipolar_debate", _ARCHETYPE_LABELS_VI["bipolar_debate"]
+    if support_ratio >= 0.45 and oppose_ratio <= 0.15 and hostile_ratio < 0.10:
+        return "consensus_support", _ARCHETYPE_LABELS_VI["consensus_support"]
+    if oppose_ratio >= 0.25 or full_polar >= VN_POLAR_Q50:
+        return "constructive_critique", _ARCHETYPE_LABELS_VI["constructive_critique"]
+    return "exploratory_neutral", _ARCHETYPE_LABELS_VI["exploratory_neutral"]
+
+
+def analyze_large_thread_dynamics(
+    *,
+    root_node: Mapping[str, Any],
+    all_nodes: Sequence[Mapping[str, Any]],
+    all_edges: Sequence[Mapping[str, Any]],
+    edge_scores: Mapping[str, Mapping[str, Any]],
+    depth_map: Mapping[str, int],
+    topic_analysis: Mapping[str, Any] | None = None,
+    trigger_importance_by_target: Mapping[str, float] | None = None,
+    k_early_ref: int = 20,
+    lang: Literal["vi", "en"] = "vi",
+    scope: Literal["early_post_hoc", "full_analysis"] = "full_analysis",
+) -> dict[str, Any]:
+    """Compute multi-milestone polarization trajectory and semantic understanding for a full post."""
+    del lang  # Output descriptions follow Vietnamese academic reporting conventions.
+    root_id = str(root_node["node_id"])
+    non_roots = [n for n in all_nodes if str(n["node_id"]) != root_id]
+
+    def _sort_key(node: Mapping[str, Any]) -> tuple[float, int, str]:
+        ts = node.get("created_at_utc")
+        if hasattr(ts, "timestamp"):
+            ts_val = float(ts.timestamp())
+        else:
+            try:
+                ts_val = float(ts) if ts is not None else 0.0
+            except (TypeError, ValueError):
+                ts_val = 0.0
+        nid = str(node["node_id"])
+        return (ts_val, int(depth_map.get(nid, 999)), nid)
+
+    non_roots.sort(key=_sort_key)
+    total_replies = len(non_roots)
+    scale_tier, scale_label_vi = _classify_scale_tier(total_replies)
+
+    children_adj: dict[str, list[str]] = {root_id: []}
+    edge_lookup: dict[tuple[str, str], dict[str, str]] = {}
+    stance_map: dict[str, float] = {}
+    hostility_by_target: dict[str, float] = {}
+    edge_score_by_target: dict[str, tuple[float, float]] = {}
+
+    for e in all_edges:
+        src = str(e["source_id"])
+        dst = str(e["target_id"])
+        eid = str(e.get("edge_id") or f"{src}->{dst}")
+        children_adj.setdefault(src, []).append(dst)
+        children_adj.setdefault(dst, [])
+        edge_lookup[(src, dst)] = {"edge_id": eid}
+        sc = edge_scores.get(eid) or {}
+        s_uv = float(sc.get("s_uv", e.get("s_uv", 0.0)))
+        h_uv = float(sc.get("h_uv", e.get("h_uv", 0.0)))
+        stance_map[eid] = s_uv
+        hostility_by_target[dst] = h_uv
+        edge_score_by_target[dst] = (s_uv, h_uv)
+
+    full_aligned, node_orientations = _compute_root_aligned_stances_and_orientations(
+        root_id=root_id,
+        children_adj=children_adj,
+        edge_lookup=edge_lookup,
+        stance_map=stance_map,
+    )
+    full_y_polar = (
+        float(_compute_full_tree_polarization(full_aligned, lambda_polar=0.5))
+        if len(full_aligned) >= 2
+        else 0.0
+    )
+
+    milestones = [m for m in (5, 10, 20, 35, 50, 75, 100, 150, 200, 300) if m < total_replies]
+    if total_replies > 0:
+        milestones.append(total_replies)
+
+    trajectory: list[dict[str, Any]] = []
+    for k_step in milestones:
+        prefix_nodes = non_roots[:k_step]
+        prefix_ids = {root_id} | {str(n["node_id"]) for n in prefix_nodes}
+        pref_adj: dict[str, list[str]] = {}
+        pref_lookup: dict[tuple[str, str], dict[str, str]] = {}
+        for (src, dst), e_row in edge_lookup.items():
+            if src in prefix_ids and dst in prefix_ids:
+                pref_adj.setdefault(src, []).append(dst)
+                pref_lookup[(src, dst)] = e_row
+        pref_aligned, _ = _compute_root_aligned_stances_and_orientations(
+            root_id=root_id,
+            children_adj=pref_adj,
+            edge_lookup=pref_lookup,
+            stance_map=stance_map,
+        )
+        y_step = (
+            float(_compute_full_tree_polarization(pref_aligned, lambda_polar=0.5))
+            if len(pref_aligned) >= 2
+            else 0.0
+        )
+
+        sup_c = opp_c = neu_c = hos_c = 0
+        authors_k: set[str] = set()
+        for idx_n, n in enumerate(prefix_nodes):
+            nid = str(n["node_id"])
+            ori = float(node_orientations.get(nid, 0.0))
+            _, h_uv = edge_score_by_target.get(nid, (0.0, 0.0))
+            if ori > 0.1:
+                sup_c += 1
+            elif ori < -0.1:
+                opp_c += 1
+            else:
+                neu_c += 1
+            if h_uv >= 0.5:
+                hos_c += 1
+            ah = n.get("author_hash") or n.get("user_id_hash") or f"anon_{idx_n}"
+            authors_k.add(str(ah))
+
+        denom = float(max(1, k_step))
+        trajectory.append(
+            {
+                "k": int(k_step),
+                "y_polar": round(y_step, 4),
+                "support_ratio": round(sup_c / denom, 4),
+                "oppose_ratio": round(opp_c / denom, 4),
+                "neutral_ratio": round(neu_c / denom, 4),
+                "hostile_ratio": round(hos_c / denom, 4),
+                "unique_authors": len(authors_k),
+            }
+        )
+
+    final_pt = (
+        trajectory[-1]
+        if trajectory
+        else {
+            "support_ratio": 0.0,
+            "oppose_ratio": 0.0,
+            "neutral_ratio": 0.0,
+            "hostile_ratio": 0.0,
+            "unique_authors": 0,
+        }
+    )
+
+    if total_replies <= k_early_ref or len(trajectory) < 2:
+        evolution_trend = "single_window"
+        early_ref_polar = trajectory[0]["y_polar"] if trajectory else full_y_polar
+        polar_delta = 0.0
+    else:
+        ref_pt = next((pt for pt in trajectory if pt["k"] >= k_early_ref), trajectory[0])
+        early_ref_polar = float(ref_pt["y_polar"])
+        polar_delta = full_y_polar - early_ref_polar
+        if polar_delta >= 0.025:
+            evolution_trend = "escalating"
+        elif polar_delta <= -0.025:
+            evolution_trend = "de_escalating"
+        else:
+            evolution_trend = "stable"
+
+    archetype, archetype_label_vi = _classify_post_archetype(
+        full_y_polar,
+        support_ratio=float(final_pt["support_ratio"]),
+        oppose_ratio=float(final_pt["oppose_ratio"]),
+        hostile_ratio=float(final_pt["hostile_ratio"]),
+        total_replies=total_replies,
+    )
+
+    pro_candidates: list[tuple[float, dict[str, Any]]] = []
+    anti_candidates: list[tuple[float, dict[str, Any]]] = []
+    flash_candidates: list[tuple[float, dict[str, Any]]] = []
+    imp_map = trigger_importance_by_target or {}
+    all_authors: set[str] = {
+        str(root_node.get("author_hash") or root_node.get("user_id_hash") or "root")
+    }
+
+    for idx_n, n in enumerate(non_roots):
+        nid = str(n["node_id"])
+        txt = " ".join(str(n.get("text") or "").split())
+        ah = n.get("author_hash") or n.get("user_id_hash") or f"anon_{idx_n}"
+        all_authors.add(str(ah))
+        if not txt or _JUNK_LIKE_RE.fullmatch(txt):
+            continue
+        ori = float(node_orientations.get(nid, 0.0))
+        s_uv, h_uv = edge_score_by_target.get(nid, (0.0, 0.0))
+        word_cnt = len(txt.split())
+        if word_cnt < 4:
+            continue
+        len_factor = min(1.8, math.log1p(word_cnt) / 3.0)
+        imp = float(imp_map.get(nid, 0.0))
+        subtree_deg = len(children_adj.get(nid, ()))
+        entry = {
+            "node_id": nid,
+            "aligned_stance": round(ori, 4),
+            "s_uv": round(s_uv, 4),
+            "h_uv": round(h_uv, 4),
+            "depth": int(depth_map.get(nid, 1)),
+            "child_replies": subtree_deg,
+            "text": txt[:240] + ("…" if len(txt) > 240 else ""),
+        }
+        if ori > 0.1:
+            pro_candidates.append((ori * len_factor * (1.0 + imp) * (1.0 - 0.35 * h_uv), entry))
+        elif ori < -0.1:
+            anti_candidates.append((abs(ori) * len_factor * (1.0 + imp) * (1.0 - 0.25 * h_uv), entry))
+
+        flash_score = 0.5 * h_uv + 0.3 * abs(s_uv) + 0.2 * min(1.0, math.log1p(subtree_deg) / 2.0)
+        if h_uv >= 0.45 or (abs(s_uv) >= 0.35 and subtree_deg >= 1):
+            flash_candidates.append((flash_score, entry))
+
+    pro_candidates.sort(key=lambda pair: (-pair[0], pair[1]["depth"], pair[1]["node_id"]))
+    anti_candidates.sort(key=lambda pair: (-pair[0], pair[1]["depth"], pair[1]["node_id"]))
+    flash_candidates.sort(key=lambda pair: (-pair[0], pair[1]["depth"], pair[1]["node_id"]))
+
+    primary_topic = str((topic_analysis or {}).get("primary_topic") or "Chưa phân loại")
+    primary_conf = float((topic_analysis or {}).get("primary_confidence") or 0.0)
+    max_depth = max((int(depth_map.get(str(n["node_id"]), 0)) for n in non_roots), default=0)
+
+    if total_replies == 0:
+        summary_vi = (
+            f"Bài viết thuộc chủ đề \"{primary_topic}\" hiện chưa có bình luận phản hồi hợp lệ."
+        )
+    else:
+        trend_phrase = (
+            f"xu hướng {(_TREND_LABELS_VI.get(evolution_trend, evolution_trend)).lower()} "
+            f"(y_polar từ {early_ref_polar:.3f} ở K={min(total_replies, k_early_ref)} "
+            f"đến {full_y_polar:.3f} toàn cây)"
+            if evolution_trend != "single_window"
+            else f"độ phân cực quan sát y_polar = {full_y_polar:.3f}"
+        )
+        summary_vi = (
+            f"Chủ đề chính: {primary_topic} (độ tin cậy {primary_conf:.1%}). "
+            f"Cấu trúc quy mô \"{scale_label_vi}\" gồm {total_replies} bình luận từ {len(all_authors)} tác giả "
+            f"(độ sâu tối đa {max_depth} tầng), mang tính chất \"{archetype_label_vi}\" "
+            f"(Tán thành {final_pt['support_ratio']:.0%}, Phản đối {final_pt['oppose_ratio']:.0%}, "
+            f"Gay gắt {final_pt['hostile_ratio']:.0%}) với {trend_phrase}."
+        )
+
+    return {
+        "scope": scope,
+        "total_replies_analyzed": total_replies,
+        "unique_authors_total": len(all_authors),
+        "max_depth": max_depth,
+        "scale_tier": scale_tier,
+        "scale_label_vi": scale_label_vi,
+        "full_y_polar": round(full_y_polar, 4),
+        "early_ref_y_polar": round(float(early_ref_polar), 4),
+        "polar_delta": round(float(polar_delta), 4),
+        "evolution_trend": evolution_trend,
+        "evolution_trend_label_vi": _TREND_LABELS_VI[evolution_trend],
+        "post_archetype": archetype,
+        "post_archetype_label_vi": archetype_label_vi,
+        "stance_ratios_full": {
+            "support": float(final_pt["support_ratio"]),
+            "oppose": float(final_pt["oppose_ratio"]),
+            "neutral": float(final_pt["neutral_ratio"]),
+            "hostile": float(final_pt["hostile_ratio"]),
+        },
+        "polarization_trajectory": trajectory,
+        "semantic_understanding": {
+            "summary_vi": summary_vi,
+            "top_pro_arguments": [item[1] for item in pro_candidates[:3]],
+            "top_anti_arguments": [item[1] for item in anti_candidates[:3]],
+            "flashpoint_comments": [item[1] for item in flash_candidates[:3]],
+        },
+    }

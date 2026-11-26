@@ -55,6 +55,10 @@ from src.data.pyg_dataset import (  # noqa: E402
     load_topic_splits_json,
 )
 from src.models.sbi_fagat import SBiFAGAT  # noqa: E402
+from src.nlp.topic_post_analyzer import (  # noqa: E402
+    analyze_large_thread_dynamics,
+    classify_post_topics,
+)
 
 _DEMO_2D_BEHAVIOR_KEYS: tuple[str, ...] = (
     "support",
@@ -80,7 +84,7 @@ _REQUIRED_CE_FILES: tuple[str, ...] = (
     "dual_head_meta.json",
     "config.json",
 )
-_MAX_POST_BYTES: int = 256 * 1024
+_MAX_POST_BYTES: int = 1024 * 1024
 
 _EXPLICIT_REPLY_RE = re.compile(
     r"^\s*[-*]?\s*([A-Za-z0-9_]+)\s*\(\s*(?:trả\s*lời|tra\s*loi|reply(?:\s+to)?|->)\s*([A-Za-z0-9_]+)\s*\)\s*:\s*(.+)$",
@@ -338,9 +342,66 @@ def _make_synthetic_polarized_preset() -> tuple[dict[str, Any], list[dict[str, A
 
 
 def build_sandbox_preset(preset_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Return in-memory Vietnamese sandbox presets designed to showcase Path Contraction."""
+    """Return in-memory Vietnamese sandbox presets (including a 42-reply large AI/Tech thread)."""
     base_ts = 1763400000.0
-    if preset_id == "preset_junk_2":
+    if preset_id == "preset_large_1":
+        post_id = "sandbox_large_1"
+        post = {
+            "id": post_id,
+            "title": "[Sandbox Bài lớn] AI tạo sinh trong đào tạo lập trình đại học và cơ hội việc làm IT của sinh viên",
+            "selftext": (
+                "Nhiều trường đại học đang cân nhắc cho sinh viên dùng trợ lý AI tạo sinh trong bài tập lớn "
+                "lập trình, trong khi doanh nghiệp phần mềm lo ngại sinh viên hổng tư duy thuật toán và kỹ năng debug."
+            ),
+            "subreddit": "vozforums",
+            "author": "op_large_ai",
+            "created_utc": base_ts,
+        }
+        spec = [
+            ("l01", f"t3_{post_id}", 40, "u_ai_01", "Ủng hộ đưa AI vào giảng dạy nhưng phải dạy cách kiểm chứng mã nguồn và viết test thay vì copy mù quáng."),
+            ("l02", f"t3_{post_id}", 80, "u_ai_02", "Chưa đồng ý cho năm nhất dùng AI ngay vì sẽ làm mất nền tảng cấu trúc dữ liệu và tư duy giải thuật."),
+            ("l03", "l01", 120, "u_ai_03", "Đồng ý với bác, năm 1-2 nên thi giấy/cấm AI hoàn toàn, lên năm 3 làm đồ án thực tế mới cho dùng."),
+            ("l04", "l02", 160, "[deleted]", "[deleted]"),
+            ("l05", "l04", 200, "u_ai_04", "Hợp lý, hồi phỏng vấn fresher vừa rồi nhiều bạn dùng AI viết API nhưng không giải thích nổi độ phức tạp O(n)."),
+            ("l06", f"t3_{post_id}", 240, "u_ai_05", "Cho mình hỏi các trường Bách Khoa hay UIT hiện có môn riêng về kỹ thuật Prompt và AI Engineer chưa?"),
+            ("l07", "l01", 280, "u_ai_06", "Doanh nghiệp bây giờ tuyển người biết dùng AI tăng năng suất 3 lần chứ ai còn cấm đoán nữa."),
+            ("l08", "l03", 320, "u_ai_07", "Chuẩn rồi bạn, công cụ giúp viết boilerplate nhanh hơn hẳn để tập trung vào kiến trúc hệ thống."),
+            ("l09", "l05", 360, "u_ai_08", "Phản đối việc đổ lỗi hoàn toàn cho AI; chương trình cũ dạy quá nặng lý thuyết suông mới là vấn đề."),
+            ("l10", "l06", 400, "u_ai_09", "Bên mình có học phần ứng dụng mô hình ngôn ngữ lớn và tích hợp vector database vào đồ án tốt nghiệp."),
+            ("l11", "l07", 440, "u_ai_10", "Không đồng ý chút nào, năng suất ảo thôi chứ sinh ra lắm lỗi bảo mật ngầm khi đưa lên production."),
+            ("l12", "l09", 480, "u_ai_11", "hóng ké"),
+            ("l13", "l12", 520, "u_ai_02", "Đúng thế, khi AI viết sai logic phân quyền mà người lập trình không đọc hiểu code thì hậu quả rất nặng."),
+            ("l14", "l10", 560, "u_ai_12", "Cảm ơn thông tin của bác, giáo trình cập nhật hướng MLOps và kiểm thử tự động nghe thực tế hơn hẳn."),
+            ("l15", "l11", 600, "u_ai_01", "Bởi vậy mới cần dạy kỹ năng code review, profiling và viết unit test tự động song song với AI."),
+            ("l16", "l13", 640, "u_ai_13", "Toàn mấy ông lý thuyết cổ hủ sợ mất việc nên bài xích AI, thực tế ngoài thị trường AI làm hộ 70% việc rồi!"),
+            ("l17", "l16", 680, "u_ai_14", "Nói chuyện trịch thượng thế bác, cứ thử vận hành hệ thống giao dịch thật xem AI có tự fix deadlock cho không."),
+            ("l18", "l16", 720, "u_ai_15", "Não tàn mới tin AI thay thế hoàn toàn kỹ sư phần mềm, toàn lùa gà bán khóa học prompt!"),
+            ("l19", "l18", 760, "u_ai_13", "Cút về code chay tiếp đi, vài năm nữa không biết dùng AI agent thì ra đường mà cạp đất!"),
+            ("l20", f"t3_{post_id}", 800, "u_ai_16", "."),
+            ("l21", "l20", 840, "u_ai_17", "Đồng ý giữ thái độ tranh luận xây dựng, chia 2 giai đoạn học thuật và thực hành là hợp lý nhất."),
+            ("l22", "l17", 880, "u_ai_04", "Chính xác, debug đa luồng hay tối ưu truy vấn SQL phức tạp vẫn đòi hỏi kiến thức hệ điều hành vững."),
+            ("l23", "l19", 920, "u_ai_18", "Bạn công kích cá nhân quá rồi, người phản biện chỉ lo sinh viên bị lệ thuộc khi chưa có tư duy nền."),
+            ("l24", "l15", 960, "u_ai_06", "Ủng hộ chấm điểm bảo vệ đồ án bằng cách hỏi trực tiếp từng dòng code và bắt sửa bug tại chỗ."),
+            ("l25", "l24", 1000, "u_ai_03", "Đồng ý"),
+            ("l26", "l22", 1040, "u_ai_19", "Chưa hợp lý nếu không giảm bớt các bài tập gõ lại CRUD lặp đi lặp lại nhàm chán."),
+            ("l27", "l23", 1080, "u_ai_15", "Thôi bỏ qua mấy thành phần hổ báo đi, quay lại chuyện lương junior IT giảm vì cung vượt cầu cũng đáng lo."),
+            ("l28", "l27", 1120, "u_ai_20", "Đúng rồi, AI nâng chuẩn đầu vào: fresher bây giờ phải nắm cả hệ thống, kiểm thử và tích hợp AI."),
+            ("l29", "l25", 1160, "u_ai_11", "Vấn đáp trực tiếp 1-1 với giảng viên là cách hiệu quả nhất để phân loại sinh viên hiểu thật hay copy AI."),
+            ("l30", f"t3_{post_id}", 1200, "u_ai_21", "Cho hỏi các bạn sinh viên tự học mô hình đồ thị và NLP hiện nay hay dùng tài nguyên nào miễn phí?"),
+            ("l31", "l30", 1240, "u_ai_12", "Kaggle T4 x2 và Google Colab đủ chạy phần lớn mô hình vừa, kết hợp Hugging Face mã nguồn mở."),
+            ("l32", "l28", 1280, "u_ai_10", "Không đồng ý chuyện AI làm giảm lương ngay đâu, chủ yếu do thị trường outsourcing chững lại từ năm ngoái."),
+            ("l33", "l32", 1320, "u_ai_20", "Cũng có lý, nhưng rõ ràng doanh nghiệp đang cắt bớt tuyển thực tập sinh đại trà vì công việc đơn giản đã có AI."),
+            ("l34", "l29", 1360, "u_ai_08", "Hợp lý, đổi hình thức thi từ trắc nghiệm học vẹt sang bảo vệ sản phẩm thực tế có lịch sử commit Git."),
+            ("l35", "l33", 1400, "u_ai_14", "Đồ ngu mới tin outsourcing tự hồi phục mà không đổi mới nâng cấp lên kỹ sư giải pháp AI."),
+            ("l36", "l35", 1440, "u_ai_10", "Nói năng cho đàng hoàng đi bạn, không đồng quan điểm kinh tế vĩ mô thì đưa số liệu ra phản biện."),
+            ("l37", "l34", 1480, "u_ai_01", "Ý tưởng chấm theo lịch sử commit Git + kiểm thử tự động rất chuẩn kỹ thuật doanh nghiệp."),
+            ("l38", "l31", 1520, "u_ai_21", "Tuyệt vời, cảm ơn bác đã chia sẻ kinh nghiệm dùng GPU đám mây cho sinh viên tự nghiên cứu."),
+            ("l39", "l37", 1560, "u_ai_07", "Tán thành phương án kết hợp đánh giá Git + vấn đáp; vừa rèn thói quen làm việc nhóm vừa chống sao chép."),
+            ("l40", "l36", 1600, "u_ai_18", "Tranh luận đến đây rõ 2 luồng rồi: siết nền tảng năm đầu và mở công cụ AI có kiểm chứng từ năm ba."),
+            ("l41", "l40", 1640, "u_ai_06", "Hợp lý, cân bằng giữa tư duy thuật toán cốt lõi và năng lực làm chủ công cụ AI."),
+            ("l42", "l39", 1680, "u_ai_03", "Mong khoa CNTT các trường sớm ban hành quy chế minh bạch để giảng viên và sinh viên thống nhất."),
+        ]
+    elif preset_id == "preset_junk_2":
         post_id = "sandbox_junk_2"
         post = {
             "id": post_id,
@@ -652,6 +713,7 @@ def _format_live_result_payload(
             "topic_id": topic_id,
             "root_title": title,
             "root_text": root_full_text,
+            "analysis_mode": str(res.get("analysis_mode") or "early"),
             "is_synthetic_fallback": bool(is_synthetic_fallback),
             "checkpoint_loaded": bool(res.get("checkpoint_loaded", False)),
             "cross_encoder_loaded": bool(res.get("cross_encoder_loaded", False)),
@@ -660,6 +722,8 @@ def _format_live_result_payload(
             "author_count": len(authors_seen),
         },
         "forecast": {
+            "gnn_k_horizon": int(res.get("gnn_k_horizon", res.get("k_observed", max(0, len(tree_nodes) - 1)))),
+            "forecast_scope": str(res.get("forecast_scope") or "early_k_in_distribution"),
             "k_observed": int(res.get("k_observed", max(0, len(tree_nodes) - 1))),
             "predicted_total_replies": round(float(res.get("predicted_total_replies", 0.0)), 1),
             "actual_total_replies": act_replies,
@@ -687,6 +751,8 @@ def _format_live_result_payload(
         },
         "user_graph": user_graph,
         "top_trigger_edges": enriched_triggers,
+        "topic_analysis": dict(res.get("topic_analysis") or {}),
+        "large_thread_analysis": dict(res.get("large_thread_analysis") or {}),
         "junk_filter_stats": dict(res.get("junk_filter_stats") or {}),
         "preserved_short_stances": kept_texts_short,
         "kept_nodes": list(res.get("kept_nodes") or []),
@@ -959,6 +1025,17 @@ class DemoBackend:
             if cid in selected_cids:
                 node_meta_by_cascade[cid][str(row["node_id"])] = row
 
+        edge_meta_by_cascade: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in et_test.to_pylist():
+            cid = str(row["cascade_id"])
+            if cid in selected_cids:
+                edge_meta_by_cascade[cid].append(row)
+
+        nlp_pt = torch.load(self.data_dir / "nlp_features.pt", map_location="cpu", weights_only=False)
+        pt_stance = nlp_pt.get("edge_stance") or nlp_pt.get("teacher_edge_stance") or {}
+        pt_hostility = nlp_pt.get("edge_hostility") or nlp_pt.get("teacher_edge_hostility") or {}
+        del nlp_pt
+
         summaries: list[dict[str, Any]] = []
         threads_by_id: dict[str, dict[str, Any]] = {}
 
@@ -1140,10 +1217,69 @@ class DemoBackend:
             title_snip = _clean_title_snippet(root_full_text, 120)
             user_graph = _build_thread_user_graph(tree_nodes, tree_edges)
 
+            # Classify topic strictly on root + early replies in V_K (zero future leakage).
+            # Use instant lexical scorer during bulk startup cache warmup so /api/tier1/threads never blocks;
+            # /api/tier1/classify_topic and sandbox use backend="auto" (mDeBERTa NLI / encoder).
+            topic_analysis = classify_post_topics(
+                title_snip,
+                root_full_text,
+                reply_snippets=[n["text"] for n in tree_nodes[1:6]],
+                lang="vi",
+                backend="lexical",
+            )
+
+            # Analyze full-thread trajectory across all real replies of the Test cascade
+            full_nodes_dict = raw_meta or {str(n["node_id"]): n for n in tree_nodes}
+            full_nodes_list = list(full_nodes_dict.values())
+            full_edges_list = edge_meta_by_cascade.get(cid) or [
+                {
+                    "edge_id": f"{e['source_id']}->{e['target_id']}",
+                    "source_id": e["source_id"],
+                    "target_id": e["target_id"],
+                    "s_uv": e["s_uv"],
+                    "h_uv": e["h_uv"],
+                }
+                for e in tree_edges
+            ]
+            full_children_adj: dict[str, list[str]] = defaultdict(list)
+            full_edge_scores: dict[str, dict[str, Any]] = {}
+            for fe in full_edges_list:
+                eid_f = str(fe.get("edge_id") or f"{fe['source_id']}->{fe['target_id']}")
+                s_f = float(pt_stance.get(eid_f, fe.get("s_uv", 0.0)))
+                h_f = float(pt_hostility.get(eid_f, fe.get("h_uv", 0.0)))
+                full_children_adj[str(fe["source_id"])].append(str(fe["target_id"]))
+                full_edge_scores[eid_f] = {"s_uv": s_f, "h_uv": h_f}
+
+            full_depth_map: dict[str, int] = {root_id: 0}
+            dq_full: deque[str] = deque([root_id])
+            while dq_full:
+                cur_f = dq_full.popleft()
+                for ch_f in full_children_adj.get(cur_f, []):
+                    if ch_f not in full_depth_map:
+                        full_depth_map[ch_f] = full_depth_map[cur_f] + 1
+                        dq_full.append(ch_f)
+
+            imp_by_target = {str(t["target_id"]): float(t.get("importance", 0.0)) for t in top_triggers}
+            root_meta_obj = raw_meta.get(root_id) or tree_nodes[0]
+            large_thread_analysis = analyze_large_thread_dynamics(
+                root_node=root_meta_obj,
+                all_nodes=full_nodes_list,
+                all_edges=full_edges_list,
+                edge_scores=full_edge_scores,
+                depth_map=full_depth_map,
+                topic_analysis=topic_analysis,
+                trigger_importance_by_target=imp_by_target,
+                k_early_ref=20,
+                lang="vi",
+                scope="early_post_hoc",
+            )
+
             summary = {
                 "cascade_id": cid,
                 "topic_id": tid,
                 "title_snippet": title_snip,
+                "primary_topic": topic_analysis.get("primary_topic", ""),
+                "scale_tier": large_thread_analysis.get("scale_tier", "medium"),
                 "k_observed": len(tree_nodes) - 1,
                 "actual_total_replies": act_replies,
                 "has_future_replies": has_future,
@@ -1168,6 +1304,7 @@ class DemoBackend:
                     "topic_id": tid,
                     "root_title": title_snip,
                     "root_text": root_full_text,
+                    "analysis_mode": "early",
                     "is_synthetic_fallback": False,
                     "checkpoint_loaded": True,
                     "cross_encoder_loaded": True,
@@ -1215,6 +1352,8 @@ class DemoBackend:
                 },
                 "user_graph": user_graph,
                 "top_trigger_edges": top_triggers,
+                "topic_analysis": topic_analysis,
+                "large_thread_analysis": large_thread_analysis,
             }
 
         return summaries, threads_by_id
@@ -1317,9 +1456,49 @@ class DemoBackend:
             raise ValueError(f"junk_mode không hợp lệ: {junk_mode_raw!r}")
         junk_mode: Literal["contract", "prune"] = "contract" if junk_mode_raw == "contract" else "prune"
 
+        default_amode = "full" if mode == "preset_large_1" else "early"
+        amode_raw = str(payload.get("analysis_mode") or default_amode).strip().lower()
+        if amode_raw not in {"early", "full"}:
+            raise ValueError(f"analysis_mode không hợp lệ: {amode_raw!r}")
+        analysis_mode: Literal["early", "full"] = "full" if amode_raw == "full" else "early"
+
+        raw_k = payload.get("k_horizon")
+        if raw_k is None:
+            k_horizon = 20
+        elif isinstance(raw_k, bool):
+            raise ValueError(f"k_horizon không hợp lệ: {raw_k!r}")
+        else:
+            k_horizon = int(raw_k)
+            if k_horizon < 1 or k_horizon > 500:
+                raise ValueError(f"k_horizon phải nằm trong [1, 500], nhận {k_horizon!r}")
+
+        raw_max_full = payload.get("max_full_comments")
+        if raw_max_full is None:
+            max_full_comments = 500
+        elif isinstance(raw_max_full, bool):
+            raise ValueError(f"max_full_comments không hợp lệ: {raw_max_full!r}")
+        else:
+            max_full_comments = int(raw_max_full)
+            if max_full_comments < 20 or max_full_comments > 500:
+                raise ValueError(
+                    f"max_full_comments phải nằm trong [20, 500], nhận {max_full_comments!r}"
+                )
+
+        custom_topics = payload.get("custom_topics")
+        topics_cache_key = json.dumps(custom_topics, ensure_ascii=False) if custom_topics is not None else ""
+        lang_raw = str(payload.get("lang") or "vi").strip().lower()
+        lang_val = "en" if lang_raw == "en" else "vi"
+
         base_ts = 1763400000.0
-        if mode in {"preset_junk_1", "preset_junk_2"}:
-            cache_key = (mode, junk_mode)
+        if mode in {"preset_junk_1", "preset_junk_2", "preset_large_1"}:
+            cache_key = (
+                mode,
+                junk_mode,
+                analysis_mode,
+                str(k_horizon),
+                str(max_full_comments),
+                topics_cache_key,
+            )
             with self._lock:
                 cached = self._sandbox_preset_cache.get(cache_key)
             if cached is not None:
@@ -1413,10 +1592,13 @@ class DemoBackend:
         res = predict_live_cascade(
             post,
             comments,
-            k_horizon=20,
+            k_horizon=k_horizon,
+            analysis_mode=analysis_mode,
+            max_full_comments=max_full_comments,
+            custom_topics=custom_topics,
             cross_encoder_ckpt=ce_ckpt,
             gnn_ckpt=gnn_ckpt,
-            lang="vi",
+            lang=lang_val,
             junk_mode=junk_mode,
             allow_untrained=True,
             is_demo=is_demo,
@@ -1430,10 +1612,43 @@ class DemoBackend:
             is_synthetic_fallback=not bool(res.get("cross_encoder_loaded", False)),
         )
         out["sandbox_mode"] = mode
-        if mode in {"preset_junk_1", "preset_junk_2"}:
+        if mode in {"preset_junk_1", "preset_junk_2", "preset_large_1"}:
+            cache_key = (
+                mode,
+                junk_mode,
+                analysis_mode,
+                str(k_horizon),
+                str(max_full_comments),
+                topics_cache_key,
+            )
             with self._lock:
-                self._sandbox_preset_cache[(mode, junk_mode)] = out
+                self._sandbox_preset_cache[cache_key] = out
         return out
+
+    def classify_topic(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, Mapping):
+            raise ValueError("Payload JSON không hợp lệ.")
+        title = str(payload.get("title") or "").strip()
+        root_text = str(payload.get("root_text") or payload.get("body") or "").strip()
+        if not title and not root_text:
+            raise ValueError("Cần cung cấp tiêu đề hoặc nội dung bài đăng để phân loại chủ đề.")
+        raw_snips = payload.get("reply_snippets")
+        snips = [str(s) for s in raw_snips[:10]] if isinstance(raw_snips, list) else []
+        custom_topics = payload.get("custom_topics")
+        lang_raw = str(payload.get("lang") or "vi").strip().lower()
+        lang_lit: Literal["vi", "en"] = "en" if lang_raw == "en" else "vi"
+        backend_raw = str(payload.get("topic_backend") or "auto").strip().lower()
+        if backend_raw not in {"auto", "nli", "embedding", "lexical"}:
+            raise ValueError(f"topic_backend không hợp lệ: {backend_raw!r}")
+        backend_lit: Literal["auto", "nli", "embedding", "lexical"] = backend_raw  # type: ignore[assignment]
+        return classify_post_topics(
+            title,
+            root_text,
+            reply_snippets=snips,
+            custom_topics=custom_topics,
+            lang=lang_lit,
+            backend=backend_lit,
+        )
 
     def get_tier2_macro(self) -> dict[str, Any]:
         with self._lock:
@@ -1663,7 +1878,7 @@ def make_handler(backend: DemoBackend):
             if self._is_traversal_attempt(self.path, parsed.path):
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "Forbidden path"})
                 return
-            if parsed.path != "/api/tier1/sandbox":
+            if parsed.path not in {"/api/tier1/sandbox", "/api/tier1/classify_topic"}:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
                 return
 
@@ -1674,7 +1889,10 @@ def make_handler(backend: DemoBackend):
                     return
                 raw = self.rfile.read(length) if length > 0 else b"{}"
                 body = json.loads(raw.decode("utf-8"))
-                result = backend.run_sandbox(body)
+                if parsed.path == "/api/tier1/classify_topic":
+                    result = backend.classify_topic(body)
+                else:
+                    result = backend.run_sandbox(body)
             except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return

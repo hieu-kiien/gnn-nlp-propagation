@@ -64,6 +64,13 @@ from src.nlp.extract_features import (
     encode_edges_with_cross_encoder,
     encode_node_embeddings,
 )
+from src.nlp.topic_post_analyzer import (
+    VN_POLAR_Q50,
+    VN_POLAR_Q75,
+    VN_POLAR_Q90,
+    analyze_large_thread_dynamics,
+    classify_post_topics,
+)
 
 _REDDIT_POST_ID_RE = re.compile(r"/comments/([^/?#]+)")
 _VALID_POST_ID_RE = re.compile(r"[A-Za-z0-9]{4,12}")
@@ -85,12 +92,6 @@ _BEHAVIOR_LABEL_VI_2D: dict[str, str] = {
     "hostile_conflict": "Xung đột / Gay gắt cao",
 }
 
-# Empirical future_only y_polar quantiles computed strictly on the VN Train split
-# (N = 1,050 cascades, K = 20, min_total_replies = 25; data/processed/vn/nodes.parquet
-# UTC cutoff 2025-06-15 to 2026-06-04; topic_splits.json train split only — zero Val/Test leakage).
-VN_POLAR_Q50: float = 0.0927623026072979
-VN_POLAR_Q75: float = 0.12019770219922066
-VN_POLAR_Q90: float = 0.15035123974084857
 VN_QUANTILE_CALIBRATION_NOTE: str = (
     "Regime thresholds calibrated strictly on VN Train split "
     "(N=1,050 cascades, K=20, min_total_replies=25, UTC 2025-06-15 to 2026-06-04); zero Val/Test leakage."
@@ -573,6 +574,11 @@ def predict_live_cascade(
     comments: Sequence[Mapping[str, Any]],
     *,
     k_horizon: int = 20,
+    analysis_mode: Literal["early", "full"] = "early",
+    max_full_comments: int = 500,
+    custom_topics: str | Sequence[str] | None = None,
+    topic_backend: Literal["auto", "nli", "embedding", "lexical"] = "auto",
+    allow_nli_topic_download: bool = False,
     cross_encoder_ckpt: Path | None = None,
     gnn_ckpt: Path | None = None,
     node_backbone: str | None = None,
@@ -581,10 +587,15 @@ def predict_live_cascade(
     allow_untrained: bool = False,
     is_demo: bool = False,
 ) -> dict[str, Any]:
-    """Build cascade graph, score early behavior, run SBiFAGAT, and emit live forecast report."""
+    """Build cascade graph, score behavior & topics, run SBiFAGAT (early K or full post), and emit report."""
     if isinstance(k_horizon, bool) or int(k_horizon) < 1:
         raise ValueError(f"k_horizon must be >= 1, got {k_horizon!r}")
+    if analysis_mode not in {"early", "full"}:
+        raise ValueError(f"analysis_mode must be 'early' or 'full', got {analysis_mode!r}")
+    if isinstance(max_full_comments, bool) or int(max_full_comments) < 1:
+        raise ValueError(f"max_full_comments must be >= 1, got {max_full_comments!r}")
     k_horizon = int(k_horizon)
+    max_full_comments = int(max_full_comments)
     junk_stats: dict[str, Any] = {}
     built = build_vn_cascade_from_thread(
         post,
@@ -623,8 +634,14 @@ def predict_live_cascade(
     non_roots = [n for n in node_records if not bool(n["is_root"])]
     non_roots.sort(key=lambda n: (n["created_at_utc"], depth_map.get(str(n["node_id"]), 999), str(n["node_id"])))
 
-    kept_nodes = [root_row] + non_roots[:k_horizon]
-    kept_id_to_idx = {str(n["node_id"]): idx for idx, n in enumerate(kept_nodes)}
+    # Keep GNN early-warning inference strictly in-distribution on V_K (k_horizon),
+    # while full mode expands visualization + large-thread discourse analysis up to max_full_comments.
+    gnn_nodes = [root_row] + non_roots[:k_horizon]
+    display_limit = min(len(non_roots), max_full_comments) if analysis_mode == "full" else k_horizon
+    display_nodes = [root_row] + non_roots[:display_limit]
+    horizon_for_features = k_horizon
+    gnn_id_to_idx = {str(n["node_id"]): idx for idx, n in enumerate(gnn_nodes)}
+    display_id_to_idx = {str(n["node_id"]): idx for idx, n in enumerate(display_nodes)}
 
     # Score edges (all edges for post-hoc check; strictly isolated from model features beyond K)
     ce_model, ce_tok, frozen_node_encoder, frozen_node_tok, cross_encoder_loaded, nlp_backend = (
@@ -672,65 +689,85 @@ def predict_live_cascade(
                 "behavior_label": _classify_2d_behavior_label(s_v, h_v),
             }
 
-    # Build early PyG CascadeData restricted strictly to V_K
-    delays_k = [max(0.0, (n["created_at_utc"] - root_ts).total_seconds()) for n in kept_nodes]
+    # Build early PyG CascadeData restricted strictly to V_K (in-distribution for SBi-FAGAT)
+    delays_gnn = [max(0.0, (n["created_at_utc"] - root_ts).total_seconds()) for n in gnn_nodes]
+    delays_display = [max(0.0, (n["created_at_utc"] - root_ts).total_seconds()) for n in display_nodes]
     denom_t = math.log1p(TEMPORAL_REF_SECONDS)
     x_rows = []
     if frozen_node_encoder is not None and frozen_node_tok is not None:
-        kept_texts = [str(n["text"]) for n in kept_nodes]
-        kept_parents = [
+        gnn_texts = [str(n["text"]) for n in gnn_nodes]
+        gnn_parents = [
             None
             if (bool(n["is_root"]) or n.get("parent_id") is None)
             else str(node_by_id.get(str(n["parent_id"]), {}).get("text", ""))
-            for n in kept_nodes
+            for n in gnn_nodes
         ]
-        kept_roots = [
+        gnn_roots = [
             None
             if (bool(n["is_root"]) or n.get("parent_id") is None)
             else root_text_str
-            for n in kept_nodes
+            for n in gnn_nodes
         ]
         emb_mat = encode_node_embeddings(
-            kept_texts,
+            gnn_texts,
             encoder=frozen_node_encoder,
             tokenizer=frozen_node_tok,
-            parent_texts=kept_parents,
-            root_texts=kept_roots,
+            parent_texts=gnn_parents,
+            root_texts=gnn_roots,
             lang=lang,
             batch_size=32,
             device=torch.device("cpu"),
         )
-        for idx_n, (n, dt_sec) in enumerate(zip(kept_nodes, delays_k)):
+        for idx_n, (n, dt_sec) in enumerate(zip(gnn_nodes, delays_gnn)):
             nid = str(n["node_id"])
             t_norm = min(1.0, math.log1p(dt_sec) / denom_t)
-            d_norm = min(1.0, float(depth_map.get(nid, 0)) / float(max(1, k_horizon)))
+            d_norm = min(1.0, float(depth_map.get(nid, 0)) / float(max(1, horizon_for_features)))
             x_rows.append(torch.cat([emb_mat[idx_n].cpu(), torch.tensor([t_norm, d_norm], dtype=torch.float32)], dim=0))
     else:
-        for n, dt_sec in zip(kept_nodes, delays_k):
+        for n, dt_sec in zip(gnn_nodes, delays_gnn):
             nid = str(n["node_id"])
             emb_768 = _deterministic_text_projection(str(n["text"]), 768)
             t_norm = min(1.0, math.log1p(dt_sec) / denom_t)
-            d_norm = min(1.0, float(depth_map.get(nid, 0)) / float(max(1, k_horizon)))
+            d_norm = min(1.0, float(depth_map.get(nid, 0)) / float(max(1, horizon_for_features)))
             x_rows.append(torch.cat([emb_768.cpu(), torch.tensor([t_norm, d_norm], dtype=torch.float32)], dim=0))
     x = torch.stack(x_rows, dim=0)
 
     td_src, td_dst = [], []
     edge_attr_rows: list[list[float]] = []
-    kept_pairs: list[tuple[str, str]] = []
-    kept_edge_details: list[dict[str, Any]] = []
-    for n in kept_nodes[1:]:
+    gnn_pairs: list[tuple[str, str]] = []
+    gnn_edge_details: list[dict[str, Any]] = []
+    for n in gnn_nodes[1:]:
         dst_id = str(n["node_id"])
         src_id = str(n["parent_id"])
-        if src_id not in kept_id_to_idx:
+        if src_id not in gnn_id_to_idx:
             continue
         edge_row = edge_lookup.get((src_id, dst_id))
         eid = str(edge_row["edge_id"]) if edge_row is not None else f"{src_id}->{dst_id}"
         sc = edge_scores[eid]
-        td_src.append(kept_id_to_idx[src_id])
-        td_dst.append(kept_id_to_idx[dst_id])
+        td_src.append(gnn_id_to_idx[src_id])
+        td_dst.append(gnn_id_to_idx[dst_id])
         edge_attr_rows.append([sc["s_uv"], sc["h_uv"]])
-        kept_pairs.append((src_id, dst_id))
-        kept_edge_details.append(
+        gnn_pairs.append((src_id, dst_id))
+        gnn_edge_details.append(
+            {
+                "edge_id": eid,
+                "parent_id": src_id,
+                "node_id": dst_id,
+                "reply_text": str(n["text"]),
+                **sc,
+            }
+        )
+
+    display_edge_details: list[dict[str, Any]] = []
+    for n in display_nodes[1:]:
+        dst_id = str(n["node_id"])
+        src_id = str(n["parent_id"])
+        if src_id not in display_id_to_idx:
+            continue
+        edge_row = edge_lookup.get((src_id, dst_id))
+        eid = str(edge_row["edge_id"]) if edge_row is not None else f"{src_id}->{dst_id}"
+        sc = edge_scores[eid]
+        display_edge_details.append(
             {
                 "edge_id": eid,
                 "parent_id": src_id,
@@ -744,23 +781,23 @@ def predict_live_cascade(
     edge_index_bu = edge_index_td[[1, 0], :] if edge_index_td.numel() > 0 else edge_index_td
     edge_attr = torch.tensor(edge_attr_rows, dtype=torch.float32) if edge_attr_rows else torch.empty((0, 2), dtype=torch.float32)
     struct_x = compute_causal_structural_node_features(
-        kept_nodes=kept_nodes,
-        delays_k=delays_k,
+        kept_nodes=gnn_nodes,
+        delays_k=delays_gnn,
         depth_map=depth_map,
-        k_horizon=k_horizon,
+        k_horizon=horizon_for_features,
     )
     cascade_stats = compute_early_cascade_burst_stats(
-        kept_nodes=kept_nodes,
-        delays_k=delays_k,
+        kept_nodes=gnn_nodes,
+        delays_k=delays_gnn,
         depth_map=depth_map,
         edge_attr_rows=edge_attr_rows,
-        k_horizon=k_horizon,
+        k_horizon=horizon_for_features,
     )
 
     early_children_adj: dict[str, list[str]] = {}
     early_edge_lookup: dict[tuple[str, str], dict[str, Any]] = {}
     early_stance_map: dict[str, float] = {}
-    for d_e in kept_edge_details:
+    for d_e in gnn_edge_details:
         pu = str(d_e["parent_id"])
         cv = str(d_e["node_id"])
         eid_e = str(d_e["edge_id"])
@@ -786,7 +823,7 @@ def predict_live_cascade(
         early_y_polar=torch.tensor([early_y_polar_val], dtype=torch.float32),
         cascade_stats=cascade_stats,
         root_index=torch.tensor([0], dtype=torch.long),
-        edge_pairs=kept_pairs,
+        edge_pairs=gnn_pairs,
     )
 
     # Load GNN checkpoint if present; otherwise check authorization before untuned inspection
@@ -848,7 +885,7 @@ def predict_live_cascade(
     diag = gnn_model.predict_with_diagnostics(data, top_k_edges=5)
 
     behavior_counts = {lbl: 0 for lbl in _UNIFIED_BEHAVIOR_LABELS}
-    for d in kept_edge_details:
+    for d in gnn_edge_details:
         lbl_d = d["behavior_label"]
         if lbl_d in behavior_counts:
             behavior_counts[lbl_d] += 1
@@ -856,7 +893,7 @@ def predict_live_cascade(
             mapped_lbl = _classify_2d_behavior_label(float(d["s_uv"]), float(d["h_uv"]))
             behavior_counts[mapped_lbl] += 1
 
-    total_early_edges = max(1, len(kept_edge_details))
+    total_early_edges = max(1, len(gnn_edge_details))
     early_behavior_summary = {
         lbl: {
             "count": int(behavior_counts[lbl]),
@@ -873,8 +910,8 @@ def predict_live_cascade(
     uncertainty_available = bool(diag.get("uncertainty_available", conf_score is not None))
 
     actual_total_replies = len(non_roots)
-    has_future = actual_total_replies > (len(kept_nodes) - 1)
-    kept_pair_set = {(str(d_e["parent_id"]), str(d_e["node_id"])) for d_e in kept_edge_details}
+    has_future = actual_total_replies > (len(gnn_nodes) - 1)
+    gnn_pair_set = {(str(d_e["parent_id"]), str(d_e["node_id"])) for d_e in gnn_edge_details}
     stance_map = {eid: sc["s_uv"] for eid, sc in edge_scores.items()}
     if has_future:
         actual_aligned = _compute_root_aligned_stances(
@@ -882,7 +919,7 @@ def predict_live_cascade(
             children_adj=children_adj,
             edge_lookup=edge_lookup,
             stance_map=stance_map,
-            excluded_pairs=kept_pair_set,
+            excluded_pairs=gnn_pair_set,
         )
         actual_full_polar: float | None = (
             _compute_full_tree_polarization(actual_aligned, lambda_polar=0.5)
@@ -911,10 +948,10 @@ def predict_live_cascade(
             "time_delay_sec": float(dt_sec),
             "text": str(n["text"]),
         }
-        for n, dt_sec in zip(kept_nodes, delays_k)
+        for n, dt_sec in zip(display_nodes, delays_display)
     ]
     serialized_kept_edges = []
-    for d_e in kept_edge_details:
+    for d_e in display_edge_details:
         s_val = float(d_e["s_uv"])
         stance_cls = "support" if s_val > 0.1 else ("oppose" if s_val < -0.1 else "neutral")
         src_s = str(d_e["parent_id"])
@@ -931,9 +968,68 @@ def predict_live_cascade(
             }
         )
 
+    imp_by_target: dict[str, float] = {}
+    for trig in diag["top_trigger_edges"]:
+        pair = trig.get("pair")
+        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+            imp_by_target[str(pair[1])] = float(trig.get("importance", 0.0))
+
+    lang_lit: Literal["vi", "en"] = "en" if str(lang).lower() == "en" else "vi"
+    topic_snippets = [
+        str(n.get("text") or "")
+        for n in (display_nodes[1:12] if analysis_mode == "full" else gnn_nodes[1:6])
+    ]
+    topic_analysis = classify_post_topics(
+        str(post.get("title") or ""),
+        str(post.get("selftext") or post.get("body") or root_row.get("text") or ""),
+        reply_snippets=topic_snippets,
+        custom_topics=custom_topics,
+        lang=lang_lit,
+        backend=topic_backend,
+        node_encoder=frozen_node_encoder,
+        node_tokenizer=frozen_node_tok,
+        allow_nli_download=allow_nli_topic_download,
+    )
+
+    if analysis_mode == "full":
+        display_ids_set = {str(n["node_id"]) for n in display_nodes}
+        full_scope_edges = [
+            e
+            for e in edge_records
+            if str(e["source_id"]) in display_ids_set and str(e["target_id"]) in display_ids_set
+        ]
+        large_thread_analysis = analyze_large_thread_dynamics(
+            root_node=root_row,
+            all_nodes=display_nodes,
+            all_edges=full_scope_edges,
+            edge_scores=edge_scores,
+            depth_map=depth_map,
+            topic_analysis=topic_analysis,
+            trigger_importance_by_target=imp_by_target,
+            k_early_ref=k_horizon,
+            lang=lang_lit,
+            scope="full_analysis",
+        )
+    else:
+        large_thread_analysis = analyze_large_thread_dynamics(
+            root_node=root_row,
+            all_nodes=node_records,
+            all_edges=edge_records,
+            edge_scores=edge_scores,
+            depth_map=depth_map,
+            topic_analysis=topic_analysis,
+            trigger_importance_by_target=imp_by_target,
+            k_early_ref=k_horizon,
+            lang=lang_lit,
+            scope="early_post_hoc",
+        )
+
     return {
         "root_title": str(post.get("title") or root_row["text"][:120]),
-        "k_observed": len(kept_nodes) - 1,
+        "analysis_mode": analysis_mode,
+        "gnn_k_horizon": len(gnn_nodes) - 1,
+        "forecast_scope": "early_k_in_distribution",
+        "k_observed": len(display_nodes) - 1,
         "edge_dim": int(target_edge_dim),
         "checkpoint_loaded": checkpoint_loaded,
         "cross_encoder_loaded": cross_encoder_loaded,
@@ -969,8 +1065,10 @@ def predict_live_cascade(
         "low_signal_warning": bool(diag["low_signal_warning"].view(-1)[0].item()),
         "top_trigger_edges": diag["top_trigger_edges"],
         "flagged_hostile": [
-            d for d in kept_edge_details if d["behavior_label"] == "hostile_conflict"
+            d for d in gnn_edge_details if d["behavior_label"] == "hostile_conflict"
         ],
+        "topic_analysis": topic_analysis,
+        "large_thread_analysis": large_thread_analysis,
         "actual_post_hoc_comparison": {
             "has_future_replies": has_future,
             "actual_total_replies": actual_total_replies,
@@ -993,7 +1091,8 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
     lines.extend(
         [
             f"Bai goc      : {result['root_title']}",
-            f"Cua so quan sat (V_K): {result['k_observed']} binh luan dau tien",
+            f"Cua so GNN du bao som (V_K): {result.get('gnn_k_horizon', result['k_observed'])} binh luan dau (in-distribution)",
+            f"Pham vi hien thi & phan tich: {result['k_observed']} binh luan ({result.get('analysis_mode', 'early')})",
             f"Trang thai GNN       : {'Da nap checkpoint huan luyen (2D [s_uv, h_uv])' if result['checkpoint_loaded'] else 'CHE DO KIEM THU CAU TRUC (CHUA NAP CHECKPOINT - KHONG CO GIA TRI DU BAO)'}",
             f"Backend NLP          : {result.get('nlp_backend', 'unknown')} (cross_encoder_loaded={result.get('cross_encoder_loaded', False)})",
             f"Che do loc rac       : {result.get('junk_mode', 'prune')}",
@@ -1061,9 +1160,33 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
             f"  - Tong so binh luan thuc te toan bai       : {act['actual_total_replies']} binh luan",
             f"  - Do phan cuc quan sat som (1..K)          : {early_pol_str}",
             f"  - Do phan cuc tuong lai thuc te (t > K)    : {act_pol_str}",
-            "=" * 78,
         ]
     )
+    topic_info = result.get("topic_analysis") or {}
+    large_info = result.get("large_thread_analysis") or {}
+    sem_info = large_info.get("semantic_understanding") or {}
+    if topic_info:
+        sec_str = ", ".join(topic_info.get("secondary_topics") or ()) or "Không"
+        lines.extend(
+            [
+                "",
+                "[6] PHAN LOAI CHU DE & HIEU BAI LON (AI):",
+                f"  - Chu de chinh ({topic_info.get('topic_backend', 'lexical')}) : "
+                f"{topic_info.get('primary_topic', 'N/A')} ({float(topic_info.get('primary_confidence', 0.0)):.1%})",
+                f"  - Chu de phu                             : {sec_str}",
+            ]
+        )
+    if large_info:
+        lines.extend(
+            [
+                f"  - Quy mo & Pham vi ({large_info.get('scope', 'full')})   : "
+                f"{large_info.get('scale_label_vi', '')} ({large_info.get('total_replies_analyzed', 0)} binh luan, {large_info.get('unique_authors_total', 0)} tac gia)",
+                f"  - Tinh chat thao luan                    : {large_info.get('post_archetype_label_vi', '')}",
+                f"  - Xu huong tien hoa                      : {large_info.get('evolution_trend_label_vi', '')}",
+                f"  - Tom tat AI                             : {sem_info.get('summary_vi', '')}",
+            ]
+        )
+    lines.append("=" * 78)
     return "\n".join(lines)
 
 
@@ -1084,6 +1207,10 @@ def main() -> None:
     parser.add_argument("--gnn-ckpt", "--checkpoint", dest="gnn_ckpt", type=Path, default=None)
     parser.add_argument("--node-backbone", type=str, default=None)
     parser.add_argument("--k-horizon", type=int, default=20)
+    parser.add_argument("--analysis-mode", choices=["early", "full"], default="early")
+    parser.add_argument("--max-full-comments", type=int, default=500)
+    parser.add_argument("--topics", type=str, default=None, help="Danh sach chu de tuy chinh (ngan cach bang dau phay).")
+    parser.add_argument("--topic-backend", choices=["auto", "nli", "embedding", "lexical"], default="auto")
     parser.add_argument("--lang", choices=["vi", "en"], default="vi")
     parser.add_argument("--junk-mode", choices=["prune", "contract"], default="prune")
     parser.add_argument("--output-json", type=Path, default=None)
@@ -1116,6 +1243,10 @@ def main() -> None:
         post,
         comments,
         k_horizon=args.k_horizon,
+        analysis_mode=args.analysis_mode,
+        max_full_comments=args.max_full_comments,
+        custom_topics=args.topics,
+        topic_backend=args.topic_backend,
         cross_encoder_ckpt=args.cross_encoder_ckpt,
         gnn_ckpt=args.gnn_ckpt,
         node_backbone=args.node_backbone,

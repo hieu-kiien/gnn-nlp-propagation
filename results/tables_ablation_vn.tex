@@ -1,0 +1,31 @@
+\begin{table*}[t]
+\centering
+\caption{Ablation Study of SBi-FAGAT Components at $K=20$ Across 5 Random Seeds. Separates stance polarity $s_{uv}$, hostility $h_{uv}$, signed $\tanh$ gate, Bottom-Up feedback, Dir-GNN mixing, dual-channel split, Camp Dipole \& Moments readout, Persistence-Residual anchoring, 8-D Burst Stats, and Global Attention Readout against a matched BiEdgeGATv2 (Matched) comparator (significance stars vs. BiEdgeGATv2 (Matched), Holm-Bonferroni adjusted).}
+\label{tab:ablation_vn}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lccccccc}
+\toprule
+Model & MSLE $\downarrow$ & MAE $\downarrow$ & $R^2_{\text{size}}$ $\uparrow$ & RMSE $\downarrow$ & $R^2_{\text{polar}}$ $\uparrow$ & Pearson $r$ $\uparrow$ & Spearman $\rho$ $\uparrow$ \\
+\midrule
+SBiFAGAT (Full) & 0.1597 $\pm$ 0.0063 & 0.3116 $\pm$ 0.0095 & 0.2849 $\pm$ 0.0282 & 0.0371 $\pm$ 0.0004 & 0.0721 $\pm$ 0.0199 & 0.2874 $\pm$ 0.0124 & 0.2375 $\pm$ 0.0198 \\
+w/o Stance Score (s\_uv=0) & 0.1592 $\pm$ 0.0064 & 0.3112 $\pm$ 0.0091 & 0.2873 $\pm$ 0.0286 & 0.0371 $\pm$ 0.0004 & 0.0712 $\pm$ 0.0193 & 0.2854 $\pm$ 0.0124 & 0.2355 $\pm$ 0.0228 \\
+w/o Hostility Score (h\_uv=0) & 0.1591 $\pm$ 0.0063 & 0.3117 $\pm$ 0.0091 & 0.2877 $\pm$ 0.0284 & 0.0370 $\pm$ 0.0004 & 0.0731 $\pm$ 0.0187 & 0.2875 $\pm$ 0.0109 & 0.2369 $\pm$ 0.0209 \\
+w/o Edge Signals (s\_uv=0, h\_uv=0) & 0.1591 $\pm$ 0.0065 & 0.3106 $\pm$ 0.0087 & 0.2878 $\pm$ 0.0289 & 0.0370 $\pm$ 0.0004 & 0.0763 $\pm$ 0.0223 & 0.2927 $\pm$ 0.0157 & 0.2407 $\pm$ 0.0247 \\
+w/o Conflict Gate (Sigmoid) & \textbf{0.1582 $\pm$ 0.0052} & 0.3090 $\pm$ 0.0063 & \textbf{0.2919 $\pm$ 0.0235} & 0.0372 $\pm$ 0.0005 & 0.0662 $\pm$ 0.0229 & 0.2827 $\pm$ 0.0188 & 0.2302 $\pm$ 0.0258 \\
+w/o Bottom-Up & 0.1584 $\pm$ 0.0090 & 0.3082 $\pm$ 0.0125 & 0.2908 $\pm$ 0.0401 & 0.0372 $\pm$ 0.0002 & 0.0653 $\pm$ 0.0114 & 0.2722 $\pm$ 0.0169 & 0.2142 $\pm$ 0.0174 \\
+w/o Attention Readout (Mean) & 0.1600 $\pm$ 0.0086 & 0.3110 $\pm$ 0.0064 & 0.2837 $\pm$ 0.0386 & 0.0373 $\pm$ 0.0003 & 0.0602 $\pm$ 0.0172 & 0.2787 $\pm$ 0.0278 & 0.2322 $\pm$ 0.0139 \\
+w/o Camp Dipole \& Moments & 0.1605 $\pm$ 0.0095 & 0.3138 $\pm$ 0.0104 & 0.2815 $\pm$ 0.0425 & 0.0372 $\pm$ 0.0002 & 0.0643 $\pm$ 0.0124 & 0.2738 $\pm$ 0.0089 & 0.2281 $\pm$ 0.0102 \\
+w/o Dir-GNN Mixing & 0.1628 $\pm$ 0.0056 & 0.3108 $\pm$ 0.0070 & 0.2712 $\pm$ 0.0251 & 0.0374 $\pm$ 0.0006 & 0.0526 $\pm$ 0.0313 & 0.2830 $\pm$ 0.0203 & 0.2341 $\pm$ 0.0145 \\
+w/o Dual-Channel Split & 0.1599 $\pm$ 0.0051 & 0.3110 $\pm$ 0.0072 & 0.2840 $\pm$ 0.0231 & \textbf{0.0369 $\pm$ 0.0003} & \textbf{0.0798 $\pm$ 0.0173} & \textbf{0.2975 $\pm$ 0.0154} & 0.2454 $\pm$ 0.0258 \\
+w/o Persistence Anchor & 0.1602 $\pm$ 0.0053 & 0.3117 $\pm$ 0.0084 & 0.2827 $\pm$ 0.0236 & 0.0370 $\pm$ 0.0004 & 0.0769 $\pm$ 0.0218 & 0.2970 $\pm$ 0.0210 & 0.2406 $\pm$ 0.0281 \\
+BiEdgeGATv2 (Matched) & 0.1590 $\pm$ 0.0068 & \textbf{0.3075 $\pm$ 0.0089} & 0.2883 $\pm$ 0.0305 & 0.0370 $\pm$ 0.0007 & 0.0752 $\pm$ 0.0364 & 0.2931 $\pm$ 0.0390 & \textbf{0.2506 $\pm$ 0.0260} \\
+w/o Burst Stats & 0.1750 $\pm$ 0.0114 & 0.3204 $\pm$ 0.0101 & 0.2166 $\pm$ 0.0510 & 0.0375 $\pm$ 0.0009 & 0.0472 $\pm$ 0.0455 & 0.2865 $\pm$ 0.0361 & 0.2315 $\pm$ 0.0195 \\
+\midrule
+$p$-value (SBiFAGAT (Full) vs. BiEdgeGATv2 (Matched)) & 8.51e-01 & 3.53e-01 & 8.51e-01 & 7.17e-01 & 7.35e-01 & 6.77e-01 & 8.80e-02 \\
+Bootstrap $p$ (SBiFAGAT (Full) vs. BiEdgeGATv2 (Matched)) & 8.53e-01 & 2.80e-01 & 8.46e-01 & 7.73e-01 & 7.80e-01 & 6.91e-01 & 4.45e-01 \\
+Holm-Bonferroni $p$ (SBiFAGAT (Full) vs. BiEdgeGATv2 (Matched)) & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 6.16e-01 \\
+Holm-Bonf Bootstrap $p$ (SBiFAGAT (Full) vs. BiEdgeGATv2 (Matched)) & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}

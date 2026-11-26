@@ -149,21 +149,40 @@
                     <button type="button" class="btn-outline btn-sm" id="btn-preset-2">
                       Preset 2 · Quy định WFH/Văn phòng
                     </button>
+                    <button type="button" class="btn-outline btn-sm" id="btn-preset-large">
+                      Preset 3 · Bài lớn 42 bình luận (AI &amp; Giáo dục)
+                    </button>
                   </div>
 
-                  <fieldset class="junk-mode-fieldset">
-                    <legend class="field-label">Cơ chế lọc bình luận nhiễu</legend>
-                    <div class="radio-inline-group">
-                      <label class="radio-inline" for="junk-contract">
-                        <input type="radio" id="junk-contract" name="junk_mode" value="contract" checked>
-                        <span>Contract (Thu gọn nút giữa, bảo toàn nhánh con)</span>
-                      </label>
-                      <label class="radio-inline" for="junk-prune">
-                        <input type="radio" id="junk-prune" name="junk_mode" value="prune">
-                        <span>Prune (Cắt bỏ nhánh sau nút rác)</span>
-                      </label>
-                    </div>
-                  </fieldset>
+                  <div class="sandbox-fieldsets">
+                    <fieldset class="junk-mode-fieldset">
+                      <legend class="field-label">Cơ chế lọc bình luận nhiễu</legend>
+                      <div class="radio-inline-group">
+                        <label class="radio-inline" for="junk-contract">
+                          <input type="radio" id="junk-contract" name="junk_mode" value="contract" checked>
+                          <span>Contract (Thu gọn nút giữa, bảo toàn nhánh con)</span>
+                        </label>
+                        <label class="radio-inline" for="junk-prune">
+                          <input type="radio" id="junk-prune" name="junk_mode" value="prune">
+                          <span>Prune (Cắt bỏ nhánh sau nút rác)</span>
+                        </label>
+                      </div>
+                    </fieldset>
+
+                    <fieldset class="junk-mode-fieldset">
+                      <legend class="field-label">Phạm vi phân tích (Sớm vs Toàn bài lớn)</legend>
+                      <div class="radio-inline-group">
+                        <label class="radio-inline" for="analysis-early">
+                          <input type="radio" id="analysis-early" name="analysis_mode" value="early" checked>
+                          <span>Dự báo sớm (<span class="tabular">K=20</span> bình luận đầu)</span>
+                        </label>
+                        <label class="radio-inline" for="analysis-full">
+                          <input type="radio" id="analysis-full" name="analysis_mode" value="full">
+                          <span>Phân tích toàn bài lớn (tối đa <span class="tabular">500</span> bình luận)</span>
+                        </label>
+                      </div>
+                    </fieldset>
+                  </div>
                 </div>
 
                 <details class="custom-input-details" id="custom-editor-details">
@@ -226,6 +245,23 @@ c9 (trả lời c4): 👍</textarea>
                         autocapitalize="none"
                         spellcheck="false"
                         placeholder="https://www.reddit.com/r/vozforums/comments/..."
+                      >
+                    </div>
+
+                    <div class="field-stack">
+                      <label for="sb-custom-topics" class="field-label">
+                        Bộ chủ đề tùy chỉnh đưa cho AI phân loại (tùy chọn)
+                      </label>
+                      <span id="sb-topics-hint" class="field-hint">
+                        Ngăn cách bằng dấu phẩy; để trống để dùng bộ 8 chủ đề chuẩn (Giao thông, Kinh tế, AI, Giáo dục...).
+                      </span>
+                      <input
+                        type="text"
+                        id="sb-custom-topics"
+                        name="custom_topics"
+                        class="text-input"
+                        aria-describedby="sb-topics-hint"
+                        placeholder="Ví dụ: Chính sách giao thông, Công nghệ AI, Giáo dục, Kinh tế"
                       >
                     </div>
 
@@ -315,6 +351,79 @@ c9 (trả lời c4): 👍</textarea>
                 Tán thành: — · Trung lập: — · Phản đối: —
               </div>
             </article>
+          </section>
+
+          <!-- AI Topic Classification & Full-Thread Large-Post Understanding -->
+          <section class="card understanding-card" id="ai-understanding-card" aria-label="Phân loại chủ đề AI và phân tích bài lớn">
+            <div class="understanding-grid">
+              <div class="topic-panel">
+                <div class="panel-heading-row">
+                  <h2 class="section-heading">Phân loại Chủ đề AI</h2>
+                  <span class="pill" id="topic-backend-pill">topic: —</span>
+                </div>
+                <div class="topic-primary-row">
+                  <span class="badge-tag badge-topic-primary" id="topic-primary-label">—</span>
+                  <span class="tabular topic-conf" id="topic-primary-conf">—</span>
+                </div>
+                <div class="topic-secondary-line" id="topic-secondary-line">Chủ đề phụ: —</div>
+
+                <ul class="topic-bars-list" id="topic-bars-list" aria-label="Xác suất phân loại theo chủ đề"></ul>
+
+                <form id="topic-reclassify-form" action="/api/tier1/classify_topic" method="post" class="topic-custom-form" novalidate>
+                  <div class="field-stack">
+                    <label for="live-custom-topics" class="field-label">
+                      Đưa danh sách chủ đề mới để AI phân loại lại bài hiện tại
+                    </label>
+                    <span id="live-topics-hint" class="field-hint">
+                      Nhập các chủ đề cách nhau bằng dấu phẩy (để trống để quay về 8 chủ đề chuẩn).
+                    </span>
+                    <div class="topic-input-row">
+                      <input
+                        type="text"
+                        id="live-custom-topics"
+                        name="custom_topics"
+                        class="text-input"
+                        aria-describedby="live-topics-hint"
+                        placeholder="Ví dụ: Giao thông đô thị, Kinh tế, Công nghệ AI, Giáo dục"
+                      >
+                      <button type="submit" class="btn-outline btn-sm" id="btn-reclassify-topic">
+                        Phân loại lại
+                      </button>
+                    </div>
+                  </div>
+                </form>
+              </div>
+
+              <div class="large-post-panel">
+                <div class="panel-heading-row">
+                  <h2 class="section-heading">Hiểu Ngữ nghĩa &amp; Tiến hóa Bài lớn</h2>
+                  <span class="pill" id="large-scope-pill">scope: —</span>
+                </div>
+                <div class="meta-pills" id="large-badges-row">
+                  <span class="badge-tag badge-root" id="large-scale-badge">—</span>
+                  <span class="badge-tag badge-neutral" id="large-archetype-badge">—</span>
+                  <span class="badge-tag badge-relink" id="large-trend-badge">—</span>
+                </div>
+                <p class="understanding-summary" id="large-summary-text">Đang tổng hợp luận điểm toàn bài...</p>
+
+                <figure class="trajectory-figure">
+                  <svg
+                    id="trajectory-svg"
+                    class="trajectory-svg"
+                    role="img"
+                    aria-label="Biểu đồ tiến hóa độ phân cực y_polar từ K=5 đến toàn bài"
+                  ></svg>
+                  <figcaption class="trajectory-caption" id="trajectory-caption">
+                    Quỹ đạo phân cực y_polar theo số lượng bình luận tích lũy.
+                  </figcaption>
+                </figure>
+
+                <details class="arguments-details" id="arguments-details">
+                  <summary class="custom-summary">Xem luận điểm tiêu biểu 2 phe &amp; điểm nóng xung đột</summary>
+                  <div class="arguments-columns" id="arguments-columns"></div>
+                </details>
+              </div>
+            </div>
           </section>
 
           <!-- Main Graph Stage + Node Inspector -->
