@@ -45,6 +45,16 @@ def test_classification_and_binary_metrics_and_trajectory_aggregation() -> None:
     assert bm["pr_auc"] == 1.0
     assert bm["best_f1"] == 1.0
 
+    # Val-selected threshold must freeze on Val and not overfit Test quantiles
+    val_y = np.array([0, 0, 0, 1, 1], dtype=np.int64)
+    val_scores = np.array([0.1, 0.2, 0.7, 0.85, 0.95], dtype=np.float64)
+    test_y = np.array([0, 1, 1, 0], dtype=np.int64)
+    test_scores = np.array([0.1, 0.85, 0.90, 0.2], dtype=np.float64)
+    bm_val = _binary_early_warning_metrics(test_y, test_scores, val_y_true=val_y, val_scores=val_scores)
+    assert bm_val["threshold_selection"] == "val_split_only"
+    assert 0.7 <= bm_val["val_selected_threshold"] <= 0.85
+    assert bm_val["best_f1"] == 1.0
+
     per_cascade = {
         f"c{i}": {
             "num_replies": 60 if i < 4 else 30,

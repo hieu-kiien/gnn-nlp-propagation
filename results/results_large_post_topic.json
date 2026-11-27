@@ -605,51 +605,69 @@
         "Early-K Persistence": {
           "roc_auc": 0.5490196078431373,
           "pr_auc": 0.24350138727621573,
-          "best_f1": 0.4
+          "best_f1": 0.3558282208588957,
+          "val_selected_threshold": 0.10822488367557526,
+          "threshold_selection": "val_split_only"
         },
         "Ridge": {
           "roc_auc": 0.623394185260311,
           "pr_auc": 0.3607469903149242,
-          "best_f1": 0.41134751773049644
+          "best_f1": 0.40384615384615385,
+          "val_selected_threshold": 0.10616103301861327,
+          "threshold_selection": "val_split_only"
         },
         "SBiFAGAT": {
           "roc_auc": 0.660018030200586,
           "pr_auc": 0.3928010557990984,
-          "best_f1": 0.4397163120567376
+          "best_f1": 0.4074074074074074,
+          "val_selected_threshold": 0.09372346103191376,
+          "threshold_selection": "val_split_only"
         }
       },
       "large_replies_ge_50": {
         "Early-K Persistence": {
           "roc_auc": 0.5,
           "pr_auc": 0.3422222222222222,
-          "best_f1": 0.5099337748344371
+          "best_f1": 0.5099337748344371,
+          "val_selected_threshold": 3.044522437723423,
+          "threshold_selection": "val_split_only"
         },
         "Ridge": {
           "roc_auc": 0.8082660582660582,
           "pr_auc": 0.6483395347960792,
-          "best_f1": 0.6538461538461539
+          "best_f1": 0.6352941176470588,
+          "val_selected_threshold": 3.9521631415147316,
+          "threshold_selection": "val_split_only"
         },
         "SBiFAGAT": {
           "roc_auc": 0.8039663039663041,
           "pr_auc": 0.676930941497239,
-          "best_f1": 0.6526315789473685
+          "best_f1": 0.6477272727272727,
+          "val_selected_threshold": 3.9443135261535645,
+          "threshold_selection": "val_split_only"
         }
       },
       "viral_replies_ge_100": {
         "Early-K Persistence": {
           "roc_auc": 0.5,
           "pr_auc": 0.08444444444444445,
-          "best_f1": 0.1557377049180328
+          "best_f1": 0.1557377049180328,
+          "val_selected_threshold": 3.044522437723423,
+          "threshold_selection": "val_split_only"
         },
         "Ridge": {
           "roc_auc": 0.9024016351558507,
           "pr_auc": 0.37502905619407634,
-          "best_f1": 0.49056603773584906
+          "best_f1": 0.4235294117647059,
+          "val_selected_threshold": 4.0346299741822005,
+          "threshold_selection": "val_split_only"
         },
         "SBiFAGAT": {
           "roc_auc": 0.8727644353602453,
           "pr_auc": 0.39105360424498986,
-          "best_f1": 0.4473684210526316
+          "best_f1": 0.4489795918367347,
+          "val_selected_threshold": 4.117841720581055,
+          "threshold_selection": "val_split_only"
         }
       }
     }

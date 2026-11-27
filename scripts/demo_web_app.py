@@ -961,9 +961,11 @@ class DemoBackend:
             if not self.live_cross_encoder_available:
                 return None
             try:
+                import torch
                 from src.nlp.dual_edge_scorer import DualHeadCrossEncoder
 
-                ce_model, ce_tok = DualHeadCrossEncoder.load_checkpoint(self.ce_dir, map_location="cpu")
+                ce_map_loc = "cuda" if torch.cuda.is_available() else "cpu"
+                ce_model, ce_tok = DualHeadCrossEncoder.load_checkpoint(self.ce_dir, map_location=ce_map_loc)
                 ce_model.eval()
                 self._ce_model = ce_model
                 self._ce_tok = ce_tok
@@ -1637,7 +1639,7 @@ class DemoBackend:
             gnn_ckpt=gnn_ckpt,
             lang=lang_val,
             junk_mode=junk_mode,
-            allow_untrained=True,
+            allow_untrained=(mode != "reddit_url"),
             is_demo=is_demo,
         )
         cid = f"vn_{str(post.get('id') or 'sandbox').removeprefix('t3_')}"

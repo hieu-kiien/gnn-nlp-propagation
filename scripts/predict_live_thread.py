@@ -683,6 +683,8 @@ def predict_live_cascade(
     all_parent_texts = [str(node_by_id[str(e["source_id"])]["text"]) for e in edge_records]
     all_reply_texts = [str(node_by_id[str(e["target_id"])]["text"]) for e in edge_records]
 
+    live_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     if all_edge_ids and ce_model is not None and ce_tok is not None:
         ce_out = encode_edges_with_cross_encoder(
             all_parent_texts,
@@ -693,7 +695,7 @@ def predict_live_cascade(
             include_root_context=use_root_ctx,
             lang=lang,
             batch_size=32,
-            device=torch.device("cpu"),
+            device=live_device,
         )
         for pos, eid in enumerate(all_edge_ids):
             s_v = float(ce_out["s_uv"][pos])
@@ -739,7 +741,7 @@ def predict_live_cascade(
             root_texts=gnn_roots,
             lang=lang,
             batch_size=32,
-            device=torch.device("cpu"),
+            device=live_device,
         )
         for idx_n, (n, dt_sec) in enumerate(zip(gnn_nodes, delays_gnn)):
             nid = str(n["node_id"])

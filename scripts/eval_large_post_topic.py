@@ -520,11 +520,34 @@ def _aggregate_scale_trajectories(
     return summary
 
 
-def _binary_early_warning_metrics(y_true: np.ndarray, scores: np.ndarray) -> dict[str, float]:
+def _binary_early_warning_metrics(
+    y_true: np.ndarray,
+    scores: np.ndarray,
+    *,
+    val_y_true: np.ndarray | None = None,
+    val_scores: np.ndarray | None = None,
+) -> dict[str, Any]:
     if np.unique(y_true).size < 2:
         return {"roc_auc": float("nan"), "pr_auc": float("nan"), "best_f1": float("nan")}
     roc = float(roc_auc_score(y_true, scores))
     pr = float(average_precision_score(y_true, scores))
+    if val_y_true is not None and val_scores is not None and np.unique(val_y_true).size >= 2:
+        best_val_f1 = -1.0
+        selected_thr = float(np.median(val_scores))
+        for q in np.linspace(0.1, 0.9, 17):
+            thr = float(np.quantile(val_scores, q))
+            vf1 = float(f1_score(val_y_true, (val_scores >= thr).astype(np.int64), zero_division=0))
+            if vf1 > best_val_f1:
+                best_val_f1 = vf1
+                selected_thr = thr
+        test_f1 = float(f1_score(y_true, (scores >= selected_thr).astype(np.int64), zero_division=0))
+        return {
+            "roc_auc": roc,
+            "pr_auc": pr,
+            "best_f1": test_f1,
+            "val_selected_threshold": selected_thr,
+            "threshold_selection": "val_split_only",
+        }
     best_f1 = 0.0
     for q in np.linspace(0.1, 0.9, 17):
         thr = float(np.quantile(scores, q))
@@ -556,7 +579,14 @@ def _evaluate_vn_early_warning(
     )
     del nlp_pt
 
+    val_list = list(val_ds)
     test_list = list(test_ds)
+    n_replies_val = np.array([float(np.expm1(float(d.y_size.item()))) for d in val_list], dtype=np.float64)
+    y_polar_val = np.array([float(d.y_polar.item()) for d in val_list], dtype=np.float64)
+    y_high_polar_val = (y_polar_val >= VN_POLAR_Q75).astype(np.int64)
+    y_large_50_val = (n_replies_val >= 50.0).astype(np.int64)
+    y_viral_100_val = (n_replies_val >= 100.0).astype(np.int64)
+
     n_replies_test = np.array([float(np.expm1(float(d.y_size.item()))) for d in test_list], dtype=np.float64)
     y_polar_test = np.array([float(d.y_polar.item()) for d in test_list], dtype=np.float64)
 
@@ -565,11 +595,14 @@ def _evaluate_vn_early_warning(
     y_viral_100 = (n_replies_test >= 100.0).astype(np.int64)
 
     # 1. Early-K Persistence
+    ep_scores_val = np.array([float(d.early_y_polar.item()) for d in val_list], dtype=np.float64)
+    esize_scores_val = np.array([float(math.log1p(max(0, int(d.x.size(0)) - 1))) for d in val_list], dtype=np.float64)
     ep_scores = np.array([float(d.early_y_polar.item()) for d in test_list], dtype=np.float64)
     esize_scores = np.array([float(math.log1p(max(0, int(d.x.size(0)) - 1))) for d in test_list], dtype=np.float64)
 
     # 2. Ridge trained strictly on VN Train/Val
-    ridge = RidgeBaseline(num_rumor_classes=4).fit_dataset(list(train_ds), list(val_ds), seed=42)
+    ridge = RidgeBaseline(num_rumor_classes=4).fit_dataset(list(train_ds), val_list, seed=42)
+    ridge_val_out = ridge.predict_dataset(val_list)
     ridge_out = ridge.predict_dataset(test_list)
 
     # 3. Trained SBiFAGAT checkpoint
@@ -588,16 +621,19 @@ def _evaluate_vn_early_warning(
     ).to(device)
     model.load_state_dict(payload["model_state_dict"], strict=True)
     model.eval()
-    loader = DataLoader(test_list, batch_size=64, shuffle=False)
-    sbi_size_preds: list[np.ndarray] = []
-    sbi_polar_preds: list[np.ndarray] = []
-    with torch.no_grad():
-        for batch in loader:
-            out = model(batch.to(device))
-            sbi_size_preds.append(out["y_size_pred"].view(-1).cpu().numpy())
-            sbi_polar_preds.append(out["y_polar_pred"].view(-1).cpu().numpy())
-    sbi_size = np.concatenate(sbi_size_preds)
-    sbi_polar = np.concatenate(sbi_polar_preds)
+
+    def _predict_sbi(ds_list: list[Any]) -> tuple[np.ndarray, np.ndarray]:
+        ld = DataLoader(ds_list, batch_size=64, shuffle=False)
+        sz_p, po_p = [], []
+        with torch.no_grad():
+            for batch in ld:
+                out = model(batch.to(device))
+                sz_p.append(out["y_size_pred"].view(-1).cpu().numpy())
+                po_p.append(out["y_polar_pred"].view(-1).cpu().numpy())
+        return np.concatenate(sz_p), np.concatenate(po_p)
+
+    sbi_size_val, sbi_polar_val = _predict_sbi(val_list)
+    sbi_size, sbi_polar = _predict_sbi(test_list)
 
     return {
         "n_test": len(test_list),
@@ -608,19 +644,37 @@ def _evaluate_vn_early_warning(
         },
         "tasks": {
             "high_future_polar_ge_q75": {
-                "Early-K Persistence": _binary_early_warning_metrics(y_high_polar, ep_scores),
-                "Ridge": _binary_early_warning_metrics(y_high_polar, ridge_out["y_polar_pred"]),
-                "SBiFAGAT": _binary_early_warning_metrics(y_high_polar, sbi_polar),
+                "Early-K Persistence": _binary_early_warning_metrics(
+                    y_high_polar, ep_scores, val_y_true=y_high_polar_val, val_scores=ep_scores_val,
+                ),
+                "Ridge": _binary_early_warning_metrics(
+                    y_high_polar, ridge_out["y_polar_pred"], val_y_true=y_high_polar_val, val_scores=ridge_val_out["y_polar_pred"],
+                ),
+                "SBiFAGAT": _binary_early_warning_metrics(
+                    y_high_polar, sbi_polar, val_y_true=y_high_polar_val, val_scores=sbi_polar_val,
+                ),
             },
             "large_replies_ge_50": {
-                "Early-K Persistence": _binary_early_warning_metrics(y_large_50, esize_scores),
-                "Ridge": _binary_early_warning_metrics(y_large_50, ridge_out["y_size_pred"]),
-                "SBiFAGAT": _binary_early_warning_metrics(y_large_50, sbi_size),
+                "Early-K Persistence": _binary_early_warning_metrics(
+                    y_large_50, esize_scores, val_y_true=y_large_50_val, val_scores=esize_scores_val,
+                ),
+                "Ridge": _binary_early_warning_metrics(
+                    y_large_50, ridge_out["y_size_pred"], val_y_true=y_large_50_val, val_scores=ridge_val_out["y_size_pred"],
+                ),
+                "SBiFAGAT": _binary_early_warning_metrics(
+                    y_large_50, sbi_size, val_y_true=y_large_50_val, val_scores=sbi_size_val,
+                ),
             },
             "viral_replies_ge_100": {
-                "Early-K Persistence": _binary_early_warning_metrics(y_viral_100, esize_scores),
-                "Ridge": _binary_early_warning_metrics(y_viral_100, ridge_out["y_size_pred"]),
-                "SBiFAGAT": _binary_early_warning_metrics(y_viral_100, sbi_size),
+                "Early-K Persistence": _binary_early_warning_metrics(
+                    y_viral_100, esize_scores, val_y_true=y_viral_100_val, val_scores=esize_scores_val,
+                ),
+                "Ridge": _binary_early_warning_metrics(
+                    y_viral_100, ridge_out["y_size_pred"], val_y_true=y_viral_100_val, val_scores=ridge_val_out["y_size_pred"],
+                ),
+                "SBiFAGAT": _binary_early_warning_metrics(
+                    y_viral_100, sbi_size, val_y_true=y_viral_100_val, val_scores=sbi_size_val,
+                ),
             },
         },
     }
@@ -951,7 +1005,17 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--max-length", type=int, default=160)
     parser.add_argument("--no-download", action="store_true")
+    parser.add_argument("--only-early-warning", action="store_true")
     args = parser.parse_args()
+
+    if args.only_early_warning:
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        existing = json.loads(args.output_json.read_text(encoding="utf-8"))
+        existing["vn_early_warning_k20"] = _evaluate_vn_early_warning(args.vn_dir, args.gnn_vn_ckpt, dev)
+        args.output_json.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+        _export_latex_and_figure(existing, output_tex=args.output_tex, figures_dir=args.figures_dir)
+        print(f"[EvalLargePostTopic] Updated vn_early_warning_k20 -> {args.output_json}", flush=True)
+        return
 
     run_benchmark(
         vn_dir=args.vn_dir,
