@@ -771,7 +771,7 @@ def _export_latex_and_figure(
     ax1.grid(axis="y", alpha=0.25, linestyle="--")
 
     tier_styles = (
-        ("medium", "Medium (25-49)", "#0072B2", "--"),
+        ("medium", "Medium (25-99)", "#0072B2", "--"),
         ("large_ge_50", "Large (>=50)", "#E69F00", "-."),
         ("mega_ge_100", "Viral (>=100)", "#D55E00", "-"),
     )

@@ -7,15 +7,15 @@ Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional
 
 > **Tài sản Dự án & Kết quả Thực nghiệm (`results/` & `archive/docs_v1/`):**
 > - **Kết quả Thực nghiệm đã Kiểm chứng (`results/`):** Chứa các tệp JSON, bảng LaTeX/Markdown và biểu đồ vector sạch (`fig5_macro_signed_network.{svg,pdf}`, `fig7_uncertainty_risk_coverage.{svg,pdf}`) từ pipeline chuẩn hóa: 10 mô hình Tầng 2 VN/PHEME 5 seeds, benchmark Tầng 1 các split (`results_main_*.json` chạy kèm `include_tier2_prior=True`, còn `tier1_tabular_*.json` chạy tách `include_tier2_prior=False`), bất định $\beta$-NLL Selective Abstention 5 seeds (`results_uncertainty_abstention.json`), kiểm định người chấm VN (`human_audit_vi`), và đo hiệu năng E2E đầy đủ Dual-Head Cross-Encoder (`results_efficiency_vn.json`: `146.04 ms` trên Kaggle Tesla T4 FP16 và `efficiency_e2e.json`: `2,206.36 ms` trên GTX 1660 SUPER FP32).
-> - **Tài liệu v1 Lưu trữ Nguyên trạng (`archive/docs_v1/`):** Toàn bộ bản thảo tiếng Anh ([archive/docs_v1/paper/](archive/docs_v1/paper/)), báo cáo tiếng Việt 4 chương & bộ slide bảo vệ ([archive/docs_v1/reports/](archive/docs_v1/reports/)), cùng tài liệu hướng dẫn v1 ([archive/docs_v1/docs/](archive/docs_v1/docs/)) được lưu trữ nguyên vẹn (R4) để phục vụ cập nhật ở giai đoạn sau.
-> - **Giao diện Demo Web MVP Offline-First (`scripts/demo_web_app.py`, `web_demo/`):** Khởi chạy cục bộ `http://127.0.0.1:8765/` (0 dependency ngoài, 0 CDN), đọc trực tiếp số liệu Tầng 2 từ `results/`, hỗ trợ bài Test VN thật từ `data/processed/vn/` + fallback ngoại tuyến trên CI, **Path Contraction** (`junk_mode="contract"`), sơ đồ cây 3 màu lập trường tách bạch chỉ báo công kích và bản đồ 2 phe Tầng 2.
+> - **Tài liệu v1 Lưu trữ Trên GitHub (`archive/docs_v1/`):** Toàn bộ bản thảo tiếng Anh (`archive/docs_v1/paper/`), báo cáo tiếng Việt 4 chương & bộ slide bảo vệ (`archive/docs_v1/reports/`), cùng tài liệu hướng dẫn v1 (`archive/docs_v1/docs/`) được lưu giữ nguyên trạng trên kho GitHub gốc (tách khỏi gói `Program Source` nộp gọn `< 25 MB`).
+> - **Giao diện Demo Web MVP Offline-First & Mega-Thread 10k Scanner (`scripts/demo_web_app.py`, `web_demo/`):** Khởi chạy cục bộ `http://127.0.0.1:8765/` (0 dependency ngoài, 0 CDN), đọc trực tiếp số liệu Tầng 2 từ `results/`, hỗ trợ bài Test VN thật từ `data/processed/vn/` + fallback ngoại tuyến trên CI, **Path Contraction** (`junk_mode="contract"`), sơ đồ cây 3 màu lập trường tách bạch chỉ báo công kích, bản đồ 2 phe Tầng 2, và **Mega-Thread 10k Scanner** bất đồng bộ (`/api/tier1/scan_jobs`, `--scan-strategy stratified|full`, `--max-full-comments 10000`) sử dụng lấy mẫu phân tầng 10 phân vị có neo tổ tiên kèm khoảng tin cậy Bootstrap 95% và cảnh báo ngoại suy quy mô (`ood_scale_warning` khi `> 345` phản hồi). Kiểm thử tải 10.000 bình luận thật trên GPU `GTX 1660 SUPER` (`stratified`, `sample_budget=600`, `DualHeadCrossEncoder` + `best_sbifagat_vn.pt`): hoàn tất trong **`39.05 s`** với **`809.79 MB`** đỉnh VRAM (`9,656` bình luận hợp lệ, `600/9,656` cạnh chấm điểm NLP, `bootstrap_ci_95=[0.1349, 0.1493]`).
 
 > **Mới bắt đầu hoặc muốn chạy trên GPU miễn phí (Google Colab / Kaggle `T4 x 2`)?**  
 > - **Hướng dẫn thực thi Cloud trọn gói:** Đọc [notebooks/CLOUD_EXECUTION_GUIDE.md](notebooks/CLOUD_EXECUTION_GUIDE.md).
 > - **Chạy benchmark GNN Tầng 1 nhanh trên Colab / Kaggle T4:** Dùng [notebooks/colab_gpu_v3_gnn_benchmarks.ipynb](notebooks/colab_gpu_v3_gnn_benchmarks.ipynb) (Temporal Holdout VN, Ablation/$K$-Curve và PHEME $K=10, N \ge 15$).
 > - **Chạy benchmark Tầng 2 Macro Signed Network trên GPU:** Dùng [notebooks/kaggle_macro_signed_gnn_t4.ipynb](notebooks/kaggle_macro_signed_gnn_t4.ipynb).
-> - **Chạy full pipeline 2 người trên Kaggle `GPU T4 x 2`:** Đọc [Hướng dẫn Chạy Song Song trên Kaggle T4 x 2](archive/docs_v1/docs/huong_dan_chay_song_song_kaggle_t4x2.md) và mở `kaggle_member1_nlp_and_vn_t4x2.ipynb`, `kaggle_member2_gnn_and_en_t4x2.ipynb`.
-> - Đọc [Hướng dẫn Nghiên cứu Dễ hiểu từ Con số 0](archive/docs_v1/docs/huong_dan_nghien_cuu_de_hieu.md) và chạy thử minh họa/kiểm chứng trên máy CPU:
+> - **Chạy full pipeline 2 người trên Kaggle `GPU T4 x 2`:** Tham khảo `archive/docs_v1/docs/huong_dan_chay_song_song_kaggle_t4x2.md` trên GitHub và mở `kaggle_member1_nlp_and_vn_t4x2.ipynb`, `kaggle_member2_gnn_and_en_t4x2.ipynb`.
+> - Tham khảo `archive/docs_v1/docs/huong_dan_nghien_cuu_de_hieu.md` trên GitHub và chạy thử minh họa/kiểm chứng trên máy CPU:
 > ```bash
 > python -m scripts.demo_research_walkthrough
 > python -m scripts.predict_live_thread --demo-offline
@@ -29,7 +29,7 @@ Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional
 ## 1. Quản trị Dự án & Năm Luật Thép
 
 - **Bảng điều phối Scrum (Jira):** [`SBIF` Board — SBi-FAGAT Research](https://sbifagat-research.atlassian.net/jira/software/projects/SBIF/boards/2)
-- **Tài liệu quy chuẩn bắt buộc:** Xem chi tiết trong [GEMINI.md](GEMINI.md) và hồ sơ [archive/docs_v1/docs/project-management/](archive/docs_v1/docs/project-management/PROJECT_CONTEXT.md). Mọi đóng góp mã nguồn và thực nghiệm phải tuân thủ tuyệt đối **5 Luật Thép**:
+- **Tài liệu quy chuẩn bắt buộc:** Xem chi tiết trong [GEMINI.md](GEMINI.md) (và bản lưu trữ v1 `archive/docs_v1/docs/project-management/PROJECT_CONTEXT.md` trên GitHub). Mọi đóng góp mã nguồn và thực nghiệm phải tuân thủ tuyệt đối **5 Luật Thép**:
   1. **Cấm dữ liệu giả trong báo cáo:** Không dùng dữ liệu sinh ngẫu nhiên (mock/synthetic) để xuất bảng hay biểu đồ kết quả thực nghiệm (tensor giả lập chỉ được dùng trong `tests/`).
   2. **Chống rò rỉ dữ liệu (Zero Data Leakage):** Chia tập Train / Val / Test (`70/15/15`) nhất quán bằng `topic_splits.json` (`min_total_replies = 25`) theo sự kiện/chủ đề gốc (*Inductive Split*, giữ nguyên cho mọi $K \in \{10, 20, 30, 50\}$; LOO dùng `edge_source="teacher"`); đầu vào chỉ giữ bài gốc + tối đa $K = 20$ bình luận sớm nhất theo `timestamp`; nhãn mục tiêu không lọt vào đặc trưng nút/cạnh.
   3. **Chống ảo giác tài liệu tham khảo:** Mọi công trình trích dẫn trong `archive/docs_v1/docs/` và `archive/docs_v1/paper/references.bib` phải được xác minh tác giả, năm, hội nghị/tạp chí và DOI/arXiv thật.
@@ -131,6 +131,9 @@ python -m scripts.predict_live_thread --demo-offline
 # Dự báo luồng Reddit thật (bắt buộc truyền checkpoint):
 python -m scripts.predict_live_thread --reddit-url "https://www.reddit.com/r/VietNam/comments/..." --gnn-ckpt checkpoints/best_sbifagat_vn.pt
 
+# Quét Mega-Thread tới 10.000 bình luận với lấy mẫu phân tầng + CI 95% (giữ GNN K=20):
+python -m scripts.predict_live_thread --reddit-url "https://www.reddit.com/r/VietNam/comments/..." --gnn-ckpt checkpoints/best_sbifagat_vn.pt --analysis-mode full --scan-strategy stratified --sample-budget 600 --max-full-comments 10000
+
 # Chạy kiểm thử cấu trúc (dry-run) bằng trọng số ngẫu nhiên:
 python -m scripts.predict_live_thread --url "https://www.reddit.com/r/VietNam/comments/..." --allow-untrained
 ```
@@ -162,7 +165,7 @@ python -m scripts.eval_large_post_topic --batch-size 128 --max-length 160
 ```
 
 - **Phân loại Chủ đề Zero-Shot PHEME ($N=2{,}664$, 9 sự kiện thật):** `mDeBERTa-v3-XNLI` GPU FP16 đạt `58.00%` Acc (`Macro-F1 = 0.4424`, `Weighted-F1 = 0.6655`, `Top-2 = 71.55%`) trên toàn cohort và `70.36%` Acc (`Top-2 = 79.64%`) trên Test-334 — vượt xa `Lexical N-gram` (`43.88%`) và `RoBERTa Cosine` (`36.90%`).
-- **Quỹ đạo Bài Lớn & Cảnh báo Sớm $K=20$ (VN Test, $N=225$, khóa ngưỡng F1 trên Val):** Các chuỗi lớn ($\ge 50$ bình luận) leo thang phân cực mạnh hơn chuỗi nhỏ (`37.96%` vs `20.00%` trên PHEME; `20.07%` vs `14.22%` trên VN). Từ tiền tố $K=20$, **`SBiFAGAT`** dẫn đầu phát hiện sớm **High Future Polarization ($\ge Q_{75}^{\text{train}}$)** với `ROC-AUC = 0.6600`, `PR-AUC = 0.3928`, `Val-F1 = 0.4074` (vượt `Ridge` `0.6234 / 0.3607 / 0.4038`), đồng thời dẫn đầu `PR-AUC` & `Val-F1` cho cảnh báo `Large >= 50` (`0.6769 / 0.6477`) và `Viral >= 100` (`0.3911 / 0.4490`) (xem `results/figures/vn/fig6_large_post_topic_trajectory.{pdf,svg}`).
+- **Quỹ đạo Bài Lớn & Cảnh báo Sớm $K=20$ (VN Test, $N=225$, khóa ngưỡng F1 trên Val):** Các chuỗi lớn ($\ge 50$ bình luận) leo thang phân cực mạnh hơn (`37.96%` vs `20.00%` trên PHEME; `20.07%` trên VN `large_ge_50` vs `14.22%` ở nhóm trung bình `Medium (25–99)` vốn chồng lấp tập `>=50` do `n=1,336` gồm cả chuỗi `50–99`). Từ tiền tố $K=20$, **`SBiFAGAT`** dẫn đầu phát hiện sớm **High Future Polarization ($\ge Q_{75}^{\text{train}}$)** với `ROC-AUC = 0.6600`, `PR-AUC = 0.3928`, `Val-F1 = 0.4074` (vượt `Ridge` `0.6234 / 0.3607 / 0.4038`), đồng thời dẫn đầu `PR-AUC` & `Val-F1` cho cảnh báo `Large >= 50` (`0.6769 / 0.6477`) và `Viral >= 100` (`0.3911 / 0.4490`) (xem `results/figures/vn/fig6_large_post_topic_trajectory.{pdf,svg}`).
 - **Bất định $\beta$-NLL (`polar_logvar` $\in [-11.0, -2.0]$) & Kiểm chứng Router Thái độ Thù địch:** Sau khi mở khóa cận dưới `polar_logvar`, `SBiFAGAT` đạt xếp hạng bất định dương trên VN (`Size` $\rho = 0.328$, giảm `30.8%` MSLE tại coverage `70%`; `Polar` $\rho = 0.201$, giảm `13.5%` RMSE tại coverage `70%`, `PICP@90% = 0.893 / 0.877`; `results/results_uncertainty_abstention.json`). Kiểm chứng `HostilityGatedTargetRouter` trên `140` cặp gán nhãn VN (`results/results_hostility_router_audit.json`) cung cấp bằng chứng định lượng cho giới hạn của bộ định tuyến zero-shot/regex không tinh chỉnh trên tiếng lóng mạng xã hội.
 
 ---
