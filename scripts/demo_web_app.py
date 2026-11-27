@@ -23,8 +23,11 @@ import os
 import re
 import sys
 import threading
+import time
+import uuid
 import webbrowser
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +40,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.predict_live_thread import (  # noqa: E402
+    TRAINING_MAX_REPLIES_REF,
+    ScanCancelledError,
     VN_POLAR_Q50,
     VN_POLAR_Q75,
     VN_POLAR_Q90,
@@ -45,6 +50,8 @@ from scripts.predict_live_thread import (  # noqa: E402
     _extract_post_id_from_url,
     _fetch_reddit_thread,
     _make_demo_offline_thread,
+    fetch_reddit_thread_paginated,
+    load_thread_from_json_payload,
     predict_live_cascade,
 )
 from src.data.arctic_shift_vn import hash_author_sha256  # noqa: E402
@@ -85,6 +92,11 @@ _REQUIRED_CE_FILES: tuple[str, ...] = (
     "config.json",
 )
 _MAX_POST_BYTES: int = 1024 * 1024
+_MAX_SCAN_JOB_BYTES: int = 16 * 1024 * 1024
+_MAX_SCAN_JOBS_KEPT: int = 8
+_MAX_TREE_RENDER_NODES: int = 120
+_VALID_JOB_ID_RE = re.compile(r"^[a-f0-9]{12,32}$")
+_VALID_BRANCH_ID_RE = re.compile(r"^[A-Za-z0-9_]{1,80}$")
 
 _EXPLICIT_REPLY_RE = re.compile(
     r"^\s*[-*]?\s*([A-Za-z0-9_]+)\s*\(\s*(?:trả\s*lời|tra\s*loi|reply(?:\s+to)?|->)\s*([A-Za-z0-9_]+)\s*\)\s*:\s*(.+)$",
@@ -737,6 +749,8 @@ def _format_live_result_payload(
             "confidence_score": conf_val,
             "uncertainty_available": unc_avail,
             "low_signal_warning": bool(res.get("low_signal_warning", False)),
+            "ood_scale_warning": bool(res.get("ood_scale_warning", False)),
+            "training_max_replies_ref": int(res.get("training_max_replies_ref", TRAINING_MAX_REPLIES_REF)),
             "behavior_counts": behavior_counts,
             "stance_counts": {
                 "support": support_cnt,
@@ -754,11 +768,224 @@ def _format_live_result_payload(
         "top_trigger_edges": enriched_triggers,
         "topic_analysis": dict(res.get("topic_analysis") or {}),
         "large_thread_analysis": dict(res.get("large_thread_analysis") or {}),
+        "mega_scan_summary": dict(res.get("mega_scan_summary") or {}),
         "junk_filter_stats": dict(res.get("junk_filter_stats") or {}),
         "preserved_short_stances": kept_texts_short,
         "kept_nodes": list(res.get("kept_nodes") or []),
         "kept_edges": list(res.get("kept_edges") or []),
     }
+
+
+def build_megathread_stress_preset(n_comments: int = 2000) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Build a synthetic multi-branch Vietnamese stress-test thread up to 10,000 comments (demo only)."""
+    cap = max(50, min(10000, int(n_comments)))
+    base_ts = 1763500000.0
+    post_id = f"mega_stress_{cap}"
+    post = {
+        "id": post_id,
+        "title": f"[Kiểm tải {cap} bình luận] Tranh luận chuyển đổi năng lượng và quy hoạch giao thông đô thị lớn",
+        "selftext": (
+            "Thảo luận mở rộng về lộ trình thay thế phương tiện xăng nội đô bằng xe điện và "
+            "phân bổ ngân sách nâng cấp mạng lưới giao thông công cộng trong 5 năm tới."
+        ),
+        "subreddit": "sandbox_stress",
+        "author": "op_stress",
+        "created_utc": base_ts,
+    }
+    leads = [
+        "Ủng hộ chuyển đổi sớm nếu đồng bộ được trạm sạc nhanh và giá vé công cộng ổn định.",
+        "Phản đối làm gấp vì thu nhập lao động phổ thông chưa đủ đổi phương tiện ngay.",
+        "Vấn đề cốt lõi là hạ tầng lưới điện chung cư cũ chứ không phải chỉ giá xe.",
+        "Nên thí điểm vùng lõi nội đô trước thay vì cấm đồng loạt toàn thành phố.",
+        "Ai chịu chi phí xử lý pin thải sau 5 năm vận hành nếu không có quỹ tái chế?",
+        "Đề xuất miễn giảm thuế trước bạ và trợ giá đổi xe cũ cho tài xế công nghệ.",
+    ]
+    pro_templates = [
+        "Đồng ý hoàn toàn, giảm khí thải trực tiếp sẽ cải thiện chất lượng không khí giờ cao điểm.",
+        "Hợp lý nếu kết hợp làn ưu tiên xe buýt điện chạy đúng giờ.",
+        "Ủng hộ thử nghiệm cuốn chiếu theo từng quận trung tâm trong 12 tháng đầu.",
+    ]
+    anti_templates = [
+        "Phản đối, không đồng ý đẩy gánh nặng chi phí lên người đi làm xa khi metro chưa thông.",
+        "Chưa hợp lý chút nào vì trạm sạc công cộng hiện quá thưa ở khu vực ngoại thành.",
+        "Không đồng ý cách áp đặt thời hạn cứng mà thiếu phương án hỗ trợ tín dụng xanh.",
+    ]
+    neutral_templates = [
+        "Xin số liệu khảo sát lưu lượng xe máy theo từng khung giờ sáng chiều để đối chiếu.",
+        "Cho mình hỏi quy chuẩn phòng cháy chữa cháy tầng hầm chung cư áp dụng thế nào?",
+    ]
+    junk_templates = ["[deleted]", "hóng ké", "."]
+
+    comments: list[dict[str, Any]] = []
+    branch_nodes: list[list[str]] = [[] for _ in leads]
+    for i in range(1, cap + 1):
+        cid = f"m{i}"
+        fullname = f"t1_{cid}"
+        if i <= len(leads):
+            b_idx = i - 1
+            pid = f"t3_{post_id}"
+            body = leads[b_idx]
+        else:
+            b_idx = (i * 7 + (i % 5)) % len(leads)
+            ancestors = branch_nodes[b_idx]
+            parent_cid = ancestors[(i * 3) % len(ancestors)] if ancestors else f"m{b_idx + 1}"
+            pid = f"t1_{parent_cid}"
+            if i % 29 == 0:
+                body = junk_templates[i % len(junk_templates)]
+            elif b_idx in (0, 3, 5) and i % 4 != 0:
+                body = pro_templates[i % len(pro_templates)]
+            elif b_idx in (1, 2, 4) and i % 4 != 0:
+                body = anti_templates[i % len(anti_templates)]
+            else:
+                body = neutral_templates[i % len(neutral_templates)]
+
+        branch_nodes[b_idx].append(cid)
+        author = None if body == "[deleted]" else f"stress_u_{(i % 420) + 1}"
+        comments.append(
+            {
+                "fullname": fullname,
+                "id": cid,
+                "link_id": f"t3_{post_id}",
+                "parent_id": pid,
+                "body": body,
+                "text": body,
+                "created_utc": base_ts + float(i * 12),
+                "author": author,
+                "author_raw": author,
+                "author_hash": hash_author_sha256(author),
+            }
+        )
+    return post, comments
+
+
+def _build_scan_job_artifacts(full_payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Slice a full scan payload into a lightweight summary (<120 SVG nodes), paginated rows, and branch subtrees."""
+    tree_nodes = list((full_payload.get("tree") or {}).get("nodes") or [])
+    tree_edges = list((full_payload.get("tree") or {}).get("edges") or [])
+    root_node = next((n for n in tree_nodes if n.get("is_root")), tree_nodes[0] if tree_nodes else None)
+    root_id = str(root_node["node_id"]) if root_node is not None else "root"
+
+    parent_of: dict[str, str] = {}
+    node_by_id: dict[str, dict[str, Any]] = {}
+    for n in tree_nodes:
+        nid = str(n["node_id"])
+        node_by_id[nid] = n
+        if n.get("parent_id") is not None:
+            parent_of[nid] = str(n["parent_id"])
+
+    branch_of: dict[str, str] = {}
+    for n in tree_nodes:
+        nid = str(n["node_id"])
+        if nid == root_id:
+            continue
+        curr = nid
+        seen: set[str] = set()
+        top_b = nid
+        while curr in parent_of and curr not in seen:
+            seen.add(curr)
+            p = parent_of[curr]
+            if p == root_id:
+                top_b = curr
+                break
+            curr = p
+        branch_of[nid] = top_b
+
+    edge_scored_by_dst: dict[str, bool] = {}
+    for e in tree_edges:
+        edge_scored_by_dst[str(e["target_id"])] = bool(e.get("is_scored", True))
+
+    comment_rows: list[dict[str, Any]] = []
+    for n in tree_nodes:
+        if n.get("is_root"):
+            continue
+        nid = str(n["node_id"])
+        comment_rows.append(
+            {
+                "node_id": nid,
+                "parent_id": n.get("parent_id"),
+                "branch_id": branch_of.get(nid, ""),
+                "author_hash": n.get("author_hash"),
+                "depth": int(n.get("depth", 1)),
+                "time_delay_sec": float(n.get("time_delay_sec", 0.0)),
+                "text": str(n.get("text") or ""),
+                "stance_class": str(n.get("stance_class") or "neutral"),
+                "behavior_label": str(n.get("behavior_label") or "neutral"),
+                "s_uv": float(n.get("s_uv", 0.0)),
+                "h_uv": float(n.get("h_uv", 0.0)),
+                "is_uncivil": bool(n.get("is_uncivil", False)),
+                "relinked": bool(n.get("relinked", False)),
+                "is_scored": bool(edge_scored_by_dst.get(nid, True)),
+            }
+        )
+
+    def _subset_tree(keep_ids: Sequence[str], branch_id: str, lead_text: str = "") -> dict[str, Any]:
+        keep_order: list[str] = []
+        keep_seen: set[str] = set()
+        for raw_id in keep_ids:
+            sid = str(raw_id)
+            if sid in node_by_id and sid not in keep_seen:
+                keep_seen.add(sid)
+                keep_order.append(sid)
+            if len(keep_order) >= _MAX_TREE_RENDER_NODES:
+                break
+        if root_id in node_by_id and root_id not in keep_seen:
+            keep_seen.add(root_id)
+            keep_order.insert(0, root_id)
+        sub_nodes = [node_by_id[nid] for nid in keep_order if nid in node_by_id]
+        sub_edges = [
+            e for e in tree_edges
+            if str(e["source_id"]) in keep_seen and str(e["target_id"]) in keep_seen
+        ]
+        return {
+            "branch_id": branch_id,
+            "lead_text": lead_text,
+            "tree": {"nodes": sub_nodes, "edges": sub_edges},
+            "tree_view_meta": {
+                "total_nodes": len(tree_nodes),
+                "shown_nodes": len(sub_nodes),
+                "active_branch_id": branch_id,
+                "view_capped": len(tree_nodes) > len(sub_nodes),
+            },
+        }
+
+    branch_trees: dict[str, dict[str, Any]] = {}
+    hotspots = list((full_payload.get("large_thread_analysis") or {}).get("hotspot_branches") or [])
+    for hb in hotspots:
+        bid = str(hb.get("branch_id") or "")
+        if not bid:
+            continue
+        branch_trees[bid] = _subset_tree(
+            list(hb.get("node_ids") or []),
+            branch_id=bid,
+            lead_text=str(hb.get("lead_text") or ""),
+        )
+
+    top_default_ids = [str(n["node_id"]) for n in tree_nodes[:_MAX_TREE_RENDER_NODES]]
+    branch_trees["_all_top"] = _subset_tree(top_default_ids, branch_id="_all_top", lead_text="Tổng quan sớm từ gốc")
+    default_branch_key = hotspots[0]["branch_id"] if hotspots and str(hotspots[0].get("branch_id") or "") in branch_trees else "_all_top"
+    default_view = branch_trees[default_branch_key]
+
+    compact = dict(full_payload)
+    compact["tree"] = default_view["tree"]
+    compact["tree_view_meta"] = default_view["tree_view_meta"]
+    compact["kept_nodes"] = list(full_payload.get("kept_nodes") or [])[:_MAX_TREE_RENDER_NODES]
+    compact["kept_edges"] = list(full_payload.get("kept_edges") or [])[:_MAX_TREE_RENDER_NODES]
+
+    ug = dict(full_payload.get("user_graph") or {})
+    u_nodes = list(ug.get("nodes") or [])
+    if len(u_nodes) > 40:
+        u_nodes.sort(key=lambda u: (not bool(u.get("is_op")), -int(u.get("reply_count", 1))))
+        kept_u = u_nodes[:40]
+        kept_u_ids = {str(u.get("user_id")) for u in kept_u}
+        kept_u_edges = [
+            ue for ue in (ug.get("edges") or [])
+            if str(ue.get("source")) in kept_u_ids and str(ue.get("target")) in kept_u_ids
+        ]
+        ug["nodes"] = kept_u
+        ug["edges"] = kept_u_edges
+        compact["user_graph"] = ug
+
+    return compact, comment_rows, branch_trees
 
 
 def _cascade_safety_flags(d: Any) -> tuple[bool, bool]:
@@ -900,6 +1127,8 @@ class DemoBackend:
         self._threads_by_id: dict[str, dict[str, Any]] = {}
         self._sandbox_preset_cache: dict[tuple[str, ...], dict[str, Any]] = {}
         self._macro_cache: dict[str, Any] | None = None
+        self._scan_jobs: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._scan_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sbif-scan")
 
         self._try_load_gnn_checkpoint()
         if preload:
@@ -1801,6 +2030,423 @@ class DemoBackend:
             self._macro_cache = payload
         return payload
 
+    def _evict_scan_jobs_locked(self) -> None:
+        while len(self._scan_jobs) >= _MAX_SCAN_JOBS_KEPT:
+            victim_id = next(
+                (
+                    jid
+                    for jid, job in self._scan_jobs.items()
+                    if job.get("status") in {"completed", "failed", "cancelled"}
+                ),
+                None,
+            )
+            if victim_id is None:
+                break
+            self._scan_jobs.pop(victim_id, None)
+
+    def _parse_custom_comments_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        post_id: str,
+        base_ts: float,
+    ) -> list[dict[str, Any]]:
+        raw_comments = payload.get("comments")
+        if isinstance(raw_comments, list) and raw_comments:
+            comments: list[dict[str, Any]] = []
+            for idx, c in enumerate(raw_comments, start=1):
+                if not isinstance(c, Mapping):
+                    continue
+                cid = str(c.get("id") or f"c{idx}").removeprefix("t1_")
+                raw_p = str(c.get("parent_id") or f"t3_{post_id}").strip()
+                if raw_p.lower() in {"root", post_id, f"t3_{post_id}"}:
+                    pid = f"t3_{post_id}"
+                elif raw_p.startswith(("t1_", "t3_")):
+                    pid = raw_p
+                else:
+                    pid = f"t1_{raw_p}"
+                body = str(c.get("text") or c.get("body") or "")
+                author = c.get("author_raw") if c.get("author_raw") is not None else c.get("author")
+                author_str = str(author) if author is not None else (
+                    None if body.strip().lower() in {"[deleted]", "[removed]"} else f"custom_u_{idx}"
+                )
+                is_bot = bool(c.get("author_is_bot")) or (
+                    isinstance(author_str, str) and author_str.strip().lower() == "automoderator"
+                )
+                raw_delay = c.get("time_delay_sec")
+                if raw_delay is None:
+                    delay = float(idx * 45.0)
+                else:
+                    if isinstance(raw_delay, bool):
+                        raise ValueError(f"Giá trị time_delay_sec không hợp lệ: {raw_delay!r}")
+                    delay = float(raw_delay)
+                    if not math.isfinite(delay) or delay < 0.0 or delay > 3650.0 * 86400.0:
+                        raise ValueError(
+                            f"Giá trị time_delay_sec không hợp lệ ({raw_delay!r}): phải nằm trong [0, 315360000] giây."
+                        )
+                comments.append(
+                    {
+                        "fullname": f"t1_{cid}",
+                        "id": cid,
+                        "link_id": f"t3_{post_id}",
+                        "parent_id": pid,
+                        "body": body,
+                        "text": body,
+                        "created_utc": base_ts + delay,
+                        "author": author_str,
+                        "author_raw": author_str,
+                        "author_is_bot": is_bot,
+                        "author_hash": hash_author_sha256(author_str),
+                    }
+                )
+            return comments
+        raw_lines = str(payload.get("raw_indented_text") or "")
+        return parse_sandbox_raw_text(raw_lines, post_id=post_id, base_ts=base_ts)
+
+    def start_scan_job(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Start an asynchronous Mega-Thread scan job supporting up to 10,000 comments."""
+        if not isinstance(payload, Mapping):
+            raise ValueError("Payload JSON không hợp lệ.")
+        mode = str(payload.get("mode") or "preset_mega_stress").strip()
+        if mode not in {"reddit_url", "custom", "json_upload", "preset_mega_stress"}:
+            raise ValueError(f"Chế độ scan_jobs không hợp lệ: {mode!r}")
+
+        junk_mode_raw = str(payload.get("junk_mode") or "contract").strip().lower()
+        if junk_mode_raw not in {"contract", "prune"}:
+            raise ValueError(f"junk_mode không hợp lệ: {junk_mode_raw!r}")
+        junk_mode: Literal["contract", "prune"] = "contract" if junk_mode_raw == "contract" else "prune"
+
+        strategy_raw = str(payload.get("scan_strategy") or "stratified").strip().lower()
+        if strategy_raw not in {"stratified", "full"}:
+            raise ValueError(f"scan_strategy không hợp lệ: {strategy_raw!r}")
+        scan_strategy: Literal["stratified", "full"] = "stratified" if strategy_raw == "stratified" else "full"
+
+        raw_k = payload.get("k_horizon")
+        if raw_k is None:
+            k_horizon = 20
+        elif isinstance(raw_k, bool):
+            raise ValueError(f"k_horizon không hợp lệ: {raw_k!r}")
+        else:
+            k_horizon = int(raw_k)
+            if k_horizon < 1 or k_horizon > 500:
+                raise ValueError(f"k_horizon phải nằm trong [1, 500], nhận {k_horizon!r}")
+
+        raw_max_full = payload.get("max_full_comments")
+        if raw_max_full is None:
+            max_full_comments = 2000 if mode == "preset_mega_stress" else 5000
+        elif isinstance(raw_max_full, bool):
+            raise ValueError(f"max_full_comments không hợp lệ: {raw_max_full!r}")
+        else:
+            max_full_comments = int(raw_max_full)
+            if max_full_comments < 20 or max_full_comments > 10000:
+                raise ValueError(f"max_full_comments phải nằm trong [20, 10000], nhận {max_full_comments!r}")
+
+        raw_budget = payload.get("sample_budget")
+        if raw_budget is None:
+            sample_budget = 600
+        elif isinstance(raw_budget, bool):
+            raise ValueError(f"sample_budget không hợp lệ: {raw_budget!r}")
+        else:
+            sample_budget = int(raw_budget)
+            if sample_budget < 20 or sample_budget > 2000:
+                raise ValueError(f"sample_budget phải nằm trong [20, 2000], nhận {sample_budget!r}")
+
+        lang_raw = str(payload.get("lang") or "vi").strip().lower()
+        lang_val = "en" if lang_raw == "en" else "vi"
+        custom_topics = payload.get("custom_topics")
+        base_ts = 1763500000.0
+
+        post_id_for_url: str | None = None
+        prepared_post: dict[str, Any] | None = None
+        prepared_comments: list[dict[str, Any]] | None = None
+        is_demo = True
+
+        if mode == "reddit_url":
+            reddit_url = str(payload.get("reddit_url") or "").strip()
+            post_id_for_url = _extract_post_id_from_url(reddit_url)
+            is_demo = False
+        elif mode == "json_upload":
+            raw_thread_json = payload.get("thread_json")
+            if raw_thread_json is None:
+                raw_thread_json = payload.get("payload")
+            if isinstance(raw_thread_json, str):
+                raw_thread_json = json.loads(raw_thread_json)
+            if raw_thread_json is None:
+                raise ValueError("Thiếu dữ liệu thread_json khi mode='json_upload'.")
+            prepared_post, prepared_comments = load_thread_from_json_payload(
+                raw_thread_json,
+                max_comments=max_full_comments,
+                source_name="json_upload",
+            )
+            if not prepared_comments:
+                raise ValueError("Tệp JSON không chứa bình luận hợp lệ nào.")
+        elif mode == "preset_mega_stress":
+            raw_stress_n = payload.get("stress_n_comments")
+            stress_n = int(raw_stress_n) if raw_stress_n is not None else min(2000, max_full_comments)
+            stress_n = max(50, min(max_full_comments, stress_n))
+            prepared_post, prepared_comments = build_megathread_stress_preset(stress_n)
+        else:
+            post_id = "mega_custom"
+            title = str(payload.get("title") or "").strip()
+            root_text = str(payload.get("root_text") or "").strip()
+            if not title and not root_text:
+                raise ValueError("Vui lòng nhập tiêu đề hoặc nội dung bài gốc.")
+            prepared_post = {
+                "id": post_id,
+                "title": title or _clean_title_snippet(root_text, 100),
+                "selftext": root_text,
+                "subreddit": "sandbox",
+                "author": "op_sandbox",
+                "created_utc": base_ts,
+            }
+            prepared_comments = self._parse_custom_comments_payload(payload, post_id=post_id, base_ts=base_ts)
+            if not prepared_comments:
+                raise ValueError("Cần ít nhất 1 bình luận để dựng cây hội thoại.")
+
+        job_id = uuid.uuid4().hex[:16]
+        cancel_ev = threading.Event()
+        now_t = time.monotonic()
+        job_rec: dict[str, Any] = {
+            "job_id": job_id,
+            "mode": mode,
+            "status": "queued",
+            "stage": "queued",
+            "percent": 0.0,
+            "processed_edges": 0,
+            "total_edges": 0,
+            "edges_per_sec": 0.0,
+            "eta_sec": None,
+            "scan_strategy": scan_strategy,
+            "max_full_comments": max_full_comments,
+            "sample_budget": sample_budget if scan_strategy == "stratified" else None,
+            "created_at": now_t,
+            "cancel_event": cancel_ev,
+            "error": None,
+            "result": None,
+            "comment_rows": [],
+            "branch_trees": {},
+        }
+        with self._lock:
+            self._evict_scan_jobs_locked()
+            self._scan_jobs[job_id] = job_rec
+
+        def _on_progress(prog: Mapping[str, Any]) -> None:
+            with self._lock:
+                rec = self._scan_jobs.get(job_id)
+                if rec is None:
+                    return
+                rec["stage"] = str(prog.get("stage") or rec["stage"])
+                rec["processed_edges"] = int(prog.get("processed", rec["processed_edges"]))
+                rec["total_edges"] = int(prog.get("total", rec["total_edges"]))
+                rec["percent"] = float(prog.get("percent", rec["percent"]))
+                if prog.get("edges_per_sec") is not None:
+                    rec["edges_per_sec"] = float(prog["edges_per_sec"])
+                rec["eta_sec"] = prog.get("eta_sec")
+
+        def _worker() -> None:
+            with self._lock:
+                rec = self._scan_jobs.get(job_id)
+                if rec is None:
+                    return
+                rec["status"] = "running"
+                rec["stage"] = "fetching_comments" if mode == "reddit_url" else "building_graph"
+
+            try:
+                if cancel_ev.is_set():
+                    raise ScanCancelledError("Đã hủy tác vụ.")
+                if mode == "reddit_url":
+                    assert post_id_for_url is not None
+                    post_obj, cmt_list = fetch_reddit_thread_paginated(
+                        post_id_for_url,
+                        max_comments=max_full_comments,
+                        progress_cb=_on_progress,
+                        cancel_event=cancel_ev,
+                    )
+                else:
+                    assert prepared_post is not None and prepared_comments is not None
+                    post_obj, cmt_list = prepared_post, prepared_comments
+
+                ce_ckpt = self.ce_dir if self.live_cross_encoder_available else None
+                cached_ce = self._get_cached_cross_encoder()
+                gnn_ckpt = self.ckpt_path if self.ckpt_path.is_file() else None
+                res = predict_live_cascade(
+                    post_obj,
+                    cmt_list,
+                    k_horizon=k_horizon,
+                    analysis_mode="full",
+                    max_full_comments=max_full_comments,
+                    scan_strategy=scan_strategy,
+                    sample_budget=sample_budget,
+                    progress_cb=_on_progress,
+                    cancel_event=cancel_ev,
+                    custom_topics=custom_topics,
+                    topic_backend="embedding" if is_demo else "auto",
+                    cross_encoder_ckpt=ce_ckpt,
+                    preloaded_ce=cached_ce,
+                    gnn_ckpt=gnn_ckpt,
+                    lang=lang_val,
+                    junk_mode=junk_mode,
+                    allow_untrained=(mode != "reddit_url"),
+                    is_demo=is_demo,
+                )
+                cid = f"vn_{str(post_obj.get('id') or 'mega').removeprefix('t3_')}"
+                full_out = _format_live_result_payload(
+                    cascade_id=cid,
+                    topic_id=f"scan_{mode}",
+                    post=post_obj,
+                    res=res,
+                    is_synthetic_fallback=not bool(res.get("cross_encoder_loaded", False)),
+                )
+                full_out["sandbox_mode"] = mode
+                compact_out, comment_rows, branch_trees = _build_scan_job_artifacts(full_out)
+                compact_out["scan_job_id"] = job_id
+
+                with self._lock:
+                    rec = self._scan_jobs.get(job_id)
+                    if rec is not None:
+                        rec["status"] = "cancelled" if cancel_ev.is_set() else "completed"
+                        rec["stage"] = "completed" if not cancel_ev.is_set() else "cancelled"
+                        if not cancel_ev.is_set():
+                            rec["percent"] = 100.0
+                            rec["result"] = compact_out
+                            rec["comment_rows"] = comment_rows
+                            rec["branch_trees"] = branch_trees
+            except ScanCancelledError as exc:
+                with self._lock:
+                    rec = self._scan_jobs.get(job_id)
+                    if rec is not None:
+                        rec["status"] = "cancelled"
+                        rec["stage"] = "cancelled"
+                        rec["error"] = str(exc)
+            except Exception as exc:
+                with self._lock:
+                    rec = self._scan_jobs.get(job_id)
+                    if rec is not None:
+                        rec["status"] = "failed"
+                        rec["stage"] = "failed"
+                        rec["error"] = str(exc)
+
+        self._scan_executor.submit(_worker)
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "mode": mode,
+            "scan_strategy": scan_strategy,
+            "max_full_comments": max_full_comments,
+        }
+
+    def get_scan_job(self, job_id: str) -> dict[str, Any]:
+        clean_id = str(job_id or "").strip()
+        if not _VALID_JOB_ID_RE.fullmatch(clean_id):
+            raise KeyError(f"Invalid job_id {job_id!r}")
+        with self._lock:
+            rec = self._scan_jobs.get(clean_id)
+            if rec is None:
+                raise KeyError(f"Unknown scan job {job_id!r}")
+            out: dict[str, Any] = {
+                "job_id": rec["job_id"],
+                "mode": rec["mode"],
+                "status": rec["status"],
+                "stage": rec["stage"],
+                "percent": rec["percent"],
+                "processed_edges": rec["processed_edges"],
+                "total_edges": rec["total_edges"],
+                "edges_per_sec": rec["edges_per_sec"],
+                "eta_sec": rec["eta_sec"],
+                "scan_strategy": rec["scan_strategy"],
+                "max_full_comments": rec["max_full_comments"],
+                "sample_budget": rec["sample_budget"],
+                "elapsed_sec": round(max(0.0, time.monotonic() - float(rec["created_at"])), 2),
+                "error": rec["error"],
+            }
+            if rec["status"] == "completed" and rec["result"] is not None:
+                out["result"] = rec["result"]
+            return out
+
+    def cancel_scan_job(self, job_id: str) -> dict[str, Any]:
+        clean_id = str(job_id or "").strip()
+        if not _VALID_JOB_ID_RE.fullmatch(clean_id):
+            raise KeyError(f"Invalid job_id {job_id!r}")
+        with self._lock:
+            rec = self._scan_jobs.get(clean_id)
+            if rec is None:
+                raise KeyError(f"Unknown scan job {job_id!r}")
+            rec["cancel_event"].set()
+            if rec["status"] == "queued":
+                rec["status"] = "cancelled"
+                rec["stage"] = "cancelled"
+            return {
+                "job_id": rec["job_id"],
+                "status": rec["status"],
+                "cancel_requested": True,
+            }
+
+    def get_scan_job_comments(
+        self,
+        job_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        stance: str = "all",
+        q: str = "",
+        branch_id: str = "",
+    ) -> dict[str, Any]:
+        clean_id = str(job_id or "").strip()
+        if not _VALID_JOB_ID_RE.fullmatch(clean_id):
+            raise KeyError(f"Invalid job_id {job_id!r}")
+        with self._lock:
+            rec = self._scan_jobs.get(clean_id)
+            if rec is None:
+                raise KeyError(f"Unknown scan job {job_id!r}")
+            rows = list(rec.get("comment_rows") or [])
+
+        st_norm = str(stance or "all").strip().lower()
+        q_norm = str(q or "").strip().lower()
+        b_norm = str(branch_id or "").strip()
+        filtered: list[dict[str, Any]] = []
+        for r in rows:
+            if b_norm and b_norm != "_all_top" and str(r.get("branch_id")) != b_norm:
+                continue
+            if st_norm == "uncivil":
+                if not r.get("is_uncivil"):
+                    continue
+            elif st_norm in {"support", "oppose", "neutral"}:
+                if str(r.get("stance_class")) != st_norm:
+                    continue
+            if q_norm and q_norm not in str(r.get("text") or "").lower():
+                continue
+            filtered.append(r)
+
+        p_sz = max(1, min(200, int(page_size)))
+        total_items = len(filtered)
+        total_pages = max(1, math.ceil(total_items / float(p_sz)))
+        p_idx = max(1, min(total_pages, int(page)))
+        start = (p_idx - 1) * p_sz
+        return {
+            "job_id": clean_id,
+            "page": p_idx,
+            "page_size": p_sz,
+            "total_items": total_items,
+            "total_pages": total_pages,
+            "items": filtered[start : start + p_sz],
+        }
+
+    def get_scan_job_branch(self, job_id: str, branch_id: str) -> dict[str, Any]:
+        clean_id = str(job_id or "").strip()
+        clean_branch = str(branch_id or "").strip()
+        if not _VALID_JOB_ID_RE.fullmatch(clean_id):
+            raise KeyError(f"Invalid job_id {job_id!r}")
+        if not _VALID_BRANCH_ID_RE.fullmatch(clean_branch):
+            raise KeyError(f"Invalid branch_id {branch_id!r}")
+        with self._lock:
+            rec = self._scan_jobs.get(clean_id)
+            if rec is None:
+                raise KeyError(f"Unknown scan job {job_id!r}")
+            branch_trees = rec.get("branch_trees") or {}
+            if clean_branch not in branch_trees:
+                raise KeyError(f"Unknown branch {branch_id!r} for job {job_id!r}")
+            return dict(branch_trees[clean_branch])
+
 
 def make_handler(backend: DemoBackend):
     """Build a hardened HTTP request handler backed by `DemoBackend`."""
@@ -1917,6 +2563,53 @@ def make_handler(backend: DemoBackend):
                 self._send_json(HTTPStatus.OK, payload)
                 return
 
+            if path.startswith("/api/tier1/scan_jobs/"):
+                tail = path.removeprefix("/api/tier1/scan_jobs/").strip("/")
+                parts = [p for p in tail.split("/") if p]
+                if len(parts) == 1:
+                    try:
+                        payload = backend.get_scan_job(parts[0])
+                    except KeyError as exc:
+                        self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                        return
+                    self._send_json(HTTPStatus.OK, payload)
+                    return
+                if len(parts) == 2 and parts[1] == "comments":
+                    qs = parse_qs(parsed.query)
+                    try:
+                        page_v = int((qs.get("page") or ["1"])[0])
+                        size_v = int((qs.get("page_size") or ["50"])[0])
+                    except ValueError:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid pagination query parameters"})
+                        return
+                    stance_v = (qs.get("stance") or ["all"])[0]
+                    q_v = (qs.get("q") or [""])[0]
+                    branch_v = (qs.get("branch_id") or [""])[0]
+                    try:
+                        payload = backend.get_scan_job_comments(
+                            parts[0],
+                            page=page_v,
+                            page_size=size_v,
+                            stance=stance_v,
+                            q=q_v,
+                            branch_id=branch_v,
+                        )
+                    except KeyError as exc:
+                        self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                        return
+                    self._send_json(HTTPStatus.OK, payload)
+                    return
+                if len(parts) == 3 and parts[1] == "branch":
+                    try:
+                        payload = backend.get_scan_job_branch(parts[0], parts[2])
+                    except KeyError as exc:
+                        self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                        return
+                    self._send_json(HTTPStatus.OK, payload)
+                    return
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+                return
+
             if path.startswith("/assets/"):
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "Asset not in allowlist"})
                 return
@@ -1928,17 +2621,38 @@ def make_handler(backend: DemoBackend):
             if self._is_traversal_attempt(self.path, parsed.path):
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "Forbidden path"})
                 return
-            if parsed.path not in {"/api/tier1/sandbox", "/api/tier1/classify_topic"}:
+
+            is_scan_create = parsed.path == "/api/tier1/scan_jobs"
+            is_scan_cancel = (
+                parsed.path.startswith("/api/tier1/scan_jobs/")
+                and parsed.path.endswith("/cancel")
+                and len([p for p in parsed.path.removeprefix("/api/tier1/scan_jobs/").strip("/").split("/") if p]) == 2
+            )
+            if parsed.path not in {"/api/tier1/sandbox", "/api/tier1/classify_topic"} and not is_scan_create and not is_scan_cancel:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
                 return
 
+            max_bytes = _MAX_SCAN_JOB_BYTES if is_scan_create else _MAX_POST_BYTES
             try:
                 length = int(self.headers.get("Content-Length") or "0")
-                if length < 0 or length > _MAX_POST_BYTES:
+                if length < 0 or length > max_bytes:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Payload size out of bounds"})
                     return
                 raw = self.rfile.read(length) if length > 0 else b"{}"
-                body = json.loads(raw.decode("utf-8"))
+                body = json.loads(raw.decode("utf-8")) if raw else {}
+                if is_scan_create:
+                    result = backend.start_scan_job(body)
+                    self._send_json(HTTPStatus.ACCEPTED, result)
+                    return
+                if is_scan_cancel:
+                    job_id = [p for p in parsed.path.removeprefix("/api/tier1/scan_jobs/").strip("/").split("/") if p][0]
+                    try:
+                        result = backend.cancel_scan_job(job_id)
+                    except KeyError as exc:
+                        self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                        return
+                    self._send_json(HTTPStatus.OK, result)
+                    return
                 if parsed.path == "/api/tier1/classify_topic":
                     result = backend.classify_topic(body)
                 else:

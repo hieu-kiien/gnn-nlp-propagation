@@ -652,6 +652,142 @@ def _classify_post_archetype(
     return key, _ARCHETYPE_LABELS_VI[key], _ARCHETYPE_LABELS_EN[key]
 
 
+def extract_hotspot_branches(
+    *,
+    root_id: str,
+    all_nodes: Sequence[Mapping[str, Any]],
+    all_edges: Sequence[Mapping[str, Any]],
+    edge_scores: Mapping[str, Mapping[str, Any]],
+    depth_map: Mapping[str, int],
+    node_orientations: Mapping[str, float] | None = None,
+    top_k: int = 5,
+    max_nodes_per_branch: int = 80,
+) -> list[dict[str, Any]]:
+    """Rank top-k depth-1 discussion branches by heated debate volume and cap subtree size for lag-free SVG."""
+    if top_k < 1 or max_nodes_per_branch < 2:
+        return []
+
+    node_by_id: dict[str, Mapping[str, Any]] = {str(n["node_id"]): n for n in all_nodes}
+    children_adj: dict[str, list[str]] = {str(n["node_id"]): [] for n in all_nodes}
+    parent_of: dict[str, str] = {}
+    edge_score_by_target: dict[str, tuple[float, float]] = {}
+
+    for e in all_edges:
+        src = str(e["source_id"])
+        dst = str(e["target_id"])
+        eid = str(e.get("edge_id") or f"{src}->{dst}")
+        children_adj.setdefault(src, []).append(dst)
+        children_adj.setdefault(dst, [])
+        parent_of[dst] = src
+        sc = edge_scores.get(eid) or {}
+        s_uv = float(sc.get("s_uv", e.get("s_uv", 0.0)))
+        h_uv = float(sc.get("h_uv", e.get("h_uv", 0.0)))
+        edge_score_by_target[dst] = (s_uv, h_uv)
+
+    root_children = list(children_adj.get(root_id, ()))
+    if not root_children:
+        return []
+
+    ori_map = node_orientations or {}
+    from collections import deque
+
+    branches: list[dict[str, Any]] = []
+    for lead_id in root_children:
+        if lead_id not in node_by_id:
+            continue
+        subtree_ids: list[str] = []
+        seen_b: set[str] = {root_id, lead_id}
+        q: deque[str] = deque([lead_id])
+        max_b_depth = int(depth_map.get(lead_id, 1))
+        while q:
+            curr = q.popleft()
+            subtree_ids.append(curr)
+            d_val = int(depth_map.get(curr, 1))
+            if d_val > max_b_depth:
+                max_b_depth = d_val
+            for ch in children_adj.get(curr, ()):
+                if ch not in seen_b:
+                    seen_b.add(ch)
+                    q.append(ch)
+
+        size = len(subtree_ids)
+        if size == 0:
+            continue
+
+        sup_c = opp_c = neu_c = hos_c = 0
+        for nid in subtree_ids:
+            s_uv, h_uv = edge_score_by_target.get(nid, (0.0, 0.0))
+            ori = float(ori_map.get(nid, s_uv))
+            if ori > 0.1:
+                sup_c += 1
+            elif ori < -0.1:
+                opp_c += 1
+            else:
+                neu_c += 1
+            if h_uv >= 0.5:
+                hos_c += 1
+
+        opp_ratio = opp_c / float(size)
+        hos_ratio = hos_c / float(size)
+        heat_score = float(size) * (0.5 + opp_ratio + hos_ratio)
+
+        # Select connected representative nodes <= max_nodes_per_branch:
+        # prioritize shallow BFS backbone + highest intensity nodes with ancestor closure.
+        target_cap = max(2, int(max_nodes_per_branch))
+        selected_set: set[str] = {root_id, lead_id}
+        selected_order: list[str] = [root_id, lead_id]
+
+        scored_desc = sorted(
+            [nid for nid in subtree_ids if nid != lead_id],
+            key=lambda nid: (
+                int(depth_map.get(nid, 999)) > 3,
+                -(edge_score_by_target.get(nid, (0.0, 0.0))[1] + abs(edge_score_by_target.get(nid, (0.0, 0.0))[0])),
+                int(depth_map.get(nid, 999)),
+                nid,
+            ),
+        )
+        for nid in scored_desc:
+            if len(selected_order) >= target_cap:
+                break
+            chain: list[str] = []
+            curr = nid
+            visited_chain: set[str] = set()
+            while curr and curr not in selected_set and curr not in visited_chain:
+                visited_chain.add(curr)
+                chain.append(curr)
+                curr = parent_of.get(curr, "")
+            if len(selected_order) + len(chain) <= target_cap:
+                for anc in reversed(chain):
+                    if anc not in selected_set:
+                        selected_set.add(anc)
+                        selected_order.append(anc)
+
+        lead_txt = " ".join(str(node_by_id[lead_id].get("text") or "").split())
+        if len(lead_txt) > 140:
+            lead_txt = lead_txt[:139].rstrip() + "…"
+
+        branches.append(
+            {
+                "branch_id": lead_id,
+                "lead_text": lead_txt,
+                "size": size,
+                "support_count": sup_c,
+                "oppose_count": opp_c,
+                "neutral_count": neu_c,
+                "hostile_count": hos_c,
+                "oppose_ratio": round(opp_ratio, 4),
+                "hostile_ratio": round(hos_ratio, 4),
+                "max_depth": max_b_depth,
+                "heat_score": round(heat_score, 3),
+                "node_ids": selected_order,
+                "truncated_for_view": size > max(0, target_cap - 1),
+            }
+        )
+
+    branches.sort(key=lambda b: (-float(b["heat_score"]), -int(b["size"]), str(b["branch_id"])))
+    return branches[:top_k]
+
+
 def analyze_large_thread_dynamics(
     *,
     root_node: Mapping[str, Any],
@@ -719,20 +855,42 @@ def analyze_large_thread_dynamics(
         else 0.0
     )
 
-    milestones = [m for m in (5, 10, 20, 35, 50, 75, 100, 150, 200, 300) if m < total_replies]
+    milestone_grid = (5, 10, 20, 35, 50, 75, 100, 150, 200, 300, 500, 1000, 2000, 3500, 5000, 7500, 10000)
+    milestones = [m for m in milestone_grid if m < total_replies]
     if total_replies > 0:
         milestones.append(total_replies)
 
+    # Bucket edges by max chronological node rank for fast O(N) incremental milestone expansion.
+    node_rank: dict[str, int] = {root_id: 0}
+    for idx_r, n_r in enumerate(non_roots, start=1):
+        node_rank[str(n_r["node_id"])] = idx_r
+    edges_by_rank: dict[int, list[tuple[str, str, dict[str, str]]]] = {}
+    for (src, dst), e_row in edge_lookup.items():
+        r_src = node_rank.get(src)
+        r_dst = node_rank.get(dst)
+        if r_src is None or r_dst is None:
+            continue
+        r_max = r_src if r_src >= r_dst else r_dst
+        edges_by_rank.setdefault(r_max, []).append((src, dst, e_row))
+
+    pref_adj: dict[str, list[str]] = {}
+    pref_lookup: dict[tuple[str, str], dict[str, str]] = {}
+    cur_rank_added = -1
+    if 0 in edges_by_rank:
+        for src, dst, e_row in edges_by_rank[0]:
+            pref_adj.setdefault(src, []).append(dst)
+            pref_lookup[(src, dst)] = e_row
+        cur_rank_added = 0
+
     trajectory: list[dict[str, Any]] = []
     for k_step in milestones:
-        prefix_nodes = non_roots[:k_step]
-        prefix_ids = {root_id} | {str(n["node_id"]) for n in prefix_nodes}
-        pref_adj: dict[str, list[str]] = {}
-        pref_lookup: dict[tuple[str, str], dict[str, str]] = {}
-        for (src, dst), e_row in edge_lookup.items():
-            if src in prefix_ids and dst in prefix_ids:
+        for r_idx in range(cur_rank_added + 1, k_step + 1):
+            for src, dst, e_row in edges_by_rank.get(r_idx, ()):
                 pref_adj.setdefault(src, []).append(dst)
                 pref_lookup[(src, dst)] = e_row
+        cur_rank_added = k_step
+
+        prefix_nodes = non_roots[:k_step]
         pref_aligned, pref_orientations = _compute_root_aligned_stances_and_orientations(
             root_id=root_id,
             children_adj=pref_adj,
@@ -899,6 +1057,17 @@ def analyze_large_thread_dynamics(
             f"Hostile {final_pt['hostile_ratio']:.0%}), {trend_phrase_en}."
         )
 
+    hotspot_branches = extract_hotspot_branches(
+        root_id=root_id,
+        all_nodes=all_nodes,
+        all_edges=all_edges,
+        edge_scores=edge_scores,
+        depth_map=depth_map,
+        node_orientations=node_orientations,
+        top_k=5,
+        max_nodes_per_branch=80,
+    )
+
     return {
         "lang": lang_norm,
         "scope": scope,
@@ -925,6 +1094,7 @@ def analyze_large_thread_dynamics(
             "hostile": float(final_pt["hostile_ratio"]),
         },
         "polarization_trajectory": trajectory,
+        "hotspot_branches": hotspot_branches,
         "semantic_understanding": {
             "synthesis_method": "extractive_quantitative",
             "summary": summary_en if lang_norm == "en" else summary_vi,

@@ -18,6 +18,8 @@
     hostile_conflict: "Xung đột / Gay gắt cao",
   };
 
+  const MAX_SVG_NODES = 120;
+
   const state = {
     activeTab: "tier1",
     tier1Mode: "real", // "real" | "sandbox"
@@ -32,6 +34,12 @@
     tier2Corpus: "vn",
     sortMetric: null,
     sortDir: "desc",
+    activeScanJobId: null,
+    activeBranchId: null,
+    megaPage: 1,
+    megaTotalPages: 1,
+    megaUploadedJson: null,
+    megaPollTimer: null,
   };
 
   // Safe DOM builders using textContent exclusively (zero dynamic HTML strings)
@@ -472,9 +480,18 @@
     const svg = $("graph-svg");
     clearEl(svg);
     const tree = payload.tree || { nodes: [], edges: [] };
-    const nodes = tree.nodes || [];
-    const edges = tree.edges || [];
-    if (!nodes.length) return;
+    const rawNodes = tree.nodes || [];
+    const rawEdges = tree.edges || [];
+    if (!rawNodes.length) return;
+
+    // Hard browser-freeze guard: never mount > MAX_SVG_NODES nodes directly in SVG DOM.
+    let nodes = rawNodes;
+    let edges = rawEdges;
+    if (rawNodes.length > MAX_SVG_NODES) {
+      nodes = rawNodes.slice(0, MAX_SVG_NODES);
+      const keepSet = new Set(nodes.map((n) => n.node_id));
+      edges = rawEdges.filter((e) => keepSet.has(e.source_id) && keepSet.has(e.target_id));
+    }
 
     const nodeMap = new Map(nodes.map((n) => [n.node_id, n]));
     const childrenMap = new Map(nodes.map((n) => [n.node_id, []]));
@@ -1198,6 +1215,29 @@
       trendBadge.textContent = `${largeInfo.evolution_trend_label_vi || largeInfo.evolution_trend || "Ổn định"} (${sign}${delta.toFixed(3)})`;
     }
 
+    const oodBadge = $("ood-scale-badge");
+    const fc = payload.forecast || {};
+    if (oodBadge) {
+      const isOod = Boolean(fc.ood_scale_warning || payload.mega_scan_summary?.ood_scale_warning);
+      oodBadge.hidden = !isOod;
+      if (isOod) {
+        const refMax = fc.training_max_replies_ref || payload.mega_scan_summary?.training_max_replies_ref || 345;
+        oodBadge.textContent = `Cảnh báo ngoại suy (> ${refMax} bình luận train)`;
+      }
+    }
+
+    const covBadge = $("mega-coverage-badge");
+    const ms = payload.mega_scan_summary || {};
+    if (covBadge) {
+      const hasCoverage = ms.total_edges && ms.scored_edges;
+      covBadge.hidden = !hasCoverage;
+      if (hasCoverage) {
+        const pct = Math.round(Number(ms.coverage_ratio ?? 1) * 100);
+        const ci = Array.isArray(ms.bootstrap_ci_95) ? ` · CI 95% [${ms.bootstrap_ci_95[0].toFixed(3)}, ${ms.bootstrap_ci_95[1].toFixed(3)}]` : "";
+        covBadge.textContent = `Chấm ${fmtInt(ms.scored_edges)}/${fmtInt(ms.total_edges)} cạnh (${pct}%)${ci}`;
+      }
+    }
+
     const sem = largeInfo.semantic_understanding || {};
     const summaryEl = $("large-summary-text");
     if (summaryEl) {
@@ -1232,17 +1272,134 @@
     }
   }
 
+  function renderHotspotBranches(payload) {
+    const bar = $("hotspot-branch-bar");
+    if (!bar) return;
+    clearEl(bar);
+    const branches = Array.isArray(payload?.large_thread_analysis?.hotspot_branches)
+      ? payload.large_thread_analysis.hotspot_branches
+      : [];
+    const jobId = payload?.scan_job_id || state.activeScanJobId;
+    if (!branches.length || !jobId) {
+      bar.hidden = true;
+      return;
+    }
+    bar.hidden = false;
+    bar.appendChild(el("span", { className: "field-label" }, "Top nhánh tranh cãi nóng:"));
+
+    const activeBid = payload?.tree_view_meta?.active_branch_id || state.activeBranchId || branches[0].branch_id;
+    const mkBtn = (bid, label) => {
+      const btn = el(
+        "button",
+        {
+          type: "button",
+          className: "hotspot-btn",
+          "aria-pressed": String(activeBid === bid),
+        },
+        label
+      );
+      btn.addEventListener("click", () => switchMegaBranch(jobId, bid));
+      return btn;
+    };
+    branches.forEach((b, idx) => {
+      bar.appendChild(
+        mkBtn(b.branch_id, `#${idx + 1} (${b.size} cmt · phản đối ${Math.round((b.oppose_ratio || 0) * 100)}%)`)
+      );
+    });
+    bar.appendChild(mkBtn("_all_top", "120 nút đầu"));
+  }
+
+  async function switchMegaBranch(jobId, branchId) {
+    try {
+      const resp = await apiGet(`/api/tier1/scan_jobs/${encodeURIComponent(jobId)}/branch/${encodeURIComponent(branchId)}`);
+      if (!state.currentPayload) return;
+      state.activeBranchId = branchId;
+      state.currentPayload = {
+        ...state.currentPayload,
+        tree: resp.tree,
+        tree_view_meta: resp.tree_view_meta,
+      };
+      renderHotspotBranches(state.currentPayload);
+      renderCurrentGraph();
+      state.megaPage = 1;
+      await loadMegaCommentsPage(1);
+    } catch (err) {
+      showError(err.message);
+    }
+  }
+
+  async function loadMegaCommentsPage(pageNum = 1) {
+    const sec = $("mega-comments-section");
+    const tbody = $("mega-comments-tbody");
+    const jobId = state.activeScanJobId;
+    if (!sec || !tbody || !jobId) {
+      if (sec) sec.hidden = true;
+      return;
+    }
+    const stance = $("mega-stance-filter") ? $("mega-stance-filter").value : "all";
+    const q = $("mega-search-input") ? $("mega-search-input").value.trim() : "";
+    const qs = new URLSearchParams({
+      page: String(pageNum),
+      page_size: "50",
+      stance,
+      q,
+    });
+    const data = await apiGet(`/api/tier1/scan_jobs/${encodeURIComponent(jobId)}/comments?${qs.toString()}`);
+    sec.hidden = false;
+    state.megaPage = data.page || 1;
+    state.megaTotalPages = data.total_pages || 1;
+    $("mega-comments-total-pill").textContent = `${fmtInt(data.total_items)} bình luận khớp`;
+    $("mega-page-info").textContent = `Trang ${state.megaPage} / ${state.megaTotalPages}`;
+    $("mega-prev-page").disabled = state.megaPage <= 1;
+    $("mega-next-page").disabled = state.megaPage >= state.megaTotalPages;
+
+    clearEl(tbody);
+    const items = data.items || [];
+    if (!items.length) {
+      const tr = el("tr");
+      const td = el("td", { colSpan: "5" }, "Không tìm thấy bình luận nào phù hợp bộ lọc.");
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+      return;
+    }
+    for (const item of items) {
+      const tr = el("tr");
+      tr.appendChild(el("td", { className: "tabular" }, `${item.node_id} (d=${item.depth})`));
+      tr.appendChild(el("td", { className: "tabular" }, item.author_hash || "—"));
+      const stInfo = STANCE_COLORS[item.stance_class] || STANCE_COLORS.neutral;
+      const stLabel = item.is_uncivil ? `${stInfo.label} · Gay gắt` : stInfo.label;
+      tr.appendChild(el("td", {}, stLabel));
+      const scoreTxt = item.is_scored ? `${Number(item.s_uv).toFixed(2)} / ${Number(item.h_uv).toFixed(2)}` : "Chưa chấm";
+      tr.appendChild(el("td", { className: "tabular" }, scoreTxt));
+      tr.appendChild(el("td", {}, item.text || ""));
+      tbody.appendChild(tr);
+    }
+  }
+
   function renderPayload(payload) {
     state.currentPayload = payload;
     state.selectedNodeId = null;
     state.selectedUserId = null;
+    if (payload.scan_job_id) {
+      state.activeScanJobId = payload.scan_job_id;
+      state.activeBranchId = payload.tree_view_meta?.active_branch_id || null;
+    } else {
+      state.activeScanJobId = null;
+      state.activeBranchId = null;
+      const sec = $("mega-comments-section");
+      if (sec) sec.hidden = true;
+    }
     renderHonestyBanner(payload);
     renderTier1KPIs(payload);
     renderTopicAnalysis(payload);
     renderLargePostUnderstanding(payload);
     renderContractionStrip(payload);
     renderTriggerEdges(payload);
+    renderHotspotBranches(payload);
     renderCurrentGraph();
+    if (state.activeScanJobId) {
+      loadMegaCommentsPage(1).catch(() => {});
+    }
   }
 
   function setViewMode(mode) {
@@ -1488,6 +1645,85 @@
   // =========================================================================
   // Initialization & Event Wiring
   // =========================================================================
+  function getSelectedMegaStrategy() {
+    const checked = document.querySelector('input[name="mega_strategy"]:checked');
+    return checked ? checked.value : "stratified";
+  }
+
+  function getSelectedMegaMaxComments() {
+    const sel = $("mega-max-comments");
+    return sel ? Number(sel.value || 2000) : 2000;
+  }
+
+  function setMegaButtonsBusy(busy) {
+    const btnStress = $("btn-mega-stress");
+    const btnRun = $("btn-mega-run");
+    const btnCancel = $("btn-mega-cancel");
+    if (btnStress) btnStress.disabled = busy;
+    if (btnRun) btnRun.disabled = busy;
+    if (btnCancel) btnCancel.hidden = !busy;
+  }
+
+  async function startMegaScanJob(reqBody) {
+    showError("");
+    if (state.megaPollTimer) {
+      clearTimeout(state.megaPollTimer);
+      state.megaPollTimer = null;
+    }
+    const progBox = $("mega-progress-box");
+    const progBar = $("mega-progress-bar");
+    const progLbl = $("mega-progress-label");
+    const progPct = $("mega-progress-pct");
+    const progMeta = $("mega-progress-meta");
+    if (progBox) progBox.hidden = false;
+    if (progBar) progBar.value = 0;
+    if (progLbl) progLbl.textContent = "Đang đưa job quét vào hàng đợi...";
+    if (progPct) progPct.textContent = "0%";
+    if (progMeta) progMeta.textContent = "";
+    setMegaButtonsBusy(true);
+
+    try {
+      const created = await apiPost("/api/tier1/scan_jobs", reqBody);
+      const jobId = created.job_id;
+      state.activeScanJobId = jobId;
+
+      const poll = async () => {
+        try {
+          const st = await apiGet(`/api/tier1/scan_jobs/${encodeURIComponent(jobId)}`);
+          const pct = Math.max(0, Math.min(100, Number(st.percent || 0)));
+          if (progBar) progBar.value = pct;
+          if (progPct) progPct.textContent = `${pct.toFixed(1)}%`;
+          if (progLbl) progLbl.textContent = `Giai đoạn: ${st.stage || st.status}`;
+          if (progMeta) {
+            const etaTxt = st.eta_sec !== null && st.eta_sec !== undefined ? ` · ETA ${st.eta_sec}s` : "";
+            progMeta.textContent = `Đã chấm ${fmtInt(st.processed_edges)}/${fmtInt(st.total_edges)} cạnh (${st.edges_per_sec || 0} cạnh/s)${etaTxt} · Đã chạy ${st.elapsed_sec || 0}s`;
+          }
+          if (st.status === "completed" && st.result) {
+            setMegaButtonsBusy(false);
+            renderPayload(st.result);
+            const ms = st.result.mega_scan_summary || {};
+            announce(`Hoàn tất quét Mega-Thread (${fmtInt(ms.kept_comments)} bình luận hợp lệ, ${fmtInt(ms.scored_edges)} cạnh đã chấm).`);
+            return;
+          }
+          if (st.status === "cancelled" || st.status === "failed") {
+            setMegaButtonsBusy(false);
+            if (st.error) showError(st.error);
+            if (progLbl) progLbl.textContent = st.status === "cancelled" ? "Đã hủy job." : "Job thất bại.";
+            return;
+          }
+          state.megaPollTimer = setTimeout(poll, 450);
+        } catch (err) {
+          setMegaButtonsBusy(false);
+          showError(err.message);
+        }
+      };
+      await poll();
+    } catch (err) {
+      setMegaButtonsBusy(false);
+      showError(err.message);
+    }
+  }
+
   function initControls() {
     $("mode-real-btn").addEventListener("click", () => switchTier1Mode("real"));
     $("mode-sandbox-btn").addEventListener("click", () => switchTier1Mode("sandbox"));
@@ -1654,6 +1890,115 @@
         junk_mode: junkMode,
       });
     });
+
+    const fileInputEl = $("mega-json-file");
+    if (fileInputEl) {
+      fileInputEl.addEventListener("change", (ev) => {
+        const f = ev.target.files && ev.target.files[0];
+        if (!f) {
+          state.megaUploadedJson = null;
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+          state.megaUploadedJson = String(reader.result || "");
+          announce(`Đã nạp tệp cục bộ: ${f.name}`);
+        };
+        reader.readAsText(f, "utf-8");
+      });
+    }
+
+    const btnMegaStress = $("btn-mega-stress");
+    if (btnMegaStress) {
+      btnMegaStress.addEventListener("click", () => {
+        const maxC = getSelectedMegaMaxComments();
+        startMegaScanJob({
+          mode: "preset_mega_stress",
+          stress_n_comments: maxC,
+          max_full_comments: maxC,
+          scan_strategy: getSelectedMegaStrategy(),
+          junk_mode: getSelectedJunkMode(),
+          custom_topics: getSandboxTopics() || undefined,
+        });
+      });
+    }
+
+    const btnMegaRun = $("btn-mega-run");
+    if (btnMegaRun) {
+      btnMegaRun.addEventListener("click", () => {
+        const maxC = getSelectedMegaMaxComments();
+        const strat = getSelectedMegaStrategy();
+        const junkMode = getSelectedJunkMode();
+        const customTopics = getSandboxTopics() || undefined;
+        if (state.megaUploadedJson) {
+          startMegaScanJob({
+            mode: "json_upload",
+            thread_json: state.megaUploadedJson,
+            max_full_comments: maxC,
+            scan_strategy: strat,
+            junk_mode: junkMode,
+            custom_topics: customTopics,
+          });
+          return;
+        }
+        const urlVal = urlInputEl.value.trim();
+        if (urlVal) {
+          startMegaScanJob({
+            mode: "reddit_url",
+            reddit_url: urlVal,
+            max_full_comments: maxC,
+            scan_strategy: strat,
+            junk_mode: junkMode,
+            custom_topics: customTopics,
+          });
+          return;
+        }
+        const rawLines = rawLinesEl.value.trim();
+        if (rawLines) {
+          startMegaScanJob({
+            mode: "custom",
+            title: titleEl.value.trim(),
+            root_text: $("sb-root-text").value.trim(),
+            raw_indented_text: rawLines,
+            max_full_comments: maxC,
+            scan_strategy: strat,
+            junk_mode: junkMode,
+            custom_topics: customTopics,
+          });
+          return;
+        }
+        showError("Vui lòng chọn tệp JSON/JSONL, dán URL Reddit hoặc bấm Chạy mẫu kiểm tải.");
+      });
+    }
+
+    const btnMegaCancel = $("btn-mega-cancel");
+    if (btnMegaCancel) {
+      btnMegaCancel.addEventListener("click", async () => {
+        if (!state.activeScanJobId) return;
+        try {
+          await apiPost(`/api/tier1/scan_jobs/${encodeURIComponent(state.activeScanJobId)}/cancel`, {});
+        } catch (err) {
+          showError(err.message);
+        }
+      });
+    }
+
+    const stanceFilterEl = $("mega-stance-filter");
+    const searchInputEl = $("mega-search-input");
+    const prevPageBtn = $("mega-prev-page");
+    const nextPageBtn = $("mega-next-page");
+    if (stanceFilterEl) {
+      stanceFilterEl.addEventListener("change", () => loadMegaCommentsPage(1).catch((e) => showError(e.message)));
+    }
+    if (searchInputEl) {
+      searchInputEl.addEventListener("input", () => loadMegaCommentsPage(1).catch((e) => showError(e.message)));
+    }
+    if (prevPageBtn) {
+      prevPageBtn.addEventListener("click", () => loadMegaCommentsPage(Math.max(1, state.megaPage - 1)).catch((e) => showError(e.message)));
+    }
+    if (nextPageBtn) {
+      nextPageBtn.addEventListener("click", () => loadMegaCommentsPage(Math.min(state.megaTotalPages, state.megaPage + 1)).catch((e) => showError(e.message)));
+    }
 
     $("corpus-vn-btn").addEventListener("click", () => renderTier2Corpus("vn"));
     $("corpus-pheme-btn").addEventListener("click", () => renderTier2Corpus("pheme"));
