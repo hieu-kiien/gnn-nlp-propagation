@@ -274,6 +274,74 @@ c9 (trả lời c4): 👍</textarea>
                 </details>
               </form>
 
+              <!-- Async Mega-Thread Scanner (up to 10,000 comments) -->
+              <section class="mega-scan-panel" id="mega-scan-panel" aria-label="Quét Mega-Thread quy mô tới 10.000 bình luận">
+                <div class="mega-panel-head">
+                  <div>
+                    <h2 class="section-heading">Quét Mega-Thread (tới 10.000 bình luận · Job nền)</h2>
+                    <p class="field-hint">
+                      Giữ nguyên dự báo sớm GNN K=20; mở rộng hậu kiểm quỹ đạo phân cực, Path Contraction và Top 5 nhánh nóng trên toàn bài lớn.
+                    </p>
+                  </div>
+                  <span class="pill tabular" id="mega-mode-pill">async /api/tier1/scan_jobs</span>
+                </div>
+
+                <div class="mega-controls-row">
+                  <div class="field-stack mega-select-wrap">
+                    <label for="mega-max-comments" class="field-label">Trần bình luận quét</label>
+                    <select id="mega-max-comments" class="select-control">
+                      <option value="500">500 bình luận</option>
+                      <option value="2000" selected>2.000 bình luận</option>
+                      <option value="5000">5.000 bình luận</option>
+                      <option value="10000">10.000 bình luận</option>
+                    </select>
+                  </div>
+
+                  <fieldset class="junk-mode-fieldset">
+                    <legend class="field-label">Chiến lược chấm cạnh NLP</legend>
+                    <div class="radio-inline-group">
+                      <label class="radio-inline" for="mega-strat-stratified">
+                        <input type="radio" id="mega-strat-stratified" name="mega_strategy" value="stratified" checked>
+                        <span>Quét nhanh phân tầng (600 mẫu + CI 95%)</span>
+                      </label>
+                      <label class="radio-inline" for="mega-strat-full">
+                        <input type="radio" id="mega-strat-full" name="mega_strategy" value="full">
+                        <span>Quét sâu 100% cạnh</span>
+                      </label>
+                    </div>
+                  </fieldset>
+
+                  <div class="field-stack mega-file-wrap">
+                    <label for="mega-json-file" class="field-label">Hoặc nạp tệp JSON/JSONL bài lớn</label>
+                    <div class="mega-file-row">
+                      <input type="file" id="mega-json-file" accept=".json,.jsonl" class="file-input-control">
+                      <button type="button" class="btn-outline btn-sm" id="btn-mega-clear-file" hidden>Bỏ chọn tệp</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="mega-actions-row">
+                  <button type="button" class="btn-outline btn-sm" id="btn-mega-stress">
+                    Chạy mẫu kiểm tải (2k–10k)
+                  </button>
+                  <button type="button" class="btn-primary btn-sm" id="btn-mega-run">
+                    Quét bài lớn bất đồng bộ (URL / JSON / Nhập tay)
+                  </button>
+                  <button type="button" class="btn-outline btn-sm btn-danger-outline" id="btn-mega-cancel" hidden>
+                    Hủy job đang chạy
+                  </button>
+                </div>
+
+                <div class="mega-progress-box" id="mega-progress-box" hidden>
+                  <div class="mega-progress-top">
+                    <span id="mega-progress-label" class="field-label">Đang khởi tạo job...</span>
+                    <span id="mega-progress-pct" class="tabular field-label">0%</span>
+                  </div>
+                  <progress id="mega-progress-bar" class="mega-progress-bar" max="100" value="0"></progress>
+                  <div id="mega-progress-meta" class="field-hint tabular"></div>
+                </div>
+              </section>
+
               <!-- Path Contraction Before/After Strip -->
               <div id="contraction-strip" class="contraction-strip" hidden>
                 <div class="contraction-header">
@@ -403,6 +471,8 @@ c9 (trả lời c4): 👍</textarea>
                   <span class="badge-tag badge-root" id="large-scale-badge">—</span>
                   <span class="badge-tag badge-neutral" id="large-archetype-badge">—</span>
                   <span class="badge-tag badge-relink" id="large-trend-badge">—</span>
+                  <span class="badge-tag badge-ood" id="ood-scale-badge" hidden>Ngoại suy quy mô (&gt; 350 cmt)</span>
+                  <span class="badge-tag badge-neutral" id="mega-coverage-badge" hidden></span>
                 </div>
                 <p class="understanding-summary" id="large-summary-text">Đang tổng hợp luận điểm trích xuất toàn bài...</p>
 
@@ -460,6 +530,8 @@ c9 (trả lời c4): 👍</textarea>
                 <p class="root-preview-text" id="root-text-display">—</p>
               </div>
 
+              <div id="hotspot-branch-bar" class="hotspot-branch-bar" hidden></div>
+
               <div class="svg-viewport" id="svg-viewport">
                 <svg
                   id="graph-svg"
@@ -484,6 +556,50 @@ c9 (trả lời c4): 👍</textarea>
               </div>
             </aside>
           </div>
+
+          <!-- Paginated Mega-Thread Comment Explorer -->
+          <section class="card mega-comments-card" id="mega-comments-section" hidden aria-label="Bảng duyệt bình luận phân trang">
+            <div class="panel-heading-row">
+              <h2 class="section-heading">Duyệt toàn bộ bình luận bài lớn (Phân trang 50/trang)</h2>
+              <span class="pill tabular" id="mega-comments-total-pill">0 bình luận</span>
+            </div>
+            <div class="mega-filter-bar">
+              <select id="mega-stance-filter" class="select-control mega-filter-select" aria-label="Lọc theo lập trường">
+                <option value="all">Tất cả lập trường</option>
+                <option value="support">Tán thành</option>
+                <option value="oppose">Phản đối</option>
+                <option value="neutral">Trung lập</option>
+                <option value="unscored">Chưa chấm NLP</option>
+                <option value="uncivil">Công kích (h ≥ 0.5)</option>
+              </select>
+              <input
+                type="search"
+                id="mega-search-input"
+                class="text-input mega-search-input"
+                placeholder="Tìm từ khóa trong bình luận..."
+                aria-label="Tìm từ khóa trong bình luận"
+              >
+              <div class="mega-pager">
+                <button type="button" class="btn-outline btn-sm" id="mega-prev-page">Trang trước</button>
+                <span id="mega-page-info" class="tabular field-label">Trang 1 / 1</span>
+                <button type="button" class="btn-outline btn-sm" id="mega-next-page">Trang sau</button>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table class="metrics-table mega-comments-table">
+                <thead>
+                  <tr>
+                    <th>ID / Tầng</th>
+                    <th>Tác giả</th>
+                    <th>Lập trường</th>
+                    <th>Điểm (s / h)</th>
+                    <th>Nội dung bình luận</th>
+                  </tr>
+                </thead>
+                <tbody id="mega-comments-tbody"></tbody>
+              </table>
+            </div>
+          </section>
         </div>
       </section>
 

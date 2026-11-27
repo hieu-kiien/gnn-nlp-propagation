@@ -1291,3 +1291,164 @@ dialog::backdrop {
     animation-duration: 0.01ms !important;
   }
 }
+
+/* Mega-Thread 10k Scanner Controls, Hotspot Switcher & Paginated Table */
+.mega-scan-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: var(--space-3);
+  background: var(--surface-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.mega-panel-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.mega-controls-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3);
+}
+
+.mega-select-wrap {
+  min-width: 170px;
+}
+
+.mega-file-wrap {
+  min-width: 240px;
+  flex: 1 1 240px;
+}
+
+.mega-file-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.file-input-control {
+  font-size: 13px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink-soft);
+}
+
+.mega-actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.btn-danger-outline {
+  border-color: #FCA5A5;
+  color: #B91C1C;
+}
+
+.mega-progress-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.mega-progress-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.mega-progress-bar {
+  width: 100%;
+  height: 10px;
+  accent-color: var(--primary);
+}
+
+.badge-ood {
+  background: #FEF3C7;
+  color: #92400E;
+  border-color: #FCD34D;
+}
+
+.hotspot-branch-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+  margin-bottom: var(--space-2);
+}
+
+.hotspot-btn {
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--ink-soft);
+  border-radius: 999px;
+  padding: 5px 11px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.hotspot-btn[aria-pressed="true"] {
+  background: var(--primary);
+  color: #FFFFFF;
+  border-color: var(--primary);
+}
+
+.mega-comments-card {
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.mega-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.mega-filter-select {
+  max-width: 210px;
+}
+
+.mega-search-input {
+  flex: 1 1 220px;
+}
+
+.mega-pager {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mega-comments-table td:last-child,
+.mega-comments-table th:last-child {
+  text-align: left;
+  white-space: normal;
+  min-width: 300px;
+}
+
+.mega-comments-table td:not(:last-child),
+.mega-comments-table th:not(:last-child) {
+  text-align: left;
+}

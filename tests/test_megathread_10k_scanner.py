@@ -1,0 +1,578 @@
+"""Unit and integration tests for the isolated Mega-Thread 10k Scanner."""
+
+from __future__ import annotations
+
+import http.client
+import json
+import threading
+import time
+from collections import deque
+from pathlib import Path
+from typing import Any
+
+import pytest
+import requests
+
+from scripts.demo_web_app import (
+    _MAX_TREE_RENDER_NODES,
+    build_megathread_stress_preset,
+    create_server,
+)
+from scripts.predict_live_thread import (
+    OOD_SCALE_THRESHOLD,
+    TRAINING_MAX_REPLIES_REF,
+    fetch_reddit_thread_paginated,
+    load_thread_from_file,
+    predict_live_cascade,
+)
+from src.data.arctic_shift_vn import build_vn_cascade_from_thread
+from src.nlp.topic_post_analyzer import (
+    analyze_large_thread_dynamics,
+    extract_hotspot_branches,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+WEB_DIR = REPO_ROOT / "web_demo"
+PAPER_DIR = REPO_ROOT / "results"
+
+
+def _http_get(port: int, path: str, timeout: float = 20.0) -> tuple[int, dict[str, Any]]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8")
+        return resp.status, json.loads(raw)
+    finally:
+        conn.close()
+
+
+def _http_post(port: int, path: str, payload: dict[str, Any], timeout: float = 20.0) -> tuple[int, dict[str, Any]]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.request(
+            "POST",
+            path,
+            body=body,
+            headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+        )
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8")
+        return resp.status, json.loads(raw)
+    finally:
+        conn.close()
+
+
+def test_build_tree_path_contraction_and_trajectory_10k_comments() -> None:
+    """10,000-comment tree construction, Path Contraction, trajectory milestones, and hotspot cap run in O(N)."""
+    t0 = time.perf_counter()
+    post, comments = build_megathread_stress_preset(10000)
+    stats: dict[str, Any] = {}
+    built = build_vn_cascade_from_thread(
+        post,
+        comments,
+        min_comments=1,
+        min_depth=1,
+        min_vi_ratio=0.0,
+        junk_mode="contract",
+        stats_out=stats,
+    )
+    assert built is not None
+    nodes, edges, _ = built
+    assert stats["raw_comments"] == 10000
+    assert stats["kept_comments"] > 9000
+    assert stats["contracted_nodes"] > 0 or stats["dropped_leaves"] > 0
+
+    root = next(n for n in nodes if bool(n["is_root"]))
+    root_id = str(root["node_id"])
+    adj: dict[str, list[str]] = {str(n["node_id"]): [] for n in nodes}
+    for e in edges:
+        adj.setdefault(str(e["source_id"]), []).append(str(e["target_id"]))
+    depth_map: dict[str, int] = {root_id: 0}
+    q: deque[str] = deque([root_id])
+    while q:
+        curr = q.popleft()
+        for ch in adj.get(curr, []):
+            assert ch not in depth_map, "Cycle detected in 10k tree"
+            depth_map[ch] = depth_map[curr] + 1
+            q.append(ch)
+    assert len(depth_map) == len(nodes)
+
+    edge_scores = {
+        str(e["edge_id"]): {
+            "s_uv": -0.6 if idx % 2 == 0 else 0.5,
+            "h_uv": 0.7 if idx % 5 == 0 else 0.1,
+        }
+        for idx, e in enumerate(edges)
+    }
+    dyn = analyze_large_thread_dynamics(
+        root_node=root,
+        all_nodes=nodes,
+        all_edges=edges,
+        edge_scores=edge_scores,
+        depth_map=depth_map,
+        scope="full_analysis",
+    )
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 8.0, f"10k graph + trajectory took too long: {elapsed:.2f}s"
+
+    ks = [pt["k"] for pt in dyn["polarization_trajectory"]]
+    for expected_m in (500, 1000, 2000, 5000, 7500):
+        assert expected_m in ks
+    assert ks[-1] == len(nodes) - 1
+
+    hotspots = dyn["hotspot_branches"]
+    assert 1 <= len(hotspots) <= 5
+    for hb in hotspots:
+        assert len(hb["node_ids"]) <= 80
+        assert hb["node_ids"][0] == root_id
+
+
+def test_extract_hotspot_branches_connected_and_capped() -> None:
+    """Extracted hotspot branch subtrees remain parent-connected and respect max_nodes_per_branch."""
+    post, comments = build_megathread_stress_preset(400)
+    built = build_vn_cascade_from_thread(post, comments, min_comments=1, min_depth=1, min_vi_ratio=0.0, junk_mode="contract")
+    assert built is not None
+    nodes, edges, _ = built
+    root = next(n for n in nodes if bool(n["is_root"]))
+    root_id = str(root["node_id"])
+    depth_map = {root_id: 0}
+    parent_of = {str(e["target_id"]): str(e["source_id"]) for e in edges}
+    for n in nodes:
+        nid = str(n["node_id"])
+        d = 0
+        c = nid
+        while c in parent_of and d < 100:
+            d += 1
+            c = parent_of[c]
+        depth_map[nid] = d
+    scores = {str(e["edge_id"]): {"s_uv": -0.4, "h_uv": 0.6} for e in edges}
+    branches = extract_hotspot_branches(
+        root_id=root_id,
+        all_nodes=nodes,
+        all_edges=edges,
+        edge_scores=scores,
+        depth_map=depth_map,
+        top_k=3,
+        max_nodes_per_branch=25,
+    )
+    assert len(branches) == 3
+    for b in branches:
+        nset = set(b["node_ids"])
+        assert len(nset) <= 25
+        for nid in nset:
+            if nid != root_id:
+                assert parent_of[nid] in nset
+
+
+def test_fetch_reddit_thread_paginated_backoff_and_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Paginated fetcher retries HTTP 429, deduplicates overlap IDs, and collects > 500 comments."""
+
+    class _FakeResp:
+        def __init__(self, status_code: int, payload: Any, headers: dict[str, str] | None = None) -> None:
+            self.status_code = status_code
+            self._payload = payload
+            self.headers = headers or {}
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise requests.HTTPError(f"HTTP {self.status_code}")
+
+        def json(self) -> Any:
+            return self._payload
+
+    calls: list[dict[str, Any]] = []
+    rate_limited_once = False
+
+    def _fake_get(url: str, params: dict[str, Any] | None = None, headers: Any = None, timeout: int = 20) -> _FakeResp:
+        nonlocal rate_limited_once
+        del headers, timeout
+        calls.append({"url": url, "params": dict(params or {})})
+        if url.endswith("/posts/search"):
+            return _FakeResp(
+                200,
+                {
+                    "data": [
+                        {
+                            "id": "abc1234",
+                            "title": "Mega post",
+                            "selftext": "Noi dung bai goc.",
+                            "author": "op_user",
+                            "created_utc": 1763500000,
+                        }
+                    ]
+                },
+            )
+        if url.endswith("/comments/search"):
+            after = (params or {}).get("after")
+            if after is None:
+                if not rate_limited_once:
+                    rate_limited_once = True
+                    return _FakeResp(429, {"error": "rate_limit"}, headers={"x-ratelimit-reset": "0.05"})
+                items = [
+                    {
+                        "id": f"c{i}",
+                        "parent_id": "t3_abc1234",
+                        "body": f"Binh luan so {i} ung ho",
+                        "author": f"u{i}",
+                        "created_utc": 1763500000 + i,
+                    }
+                    for i in range(1, 501)
+                ]
+                return _FakeResp(200, {"data": items})
+            # Page 2 includes 5 overlapping duplicate IDs (c496..c500) + 250 fresh comments
+            items = [
+                {
+                    "id": f"c{i}",
+                    "parent_id": "t3_abc1234",
+                    "body": f"Binh luan so {i} phan doi",
+                    "author": f"u{i}",
+                    "created_utc": 1763500000 + i,
+                }
+                for i in range(496, 751)
+            ]
+            return _FakeResp(200, {"data": items})
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(requests, "get", _fake_get)
+    progress_events: list[dict[str, Any]] = []
+    post, comments = fetch_reddit_thread_paginated(
+        "abc1234",
+        max_comments=1200,
+        progress_cb=progress_events.append,
+    )
+    assert post["id"] == "abc1234"
+    assert len(comments) == 750
+    assert len({c["id"] for c in comments}) == 750
+    assert rate_limited_once is True
+    assert len(progress_events) == 2
+
+
+def test_load_thread_from_json_and_jsonl_files(tmp_path: Path) -> None:
+    """Local JSON and JSONL loader respects max_comments up to 10,000."""
+    json_p = tmp_path / "thread.json"
+    json_p.write_text(
+        json.dumps(
+            {
+                "id": "loc1",
+                "title": "Chu de cuc bo",
+                "text": "Noi dung bai viet",
+                "comments": [
+                    {"id": f"c{i}", "parent_id": "root", "text": f"Binh luan {i}", "author": f"u{i}"}
+                    for i in range(1, 25)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    post, cmts = load_thread_from_file(json_p, max_comments=10)
+    assert post["id"] == "loc1"
+    assert len(cmts) == 10
+
+    jsonl_p = tmp_path / "thread.jsonl"
+    lines = [
+        json.dumps({"id": "loc2", "title": "Bai JSONL", "text": "Noi dung"}),
+        *[json.dumps({"id": f"x{i}", "parent_id": "root", "text": f"Dong {i}"}) for i in range(1, 15)],
+    ]
+    jsonl_p.write_text("\n".join(lines), encoding="utf-8")
+    post2, cmts2 = load_thread_from_file(jsonl_p, max_comments=12)
+    assert post2["id"] == "loc2"
+    assert len(cmts2) == 12
+
+
+def test_predict_live_cascade_stratified_10k_keeps_early_k20() -> None:
+    """Stratified 10k scan preserves GNN K=20 isolation, flags OOD > 350, and computes bootstrap CI."""
+    post, comments = build_megathread_stress_preset(10000)
+    assert len(comments) == 10000
+    progress_seen: list[dict[str, Any]] = []
+    res = predict_live_cascade(
+        post,
+        comments,
+        k_horizon=20,
+        analysis_mode="full",
+        max_full_comments=10000,
+        scan_strategy="stratified",
+        sample_budget=600,
+        progress_cb=progress_seen.append,
+        topic_backend="lexical",
+        allow_untrained=True,
+        is_demo=True,
+    )
+    assert res["gnn_k_horizon"] == 20
+    assert res["ood_scale_warning"] is True
+    assert OOD_SCALE_THRESHOLD == 350
+    assert res["training_max_replies_ref"] == TRAINING_MAX_REPLIES_REF == 345
+    ms = res["mega_scan_summary"]
+    assert ms["scan_strategy"] == "stratified"
+    assert ms["total_raw_comments"] == 10000
+    assert ms["kept_comments"] > 9000
+    assert 400 <= ms["scored_edges"] <= 900
+    assert 0.0 < ms["coverage_ratio"] < 0.25
+    ci = ms["bootstrap_ci_95"]
+    assert isinstance(ci, list) and len(ci) == 2 and 0.0 <= ci[0] <= ci[1] <= 1.0
+    assert len(ms["hotspot_branches"]) >= 1
+    assert progress_seen and progress_seen[-1]["processed"] == progress_seen[-1]["total"]
+
+
+def test_async_scan_jobs_lifecycle_pagination_branches_and_cancel(tmp_path: Path) -> None:
+    """Verify full async /api/tier1/scan_jobs HTTP lifecycle, filtering, branch switch, cancel & frontend guards."""
+    server = create_server(
+        host="127.0.0.1",
+        port=0,
+        data_dir=tmp_path / "missing_vn",
+        ckpt_path=tmp_path / "missing_ckpt.pt",
+        ce_dir=tmp_path / "missing_ce",
+        paper_dir=PAPER_DIR,
+        web_dir=WEB_DIR,
+        preload=False,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    try:
+        # 1. Validation guards
+        st_bad, _ = _http_post(
+            port,
+            "/api/tier1/scan_jobs",
+            {"mode": "preset_mega_stress", "max_full_comments": 50000},
+        )
+        assert st_bad == 400
+
+        st_bad_url, _ = _http_post(
+            port,
+            "/api/tier1/scan_jobs",
+            {"mode": "reddit_url", "reddit_url": "https://reddit.com/../bad"},
+        )
+        assert st_bad_url == 400
+
+        # 2. Launch 1,200-comment stratified stress job
+        st_cr, created = _http_post(
+            port,
+            "/api/tier1/scan_jobs",
+            {
+                "mode": "preset_mega_stress",
+                "stress_n_comments": 1200,
+                "max_full_comments": 1200,
+                "scan_strategy": "stratified",
+                "sample_budget": 300,
+                "junk_mode": "contract",
+            },
+        )
+        assert st_cr == 202
+        job_id = created["job_id"]
+
+        final_job: dict[str, Any] = {}
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            st_p, job_state = _http_get(port, f"/api/tier1/scan_jobs/{job_id}")
+            assert st_p == 200
+            if job_state["status"] in {"completed", "failed", "cancelled"}:
+                final_job = job_state
+                break
+            time.sleep(0.15)
+        assert final_job.get("status") == "completed", f"Job did not complete: {final_job}"
+
+        res = final_job["result"]
+        assert res["forecast"]["gnn_k_horizon"] == 20
+        assert res["forecast"]["ood_scale_warning"] is True
+        assert len(res["tree"]["nodes"]) <= _MAX_TREE_RENDER_NODES
+        hotspots = res["large_thread_analysis"]["hotspot_branches"]
+        assert len(hotspots) >= 1
+
+        # 3. Server-side paginated & filtered comment retrieval
+        st_pg, page1 = _http_get(port, f"/api/tier1/scan_jobs/{job_id}/comments?page=1&page_size=50&stance=all")
+        assert st_pg == 200
+        assert len(page1["items"]) == 50
+        assert page1["total_items"] > 1000
+        assert page1["total_pages"] >= 20
+
+        st_flt, filt = _http_get(port, f"/api/tier1/scan_jobs/{job_id}/comments?page=1&page_size=50&q=metro")
+        assert st_flt == 200
+        assert all("metro" in r["text"].lower() for r in filt["items"])
+
+        # 4. Hotspot branch subtree fetch <= 80 nodes
+        bid = hotspots[0]["branch_id"]
+        st_br, br_data = _http_get(port, f"/api/tier1/scan_jobs/{job_id}/branch/{bid}")
+        assert st_br == 200
+        assert len(br_data["tree"]["nodes"]) <= 80
+
+        # 5. Cancellation endpoint works cleanly
+        st_cr2, created2 = _http_post(
+            port,
+            "/api/tier1/scan_jobs",
+            {
+                "mode": "preset_mega_stress",
+                "stress_n_comments": 2000,
+                "max_full_comments": 2000,
+                "scan_strategy": "full",
+            },
+        )
+        assert st_cr2 == 202
+        st_can, can_resp = _http_post(port, f"/api/tier1/scan_jobs/{created2['job_id']}/cancel", {})
+        assert st_can == 200
+        assert can_resp["cancel_requested"] is True
+        # Wait briefly so background worker drains cleanly before server shutdown
+        for _ in range(40):
+            _, st_check = _http_get(port, f"/api/tier1/scan_jobs/{created2['job_id']}")
+            if st_check["status"] in {"cancelled", "completed", "failed"}:
+                break
+            time.sleep(0.1)
+
+        # 6. Frontend static invariants preserved + Mega-Thread controls present
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        js = (WEB_DIR / "app.js").read_text(encoding="utf-8")
+        assert 'id="mega-scan-panel"' in html
+        assert 'id="mega-comments-section"' in html
+        assert 'id="hotspot-branch-bar"' in html
+        assert 'id="btn-mega-clear-file"' in html
+        assert 'value="unscored"' in html
+        assert "MAX_SVG_NODES = 120" in js
+        assert "megaCommentsReqSeq" in js
+        assert "innerHTML" not in js
+        assert "insertAdjacentHTML" not in js
+
+        # 7. Query strings with '..' are NOT misclassified as path traversal
+        st_qs_dot, qs_dot = _http_get(
+            port, f"/api/tier1/scan_jobs/{job_id}/comments?page=1&page_size=20&q=a..b"
+        )
+        assert st_qs_dot == 200
+        assert "items" in qs_dot
+
+        # 8. Unscored filter works on stratified jobs
+        st_unsc, unsc_pg = _http_get(
+            port, f"/api/tier1/scan_jobs/{job_id}/comments?page=1&page_size=20&stance=unscored"
+        )
+        assert st_unsc == 200
+        assert unsc_pg["total_items"] > 0
+        assert all(not r["is_scored"] for r in unsc_pg["items"])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_megathread_jsonl_and_stratified_connectedness_regressions(tmp_path: Path) -> None:
+    """Verify multi-line JSONL ingestion, connected stratified edges, and no 0.0 trajectory dilution."""
+    from scripts.predict_live_thread import _select_stratified_edges, load_thread_from_text
+    from src.nlp.topic_post_analyzer import analyze_large_thread_dynamics
+
+    # Multi-line JSONL parsing + NaN rejection
+    jsonl_text = "\n".join(
+        [
+            json.dumps({"id": "jroot", "title": "Chủ đề thử nghiệm", "text": "Bài gốc", "created_utc": 1700000000}),
+            json.dumps({"id": "c1", "parent_id": "t3_jroot", "text": "Đồng ý quan điểm này.", "created_utc": 1700000050}),
+            json.dumps({"id": "c2", "parent_id": "t1_c1", "text": "Không đồng ý chút nào.", "created_utc": 1700000100}),
+        ]
+    )
+    post, cmts = load_thread_from_text(jsonl_text, is_jsonl_hint=True)
+    assert post["id"] == "jroot"
+    assert len(cmts) == 2
+
+    with pytest.raises(ValueError, match="Non-finite"):
+        load_thread_from_text(
+            json.dumps({"id": "nanpost", "comments": [{"id": "c1", "created_utc": float("nan"), "text": "hi"}]})
+        )
+
+    # Stratified edge selection must remain 100% ancestor-connected to root and zero-dilution free
+    all_nodes = [{"node_id": "root", "is_root": True, "created_at_utc": 0.0, "text": "Gốc", "author_hash": "op"}]
+    all_edges = []
+    depth_map = {"root": 0}
+    for i in range(1, 301):
+        nid = f"n{i}"
+        pid = "root" if i <= 6 else f"n{((i - 1) // 2) or 1}"
+        depth_map[nid] = depth_map[pid] + 1
+        all_nodes.append({"node_id": nid, "parent_id": pid, "is_root": False, "created_at_utc": float(i * 10), "text": f"Bình luận số {i} thảo luận vấn đề này", "author_hash": f"u{i % 30}"})
+        all_edges.append({"edge_id": f"{pid}->{nid}", "source_id": pid, "target_id": nid})
+
+    picked = _select_stratified_edges(
+        root_id="root",
+        gnn_nodes=all_nodes[:21],
+        candidate_non_roots=all_nodes[1:],
+        edge_records=all_edges,
+        depth_map=depth_map,
+        sample_budget=120,
+    )
+    edge_by_id = {e["edge_id"]: e for e in all_edges}
+    parent_by_dst = {e["target_id"]: e["source_id"] for e in all_edges}
+    picked_dsts = {edge_by_id[eid]["target_id"] for eid in picked}
+    for eid in picked:
+        src = edge_by_id[eid]["source_id"]
+        assert src == "root" or src in picked_dsts, f"Orphan edge sampled: {eid}"
+
+    scored_edges = [e for e in all_edges if e["edge_id"] in picked]
+    edge_scores = {
+        e["edge_id"]: (
+            {"s_uv": 0.65, "h_uv": 0.1, "behavior_label": "support", "is_scored": True}
+            if e["edge_id"] in picked
+            else {"s_uv": 0.0, "h_uv": 0.0, "behavior_label": "unscored", "is_scored": False}
+        )
+        for e in all_edges
+    }
+    scored_node_ids = {"root"} | {e["source_id"] for e in scored_edges} | {e["target_id"] for e in scored_edges}
+    dyn = analyze_large_thread_dynamics(
+        root_node=all_nodes[0],
+        all_nodes=[n for n in all_nodes if n["node_id"] in scored_node_ids],
+        all_edges=scored_edges,
+        edge_scores=edge_scores,
+        depth_map=depth_map,
+        full_tree_nodes=all_nodes,
+        full_tree_edges=all_edges,
+    )
+    assert dyn["total_replies_analyzed"] == 300
+    assert dyn["polarization_trajectory"][-1]["k"] == 300
+    # Unscored edges must not dilute support_ratio down toward zero
+    assert dyn["stance_ratios_full"]["support"] >= 0.95
+    for dst in picked_dsts:
+        assert dst in parent_by_dst
+
+
+def test_scan_job_queue_full_429_and_branch_chars(tmp_path: Path) -> None:
+    """Verify branch IDs with dots/hyphens resolve, '..' fails, and QueueFullError maps to HTTP 429."""
+    from scripts.demo_web_app import DemoBackend, QueueFullError, create_server
+
+    server = create_server(
+        host="127.0.0.1",
+        port=0,
+        data_dir=tmp_path / "missing_vn",
+        ckpt_path=tmp_path / "missing_ckpt.pt",
+        ce_dir=tmp_path / "missing_ce",
+        paper_dir=PAPER_DIR,
+        web_dir=WEB_DIR,
+        preload=False,
+    )
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        # Check QueueFullError HTTP 429 behavior cleanly
+        backend: DemoBackend = server._backend  # type: ignore[attr-defined]
+        with backend._lock:
+            for idx in range(4):
+                backend._scan_jobs[f"aaaa1111bbbb000{idx}"] = {"status": "running", "cancel_event": threading.Event()}
+        st_429, body_429 = _http_post(
+            port,
+            "/api/tier1/scan_jobs",
+            {"mode": "preset_mega_stress", "stress_n_comments": 100, "max_full_comments": 100},
+        )
+        assert st_429 == 429
+        assert "đầy" in body_429["error"]
+        with backend._lock:
+            backend._scan_jobs.clear()
+
+        # Check branch ID character validation allows hyphen/dot/colon and blocks '..'
+        fake_jid = "1111222233334444"
+        with backend._lock:
+            backend._scan_jobs[fake_jid] = {
+                "status": "completed",
+                "branch_trees": {"t1_abc-1.2": {"tree": {"nodes": [], "edges": []}}},
+                "cancel_event": threading.Event(),
+            }
+        st_b_ok, _ = _http_get(port, f"/api/tier1/scan_jobs/{fake_jid}/branch/t1_abc-1.2")
+        assert st_b_ok == 200
+        st_b_bad, _ = _http_get(port, f"/api/tier1/scan_jobs/{fake_jid}/branch/..%2Fetc")
+        assert st_b_bad in {403, 404}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
