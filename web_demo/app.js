@@ -8,6 +8,7 @@
     support: { fill: "#ECFDF5", stroke: "#059669", text: "#065F46", edge: "#059669", label: "Tán thành" },
     oppose: { fill: "#FEF2F2", stroke: "#DC2626", text: "#991B1B", edge: "#DC2626", label: "Phản đối" },
     neutral: { fill: "#F8FAFC", stroke: "#64748B", text: "#334155", edge: "#64748B", label: "Trung lập" },
+    unscored: { fill: "#F1F5F9", stroke: "#94A3B8", text: "#475569", edge: "#CBD5E1", label: "Chưa chấm" },
   };
 
   const BEHAVIOR_VI = {
@@ -16,6 +17,7 @@
     neutral: "Trung lập / Hỏi thông tin",
     constructive_oppose: "Phản biện ôn hòa",
     hostile_conflict: "Xung đột / Gay gắt cao",
+    unscored: "Chưa chấm NLP (chọn Quét sâu 100% hoặc xem mẫu phân tầng)",
   };
 
   const MAX_SVG_NODES = 120;
@@ -40,6 +42,8 @@
     megaTotalPages: 1,
     megaUploadedJson: null,
     megaPollTimer: null,
+    megaSearchDebounceTimer: null,
+    megaCommentsReqSeq: 0,
   };
 
   // Safe DOM builders using textContent exclusively (zero dynamic HTML strings)
@@ -278,11 +282,11 @@
         : "N/A (disabled)";
     $("kpi-authors").textContent = fmtInt(meta.author_count);
 
-    const sc = fc.stance_counts || { support: 0, oppose: 0, neutral: 0 };
-    const total = Math.max(1, (sc.support || 0) + (sc.neutral || 0) + (sc.oppose || 0));
-    $("bar-support").style.width = `${((sc.support || 0) / total) * 100}%`;
-    $("bar-neutral").style.width = `${((sc.neutral || 0) / total) * 100}%`;
-    $("bar-oppose").style.width = `${((sc.oppose || 0) / total) * 100}%`;
+    const sc = fc.stance_counts || { support: 0, oppose: 0, neutral: 0, unscored: 0 };
+    const scoredTotal = Math.max(1, (sc.support || 0) + (sc.neutral || 0) + (sc.oppose || 0));
+    $("bar-support").style.width = `${((sc.support || 0) / scoredTotal) * 100}%`;
+    $("bar-neutral").style.width = `${((sc.neutral || 0) / scoredTotal) * 100}%`;
+    $("bar-oppose").style.width = `${((sc.oppose || 0) / scoredTotal) * 100}%`;
 
     const kObsVal = fc.k_observed ?? 0;
     const gnnKVal = fc.gnn_k_horizon ?? kObsVal;
@@ -290,8 +294,9 @@
       meta.analysis_mode === "full" && kObsVal !== gnnKVal
         ? `GNN K=${gnnKVal} · Hiển thị N=${kObsVal}`
         : `GNN K=${gnnKVal}`;
+    const unscoredPart = sc.unscored ? ` · Chưa chấm: ${fmtInt(sc.unscored)}` : "";
     $("kpi-stance-counts").textContent =
-      `Tán thành: ${sc.support || 0} · Trung lập: ${sc.neutral || 0} · Phản đối: ${sc.oppose || 0}`;
+      `Tán thành: ${sc.support || 0} · Trung lập: ${sc.neutral || 0} · Phản đối: ${sc.oppose || 0}${unscoredPart}`;
 
     $("root-title-display").textContent = meta.root_title || "—";
     $("root-text-display").textContent = meta.root_text || "—";
@@ -357,7 +362,27 @@
         if (state.viewMode !== "tree") {
           setViewMode("tree");
         }
-        selectTreeNode(tr.target_id);
+        const match = (state.currentPayload?.tree?.nodes || []).find((n) => n.node_id === tr.target_id);
+        if (match) {
+          selectTreeNode(tr.target_id);
+        } else {
+          state.selectedNodeId = tr.target_id;
+          renderTreeNodeInspector({
+            node_id: tr.target_id,
+            parent_id: tr.source_id,
+            author_hash: "— (ngoài nhánh đang xem)",
+            depth: "1..K",
+            time_delay_sec: 0,
+            text: tr.reply_text_snippet || tr.target_id,
+            stance_class: tr.stance_class || "neutral",
+            behavior_label: tr.h_uv >= 0.5 ? "hostile_conflict" : (tr.stance_class || "neutral"),
+            s_uv: tr.s_uv ?? 0,
+            h_uv: tr.h_uv ?? 0,
+            gamma_td: tr.gamma_td,
+            is_uncivil: Boolean(tr.is_uncivil),
+            relinked: false,
+          });
+        }
       });
       li.appendChild(btn);
       list.appendChild(li);
@@ -484,11 +509,33 @@
     const rawEdges = tree.edges || [];
     if (!rawNodes.length) return;
 
-    // Hard browser-freeze guard: never mount > MAX_SVG_NODES nodes directly in SVG DOM.
+    // Hard browser-freeze guard: BFS from root up to MAX_SVG_NODES so all kept nodes stay connected.
     let nodes = rawNodes;
     let edges = rawEdges;
     if (rawNodes.length > MAX_SVG_NODES) {
-      nodes = rawNodes.slice(0, MAX_SVG_NODES);
+      const rootCand = rawNodes.find((n) => n.is_root) || rawNodes[0];
+      const byId = new Map(rawNodes.map((n) => [n.node_id, n]));
+      const chAdj = new Map(rawNodes.map((n) => [n.node_id, []]));
+      for (const n of rawNodes) {
+        if (n.parent_id && chAdj.has(n.parent_id)) {
+          chAdj.get(n.parent_id).push(n.node_id);
+        }
+      }
+      const bfsNodes = [];
+      const seenBfs = new Set([rootCand.node_id]);
+      const queue = [rootCand.node_id];
+      while (queue.length && bfsNodes.length < MAX_SVG_NODES) {
+        const curId = queue.shift();
+        const curNode = byId.get(curId);
+        if (curNode) bfsNodes.push(curNode);
+        for (const chId of chAdj.get(curId) || []) {
+          if (!seenBfs.has(chId) && bfsNodes.length + queue.length < MAX_SVG_NODES * 2) {
+            seenBfs.add(chId);
+            queue.push(chId);
+          }
+        }
+      }
+      nodes = bfsNodes;
       const keepSet = new Set(nodes.map((n) => n.node_id));
       edges = rawEdges.filter((e) => keepSet.has(e.source_id) && keepSet.has(e.target_id));
     }
@@ -1095,13 +1142,17 @@
     const kVals = points.map((p, idx) => Number(p.k ?? p.milestone_k ?? p.n_replies ?? idx + 1));
     const minK = Math.min(...kVals);
     const maxK = Math.max(minK + 1, ...kVals);
+    const useLogScale = maxK >= 500;
+    const tx = (kVal) => (useLogScale ? Math.log1p(Math.max(0, kVal)) : kVal);
+    const minT = tx(minK);
+    const maxT = Math.max(minT + 1e-6, tx(maxK));
     const coords = points.map((p, idx) => {
       const kVal = kVals[idx];
       const yVal = Math.max(0, Math.min(1, Number(p.y_polar ?? p.polar ?? 0)));
       const x =
         points.length === 1
           ? padL + plotW / 2
-          : padL + ((kVal - minK) / Math.max(1, maxK - minK)) * plotW;
+          : padL + ((tx(kVal) - minT) / Math.max(1e-6, maxT - minT)) * plotW;
       const y = padT + (1 - yVal) * plotH;
       return { x, y, kVal, yVal, label: p.label || `K=${kVal}` };
     });
@@ -1122,7 +1173,9 @@
       );
     }
 
-    coords.forEach((c) => {
+    const labelStep = coords.length > 7 ? Math.ceil(coords.length / 6) : 1;
+    let lastLblX = -999;
+    coords.forEach((c, idx) => {
       const dot = createSvgNode("circle", {
         cx: c.x.toFixed(1),
         cy: c.y.toFixed(1),
@@ -1136,21 +1189,28 @@
       dot.appendChild(title);
       svg.appendChild(dot);
 
-      const xLbl = createSvgNode("text", {
-        x: c.x.toFixed(1),
-        y: H - 8,
-        "text-anchor": "middle",
-        fill: "#475569",
-        "font-size": 10,
-      });
-      xLbl.textContent = `K=${c.kVal}`;
-      svg.appendChild(xLbl);
+      const isEdgeTick = idx === 0 || idx === coords.length - 1;
+      if ((isEdgeTick || idx % labelStep === 0) && (c.x - lastLblX >= 38 || isEdgeTick)) {
+        if (!isEdgeTick || c.x - lastLblX >= 28) {
+          lastLblX = c.x;
+          const xLbl = createSvgNode("text", {
+            x: c.x.toFixed(1),
+            y: H - 8,
+            "text-anchor": "middle",
+            fill: "#475569",
+            "font-size": 10,
+          });
+          xLbl.textContent = c.kVal >= 1000 ? `K=${(c.kVal / 1000).toFixed(c.kVal % 1000 === 0 ? 0 : 1)}k` : `K=${c.kVal}`;
+          svg.appendChild(xLbl);
+        }
+      }
     });
 
     if (caption) {
       const first = coords[0];
       const last = coords[coords.length - 1];
-      caption.textContent = `Diễn biến y_polar từ K=${first.kVal} (${first.yVal.toFixed(3)}) đến K=${last.kVal} (${last.yVal.toFixed(3)}).`;
+      const scaleNote = useLogScale ? " (trục K log1p)" : "";
+      caption.textContent = `Diễn biến y_polar từ K=${first.kVal} (${first.yVal.toFixed(3)}) đến K=${last.kVal} (${last.yVal.toFixed(3)})${scaleNote}.`;
     }
   }
 
@@ -1319,8 +1379,12 @@
         tree: resp.tree,
         tree_view_meta: resp.tree_view_meta,
       };
+      if (state.viewMode !== "tree") {
+        setViewMode("tree");
+      } else {
+        renderCurrentGraph();
+      }
       renderHotspotBranches(state.currentPayload);
-      renderCurrentGraph();
       state.megaPage = 1;
       await loadMegaCommentsPage(1);
     } catch (err) {
@@ -1336,6 +1400,7 @@
       if (sec) sec.hidden = true;
       return;
     }
+    const reqSeq = ++state.megaCommentsReqSeq;
     const stance = $("mega-stance-filter") ? $("mega-stance-filter").value : "all";
     const q = $("mega-search-input") ? $("mega-search-input").value.trim() : "";
     const qs = new URLSearchParams({
@@ -1344,7 +1409,13 @@
       stance,
       q,
     });
+    if (state.activeBranchId && state.activeBranchId !== "_all_top") {
+      qs.set("branch_id", state.activeBranchId);
+    }
     const data = await apiGet(`/api/tier1/scan_jobs/${encodeURIComponent(jobId)}/comments?${qs.toString()}`);
+    if (reqSeq !== state.megaCommentsReqSeq || state.activeScanJobId !== jobId) {
+      return;
+    }
     sec.hidden = false;
     state.megaPage = data.page || 1;
     state.megaTotalPages = data.total_pages || 1;
@@ -1366,7 +1437,8 @@
       const tr = el("tr");
       tr.appendChild(el("td", { className: "tabular" }, `${item.node_id} (d=${item.depth})`));
       tr.appendChild(el("td", { className: "tabular" }, item.author_hash || "—"));
-      const stInfo = STANCE_COLORS[item.stance_class] || STANCE_COLORS.neutral;
+      const stanceKey = item.is_scored === false ? "unscored" : item.stance_class;
+      const stInfo = STANCE_COLORS[stanceKey] || STANCE_COLORS.neutral;
       const stLabel = item.is_uncivil ? `${stInfo.label} · Gay gắt` : stInfo.label;
       tr.appendChild(el("td", {}, stLabel));
       const scoreTxt = item.is_scored ? `${Number(item.s_uv).toFixed(2)} / ${Number(item.h_uv).toFixed(2)}` : "Chưa chấm";
@@ -1377,6 +1449,11 @@
   }
 
   function renderPayload(payload) {
+    if (!payload.scan_job_id && state.megaPollTimer) {
+      clearTimeout(state.megaPollTimer);
+      state.megaPollTimer = null;
+      setMegaButtonsBusy(false);
+    }
     state.currentPayload = payload;
     state.selectedNodeId = null;
     state.selectedUserId = null;
@@ -1495,6 +1572,11 @@
   }
 
   function switchTier1Mode(mode) {
+    if (state.megaPollTimer) {
+      clearTimeout(state.megaPollTimer);
+      state.megaPollTimer = null;
+      setMegaButtonsBusy(false);
+    }
     state.tier1Mode = mode;
     const isReal = mode === "real";
     $("mode-real-btn").setAttribute("aria-pressed", String(isReal));
@@ -1698,8 +1780,12 @@
             const etaTxt = st.eta_sec !== null && st.eta_sec !== undefined ? ` · ETA ${st.eta_sec}s` : "";
             progMeta.textContent = `Đã chấm ${fmtInt(st.processed_edges)}/${fmtInt(st.total_edges)} cạnh (${st.edges_per_sec || 0} cạnh/s)${etaTxt} · Đã chạy ${st.elapsed_sec || 0}s`;
           }
-          if (st.status === "completed" && st.result) {
+          if (st.status === "completed") {
             setMegaButtonsBusy(false);
+            if (!st.result) {
+              showError("Job đã hoàn tất nhưng thiếu dữ liệu kết quả.");
+              return;
+            }
             renderPayload(st.result);
             const ms = st.result.mega_scan_summary || {};
             announce(`Hoàn tất quét Mega-Thread (${fmtInt(ms.kept_comments)} bình luận hợp lệ, ${fmtInt(ms.scored_edges)} cạnh đã chấm).`);
@@ -1892,19 +1978,30 @@
     });
 
     const fileInputEl = $("mega-json-file");
+    const btnClearFile = $("btn-mega-clear-file");
     if (fileInputEl) {
       fileInputEl.addEventListener("change", (ev) => {
         const f = ev.target.files && ev.target.files[0];
         if (!f) {
           state.megaUploadedJson = null;
+          if (btnClearFile) btnClearFile.hidden = true;
           return;
         }
         const reader = new FileReader();
         reader.onload = () => {
           state.megaUploadedJson = String(reader.result || "");
+          if (btnClearFile) btnClearFile.hidden = false;
           announce(`Đã nạp tệp cục bộ: ${f.name}`);
         };
         reader.readAsText(f, "utf-8");
+      });
+    }
+    if (btnClearFile) {
+      btnClearFile.addEventListener("click", () => {
+        state.megaUploadedJson = null;
+        if (fileInputEl) fileInputEl.value = "";
+        btnClearFile.hidden = true;
+        announce("Đã bỏ chọn tệp JSON/JSONL.");
       });
     }
 
@@ -1991,7 +2088,14 @@
       stanceFilterEl.addEventListener("change", () => loadMegaCommentsPage(1).catch((e) => showError(e.message)));
     }
     if (searchInputEl) {
-      searchInputEl.addEventListener("input", () => loadMegaCommentsPage(1).catch((e) => showError(e.message)));
+      searchInputEl.addEventListener("input", () => {
+        if (state.megaSearchDebounceTimer) {
+          clearTimeout(state.megaSearchDebounceTimer);
+        }
+        state.megaSearchDebounceTimer = setTimeout(() => {
+          loadMegaCommentsPage(1).catch((e) => showError(e.message));
+        }, 250);
+      });
     }
     if (prevPageBtn) {
       prevPageBtn.addEventListener("click", () => loadMegaCommentsPage(Math.max(1, state.megaPage - 1)).catch((e) => showError(e.message)));

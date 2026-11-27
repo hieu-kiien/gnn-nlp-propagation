@@ -33,7 +33,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -52,6 +52,7 @@ from scripts.predict_live_thread import (  # noqa: E402
     _make_demo_offline_thread,
     fetch_reddit_thread_paginated,
     load_thread_from_json_payload,
+    load_thread_from_text,
     predict_live_cascade,
 )
 from src.data.arctic_shift_vn import hash_author_sha256  # noqa: E402
@@ -93,10 +94,15 @@ _REQUIRED_CE_FILES: tuple[str, ...] = (
 )
 _MAX_POST_BYTES: int = 1024 * 1024
 _MAX_SCAN_JOB_BYTES: int = 16 * 1024 * 1024
-_MAX_SCAN_JOBS_KEPT: int = 8
+_MAX_SCAN_JOBS_KEPT: int = 4
+_MAX_ACTIVE_SCAN_QUEUE: int = 4
 _MAX_TREE_RENDER_NODES: int = 120
 _VALID_JOB_ID_RE = re.compile(r"^[a-f0-9]{12,32}$")
-_VALID_BRANCH_ID_RE = re.compile(r"^[A-Za-z0-9_]{1,80}$")
+_VALID_BRANCH_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
+
+
+class QueueFullError(RuntimeError):
+    """Raised when active background scan queue capacity is saturated (HTTP 429)."""
 
 _EXPLICIT_REPLY_RE = re.compile(
     r"^\s*[-*]?\s*([A-Za-z0-9_]+)\s*\(\s*(?:trả\s*lời|tra\s*loi|reply(?:\s+to)?|->)\s*([A-Za-z0-9_]+)\s*\)\s*:\s*(.+)$",
@@ -226,16 +232,18 @@ def _build_thread_user_graph(
         else:
             camp_map[uid] = 1
 
+    adj_pairs: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    for (u_a, u_b), acc in pair_acc.items():
+        mean_s = acc["sum_s"] / float(acc["count"])
+        adj_pairs[u_a].append((u_b, mean_s))
+        adj_pairs[u_b].append((u_a, mean_s))
+
     for uid, bal in balance_map.items():
         if user_stats[uid]["is_op"] or abs(bal) > 0.05:
             continue
         vote_c0 = 0.0
         vote_c1 = 0.0
-        for (u_a, u_b), acc in pair_acc.items():
-            if u_a != uid and u_b != uid:
-                continue
-            other = u_b if u_a == uid else u_a
-            mean_s = acc["sum_s"] / float(acc["count"])
+        for other, mean_s in adj_pairs.get(uid, ()):
             other_camp = camp_map.get(other, 0)
             if mean_s > 0.1:
                 if other_camp == 0:
@@ -591,7 +599,7 @@ def _format_live_result_payload(
 
     tree_nodes: list[dict[str, Any]] = []
     node_text_by_id: dict[str, str] = {}
-    support_cnt = oppose_cnt = neutral_cnt = 0
+    support_cnt = oppose_cnt = neutral_cnt = unscored_cnt = 0
     authors_seen: set[str] = set()
 
     for idx, n in enumerate(raw_nodes):
@@ -618,6 +626,7 @@ def _format_live_result_payload(
                     "gamma_td": 0.0,
                     "is_uncivil": False,
                     "relinked": False,
+                    "is_scored": True,
                 }
             )
             continue
@@ -626,8 +635,16 @@ def _format_live_result_payload(
         e_meta = edge_by_dst.get(nid, {})
         s_uv = float(e_meta.get("s_uv", 0.0))
         h_uv = float(e_meta.get("h_uv", 0.0))
-        stance_cls = str(e_meta.get("stance_class") or _stance_class_from_score(s_uv))
-        if stance_cls == "support":
+        is_scored = bool(e_meta.get("is_scored", True))
+        stance_cls = (
+            "unscored"
+            if not is_scored
+            else str(e_meta.get("stance_class") or _stance_class_from_score(s_uv))
+        )
+        if not is_scored or stance_cls == "unscored":
+            stance_cls = "unscored"
+            unscored_cnt += 1
+        elif stance_cls == "support":
             support_cnt += 1
         elif stance_cls == "oppose":
             oppose_cnt += 1
@@ -645,12 +662,16 @@ def _format_live_result_payload(
                 "time_delay_sec": float(n.get("time_delay_sec", 0.0)),
                 "text": str(n.get("text") or ""),
                 "stance_class": stance_cls,
-                "behavior_label": str(e_meta.get("behavior_label") or _behavior_from_2d(s_uv, h_uv)),
+                "behavior_label": str(
+                    e_meta.get("behavior_label")
+                    or ("unscored" if not is_scored else _behavior_from_2d(s_uv, h_uv))
+                ),
                 "s_uv": round(s_uv, 4),
                 "h_uv": round(h_uv, 4),
                 "gamma_td": round(gamma_val, 4) if gamma_val is not None else None,
                 "is_uncivil": h_uv >= 0.5,
                 "relinked": bool(e_meta.get("relinked", False)),
+                "is_scored": is_scored,
             }
         )
 
@@ -660,19 +681,21 @@ def _format_live_result_payload(
         dst = str(e["target_id"])
         s_uv = float(e.get("s_uv", 0.0))
         h_uv = float(e.get("h_uv", 0.0))
+        is_scored = bool(e.get("is_scored", True))
         trig = trigger_by_pair.get((src, dst))
         gamma_val = float(trig["gamma_td"]) if trig is not None and "gamma_td" in trig else None
         tree_edges.append(
             {
                 "source_id": src,
                 "target_id": dst,
-                "stance_class": str(e.get("stance_class") or _stance_class_from_score(s_uv)),
-                "behavior_label": str(e.get("behavior_label") or _behavior_from_2d(s_uv, h_uv)),
+                "stance_class": "unscored" if not is_scored else str(e.get("stance_class") or _stance_class_from_score(s_uv)),
+                "behavior_label": "unscored" if not is_scored else str(e.get("behavior_label") or _behavior_from_2d(s_uv, h_uv)),
                 "s_uv": round(s_uv, 4),
                 "h_uv": round(h_uv, 4),
                 "gamma_td": round(gamma_val, 4) if gamma_val is not None else None,
                 "is_uncivil": h_uv >= 0.5,
                 "relinked": bool(e.get("relinked", False)),
+                "is_scored": is_scored,
             }
         )
 
@@ -717,7 +740,7 @@ def _format_live_result_payload(
         or ("future_only" if has_future else "no_future_replies")
     )
     user_graph = _build_thread_user_graph(tree_nodes, tree_edges)
-    kept_texts_short = [n["text"] for n in tree_nodes[1:] if len(n["text"].split()) <= 3]
+    kept_texts_short = [n["text"] for n in tree_nodes[1:] if len(n["text"].split()) <= 3][:24]
 
     return {
         "meta": {
@@ -756,6 +779,7 @@ def _format_live_result_payload(
                 "support": support_cnt,
                 "oppose": oppose_cnt,
                 "neutral": neutral_cnt,
+                "unscored": unscored_cnt,
             },
             "early_burst_metrics": dict(res.get("early_burst_metrics") or {}),
             "regime_thresholds": dict(res.get("regime_thresholds") or {"q50": VN_POLAR_Q50, "q75": VN_POLAR_Q75, "q90": VN_POLAR_Q90}),
@@ -921,6 +945,9 @@ def _build_scan_job_artifacts(full_payload: dict[str, Any]) -> tuple[dict[str, A
     def _subset_tree(keep_ids: Sequence[str], branch_id: str, lead_text: str = "") -> dict[str, Any]:
         keep_order: list[str] = []
         keep_seen: set[str] = set()
+        if root_id in node_by_id:
+            keep_seen.add(root_id)
+            keep_order.append(root_id)
         for raw_id in keep_ids:
             sid = str(raw_id)
             if sid in node_by_id and sid not in keep_seen:
@@ -928,9 +955,6 @@ def _build_scan_job_artifacts(full_payload: dict[str, Any]) -> tuple[dict[str, A
                 keep_order.append(sid)
             if len(keep_order) >= _MAX_TREE_RENDER_NODES:
                 break
-        if root_id in node_by_id and root_id not in keep_seen:
-            keep_seen.add(root_id)
-            keep_order.insert(0, root_id)
         sub_nodes = [node_by_id[nid] for nid in keep_order if nid in node_by_id]
         sub_edges = [
             e for e in tree_edges
@@ -983,6 +1007,10 @@ def _build_scan_job_artifacts(full_payload: dict[str, Any]) -> tuple[dict[str, A
         ]
         ug["nodes"] = kept_u
         ug["edges"] = kept_u_edges
+        ug["camp_counts"] = {
+            "camp0": sum(1 for u in kept_u if int(u.get("camp", 0)) == 0),
+            "camp1": sum(1 for u in kept_u if int(u.get("camp", 0)) == 1),
+        }
         compact["user_graph"] = ug
 
     return compact, comment_rows, branch_trees
@@ -1116,6 +1144,7 @@ class DemoBackend:
 
         self._lock = threading.Lock()
         self._ce_lock = threading.Lock()
+        self._inference_lock = threading.RLock()
         self._gnn_model: SBiFAGAT | None = None
         self._gnn_ckpt_loaded = False
         self._ce_model: Any = None
@@ -1133,6 +1162,9 @@ class DemoBackend:
         self._try_load_gnn_checkpoint()
         if preload:
             self._ensure_tier1_threads_loaded()
+
+    def close(self) -> None:
+        self._scan_executor.shutdown(wait=False, cancel_futures=True)
 
     @property
     def real_vn_data_available(self) -> bool:
@@ -1790,63 +1822,7 @@ class DemoBackend:
                 "author": "op_sandbox",
                 "created_utc": base_ts,
             }
-            raw_comments = payload.get("comments")
-            if isinstance(raw_comments, list) and raw_comments:
-                comments = []
-                for idx, c in enumerate(raw_comments, start=1):
-                    if not isinstance(c, Mapping):
-                        continue
-                    cid = str(c.get("id") or f"c{idx}").removeprefix("t1_")
-                    raw_p = str(c.get("parent_id") or f"t3_{post_id}").strip()
-                    if raw_p.lower() in {"root", post_id, f"t3_{post_id}"}:
-                        pid = f"t3_{post_id}"
-                    elif raw_p.startswith(("t1_", "t3_")):
-                        pid = raw_p
-                    else:
-                        pid = f"t1_{raw_p}"
-                    body = str(c.get("text") or c.get("body") or "")
-                    author = c.get("author_raw") if c.get("author_raw") is not None else c.get("author")
-                    author_str = str(author) if author is not None else (
-                        None if body.strip().lower() in {"[deleted]", "[removed]"} else f"custom_u_{idx}"
-                    )
-                    is_bot = bool(c.get("author_is_bot")) or (
-                        isinstance(author_str, str) and author_str.strip().lower() == "automoderator"
-                    )
-                    raw_delay = c.get("time_delay_sec")
-                    if raw_delay is None:
-                        delay = float(idx * 45.0)
-                    else:
-                        if isinstance(raw_delay, bool):
-                            raise ValueError(f"Giá trị time_delay_sec không hợp lệ: {raw_delay!r}")
-                        try:
-                            delay = float(raw_delay)
-                        except (TypeError, ValueError) as exc:
-                            raise ValueError(
-                                f"Giá trị time_delay_sec không hợp lệ: {raw_delay!r}"
-                            ) from exc
-                        if not math.isfinite(delay) or delay < 0.0 or delay > 3650.0 * 86400.0:
-                            raise ValueError(
-                                f"Giá trị time_delay_sec không hợp lệ ({raw_delay!r}): "
-                                "phải hữu hạn và nằm trong [0, 315360000] giây."
-                            )
-                    comments.append(
-                        {
-                            "fullname": f"t1_{cid}",
-                            "id": cid,
-                            "link_id": f"t3_{post_id}",
-                            "parent_id": pid,
-                            "body": body,
-                            "text": body,
-                            "created_utc": base_ts + delay,
-                            "author": author_str,
-                            "author_raw": author_str,
-                            "author_is_bot": is_bot,
-                            "author_hash": hash_author_sha256(author_str),
-                        }
-                    )
-            else:
-                raw_lines = str(payload.get("raw_indented_text") or "")
-                comments = parse_sandbox_raw_text(raw_lines, post_id=post_id, base_ts=base_ts)
+            comments = self._parse_custom_comments_payload(payload, post_id=post_id, base_ts=base_ts)
             if not comments:
                 raise ValueError("Cần ít nhất 1 bình luận để dựng cây hội thoại.")
             is_demo = True
@@ -1870,6 +1846,7 @@ class DemoBackend:
             junk_mode=junk_mode,
             allow_untrained=(mode != "reddit_url"),
             is_demo=is_demo,
+            inference_lock=self._inference_lock,
         )
         cid = f"vn_{str(post.get('id') or 'sandbox').removeprefix('t3_')}"
         out = _format_live_result_payload(
@@ -1912,17 +1889,18 @@ class DemoBackend:
         backend_lit: Literal["auto", "nli", "embedding", "lexical"] = backend_raw  # type: ignore[assignment]
         cached_ce = self._get_cached_cross_encoder()
         allow_nli_dl = bool(payload.get("allow_nli_download", False))
-        return classify_post_topics(
-            title,
-            root_text,
-            reply_snippets=snips,
-            custom_topics=custom_topics,
-            lang=lang_lit,
-            backend=backend_lit,
-            node_encoder=cached_ce[0].encoder if cached_ce is not None else None,
-            node_tokenizer=cached_ce[1] if cached_ce is not None else None,
-            allow_nli_download=allow_nli_dl,
-        )
+        with self._inference_lock:
+            return classify_post_topics(
+                title,
+                root_text,
+                reply_snippets=snips,
+                custom_topics=custom_topics,
+                lang=lang_lit,
+                backend=backend_lit,
+                node_encoder=cached_ce[0].encoder if cached_ce is not None else None,
+                node_tokenizer=cached_ce[1] if cached_ce is not None else None,
+                allow_nli_download=allow_nli_dl,
+            )
 
     def get_tier2_macro(self) -> dict[str, Any]:
         with self._lock:
@@ -2042,7 +2020,25 @@ class DemoBackend:
             )
             if victim_id is None:
                 break
-            self._scan_jobs.pop(victim_id, None)
+            victim = self._scan_jobs.pop(victim_id, None)
+            if isinstance(victim, dict):
+                victim["comment_rows"] = []
+                victim["branch_trees"] = {}
+                victim["result"] = None
+
+    @staticmethod
+    def _coerce_int_bound(raw: Any, *, field: str, default: int, lo: int, hi: int) -> int:
+        if raw is None:
+            return default
+        if isinstance(raw, (bool, list, dict)):
+            raise ValueError(f"{field} không hợp lệ: {raw!r}")
+        try:
+            val = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} không hợp lệ: {raw!r}") from exc
+        if val < lo or val > hi:
+            raise ValueError(f"{field} phải nằm trong [{lo}, {hi}], nhận {val!r}")
+        return val
 
     def _parse_custom_comments_payload(
         self,
@@ -2121,35 +2117,18 @@ class DemoBackend:
             raise ValueError(f"scan_strategy không hợp lệ: {strategy_raw!r}")
         scan_strategy: Literal["stratified", "full"] = "stratified" if strategy_raw == "stratified" else "full"
 
-        raw_k = payload.get("k_horizon")
-        if raw_k is None:
-            k_horizon = 20
-        elif isinstance(raw_k, bool):
-            raise ValueError(f"k_horizon không hợp lệ: {raw_k!r}")
-        else:
-            k_horizon = int(raw_k)
-            if k_horizon < 1 or k_horizon > 500:
-                raise ValueError(f"k_horizon phải nằm trong [1, 500], nhận {k_horizon!r}")
-
-        raw_max_full = payload.get("max_full_comments")
-        if raw_max_full is None:
-            max_full_comments = 2000 if mode == "preset_mega_stress" else 5000
-        elif isinstance(raw_max_full, bool):
-            raise ValueError(f"max_full_comments không hợp lệ: {raw_max_full!r}")
-        else:
-            max_full_comments = int(raw_max_full)
-            if max_full_comments < 20 or max_full_comments > 10000:
-                raise ValueError(f"max_full_comments phải nằm trong [20, 10000], nhận {max_full_comments!r}")
-
-        raw_budget = payload.get("sample_budget")
-        if raw_budget is None:
-            sample_budget = 600
-        elif isinstance(raw_budget, bool):
-            raise ValueError(f"sample_budget không hợp lệ: {raw_budget!r}")
-        else:
-            sample_budget = int(raw_budget)
-            if sample_budget < 20 or sample_budget > 2000:
-                raise ValueError(f"sample_budget phải nằm trong [20, 2000], nhận {sample_budget!r}")
+        k_horizon = self._coerce_int_bound(payload.get("k_horizon"), field="k_horizon", default=20, lo=1, hi=500)
+        default_cap = 2000 if mode == "preset_mega_stress" else 5000
+        max_full_comments = self._coerce_int_bound(
+            payload.get("max_full_comments"),
+            field="max_full_comments",
+            default=default_cap,
+            lo=20,
+            hi=10000,
+        )
+        sample_budget = self._coerce_int_bound(
+            payload.get("sample_budget"), field="sample_budget", default=600, lo=20, hi=2000
+        )
 
         lang_raw = str(payload.get("lang") or "vi").strip().lower()
         lang_val = "en" if lang_raw == "en" else "vi"
@@ -2159,31 +2138,40 @@ class DemoBackend:
         post_id_for_url: str | None = None
         prepared_post: dict[str, Any] | None = None
         prepared_comments: list[dict[str, Any]] | None = None
-        is_demo = True
+        is_demo = bool(payload.get("is_demo", mode in {"preset_mega_stress", "custom"}))
+        allow_untrained = bool(payload.get("allow_untrained", mode in {"preset_mega_stress", "custom"}))
 
         if mode == "reddit_url":
             reddit_url = str(payload.get("reddit_url") or "").strip()
             post_id_for_url = _extract_post_id_from_url(reddit_url)
-            is_demo = False
         elif mode == "json_upload":
             raw_thread_json = payload.get("thread_json")
             if raw_thread_json is None:
                 raw_thread_json = payload.get("payload")
-            if isinstance(raw_thread_json, str):
-                raw_thread_json = json.loads(raw_thread_json)
             if raw_thread_json is None:
                 raise ValueError("Thiếu dữ liệu thread_json khi mode='json_upload'.")
-            prepared_post, prepared_comments = load_thread_from_json_payload(
-                raw_thread_json,
-                max_comments=max_full_comments,
-                source_name="json_upload",
-            )
+            if isinstance(raw_thread_json, str):
+                prepared_post, prepared_comments = load_thread_from_text(
+                    raw_thread_json,
+                    max_comments=max_full_comments,
+                    source_name="json_upload",
+                )
+            else:
+                prepared_post, prepared_comments = load_thread_from_json_payload(
+                    raw_thread_json,
+                    max_comments=max_full_comments,
+                    source_name="json_upload",
+                )
             if not prepared_comments:
-                raise ValueError("Tệp JSON không chứa bình luận hợp lệ nào.")
+                raise ValueError("Tệp JSON/JSONL không chứa bình luận hợp lệ nào.")
         elif mode == "preset_mega_stress":
-            raw_stress_n = payload.get("stress_n_comments")
-            stress_n = int(raw_stress_n) if raw_stress_n is not None else min(2000, max_full_comments)
-            stress_n = max(50, min(max_full_comments, stress_n))
+            stress_n = self._coerce_int_bound(
+                payload.get("stress_n_comments"),
+                field="stress_n_comments",
+                default=min(2000, max_full_comments),
+                lo=50,
+                hi=max_full_comments,
+            )
             prepared_post, prepared_comments = build_megathread_stress_preset(stress_n)
         else:
             post_id = "mega_custom"
@@ -2227,6 +2215,13 @@ class DemoBackend:
             "branch_trees": {},
         }
         with self._lock:
+            active_cnt = sum(
+                1 for j in self._scan_jobs.values() if j.get("status") in {"queued", "running"}
+            )
+            if active_cnt >= _MAX_ACTIVE_SCAN_QUEUE:
+                raise QueueFullError(
+                    f"Hàng đợi quét Mega-Thread đang đầy ({active_cnt}/{_MAX_ACTIVE_SCAN_QUEUE} job đang chạy/chờ). Vui lòng đợi hoặc hủy bớt job."
+                )
             self._evict_scan_jobs_locked()
             self._scan_jobs[job_id] = job_rec
 
@@ -2246,7 +2241,7 @@ class DemoBackend:
         def _worker() -> None:
             with self._lock:
                 rec = self._scan_jobs.get(job_id)
-                if rec is None:
+                if rec is None or cancel_ev.is_set() or rec.get("status") == "cancelled":
                     return
                 rec["status"] = "running"
                 rec["stage"] = "fetching_comments" if mode == "reddit_url" else "building_graph"
@@ -2280,14 +2275,15 @@ class DemoBackend:
                     progress_cb=_on_progress,
                     cancel_event=cancel_ev,
                     custom_topics=custom_topics,
-                    topic_backend="embedding" if is_demo else "auto",
+                    topic_backend="embedding" if (is_demo or ce_ckpt is not None) else "auto",
                     cross_encoder_ckpt=ce_ckpt,
                     preloaded_ce=cached_ce,
                     gnn_ckpt=gnn_ckpt,
                     lang=lang_val,
                     junk_mode=junk_mode,
-                    allow_untrained=(mode != "reddit_url"),
+                    allow_untrained=allow_untrained,
                     is_demo=is_demo,
+                    inference_lock=self._inference_lock,
                 )
                 cid = f"vn_{str(post_obj.get('id') or 'mega').removeprefix('t3_')}"
                 full_out = _format_live_result_payload(
@@ -2410,8 +2406,11 @@ class DemoBackend:
             if st_norm == "uncivil":
                 if not r.get("is_uncivil"):
                     continue
-            elif st_norm in {"support", "oppose", "neutral"}:
-                if str(r.get("stance_class")) != st_norm:
+            elif st_norm in {"support", "oppose", "neutral", "unscored"}:
+                if st_norm == "unscored":
+                    if r.get("is_scored", True) and str(r.get("stance_class")) != "unscored":
+                        continue
+                elif not r.get("is_scored", True) or str(r.get("stance_class")) != st_norm:
                     continue
             if q_norm and q_norm not in str(r.get("text") or "").lower():
                 continue
@@ -2433,10 +2432,10 @@ class DemoBackend:
 
     def get_scan_job_branch(self, job_id: str, branch_id: str) -> dict[str, Any]:
         clean_id = str(job_id or "").strip()
-        clean_branch = str(branch_id or "").strip()
+        clean_branch = unquote(str(branch_id or "")).strip()
         if not _VALID_JOB_ID_RE.fullmatch(clean_id):
             raise KeyError(f"Invalid job_id {job_id!r}")
-        if not _VALID_BRANCH_ID_RE.fullmatch(clean_branch):
+        if ".." in clean_branch or not _VALID_BRANCH_ID_RE.fullmatch(clean_branch):
             raise KeyError(f"Invalid branch_id {branch_id!r}")
         with self._lock:
             rec = self._scan_jobs.get(clean_id)
@@ -2494,8 +2493,9 @@ def make_handler(backend: DemoBackend):
             self._send_bytes(status, "application/json; charset=utf-8", raw)
 
         def _is_traversal_attempt(self, raw_path: str, clean_path: str) -> bool:
-            low_raw = raw_path.lower()
-            if ".." in raw_path or ".." in clean_path or "\\" in raw_path or "%2e" in low_raw or "\x00" in raw_path:
+            raw_no_qs = raw_path.split("?", 1)[0]
+            low_raw = raw_no_qs.lower()
+            if ".." in raw_no_qs or ".." in clean_path or "\\" in raw_no_qs or "%2e" in low_raw or "\x00" in raw_no_qs:
                 return True
             return any(
                 clean_path.startswith(prefix)
@@ -2657,6 +2657,9 @@ def make_handler(backend: DemoBackend):
                     result = backend.classify_topic(body)
                 else:
                     result = backend.run_sandbox(body)
+            except QueueFullError as exc:
+                self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": str(exc)})
+                return
             except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -2667,6 +2670,18 @@ def make_handler(backend: DemoBackend):
             self._send_json(HTTPStatus.OK, result)
 
     return DemoRequestHandler
+
+
+class _DemoThreadingHTTPServer(ThreadingHTTPServer):
+    def __init__(self, server_address: tuple[str, int], RequestHandlerClass: type[BaseHTTPRequestHandler], backend: DemoBackend) -> None:
+        self._backend = backend
+        super().__init__(server_address, RequestHandlerClass)
+
+    def server_close(self) -> None:
+        try:
+            self._backend.close()
+        finally:
+            super().server_close()
 
 
 def create_server(
@@ -2695,7 +2710,7 @@ def create_server(
         preload=preload,
     )
     handler_cls = make_handler(backend)
-    return ThreadingHTTPServer((clean_host, int(port)), handler_cls)
+    return _DemoThreadingHTTPServer((clean_host, int(port)), handler_cls, backend)
 
 
 def main() -> None:

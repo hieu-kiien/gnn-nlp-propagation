@@ -370,23 +370,24 @@ def _score_topics_with_nli(
     device: torch.device,
 ) -> tuple[list[float], list[float]]:
     model, tok, ent_idx, con_idx = nli_bundle
-    model = model.to(device)
     if lang == "en":
         hypotheses = [f"This text is about {c['label']}." for c in candidates]
     else:
         hypotheses = [f"Văn bản này nói về {c['label']}." for c in candidates]
 
-    enc = tok(
-        [context_text] * len(candidates),
-        hypotheses,
-        padding=True,
-        truncation=True,
-        max_length=192,
-        return_tensors="pt",
-    )
-    enc = {k: v.to(device) for k, v in enc.items()}
-    with torch.no_grad():
-        logits = model(**enc).logits.float()
+    with _NLI_LOCK:
+        model = model.to(device)
+        enc = tok(
+            [context_text] * len(candidates),
+            hypotheses,
+            padding=True,
+            truncation=True,
+            max_length=192,
+            return_tensors="pt",
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+        with torch.no_grad():
+            logits = model(**enc).logits.float()
     diff = logits[:, ent_idx] - logits[:, con_idx]
     relevances = torch.sigmoid(diff).detach().cpu().tolist()
     scores = F.softmax(diff / 1.5, dim=0).detach().cpu().tolist()
@@ -671,6 +672,7 @@ def extract_hotspot_branches(
     children_adj: dict[str, list[str]] = {str(n["node_id"]): [] for n in all_nodes}
     parent_of: dict[str, str] = {}
     edge_score_by_target: dict[str, tuple[float, float]] = {}
+    scored_target_ids: set[str] = set()
 
     for e in all_edges:
         src = str(e["source_id"])
@@ -680,11 +682,14 @@ def extract_hotspot_branches(
         children_adj.setdefault(dst, [])
         parent_of[dst] = src
         sc = edge_scores.get(eid) or {}
+        if sc.get("is_scored", True) is False:
+            continue
+        scored_target_ids.add(dst)
         s_uv = float(sc.get("s_uv", e.get("s_uv", 0.0)))
         h_uv = float(sc.get("h_uv", e.get("h_uv", 0.0)))
         edge_score_by_target[dst] = (s_uv, h_uv)
 
-    root_children = list(children_adj.get(root_id, ()))
+    root_children = list(dict.fromkeys(children_adj.get(root_id, ())))
     if not root_children:
         return []
 
@@ -716,6 +721,8 @@ def extract_hotspot_branches(
 
         sup_c = opp_c = neu_c = hos_c = 0
         for nid in subtree_ids:
+            if nid not in scored_target_ids:
+                continue
             s_uv, h_uv = edge_score_by_target.get(nid, (0.0, 0.0))
             ori = float(ori_map.get(nid, s_uv))
             if ori > 0.1:
@@ -727,8 +734,10 @@ def extract_hotspot_branches(
             if h_uv >= 0.5:
                 hos_c += 1
 
-        opp_ratio = opp_c / float(size)
-        hos_ratio = hos_c / float(size)
+        scored_branch_n = sup_c + opp_c + neu_c
+        ratio_denom = float(max(1, scored_branch_n))
+        opp_ratio = opp_c / ratio_denom if scored_branch_n > 0 else 0.0
+        hos_ratio = hos_c / ratio_denom if scored_branch_n > 0 else 0.0
         heat_score = float(size) * (0.5 + opp_ratio + hos_ratio)
 
         # Select connected representative nodes <= max_nodes_per_branch:
@@ -740,6 +749,7 @@ def extract_hotspot_branches(
         scored_desc = sorted(
             [nid for nid in subtree_ids if nid != lead_id],
             key=lambda nid: (
+                nid not in scored_target_ids,
                 int(depth_map.get(nid, 999)) > 3,
                 -(edge_score_by_target.get(nid, (0.0, 0.0))[1] + abs(edge_score_by_target.get(nid, (0.0, 0.0))[0])),
                 int(depth_map.get(nid, 999)),
@@ -756,7 +766,7 @@ def extract_hotspot_branches(
                 visited_chain.add(curr)
                 chain.append(curr)
                 curr = parent_of.get(curr, "")
-            if len(selected_order) + len(chain) <= target_cap:
+            if curr in selected_set and len(selected_order) + len(chain) <= target_cap:
                 for anc in reversed(chain):
                     if anc not in selected_set:
                         selected_set.add(anc)
@@ -800,11 +810,14 @@ def analyze_large_thread_dynamics(
     k_early_ref: int = 20,
     lang: Literal["vi", "en"] = "vi",
     scope: Literal["early_post_hoc", "full_analysis"] = "full_analysis",
+    full_tree_nodes: Sequence[Mapping[str, Any]] | None = None,
+    full_tree_edges: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Compute multi-milestone polarization trajectory and extractive discourse summary for a full post."""
     lang_norm: Literal["vi", "en"] = "en" if str(lang).lower() == "en" else "vi"
     root_id = str(root_node["node_id"])
-    non_roots = [n for n in all_nodes if str(n["node_id"]) != root_id]
+    struct_nodes = list(full_tree_nodes) if full_tree_nodes is not None else list(all_nodes)
+    struct_edges = list(full_tree_edges) if full_tree_edges is not None else list(all_edges)
 
     def _sort_key(node: Mapping[str, Any]) -> tuple[float, int, str]:
         ts = node.get("created_at_utc")
@@ -818,25 +831,33 @@ def analyze_large_thread_dynamics(
         nid = str(node["node_id"])
         return (ts_val, int(depth_map.get(nid, 999)), nid)
 
-    non_roots.sort(key=_sort_key)
-    total_replies = len(non_roots)
+    full_non_roots = [n for n in struct_nodes if str(n["node_id"]) != root_id]
+    full_non_roots.sort(key=_sort_key)
+    total_replies = len(full_non_roots)
     scale_tier, scale_label_vi = _classify_scale_tier(total_replies)
     scale_label_en = _SCALE_LABELS_EN[scale_tier]
+
+    non_roots = [n for n in all_nodes if str(n["node_id"]) != root_id]
+    non_roots.sort(key=_sort_key)
 
     children_adj: dict[str, list[str]] = {root_id: []}
     edge_lookup: dict[tuple[str, str], dict[str, str]] = {}
     stance_map: dict[str, float] = {}
     hostility_by_target: dict[str, float] = {}
     edge_score_by_target: dict[str, tuple[float, float]] = {}
+    scored_target_ids: set[str] = set()
 
     for e in all_edges:
         src = str(e["source_id"])
         dst = str(e["target_id"])
         eid = str(e.get("edge_id") or f"{src}->{dst}")
+        sc = edge_scores.get(eid) or {}
+        if sc.get("is_scored", True) is False:
+            continue
+        scored_target_ids.add(dst)
         children_adj.setdefault(src, []).append(dst)
         children_adj.setdefault(dst, [])
         edge_lookup[(src, dst)] = {"edge_id": eid}
-        sc = edge_scores.get(eid) or {}
         s_uv = float(sc.get("s_uv", e.get("s_uv", 0.0)))
         h_uv = float(sc.get("h_uv", e.get("h_uv", 0.0)))
         stance_map[eid] = s_uv
@@ -860,9 +881,9 @@ def analyze_large_thread_dynamics(
     if total_replies > 0:
         milestones.append(total_replies)
 
-    # Bucket edges by max chronological node rank for fast O(N) incremental milestone expansion.
+    # Bucket scored edges by max chronological node rank on the full tree for true-k O(N) incremental milestones.
     node_rank: dict[str, int] = {root_id: 0}
-    for idx_r, n_r in enumerate(non_roots, start=1):
+    for idx_r, n_r in enumerate(full_non_roots, start=1):
         node_rank[str(n_r["node_id"])] = idx_r
     edges_by_rank: dict[int, list[tuple[str, str, dict[str, str]]]] = {}
     for (src, dst), e_row in edge_lookup.items():
@@ -883,6 +904,9 @@ def analyze_large_thread_dynamics(
         cur_rank_added = 0
 
     trajectory: list[dict[str, Any]] = []
+    sup_c = opp_c = neu_c = hos_c = 0
+    authors_k: set[str] = set()
+    prev_k_step = 0
     for k_step in milestones:
         for r_idx in range(cur_rank_added + 1, k_step + 1):
             for src, dst, e_row in edges_by_rank.get(r_idx, ()):
@@ -890,7 +914,6 @@ def analyze_large_thread_dynamics(
                 pref_lookup[(src, dst)] = e_row
         cur_rank_added = k_step
 
-        prefix_nodes = non_roots[:k_step]
         pref_aligned, pref_orientations = _compute_root_aligned_stances_and_orientations(
             root_id=root_id,
             children_adj=pref_adj,
@@ -903,11 +926,18 @@ def analyze_large_thread_dynamics(
             else 0.0
         )
 
+        # Accumulate unique authors incrementally over full_non_roots[prev_k_step:k_step]
+        for idx_n in range(prev_k_step, k_step):
+            n_full = full_non_roots[idx_n]
+            ah = n_full.get("author_hash") or n_full.get("user_id_hash") or f"anon_{idx_n}"
+            authors_k.add(str(ah))
+        prev_k_step = k_step
+
+        # Stance ratios must reflect scored edges present in the prefix without 0.0 dilution from unscored nodes.
         sup_c = opp_c = neu_c = hos_c = 0
-        authors_k: set[str] = set()
-        for idx_n, n in enumerate(prefix_nodes):
-            nid = str(n["node_id"])
-            ori = float(pref_orientations.get(nid, 0.0))
+        for nid, ori in pref_orientations.items():
+            if nid == root_id or nid not in scored_target_ids:
+                continue
             _, h_uv = edge_score_by_target.get(nid, (0.0, 0.0))
             if ori > 0.1:
                 sup_c += 1
@@ -917,18 +947,18 @@ def analyze_large_thread_dynamics(
                 neu_c += 1
             if h_uv >= 0.5:
                 hos_c += 1
-            ah = n.get("author_hash") or n.get("user_id_hash") or f"anon_{idx_n}"
-            authors_k.add(str(ah))
 
-        denom = float(max(1, k_step))
+        scored_prefix_n = sup_c + opp_c + neu_c
+        denom = float(max(1, scored_prefix_n))
         trajectory.append(
             {
                 "k": int(k_step),
                 "y_polar": round(y_step, 4),
-                "support_ratio": round(sup_c / denom, 4),
-                "oppose_ratio": round(opp_c / denom, 4),
-                "neutral_ratio": round(neu_c / denom, 4),
-                "hostile_ratio": round(hos_c / denom, 4),
+                "support_ratio": round(sup_c / denom, 4) if scored_prefix_n > 0 else 0.0,
+                "oppose_ratio": round(opp_c / denom, 4) if scored_prefix_n > 0 else 0.0,
+                "neutral_ratio": round(neu_c / denom, 4) if scored_prefix_n > 0 else 0.0,
+                "hostile_ratio": round(hos_c / denom, 4) if scored_prefix_n > 0 else 0.0,
+                "scored_in_window": int(scored_prefix_n),
                 "unique_authors": len(authors_k),
             }
         )
@@ -979,12 +1009,12 @@ def analyze_large_thread_dynamics(
         str(root_node.get("author_hash") or root_node.get("user_id_hash") or "root")
     }
 
-    for idx_n, n in enumerate(non_roots):
+    for idx_n, n in enumerate(full_non_roots):
         nid = str(n["node_id"])
         txt = " ".join(str(n.get("text") or "").split())
         ah = n.get("author_hash") or n.get("user_id_hash") or f"anon_{idx_n}"
         all_authors.add(str(ah))
-        if not txt or _JUNK_LIKE_RE.fullmatch(txt):
+        if nid not in scored_target_ids or not txt or _JUNK_LIKE_RE.fullmatch(txt):
             continue
         ori = float(node_orientations.get(nid, 0.0))
         s_uv, h_uv = edge_score_by_target.get(nid, (0.0, 0.0))
@@ -1018,7 +1048,7 @@ def analyze_large_thread_dynamics(
 
     primary_topic = str((topic_analysis or {}).get("primary_topic") or "Chưa phân loại")
     primary_conf = float((topic_analysis or {}).get("primary_confidence") or 0.0)
-    max_depth = max((int(depth_map.get(str(n["node_id"]), 0)) for n in non_roots), default=0)
+    max_depth = max((int(depth_map.get(str(n["node_id"]), 0)) for n in full_non_roots), default=0)
 
     if total_replies == 0:
         summary_vi = (
@@ -1059,8 +1089,8 @@ def analyze_large_thread_dynamics(
 
     hotspot_branches = extract_hotspot_branches(
         root_id=root_id,
-        all_nodes=all_nodes,
-        all_edges=all_edges,
+        all_nodes=struct_nodes,
+        all_edges=struct_edges,
         edge_scores=edge_scores,
         depth_map=depth_map,
         node_orientations=node_orientations,

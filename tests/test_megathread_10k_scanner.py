@@ -425,9 +425,153 @@ def test_async_scan_jobs_lifecycle_pagination_branches_and_cancel(tmp_path: Path
         assert 'id="mega-scan-panel"' in html
         assert 'id="mega-comments-section"' in html
         assert 'id="hotspot-branch-bar"' in html
+        assert 'id="btn-mega-clear-file"' in html
+        assert 'value="unscored"' in html
         assert "MAX_SVG_NODES = 120" in js
+        assert "megaCommentsReqSeq" in js
         assert "innerHTML" not in js
         assert "insertAdjacentHTML" not in js
+
+        # 7. Query strings with '..' are NOT misclassified as path traversal
+        st_qs_dot, qs_dot = _http_get(
+            port, f"/api/tier1/scan_jobs/{job_id}/comments?page=1&page_size=20&q=a..b"
+        )
+        assert st_qs_dot == 200
+        assert "items" in qs_dot
+
+        # 8. Unscored filter works on stratified jobs
+        st_unsc, unsc_pg = _http_get(
+            port, f"/api/tier1/scan_jobs/{job_id}/comments?page=1&page_size=20&stance=unscored"
+        )
+        assert st_unsc == 200
+        assert unsc_pg["total_items"] > 0
+        assert all(not r["is_scored"] for r in unsc_pg["items"])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_megathread_jsonl_and_stratified_connectedness_regressions(tmp_path: Path) -> None:
+    """Verify multi-line JSONL ingestion, connected stratified edges, and no 0.0 trajectory dilution."""
+    from scripts.predict_live_thread import _select_stratified_edges, load_thread_from_text
+    from src.nlp.topic_post_analyzer import analyze_large_thread_dynamics
+
+    # Multi-line JSONL parsing + NaN rejection
+    jsonl_text = "\n".join(
+        [
+            json.dumps({"id": "jroot", "title": "Chủ đề thử nghiệm", "text": "Bài gốc", "created_utc": 1700000000}),
+            json.dumps({"id": "c1", "parent_id": "t3_jroot", "text": "Đồng ý quan điểm này.", "created_utc": 1700000050}),
+            json.dumps({"id": "c2", "parent_id": "t1_c1", "text": "Không đồng ý chút nào.", "created_utc": 1700000100}),
+        ]
+    )
+    post, cmts = load_thread_from_text(jsonl_text, is_jsonl_hint=True)
+    assert post["id"] == "jroot"
+    assert len(cmts) == 2
+
+    with pytest.raises(ValueError, match="Non-finite"):
+        load_thread_from_text(
+            json.dumps({"id": "nanpost", "comments": [{"id": "c1", "created_utc": float("nan"), "text": "hi"}]})
+        )
+
+    # Stratified edge selection must remain 100% ancestor-connected to root and zero-dilution free
+    all_nodes = [{"node_id": "root", "is_root": True, "created_at_utc": 0.0, "text": "Gốc", "author_hash": "op"}]
+    all_edges = []
+    depth_map = {"root": 0}
+    for i in range(1, 301):
+        nid = f"n{i}"
+        pid = "root" if i <= 6 else f"n{((i - 1) // 2) or 1}"
+        depth_map[nid] = depth_map[pid] + 1
+        all_nodes.append({"node_id": nid, "parent_id": pid, "is_root": False, "created_at_utc": float(i * 10), "text": f"Bình luận số {i} thảo luận vấn đề này", "author_hash": f"u{i % 30}"})
+        all_edges.append({"edge_id": f"{pid}->{nid}", "source_id": pid, "target_id": nid})
+
+    picked = _select_stratified_edges(
+        root_id="root",
+        gnn_nodes=all_nodes[:21],
+        candidate_non_roots=all_nodes[1:],
+        edge_records=all_edges,
+        depth_map=depth_map,
+        sample_budget=120,
+    )
+    edge_by_id = {e["edge_id"]: e for e in all_edges}
+    parent_by_dst = {e["target_id"]: e["source_id"] for e in all_edges}
+    picked_dsts = {edge_by_id[eid]["target_id"] for eid in picked}
+    for eid in picked:
+        src = edge_by_id[eid]["source_id"]
+        assert src == "root" or src in picked_dsts, f"Orphan edge sampled: {eid}"
+
+    scored_edges = [e for e in all_edges if e["edge_id"] in picked]
+    edge_scores = {
+        e["edge_id"]: (
+            {"s_uv": 0.65, "h_uv": 0.1, "behavior_label": "support", "is_scored": True}
+            if e["edge_id"] in picked
+            else {"s_uv": 0.0, "h_uv": 0.0, "behavior_label": "unscored", "is_scored": False}
+        )
+        for e in all_edges
+    }
+    scored_node_ids = {"root"} | {e["source_id"] for e in scored_edges} | {e["target_id"] for e in scored_edges}
+    dyn = analyze_large_thread_dynamics(
+        root_node=all_nodes[0],
+        all_nodes=[n for n in all_nodes if n["node_id"] in scored_node_ids],
+        all_edges=scored_edges,
+        edge_scores=edge_scores,
+        depth_map=depth_map,
+        full_tree_nodes=all_nodes,
+        full_tree_edges=all_edges,
+    )
+    assert dyn["total_replies_analyzed"] == 300
+    assert dyn["polarization_trajectory"][-1]["k"] == 300
+    # Unscored edges must not dilute support_ratio down toward zero
+    assert dyn["stance_ratios_full"]["support"] >= 0.95
+    for dst in picked_dsts:
+        assert dst in parent_by_dst
+
+
+def test_scan_job_queue_full_429_and_branch_chars(tmp_path: Path) -> None:
+    """Verify branch IDs with dots/hyphens resolve, '..' fails, and QueueFullError maps to HTTP 429."""
+    from scripts.demo_web_app import DemoBackend, QueueFullError, create_server
+
+    server = create_server(
+        host="127.0.0.1",
+        port=0,
+        data_dir=tmp_path / "missing_vn",
+        ckpt_path=tmp_path / "missing_ckpt.pt",
+        ce_dir=tmp_path / "missing_ce",
+        paper_dir=PAPER_DIR,
+        web_dir=WEB_DIR,
+        preload=False,
+    )
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        # Check QueueFullError HTTP 429 behavior cleanly
+        backend: DemoBackend = server._backend  # type: ignore[attr-defined]
+        with backend._lock:
+            for idx in range(4):
+                backend._scan_jobs[f"aaaa1111bbbb000{idx}"] = {"status": "running", "cancel_event": threading.Event()}
+        st_429, body_429 = _http_post(
+            port,
+            "/api/tier1/scan_jobs",
+            {"mode": "preset_mega_stress", "stress_n_comments": 100, "max_full_comments": 100},
+        )
+        assert st_429 == 429
+        assert "đầy" in body_429["error"]
+        with backend._lock:
+            backend._scan_jobs.clear()
+
+        # Check branch ID character validation allows hyphen/dot/colon and blocks '..'
+        fake_jid = "1111222233334444"
+        with backend._lock:
+            backend._scan_jobs[fake_jid] = {
+                "status": "completed",
+                "branch_trees": {"t1_abc-1.2": {"tree": {"nodes": [], "edges": []}}},
+                "cancel_event": threading.Event(),
+            }
+        st_b_ok, _ = _http_get(port, f"/api/tier1/scan_jobs/{fake_jid}/branch/t1_abc-1.2")
+        assert st_b_ok == 200
+        st_b_bad, _ = _http_get(port, f"/api/tier1/scan_jobs/{fake_jid}/branch/..%2Fetc")
+        assert st_b_bad in {403, 404}
     finally:
         server.shutdown()
         server.server_close()

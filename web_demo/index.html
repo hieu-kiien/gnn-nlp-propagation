@@ -313,7 +313,10 @@ c9 (trả lời c4): 👍</textarea>
 
                   <div class="field-stack mega-file-wrap">
                     <label for="mega-json-file" class="field-label">Hoặc nạp tệp JSON/JSONL bài lớn</label>
-                    <input type="file" id="mega-json-file" accept=".json,.jsonl" class="file-input-control">
+                    <div class="mega-file-row">
+                      <input type="file" id="mega-json-file" accept=".json,.jsonl" class="file-input-control">
+                      <button type="button" class="btn-outline btn-sm" id="btn-mega-clear-file" hidden>Bỏ chọn tệp</button>
+                    </div>
                   </div>
                 </div>
 
@@ -566,6 +569,7 @@ c9 (trả lời c4): 👍</textarea>
                 <option value="support">Tán thành</option>
                 <option value="oppose">Phản đối</option>
                 <option value="neutral">Trung lập</option>
+                <option value="unscored">Chưa chấm NLP</option>
                 <option value="uncivil">Công kích (h ≥ 0.5)</option>
               </select>
               <input

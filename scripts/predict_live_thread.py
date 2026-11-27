@@ -16,6 +16,7 @@ the true future (`t > K`, `future_only`) outcome WITHOUT ever leaking post-K dat
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -222,10 +223,13 @@ def _http_get_json_with_backoff(
     headers: Mapping[str, str],
     timeout: int = 20,
     max_retries: int = 4,
+    cancel_event: threading.Event | None = None,
 ) -> Any:
     backoff = 1.0
     last_exc: Exception | None = None
     for attempt in range(max_retries):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelledError("Đã hủy tác vụ tải dữ liệu.")
         try:
             resp = requests.get(url, params=params, headers=headers, timeout=timeout)
             if getattr(resp, "status_code", 200) == 429:
@@ -234,15 +238,27 @@ def _http_get_json_with_backoff(
                     wait_s = float(reset_hdr) if reset_hdr is not None else backoff
                 except (TypeError, ValueError):
                     wait_s = backoff
-                time.sleep(min(max(0.05, wait_s), 16.0))
+                sleep_s = min(max(0.05, wait_s), 16.0)
+                if cancel_event is not None:
+                    if cancel_event.wait(sleep_s):
+                        raise ScanCancelledError("Đã hủy tác vụ trong lúc chờ rate-limit.")
+                else:
+                    time.sleep(sleep_s)
                 backoff *= 2.0
                 continue
             resp.raise_for_status()
             return resp.json()
+        except ScanCancelledError:
+            raise
         except Exception as exc:
             last_exc = exc
             if attempt < max_retries - 1:
-                time.sleep(min(backoff, 4.0))
+                sleep_s = min(backoff, 4.0)
+                if cancel_event is not None:
+                    if cancel_event.wait(sleep_s):
+                        raise ScanCancelledError("Đã hủy tác vụ trong lúc chờ thử lại.") from exc
+                else:
+                    time.sleep(sleep_s)
                 backoff *= 2.0
     if last_exc is not None:
         raise last_exc
@@ -250,20 +266,96 @@ def _http_get_json_with_backoff(
 
 
 def _extract_tree_items(items: Sequence[Mapping[str, Any]], *, post_id: str, out: list[dict[str, Any]]) -> None:
-    for item in items:
+    """Iteratively extract comment nodes from Arctic Shift /comments/tree payloads, skipping 'more' stubs."""
+    stack: list[Any] = list(reversed(items))
+    while stack:
+        item = stack.pop()
         if not isinstance(item, Mapping):
+            continue
+        if item.get("kind") == "more":
             continue
         data = item.get("data") if isinstance(item.get("data"), Mapping) else item
         cid = str(data.get("id") or "").removeprefix("t1_")
-        if cid:
+        if cid and not ("children" in data and "body" not in data and "text" not in data):
             out.append(_normalize_arctic_comment(data, post_id=post_id))
         replies = data.get("replies")
         if isinstance(replies, Mapping):
             sub = replies.get("data", {}).get("children") or replies.get("children") or []
-            if isinstance(sub, Sequence):
-                _extract_tree_items(sub, post_id=post_id, out=out)
+            if isinstance(sub, Sequence) and not isinstance(sub, (str, bytes)):
+                stack.extend(reversed(sub))
         elif isinstance(replies, Sequence) and not isinstance(replies, (str, bytes)):
-            _extract_tree_items(replies, post_id=post_id, out=out)
+            stack.extend(reversed(replies))
+
+
+def _fetch_reddit_public_json(
+    post_id: str,
+    *,
+    headers: Mapping[str, str],
+    timeout: int = 20,
+    cap: int | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+    """Fetch Reddit public thread JSON iteratively with strict structure checks."""
+    json_url = f"https://www.reddit.com/comments/{post_id}.json?limit=500"
+    resp = requests.get(json_url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    payload = resp.json()
+    if (
+        not isinstance(payload, list)
+        or len(payload) < 2
+        or not isinstance(payload[0], Mapping)
+        or not isinstance(payload[1], Mapping)
+    ):
+        raise ValueError(f"Reddit public JSON payload invalid for post_id={post_id!r}")
+    post_children = (payload[0].get("data") or {}).get("children") or []
+    if not post_children or not isinstance(post_children[0], Mapping) or "data" not in post_children[0]:
+        raise ValueError(f"Reddit public JSON missing root post data for post_id={post_id!r}")
+    post_raw = dict(post_children[0]["data"])
+    root_children = (payload[1].get("data") or {}).get("children") or []
+    if not isinstance(root_children, Sequence):
+        root_children = []
+
+    flat_comments: list[dict[str, Any]] = []
+    truncated = False
+    stack: list[Any] = list(reversed(root_children))
+    while stack:
+        child = stack.pop()
+        if not isinstance(child, Mapping):
+            continue
+        kind = child.get("kind")
+        if kind == "more":
+            truncated = True
+            continue
+        if kind != "t1":
+            continue
+        d = child.get("data")
+        if not isinstance(d, Mapping):
+            continue
+        cid = str(d.get("id") or "").removeprefix("t1_")
+        raw_author = d.get("author")
+        body_txt = str(d.get("body") or "")
+        flat_comments.append(
+            {
+                "fullname": f"t1_{cid}",
+                "id": cid,
+                "link_id": f"t3_{post_id}",
+                "parent_id": str(d.get("parent_id") or f"t3_{post_id}"),
+                "body": body_txt,
+                "text": body_txt,
+                "created_utc": d.get("created_utc"),
+                "author": raw_author,
+                "author_is_bot": isinstance(raw_author, str) and raw_author.strip().lower() == "automoderator",
+                "author_hash": hash_author_sha256(str(raw_author) if raw_author is not None else None),
+            }
+        )
+        if cap is not None and len(flat_comments) >= cap:
+            truncated = True
+            break
+        replies = d.get("replies")
+        if isinstance(replies, Mapping):
+            sub_children = (replies.get("data") or {}).get("children") or []
+            if isinstance(sub_children, Sequence) and not isinstance(sub_children, (str, bytes)):
+                stack.extend(reversed(sub_children))
+    return post_raw, flat_comments, truncated
 
 
 def fetch_reddit_thread_paginated(
@@ -290,20 +382,25 @@ def fetch_reddit_thread_paginated(
             headers=headers,
             timeout=timeout,
             max_retries=3,
+            cancel_event=cancel_event,
         )
         sub_data = (sub_payload or {}).get("data") or []
         if sub_data:
             post = sub_data[0]
+    except ScanCancelledError:
+        raise
     except Exception:
         post = None
 
     if post is not None:
         cursor_after: int | None = None
-        max_pages = max(25, math.ceil(cap / 100) + 5)
+        consecutive_empty_adds = 0
+        # Arctic Shift /comments/search hard-caps limit at 100 per page
+        max_pages = max(25, math.ceil(cap / 100) + 10)
         for page_idx in range(max_pages):
             if cancel_event is not None and cancel_event.is_set():
                 raise ScanCancelledError("Đã hủy tác vụ tải bình luận.")
-            page_limit = min(500, cap - len(comments))
+            page_limit = min(100, cap - len(comments))
             if page_limit <= 0:
                 break
             params: dict[str, Any] = {"link_id": f"t3_{post_id}", "limit": page_limit, "sort": "asc"}
@@ -316,7 +413,10 @@ def fetch_reddit_thread_paginated(
                     headers=headers,
                     timeout=timeout,
                     max_retries=4,
+                    cancel_event=cancel_event,
                 )
+            except ScanCancelledError:
+                raise
             except Exception:
                 break
 
@@ -336,7 +436,7 @@ def fetch_reddit_thread_paginated(
                     ts_f = float(ts_val) if ts_val is not None else None
                 except (TypeError, ValueError):
                     ts_f = None
-                if ts_f is not None and (max_ts_seen is None or ts_f > max_ts_seen):
+                if ts_f is not None and math.isfinite(ts_f) and (max_ts_seen is None or ts_f > max_ts_seen):
                     max_ts_seen = ts_f
                 if cid and cid not in seen_ids:
                     seen_ids.add(cid)
@@ -345,16 +445,26 @@ def fetch_reddit_thread_paginated(
                     if len(comments) >= cap:
                         break
 
-            if progress_cb is not None:
-                progress_cb(
-                    {
-                        "stage": "fetching_comments",
-                        "page": page_idx + 1,
-                        "processed": len(comments),
-                        "total": cap,
-                        "percent": min(99.0, round(100.0 * len(comments) / max(1, cap), 1)),
-                    }
-                )
+            if added_this_page == 0:
+                consecutive_empty_adds += 1
+                if (
+                    consecutive_empty_adds >= 2
+                    or max_ts_seen is None
+                    or (cursor_after is not None and int(max_ts_seen) < cursor_after)
+                ):
+                    break
+            else:
+                consecutive_empty_adds = 0
+                if progress_cb is not None:
+                    progress_cb(
+                        {
+                            "stage": "fetching_comments",
+                            "page": page_idx + 1,
+                            "processed": len(comments),
+                            "total": cap,
+                            "percent": min(99.0, round(100.0 * len(comments) / max(1, cap), 1)),
+                        }
+                    )
 
             if len(comments) >= cap or len(raw_comments) < page_limit:
                 break
@@ -373,6 +483,7 @@ def fetch_reddit_thread_paginated(
                     headers=headers,
                     timeout=max(timeout, 30),
                     max_retries=3,
+                    cancel_event=cancel_event,
                 )
                 tree_out: list[dict[str, Any]] = []
                 _extract_tree_items((tree_payload or {}).get("data") or [], post_id=post_id, out=tree_out)
@@ -383,50 +494,18 @@ def fetch_reddit_thread_paginated(
                         comments.append(row)
                         if len(comments) >= cap:
                             break
+            except ScanCancelledError:
+                raise
             except Exception:
                 pass
 
         if comments:
             return post, comments[:cap]
 
-    # Fallback: official public Reddit thread JSON endpoint
-    json_url = f"https://www.reddit.com/comments/{post_id}.json?limit=500"
-    resp = requests.get(json_url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    payload = resp.json()
-    post_raw = payload[0]["data"]["children"][0]["data"]
-
-    flat_comments: list[dict[str, Any]] = []
-
-    def _walk_listing(children: Sequence[Mapping[str, Any]]) -> None:
-        for child in children:
-            if child.get("kind") != "t1":
-                continue
-            d = child.get("data", {})
-            cid = str(d.get("id") or "")
-            raw_author = d.get("author")
-            flat_comments.append(
-                {
-                    "fullname": f"t1_{cid}",
-                    "id": cid,
-                    "link_id": f"t3_{post_id}",
-                    "parent_id": str(d.get("parent_id") or f"t3_{post_id}"),
-                    "body": str(d.get("body") or ""),
-                    "text": str(d.get("body") or ""),
-                    "created_utc": d.get("created_utc"),
-                    "author": raw_author,
-                    "author_is_bot": isinstance(raw_author, str)
-                    and raw_author.strip().lower() == "automoderator",
-                    "author_hash": hash_author_sha256(
-                        str(raw_author) if raw_author is not None else None
-                    ),
-                }
-            )
-            replies = d.get("replies")
-            if isinstance(replies, Mapping):
-                _walk_listing(replies.get("data", {}).get("children", []))
-
-    _walk_listing(payload[1]["data"]["children"])
+    # Fallback: official public Reddit thread JSON endpoint (returns up to ~500 expanded comments)
+    post_raw, flat_comments, _truncated = _fetch_reddit_public_json(
+        post_id, headers=headers, timeout=timeout, cap=cap
+    )
     return post_raw, flat_comments[:cap]
 
 
@@ -454,55 +533,35 @@ def _fetch_reddit_thread(
             post = sub_data[0]
             com_resp = requests.get(
                 f"{ARCTIC_SHIFT_API_BASE}/comments/search",
-                params={"link_id": f"t3_{post_id}", "limit": 500, "sort": "asc"},
+                params={"link_id": f"t3_{post_id}", "limit": min(100, int(max_comments)), "sort": "asc"},
                 headers=headers,
                 timeout=timeout,
             )
             com_resp.raise_for_status()
             raw_comments = com_resp.json().get("data") or []
             comments = [_normalize_arctic_comment(c, post_id=post_id) for c in raw_comments]
+            if len(comments) < int(max_comments) and len(raw_comments) == 100:
+                return fetch_reddit_thread_paginated(post_id, max_comments=int(max_comments), timeout=timeout)
             return post, comments
     except Exception:
         pass
 
-    json_url = f"https://www.reddit.com/comments/{post_id}.json?limit=500"
-    resp = requests.get(json_url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    payload = resp.json()
-    post_raw = payload[0]["data"]["children"][0]["data"]
-
-    flat_comments: list[dict[str, Any]] = []
-
-    def _walk_listing(children: Sequence[Mapping[str, Any]]) -> None:
-        for child in children:
-            if child.get("kind") != "t1":
-                continue
-            d = child.get("data", {})
-            cid = str(d.get("id") or "")
-            raw_author = d.get("author")
-            flat_comments.append(
-                {
-                    "fullname": f"t1_{cid}",
-                    "id": cid,
-                    "link_id": f"t3_{post_id}",
-                    "parent_id": str(d.get("parent_id") or f"t3_{post_id}"),
-                    "body": str(d.get("body") or ""),
-                    "text": str(d.get("body") or ""),
-                    "created_utc": d.get("created_utc"),
-                    "author": raw_author,
-                    "author_is_bot": isinstance(raw_author, str)
-                    and raw_author.strip().lower() == "automoderator",
-                    "author_hash": hash_author_sha256(
-                        str(raw_author) if raw_author is not None else None
-                    ),
-                }
-            )
-            replies = d.get("replies")
-            if isinstance(replies, Mapping):
-                _walk_listing(replies.get("data", {}).get("children", []))
-
-    _walk_listing(payload[1]["data"]["children"])
+    post_raw, flat_comments, _ = _fetch_reddit_public_json(
+        post_id, headers=headers, timeout=timeout, cap=int(max_comments)
+    )
     return post_raw, flat_comments
+
+
+def _coerce_finite_float(val: Any, *, field_name: str, source_name: str) -> float:
+    if isinstance(val, bool):
+        raise ValueError(f"Invalid boolean for numeric field '{field_name}' in {source_name}")
+    try:
+        out = float(val)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid numeric field '{field_name}'={val!r} in {source_name}") from exc
+    if not math.isfinite(out):
+        raise ValueError(f"Non-finite value for '{field_name}' in {source_name}")
+    return out
 
 
 def load_thread_from_json_payload(
@@ -511,49 +570,69 @@ def load_thread_from_json_payload(
     max_comments: int = 10000,
     source_name: str = "payload",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Parse either Reddit listing JSON or SBi-FAGAT object JSON up to `max_comments`."""
+    """Parse either Reddit listing JSON or SBi-FAGAT object JSON up to `max_comments` iteratively."""
     cap = max(1, min(10000, int(max_comments)))
     if isinstance(raw, list) and len(raw) >= 2 and isinstance(raw[0], Mapping) and "data" in raw[0]:
-        post = raw[0]["data"]["children"][0]["data"]
-        flat: list[dict[str, Any]] = []
+        root_data = raw[0].get("data")
+        if not isinstance(root_data, Mapping):
+            raise ValueError(f"Invalid Reddit listing root data in {source_name}")
+        root_children = root_data.get("children") or []
+        if not isinstance(root_children, Sequence) or not root_children or not isinstance(root_children[0], Mapping):
+            raise ValueError(f"Missing root post in Reddit listing {source_name}")
+        post_data = root_children[0].get("data")
+        if not isinstance(post_data, Mapping):
+            raise ValueError(f"Invalid root post entry in Reddit listing {source_name}")
+        post = dict(post_data)
         post_id = str(post.get("id") or "local_thread")
 
-        def _walk(children: Sequence[Mapping[str, Any]]) -> None:
-            for ch in children:
-                if len(flat) >= cap:
-                    return
-                if ch.get("kind") != "t1":
-                    continue
-                d = ch.get("data", {})
-                cid = str(d.get("id") or "")
-                raw_author = d.get("author")
-                flat.append(
-                    {
-                        "fullname": f"t1_{cid}",
-                        "id": cid,
-                        "link_id": f"t3_{post_id}",
-                        "parent_id": str(d.get("parent_id") or f"t3_{post_id}"),
-                        "text": str(d.get("body") or ""),
-                        "body": str(d.get("body") or ""),
-                        "created_utc": d.get("created_utc"),
-                        "author": raw_author,
-                        "author_is_bot": isinstance(raw_author, str)
-                        and raw_author.strip().lower() == "automoderator",
-                        "author_hash": hash_author_sha256(
-                            str(raw_author) if raw_author is not None else None
-                        ),
-                    }
-                )
-                rep = d.get("replies")
-                if isinstance(rep, Mapping):
-                    _walk(rep.get("data", {}).get("children", []))
+        listing_1 = raw[1]
+        if not isinstance(listing_1, Mapping) or not isinstance(listing_1.get("data"), Mapping):
+            raise ValueError(f"Invalid Reddit comment listing in {source_name}")
+        top_children = listing_1["data"].get("children") or []
+        if not isinstance(top_children, Sequence) or isinstance(top_children, (str, bytes)):
+            raise ValueError(f"Invalid Reddit comment children sequence in {source_name}")
 
-        _walk(raw[1]["data"]["children"])
+        flat: list[dict[str, Any]] = []
+        stack: list[Any] = list(reversed(top_children))
+        while stack and len(flat) < cap:
+            ch = stack.pop()
+            if not isinstance(ch, Mapping) or ch.get("kind") != "t1":
+                continue
+            d = ch.get("data")
+            if not isinstance(d, Mapping):
+                continue
+            cid = str(d.get("id") or "").removeprefix("t1_")
+            raw_author = d.get("author")
+            body_txt = str(d.get("body") or "")
+            flat.append(
+                {
+                    "fullname": f"t1_{cid}",
+                    "id": cid,
+                    "link_id": f"t3_{post_id}",
+                    "parent_id": str(d.get("parent_id") or f"t3_{post_id}"),
+                    "text": body_txt,
+                    "body": body_txt,
+                    "created_utc": d.get("created_utc"),
+                    "author": raw_author,
+                    "author_is_bot": isinstance(raw_author, str) and raw_author.strip().lower() == "automoderator",
+                    "author_hash": hash_author_sha256(str(raw_author) if raw_author is not None else None),
+                }
+            )
+            rep = d.get("replies")
+            if isinstance(rep, Mapping):
+                sub_c = (rep.get("data") or {}).get("children") or []
+                if isinstance(sub_c, Sequence) and not isinstance(sub_c, (str, bytes)):
+                    stack.extend(reversed(sub_c))
         return post, flat[:cap]
 
     if isinstance(raw, Mapping):
         post_id = str(raw.get("id") or "custom_live").removeprefix("t3_")
-        base_ts = float(raw.get("created_utc") or 1763200000.0)
+        raw_base_ts = raw.get("created_utc")
+        base_ts = (
+            _coerce_finite_float(raw_base_ts, field_name="created_utc", source_name=source_name)
+            if raw_base_ts is not None
+            else 1763200000.0
+        )
         post = {
             "id": post_id,
             "title": str(raw.get("title") or ""),
@@ -562,10 +641,15 @@ def load_thread_from_json_payload(
             "author": str(raw.get("author") or "op"),
             "created_utc": base_ts,
         }
+        raw_comments = raw.get("comments", [])
+        if raw_comments is None:
+            raw_comments = []
+        if not isinstance(raw_comments, Sequence) or isinstance(raw_comments, (str, bytes)):
+            raise ValueError(f"Invalid 'comments' list in {source_name}")
         comments: list[dict[str, Any]] = []
-        for idx, c in enumerate(raw.get("comments", []), start=1):
+        for idx, c in enumerate(raw_comments, start=1):
             if not isinstance(c, Mapping):
-                continue
+                raise ValueError(f"Comment #{idx} is not a JSON object in {source_name}")
             cid = str(c.get("id") or f"c{idx}").removeprefix("t1_")
             pid = str(c.get("parent_id") or f"t3_{post_id}").strip()
             if pid.lower() in {"root", post_id, f"t3_{post_id}"}:
@@ -578,9 +662,14 @@ def load_thread_from_json_payload(
             raw_delay = c.get("time_delay_sec")
             ts_c = c.get("created_utc")
             if ts_c is None:
-                ts_val = base_ts + (float(raw_delay) if raw_delay is not None else idx * 45.0)
+                delay_val = (
+                    _coerce_finite_float(raw_delay, field_name="time_delay_sec", source_name=source_name)
+                    if raw_delay is not None
+                    else idx * 45.0
+                )
+                ts_val = base_ts + delay_val
             else:
-                ts_val = float(ts_c)
+                ts_val = _coerce_finite_float(ts_c, field_name="created_utc", source_name=source_name)
             comments.append(
                 {
                     "fullname": f"t1_{cid}",
@@ -603,22 +692,50 @@ def load_thread_from_json_payload(
     raise ValueError(f"Unsupported thread JSON structure in {source_name}")
 
 
+def load_thread_from_text(
+    text: str,
+    *,
+    max_comments: int = 10000,
+    source_name: str = "input",
+    is_jsonl_hint: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Parse either standard JSON or line-delimited JSONL discussion text."""
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        raise ValueError(f"Empty JSON/JSONL content in {source_name}")
+    if not is_jsonl_hint:
+        try:
+            raw = json.loads(cleaned)
+            return load_thread_from_json_payload(raw, max_comments=max_comments, source_name=source_name)
+        except json.JSONDecodeError:
+            pass
+    records = [json.loads(line) for line in cleaned.splitlines() if line.strip()]
+    if not records:
+        raise ValueError(f"Empty JSONL content in {source_name}")
+    first = records[0]
+    if isinstance(first, Mapping) and "comments" in first and len(records) == 1:
+        return load_thread_from_json_payload(first, max_comments=max_comments, source_name=source_name)
+    if not isinstance(first, Mapping):
+        raise ValueError(f"First JSONL record must be an object in {source_name}")
+    root_row = dict(first)
+    extra_comments = [r for r in records[1:] if isinstance(r, Mapping)]
+    if "comments" in root_row and isinstance(root_row.get("comments"), list):
+        root_row["comments"] = list(root_row["comments"]) + extra_comments
+    else:
+        root_row["comments"] = extra_comments
+    return load_thread_from_json_payload(root_row, max_comments=max_comments, source_name=source_name)
+
+
 def load_thread_from_file(path: Path, *, max_comments: int = 10000) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Load a local JSON or JSONL social discussion file (up to `max_comments`)."""
     p = Path(path)
-    text = p.read_text(encoding="utf-8").strip()
-    if p.suffix.lower() == ".jsonl":
-        records = [json.loads(line) for line in text.splitlines() if line.strip()]
-        if not records:
-            raise ValueError(f"Empty JSONL file: {p}")
-        first = records[0]
-        if isinstance(first, Mapping) and "comments" in first:
-            return load_thread_from_json_payload(first, max_comments=max_comments, source_name=str(p))
-        root_row = dict(first) if isinstance(first, Mapping) else {}
-        root_row["comments"] = [r for r in records[1:] if isinstance(r, Mapping)]
-        return load_thread_from_json_payload(root_row, max_comments=max_comments, source_name=str(p))
-    raw = json.loads(text)
-    return load_thread_from_json_payload(raw, max_comments=max_comments, source_name=str(p))
+    text = p.read_text(encoding="utf-8")
+    return load_thread_from_text(
+        text,
+        max_comments=max_comments,
+        source_name=str(p),
+        is_jsonl_hint=(p.suffix.lower() == ".jsonl"),
+    )
 
 
 def _load_thread_from_json(path: Path, *, max_comments: int = 10000) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -869,7 +986,8 @@ def _select_stratified_edges(
     depth_map: Mapping[str, int],
     sample_budget: int,
 ) -> set[str]:
-    """Deterministically sample edges across 10 chronological deciles + deep branches with ancestor closure."""
+    """Deterministically sample edges uniformly across 10 chronological deciles with full ancestor closure."""
+    del depth_map  # Unbiased stratified sampling does not oversample deep subtrees
     budget = max(1, int(sample_budget))
     if len(edge_records) <= budget:
         return {str(e["edge_id"]) for e in edge_records}
@@ -883,29 +1001,6 @@ def _select_stratified_edges(
 
     selected_eids: set[str] = set()
     gnn_ids = {str(n["node_id"]) for n in gnn_nodes}
-    for e in edge_records:
-        if str(e["target_id"]) in gnn_ids:
-            selected_eids.add(str(e["edge_id"]))
-
-    remaining_nodes = [
-        n for n in candidate_non_roots
-        if str(n["node_id"]) not in gnn_ids and str(n["node_id"]) in edge_by_dst
-    ]
-    if not remaining_nodes:
-        return selected_eids
-
-    n_deciles = 10
-    buckets: list[list[Mapping[str, Any]]] = [[] for _ in range(n_deciles)]
-    total_rem = len(remaining_nodes)
-    for idx_r, node in enumerate(remaining_nodes):
-        b_idx = min(n_deciles - 1, (idx_r * n_deciles) // max(1, total_rem))
-        buckets[b_idx].append(node)
-
-    # Inside each decile, prioritize deeper branches first while remaining completely deterministic
-    for b_idx in range(n_deciles):
-        buckets[b_idx].sort(
-            key=lambda n: (-int(depth_map.get(str(n["node_id"]), 1)), str(n["node_id"]))
-        )
 
     def _add_with_ancestors(target_id: str, hard_cap: int) -> bool:
         chain_eids: list[str] = []
@@ -915,19 +1010,46 @@ def _select_stratified_edges(
             seen_c.add(curr)
             e_row = edge_by_dst.get(curr)
             if e_row is None:
-                break
+                return False
             eid = str(e_row["edge_id"])
             if eid not in selected_eids:
                 chain_eids.append(eid)
             curr = parent_by_dst.get(curr, "")
-        if not chain_eids:
+        if curr != root_id or not chain_eids:
             return False
         if len(selected_eids) + len(chain_eids) <= hard_cap:
             selected_eids.update(chain_eids)
             return True
         return False
 
-    hard_cap = max(budget, len(selected_eids) + int(budget * 0.15))
+    for e in edge_records:
+        dst_g = str(e["target_id"])
+        if dst_g in gnn_ids:
+            _add_with_ancestors(dst_g, len(edge_records))
+
+    remaining_nodes = [
+        n for n in candidate_non_roots
+        if str(n["node_id"]) not in gnn_ids and str(n["node_id"]) in edge_by_dst
+    ]
+    if not remaining_nodes or len(selected_eids) >= budget:
+        return selected_eids
+
+    n_deciles = 10
+    buckets: list[list[Mapping[str, Any]]] = [[] for _ in range(n_deciles)]
+    total_rem = len(remaining_nodes)
+    for idx_r, node in enumerate(remaining_nodes):
+        b_idx = min(n_deciles - 1, (idx_r * n_deciles) // max(1, total_rem))
+        buckets[b_idx].append(node)
+
+    # Uniform seeded permutation inside each chronological decile preserves unbiased coverage
+    rng = np.random.default_rng(42)
+    for b_idx in range(n_deciles):
+        b_list = buckets[b_idx]
+        if len(b_list) > 1:
+            perm = rng.permutation(len(b_list))
+            buckets[b_idx] = [b_list[int(pos)] for pos in perm]
+
+    hard_cap = max(len(selected_eids), budget + int(budget * 0.15))
     cursor_in_bucket = [0] * n_deciles
     made_progress = True
     while len(selected_eids) < budget and made_progress:
@@ -942,14 +1064,6 @@ def _select_stratified_edges(
                 if _add_with_ancestors(str(cand["node_id"]), hard_cap):
                     made_progress = True
                     break
-                # Single-edge fallback if ancestor chain slightly exceeds soft cap when still under budget
-                e_direct = edge_by_dst.get(str(cand["node_id"]))
-                if e_direct is not None and len(selected_eids) < budget:
-                    eid_d = str(e_direct["edge_id"])
-                    if eid_d not in selected_eids:
-                        selected_eids.add(eid_d)
-                        made_progress = True
-                        break
 
     return selected_eids
 
@@ -997,6 +1111,7 @@ def predict_live_cascade(
     junk_mode: Literal["prune", "contract"] = "prune",
     allow_untrained: bool = False,
     is_demo: bool = False,
+    inference_lock: threading.RLock | None = None,
 ) -> dict[str, Any]:
     """Build cascade graph, score behavior & topics, run SBiFAGAT (early K) + scalable post-hoc scan (up to 10k)."""
     t_scan_start = time.perf_counter()
@@ -1131,17 +1246,18 @@ def predict_live_cascade(
             if cancel_event is not None and cancel_event.is_set():
                 raise ScanCancelledError("Tác vụ quét đã bị hủy trong quá trình chấm cạnh.")
             b_end = min(total_to_score, b_start + batch_sz)
-            ce_out = encode_edges_with_cross_encoder(
-                score_parent_texts[b_start:b_end],
-                score_reply_texts[b_start:b_end],
-                cross_encoder=ce_model,
-                tokenizer=ce_tok,
-                root_texts=[root_text_str] * (b_end - b_start),
-                include_root_context=use_root_ctx,
-                lang=lang,
-                batch_size=batch_sz,
-                device=live_device,
-            )
+            with (inference_lock if inference_lock is not None else contextlib.nullcontext()):
+                ce_out = encode_edges_with_cross_encoder(
+                    score_parent_texts[b_start:b_end],
+                    score_reply_texts[b_start:b_end],
+                    cross_encoder=ce_model,
+                    tokenizer=ce_tok,
+                    root_texts=[root_text_str] * (b_end - b_start),
+                    include_root_context=use_root_ctx,
+                    lang=lang,
+                    batch_size=batch_sz,
+                    device=live_device,
+                )
             for rel_pos, eid in enumerate(score_edge_ids[b_start:b_end]):
                 s_v = float(ce_out["s_uv"][rel_pos])
                 h_v = float(ce_out["h_uv"][rel_pos])
@@ -1193,7 +1309,7 @@ def predict_live_cascade(
     for e in edge_records:
         eid_all = str(e["edge_id"])
         if eid_all not in edge_scores:
-            edge_scores[eid_all] = {"s_uv": 0.0, "h_uv": 0.0, "behavior_label": "neutral", "is_scored": False}
+            edge_scores[eid_all] = {"s_uv": 0.0, "h_uv": 0.0, "behavior_label": "unscored", "is_scored": False}
 
     # Build early PyG CascadeData restricted strictly to V_K (in-distribution for SBi-FAGAT)
     delays_gnn = [max(0.0, (n["created_at_utc"] - root_ts).total_seconds()) for n in gnn_nodes]
@@ -1214,16 +1330,17 @@ def predict_live_cascade(
             else root_text_str
             for n in gnn_nodes
         ]
-        emb_mat = encode_node_embeddings(
-            gnn_texts,
-            encoder=frozen_node_encoder,
-            tokenizer=frozen_node_tok,
-            parent_texts=gnn_parents,
-            root_texts=gnn_roots,
-            lang=lang,
-            batch_size=32,
-            device=live_device,
-        )
+        with (inference_lock if inference_lock is not None else contextlib.nullcontext()):
+            emb_mat = encode_node_embeddings(
+                gnn_texts,
+                encoder=frozen_node_encoder,
+                tokenizer=frozen_node_tok,
+                parent_texts=gnn_parents,
+                root_texts=gnn_roots,
+                lang=lang,
+                batch_size=32,
+                device=live_device,
+            )
         for idx_n, (n, dt_sec) in enumerate(zip(gnn_nodes, delays_gnn)):
             nid = str(n["node_id"])
             t_norm = min(1.0, math.log1p(dt_sec) / denom_t)
@@ -1388,7 +1505,8 @@ def predict_live_cascade(
     else:
         data.edge_attr = torch.empty((0, target_edge_dim), dtype=torch.float32)
 
-    diag = gnn_model.predict_with_diagnostics(data, top_k_edges=5)
+    with (inference_lock if inference_lock is not None else contextlib.nullcontext()):
+        diag = gnn_model.predict_with_diagnostics(data, top_k_edges=5)
 
     behavior_counts = {lbl: 0 for lbl in _UNIFIED_BEHAVIOR_LABELS}
     for d in gnn_edge_details:
@@ -1419,9 +1537,10 @@ def predict_live_cascade(
     has_future = actual_total_replies > (len(gnn_nodes) - 1)
     gnn_pair_set = {(str(d_e["parent_id"]), str(d_e["node_id"])) for d_e in gnn_edge_details}
     scored_edges_only = [e for e in edges_to_score if bool(edge_scores.get(str(e["edge_id"]), {}).get("is_scored", True))]
+    is_partial_scoring = bool(is_stratified_subsampled or len(scored_edges_only) < len(edge_records))
     stance_map = {eid: sc["s_uv"] for eid, sc in edge_scores.items()}
     if has_future:
-        if is_stratified_subsampled:
+        if is_partial_scoring:
             sc_adj: dict[str, list[str]] = {}
             sc_lookup: dict[tuple[str, str], Mapping[str, Any]] = {}
             for e_sc in scored_edges_only:
@@ -1448,7 +1567,12 @@ def predict_live_cascade(
             if actual_aligned
             else 0.0
         )
-        actual_polar_mode = "stratified_sample_future_only" if is_stratified_subsampled else "future_only"
+        if is_stratified_subsampled:
+            actual_polar_mode = "stratified_sample_future_only"
+        elif is_partial_scoring:
+            actual_polar_mode = "capped_full_future_only"
+        else:
+            actual_polar_mode = "future_only"
     else:
         actual_aligned = []
         actual_full_polar = None
@@ -1480,7 +1604,12 @@ def predict_live_cascade(
     serialized_kept_edges = []
     for d_e in display_edge_details:
         s_val = float(d_e["s_uv"])
-        stance_cls = "support" if s_val > 0.1 else ("oppose" if s_val < -0.1 else "neutral")
+        is_sc = bool(d_e.get("is_scored", True))
+        stance_cls = (
+            "unscored"
+            if not is_sc
+            else ("support" if s_val > 0.1 else ("oppose" if s_val < -0.1 else "neutral"))
+        )
         src_s = str(d_e["parent_id"])
         dst_s = str(d_e["node_id"])
         serialized_kept_edges.append(
@@ -1492,7 +1621,7 @@ def predict_live_cascade(
                 "stance_class": stance_cls,
                 "behavior_label": str(d_e["behavior_label"]),
                 "relinked": (src_s, dst_s) in relinked_pair_set,
-                "is_scored": bool(d_e.get("is_scored", True)),
+                "is_scored": is_sc,
             }
         )
 
@@ -1506,63 +1635,51 @@ def predict_live_cascade(
         str(n.get("text") or "")
         for n in (display_nodes[1:12] if analysis_mode == "full" else gnn_nodes[1:6])
     ]
-    topic_analysis = classify_post_topics(
-        str(post.get("title") or ""),
-        str(post.get("selftext") or post.get("body") or root_row.get("text") or ""),
-        reply_snippets=topic_snippets,
-        custom_topics=custom_topics,
-        lang=lang_lit,
-        backend=topic_backend,
-        node_encoder=frozen_node_encoder,
-        node_tokenizer=frozen_node_tok,
-        allow_nli_download=allow_nli_topic_download,
-    )
+    with (inference_lock if inference_lock is not None else contextlib.nullcontext()):
+        topic_analysis = classify_post_topics(
+            str(post.get("title") or ""),
+            str(post.get("selftext") or post.get("body") or root_row.get("text") or ""),
+            reply_snippets=topic_snippets,
+            custom_topics=custom_topics,
+            lang=lang_lit,
+            backend=topic_backend,
+            node_encoder=frozen_node_encoder,
+            node_tokenizer=frozen_node_tok,
+            allow_nli_download=allow_nli_topic_download,
+        )
 
-    if analysis_mode == "full":
-        display_ids_set = {str(n["node_id"]) for n in display_nodes}
-        if is_stratified_subsampled:
-            full_scope_edges = [
-                e for e in scored_edges_only
-                if str(e["source_id"]) in display_ids_set and str(e["target_id"]) in display_ids_set
-            ]
-            participating_ids = {root_id} | {str(e["source_id"]) for e in full_scope_edges} | {str(e["target_id"]) for e in full_scope_edges}
-            analysis_nodes = [n for n in display_nodes if str(n["node_id"]) in participating_ids]
-        else:
-            analysis_nodes = display_nodes
-            full_scope_edges = [
-                e for e in edge_records
-                if str(e["source_id"]) in display_ids_set and str(e["target_id"]) in display_ids_set
-            ]
-        large_thread_analysis = analyze_large_thread_dynamics(
-            root_node=root_row,
-            all_nodes=analysis_nodes,
-            all_edges=full_scope_edges,
-            edge_scores=edge_scores,
-            depth_map=depth_map,
-            topic_analysis=topic_analysis,
-            trigger_importance_by_target=imp_by_target,
-            k_early_ref=k_horizon,
-            lang=lang_lit,
-            scope="full_analysis",
+    if is_partial_scoring:
+        scored_node_ids = (
+            {root_id}
+            | {str(e["source_id"]) for e in scored_edges_only}
+            | {str(e["target_id"]) for e in scored_edges_only}
         )
+        analysis_nodes = [n for n in node_records if str(n["node_id"]) in scored_node_ids]
+        analysis_edges = scored_edges_only
     else:
-        large_thread_analysis = analyze_large_thread_dynamics(
-            root_node=root_row,
-            all_nodes=node_records,
-            all_edges=edges_to_score if is_stratified_subsampled else edge_records,
-            edge_scores=edge_scores,
-            depth_map=depth_map,
-            topic_analysis=topic_analysis,
-            trigger_importance_by_target=imp_by_target,
-            k_early_ref=k_horizon,
-            lang=lang_lit,
-            scope="early_post_hoc",
-        )
+        analysis_nodes = node_records
+        analysis_edges = edge_records
+
+    large_thread_analysis = analyze_large_thread_dynamics(
+        root_node=root_row,
+        all_nodes=analysis_nodes,
+        all_edges=analysis_edges,
+        edge_scores=edge_scores,
+        depth_map=depth_map,
+        topic_analysis=topic_analysis,
+        trigger_importance_by_target=imp_by_target,
+        k_early_ref=k_horizon,
+        lang=lang_lit,
+        scope="full_analysis" if analysis_mode == "full" else "early_post_hoc",
+        full_tree_nodes=node_records,
+        full_tree_edges=edge_records,
+    )
 
     if is_stratified_subsampled:
         large_thread_analysis["is_stratified_estimate"] = True
         large_thread_analysis["bootstrap_ci_95"] = bootstrap_ci_95
-        large_thread_analysis["total_replies_kept_tree"] = len(display_nodes) - 1
+    if is_partial_scoring:
+        large_thread_analysis["total_replies_kept_tree"] = len(non_roots)
 
     total_scope_edges = max(len(scope_edges), len(edges_to_score))
     coverage_ratio = round(float(len(edges_to_score)) / float(max(1, total_scope_edges)), 4)
@@ -1715,7 +1832,8 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
     early_pol_str = f"{float(early_pol):.4f}" if early_pol is not None else "N/A"
     act_pol = act.get("actual_full_polarization")
     if act.get("has_future_replies") and act_pol is not None:
-        act_pol_str = f"{float(act_pol):.4f} (future_only, t > K)"
+        act_mode = str(act.get("actual_full_polarization_mode") or "future_only")
+        act_pol_str = f"{float(act_pol):.4f} ({act_mode}, t > K)"
     else:
         act_pol_str = "N/A (chua co binh luan t > K)"
     lines.extend(
