@@ -69,3 +69,58 @@ def test_classification_and_binary_metrics_and_trajectory_aggregation() -> None:
     assert agg["large_ge_50"]["count"] == 4
     assert agg["large_ge_50"]["escalating_rate"] == 0.75
     assert any(pt["k"] == 50 and pt["n"] == 4 for pt in agg["large_ge_50"]["milestones"])
+
+
+def test_length_sorted_mdeberta_nli_preserves_alignment(monkeypatch) -> None:
+    import sys
+    import types
+    import torch
+    from scripts.eval_large_post_topic import _score_batch_mdeberta_nli
+
+    class _FakeTok:
+        def __call__(self, premises, hyps, **kwargs):
+            # Different contexts prefer different candidates so row swaps immediately fail assertions.
+            scores = []
+            for p, h in zip(premises, hyps):
+                s = 2.0 if (("sports" in p.lower() and "Sports" in h) or ("finance" in p.lower() and "Finance" in h) or ("tech" in p.lower() and "Tech" in h)) else -2.0
+                scores.append(s)
+            return {"input_ids": torch.tensor(scores, dtype=torch.float32).unsqueeze(1)}
+
+    class _FakeCfg:
+        label2id = {"entailment": 0, "neutral": 1, "contradiction": 2}
+
+    class _FakeModel:
+        config = _FakeCfg()
+
+        def to(self, dev):
+            return self
+
+        def eval(self):
+            return self
+
+        def __call__(self, **enc):
+            sig = enc["input_ids"][:, 0]
+            logits = torch.stack([sig, torch.zeros_like(sig), -sig], dim=-1)
+            return types.SimpleNamespace(logits=logits)
+
+    fake_tf = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **k: _FakeTok()),
+        AutoModelForSequenceClassification=types.SimpleNamespace(from_pretrained=lambda *a, **k: _FakeModel()),
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_tf)
+
+    contexts = [
+        "short sports clip",
+        "much longer finance market macroeconomics discussion thread with many tokens",
+        "medium length tech software engineering post",
+    ]
+    cands = [
+        {"id": "sp", "label": "Sports"},
+        {"id": "fn", "label": "Finance"},
+        {"id": "tc", "label": "Tech"},
+    ]
+    probs, _ = _score_batch_mdeberta_nli(
+        contexts, cands, lang="en", device=torch.device("cpu"), batch_size=2, max_length=160, allow_download=False
+    )
+    assert probs.shape == (3, 3)
+    assert list(np.argmax(probs, axis=1)) == [0, 1, 2]

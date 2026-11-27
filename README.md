@@ -154,6 +154,15 @@ python -m scripts.compute_kappa --input data/interim/human_audit_vi_120.csv --al
 python -m scripts.audit_vn_50_trees --evaluate --allow-single-gold --audit-csv data/interim/human_audit_vn_30_trees.csv --output-json results/results_human_audit_vn_30_trees.json
 ```
 
+### Đánh giá Mở rộng: Chủ đề Zero-Shot & Động lực Bài Lớn (`results_large_post_topic.json`)
+
+```bash
+python -m scripts.eval_large_post_topic --batch-size 128 --max-length 160
+```
+
+- **Phân loại Chủ đề Zero-Shot PHEME ($N=2{,}664$, 9 sự kiện thật):** `mDeBERTa-v3-XNLI` GPU FP16 đạt `58.00%` Acc (`Macro-F1 = 0.4424`, `Weighted-F1 = 0.6655`, `Top-2 = 71.55%`) trên toàn cohort và `70.36%` Acc (`Top-2 = 79.64%`) trên Test-334 — vượt xa `Lexical N-gram` (`43.88%`) và `RoBERTa Cosine` (`36.90%`).
+- **Quỹ đạo Bài Lớn & Cảnh báo Sớm $K=20$ (VN Test, $N=225$):** Các chuỗi lớn ($\ge 50$ bình luận) leo thang phân cực mạnh hơn chuỗi nhỏ (`37.96%` vs `20.00%` trên PHEME; `20.07%` vs `14.22%` trên VN). Từ tiền tố $K=20$, **`SBiFAGAT`** dẫn đầu toàn diện phát hiện sớm **High Future Polarization ($\ge Q_{75}^{\text{train}}$)** với `ROC-AUC = 0.6600`, `PR-AUC = 0.3928`, `F1 = 0.4397` (vượt `Ridge` `0.6234 / 0.3607`), đồng thời dẫn đầu `PR-AUC` cho cảnh báo `Large >= 50` (`0.6769`) và `Viral >= 100` (`0.3911`) (xem `results/figures/vn/fig6_large_post_topic_trajectory.{pdf,svg}`).
+
 ---
 
 ## 4. Quy ước Làm việc Nhóm (Git & Jira)

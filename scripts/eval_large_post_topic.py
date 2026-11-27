@@ -283,15 +283,20 @@ def _score_batch_mdeberta_nli(
             pair_hyps.append(hyp)
 
     use_amp = device.type == "cuda"
-    diffs: list[np.ndarray] = []
     total_pairs = len(pair_premises)
+    # Length-sorted dynamic batching minimizes Transformer O(L^2) padding overhead without changing logits.
+    order = sorted(range(total_pairs), key=lambda i: len(pair_premises[i]) + len(pair_hyps[i]))
+    sorted_premises = [pair_premises[i] for i in order]
+    sorted_hyps = [pair_hyps[i] for i in order]
+
+    diffs_sorted: list[np.ndarray] = []
     next_pct = 25
     t0 = time.perf_counter()
     with torch.no_grad():
         for start in range(0, total_pairs, batch_size):
             enc = tok(
-                pair_premises[start : start + batch_size],
-                pair_hyps[start : start + batch_size],
+                sorted_premises[start : start + batch_size],
+                sorted_hyps[start : start + batch_size],
                 padding=True,
                 truncation=True,
                 max_length=max_length,
@@ -301,7 +306,7 @@ def _score_batch_mdeberta_nli(
             with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                 logits = model(**enc).logits.float()
             diff = (logits[:, ent_idx] - logits[:, con_idx]).detach().cpu().numpy()
-            diffs.append(diff)
+            diffs_sorted.append(diff)
             done = min(total_pairs, start + batch_size)
             pct = (100 * done) // max(1, total_pairs)
             if pct >= next_pct:
@@ -313,7 +318,9 @@ def _score_batch_mdeberta_nli(
                     next_pct += 25
     ms_per_post = ((time.perf_counter() - t0) * 1000.0) / max(1, n_posts)
 
-    diff_mat = np.concatenate(diffs).reshape(n_posts, n_cands)
+    diff_arr = np.empty(total_pairs, dtype=np.float32)
+    diff_arr[np.asarray(order, dtype=np.int64)] = np.concatenate(diffs_sorted).astype(np.float32)
+    diff_mat = diff_arr.reshape(n_posts, n_cands)
     probs = F.softmax(torch.from_numpy(diff_mat) / 1.5, dim=-1).numpy()
 
     del model
