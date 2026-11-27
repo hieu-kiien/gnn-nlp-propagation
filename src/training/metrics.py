@@ -12,6 +12,8 @@ from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import accuracy_score, f1_score, r2_score, roc_auc_score
 from torch import Tensor
 
+from src.models.baselines import POLAR_LOGVAR_BOUNDS, SIZE_LOGVAR_BOUNDS
+
 
 def compute_multitask_loss(
     outputs: dict[str, Tensor],
@@ -76,8 +78,8 @@ def compute_multitask_loss(
 
     if lambda_uncertainty > 0.0 and "size_logvar" in outputs and "polar_logvar" in outputs:
         # Seitzer et al. (ICLR 2022) beta-NLL with detached residuals so uncertainty cannot corrupt means
-        s_lv = outputs["size_logvar"].view(-1).clamp(-6.0, 3.0)
-        p_lv = outputs["polar_logvar"].view(-1).clamp(-6.0, 3.0)
+        s_lv = outputs["size_logvar"].view(-1).clamp(*SIZE_LOGVAR_BOUNDS)
+        p_lv = outputs["polar_logvar"].view(-1).clamp(*POLAR_LOGVAR_BOUNDS)
         err_size_sq = (y_size_pred.detach() - y_size) ** 2
         err_polar_sq = (y_polar_pred.detach() - y_polar) ** 2
         w_s = torch.exp(float(beta_nll) * s_lv).detach() if beta_nll > 0.0 else 1.0

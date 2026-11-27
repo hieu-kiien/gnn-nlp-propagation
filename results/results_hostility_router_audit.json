@@ -1,0 +1,117 @@
+{
+  "is_real_data": true,
+  "provenance_note": "Evaluated strictly on audited VN pairs (pilot_20 + test_120 = 140 pairs; no raw text or machine-key rows exported).",
+  "hostility_gate_threshold": 0.5,
+  "vn_140_router_stats": {
+    "hostility_gate_threshold": 0.5,
+    "total_pairs": 140,
+    "gated_count": 53,
+    "rerouted_count": 1
+  },
+  "vn_120_router_stats": {
+    "hostility_gate_threshold": 0.5,
+    "total_pairs": 120,
+    "gated_count": 47,
+    "rerouted_count": 1
+  },
+  "vn_140_hostile_quadrants": {
+    "before": {
+      "total_pairs": 140,
+      "support_uncivil": {
+        "count": 7,
+        "correct_count": 1,
+        "accuracy": 0.14285714285714285,
+        "oppose_count": 4,
+        "oppose_rate": 0.5714285714285714,
+        "mean_s_uv": -0.24947457142857146
+      },
+      "oppose_uncivil": {
+        "count": 4,
+        "correct_count": 2,
+        "accuracy": 0.5,
+        "oppose_count": 2,
+        "oppose_rate": 0.5,
+        "mean_s_uv": -0.0744725
+      },
+      "all_uncivil_count": 11,
+      "rerouted_third_party_count": 0
+    },
+    "after": {
+      "total_pairs": 140,
+      "support_uncivil": {
+        "count": 7,
+        "correct_count": 1,
+        "accuracy": 0.14285714285714285,
+        "oppose_count": 4,
+        "oppose_rate": 0.5714285714285714,
+        "mean_s_uv": -0.24947457142857146
+      },
+      "oppose_uncivil": {
+        "count": 4,
+        "correct_count": 2,
+        "accuracy": 0.5,
+        "oppose_count": 2,
+        "oppose_rate": 0.5,
+        "mean_s_uv": -0.0744725
+      },
+      "all_uncivil_count": 11,
+      "rerouted_third_party_count": 1
+    }
+  },
+  "vn_120_test_overall": {
+    "before": {
+      "num_samples": 120,
+      "accuracy": 0.4,
+      "macro_f1": 0.37602240896358546,
+      "weighted_accuracy": 0.2479123540622844,
+      "weighted_macro_f1": 0.23242523923468397,
+      "cohen_kappa_unweighted": 0.09999999999999998,
+      "pearson_r": 0.25529097797484873,
+      "spearman_r": 0.2726413068309404,
+      "confusion_matrix": [
+        [
+          28,
+          17,
+          17
+        ],
+        [
+          10,
+          11,
+          14
+        ],
+        [
+          2,
+          12,
+          9
+        ]
+      ]
+    },
+    "after": {
+      "num_samples": 120,
+      "accuracy": 0.4,
+      "macro_f1": 0.37556696779997756,
+      "weighted_accuracy": 0.2479123540622844,
+      "weighted_macro_f1": 0.23245864698317184,
+      "cohen_kappa_unweighted": 0.09746161078031967,
+      "pearson_r": 0.19293712548123432,
+      "spearman_r": 0.23234132193043022,
+      "confusion_matrix": [
+        [
+          28,
+          17,
+          17
+        ],
+        [
+          10,
+          11,
+          14
+        ],
+        [
+          3,
+          11,
+          9
+        ]
+      ]
+    }
+  }
+}

@@ -1233,12 +1233,14 @@ class HostilityGatedTargetRouter:
                 and self.nli_scorer is not None
                 and hasattr(self.nli_scorer, "_score_premise_hypothesis")
             ):
+                u_clip = u_txt[:600]
+                v_clip = v_txt[:600]
                 if self.lang == "en":
-                    premise = f"Parent comment: {u_txt}\nReply: {v_txt}"
+                    premise = f"Parent comment: {u_clip}\nReply: {v_clip}"
                     h_3p = "The reply agrees with the parent commenter while criticizing a third party."
                     h_direct = "The reply directly attacks or disagrees with the parent commenter."
                 else:
-                    premise = f"Bình luận trước: {u_txt}\nPhản hồi: {v_txt}"
+                    premise = f"Bình luận trước: {u_clip}\nPhản hồi: {v_clip}"
                     h_3p = "Phản hồi này đồng tình với người bình luận trước nhưng chỉ trích một bên thứ ba."
                     h_direct = "Phản hồi này phản đối hoặc công kích trực tiếp người bình luận trước."
                 eff_len = _effective_max_length(

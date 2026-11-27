@@ -77,6 +77,7 @@ Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional
 │   ├── run_ablation.py         # Thực nghiệm cắt bỏ thành phần (+ BiEdgeGATv2) & quét K cửa sổ tương lai cố định
 │   ├── eval_large_post_topic.py # Đánh giá Zero-Shot Topic (9 sự kiện PHEME + VN), trajectory đa mốc & early-warning K=20
 │   ├── eval_uncertainty_abstention.py # Đánh giá bất định beta-NLL & Selective Abstention (Risk-Coverage) 5 seeds
+│   ├── eval_hostility_router_audit.py # Kiểm chứng HostilityGatedTargetRouter trên 140 cặp kiểm định VN (zero-PII)
 │   └── run_upfd_extension.py   # Thực nghiệm chuyển giao cấu trúc phi văn bản trên UPFD (Accuracy, Macro-F1, ROC-AUC)
 ├── src/
 │   ├── data/                   # schema.py, pheme_loader.py, arctic_shift_vn.py, pyg_dataset.py, user_network.py
@@ -162,6 +163,7 @@ python -m scripts.eval_large_post_topic --batch-size 128 --max-length 160
 
 - **Phân loại Chủ đề Zero-Shot PHEME ($N=2{,}664$, 9 sự kiện thật):** `mDeBERTa-v3-XNLI` GPU FP16 đạt `58.00%` Acc (`Macro-F1 = 0.4424`, `Weighted-F1 = 0.6655`, `Top-2 = 71.55%`) trên toàn cohort và `70.36%` Acc (`Top-2 = 79.64%`) trên Test-334 — vượt xa `Lexical N-gram` (`43.88%`) và `RoBERTa Cosine` (`36.90%`).
 - **Quỹ đạo Bài Lớn & Cảnh báo Sớm $K=20$ (VN Test, $N=225$):** Các chuỗi lớn ($\ge 50$ bình luận) leo thang phân cực mạnh hơn chuỗi nhỏ (`37.96%` vs `20.00%` trên PHEME; `20.07%` vs `14.22%` trên VN). Từ tiền tố $K=20$, **`SBiFAGAT`** dẫn đầu toàn diện phát hiện sớm **High Future Polarization ($\ge Q_{75}^{\text{train}}$)** với `ROC-AUC = 0.6600`, `PR-AUC = 0.3928`, `F1 = 0.4397` (vượt `Ridge` `0.6234 / 0.3607`), đồng thời dẫn đầu `PR-AUC` cho cảnh báo `Large >= 50` (`0.6769`) và `Viral >= 100` (`0.3911`) (xem `results/figures/vn/fig6_large_post_topic_trajectory.{pdf,svg}`).
+- **Bất định $\beta$-NLL (`polar_logvar` $\in [-11.0, -2.0]$) & Kiểm chứng Router Thái độ Thù địch:** Sau khi mở khóa cận dưới `polar_logvar`, `SBiFAGAT` đạt xếp hạng bất định dương trên VN (`Size` $\rho = 0.328$, giảm `30.8%` MSLE tại coverage `70%`; `Polar` $\rho = 0.201$, giảm `13.5%` RMSE tại coverage `70%`, `PICP@90% = 0.893 / 0.877`; `results/results_uncertainty_abstention.json`). Kiểm chứng `HostilityGatedTargetRouter` trên `140` cặp gán nhãn VN (`results/results_hostility_router_audit.json`) cung cấp bằng chứng định lượng cho giới hạn của bộ định tuyến zero-shot/regex không tinh chỉnh trên tiếng lóng mạng xã hội.
 
 ---
 

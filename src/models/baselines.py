@@ -23,6 +23,9 @@ from torch import Tensor
 from torch_geometric.nn import FAConv, GATv2Conv, GCNConv, global_mean_pool
 from torch_geometric.utils import degree, dropout_edge, scatter, softmax, to_undirected
 
+SIZE_LOGVAR_BOUNDS: tuple[float, float] = (-6.0, 3.0)
+POLAR_LOGVAR_BOUNDS: tuple[float, float] = (-11.0, -2.0)
+
 
 def resolve_root_indices(data: Any, num_nodes: int) -> tuple[Tensor, Tensor]:
     """Resolve per-graph root node indices and batch assignment vector safely."""
@@ -291,11 +294,13 @@ class MultiTaskHead(nn.Module):
             "node_emb": node_emb,
         }
         if self.uncertainty_head is not None:
-            raw_logvars = -6.0 + 9.0 * torch.sigmoid(self.uncertainty_head(reg_emb.detach()))
-            size_logvar = raw_logvars[:, 0]
-            polar_logvar = raw_logvars[:, 1]
+            raw_unc = torch.sigmoid(self.uncertainty_head(reg_emb.detach()))
+            s_min, s_max = SIZE_LOGVAR_BOUNDS
+            p_min, p_max = POLAR_LOGVAR_BOUNDS
+            size_logvar = s_min + (s_max - s_min) * raw_unc[:, 0]
+            polar_logvar = p_min + (p_max - p_min) * raw_unc[:, 1]
             polar_sigma = torch.exp(0.5 * polar_logvar)
-            confidence = torch.exp(-polar_sigma / 0.25).clamp(0.0, 1.0)
+            confidence = torch.exp(-polar_sigma / 0.15).clamp(0.0, 1.0)
             result["size_logvar"] = size_logvar
             result["polar_logvar"] = polar_logvar
             result["confidence_score"] = confidence

@@ -44,6 +44,7 @@ from src.data.pyg_dataset import (  # noqa: E402
     TOTAL_NODE_FEATURE_DIM,
     load_cascade_parquet,
 )
+from src.models.baselines import POLAR_LOGVAR_BOUNDS, SIZE_LOGVAR_BOUNDS  # noqa: E402
 from src.models.sbi_fagat import SBiFAGAT  # noqa: E402
 from src.training.metrics import evaluate_predictions  # noqa: E402
 from src.training.trainer import train_and_evaluate_single_seed  # noqa: E402
@@ -134,12 +135,12 @@ def _collect_uncertainty_predictions(
             out = model(batch)
             ys_t.append(batch.y_size.view(-1).cpu().numpy())
             ys_p.append(out["y_size_pred"].view(-1).cpu().numpy())
-            s_lv = out["size_logvar"].view(-1).clamp(-6.0, 3.0)
+            s_lv = out["size_logvar"].view(-1).clamp(*SIZE_LOGVAR_BOUNDS)
             ys_sig.append(torch.exp(0.5 * s_lv).cpu().numpy())
 
             yp_t.append(batch.y_polar.view(-1).cpu().numpy())
             yp_p.append(out["y_polar_pred"].view(-1).cpu().numpy())
-            p_lv = out["polar_logvar"].view(-1).clamp(-6.0, 3.0)
+            p_lv = out["polar_logvar"].view(-1).clamp(*POLAR_LOGVAR_BOUNDS)
             yp_sig.append(torch.exp(0.5 * p_lv).cpu().numpy())
     return {
         "y_size_true": np.concatenate(ys_t),
@@ -248,6 +249,8 @@ def _run_dataset_uncertainty(
             {
                 "seed": int(seed),
                 "regression": reg_m,
+                "sigma_size_mean": float(np.mean(preds["sigma_size"])),
+                "sigma_polar_mean": float(np.mean(preds["sigma_polar"])),
                 "size_abstention": size_curve,
                 "polar_abstention": polar_curve,
             }
@@ -315,6 +318,10 @@ def _run_dataset_uncertainty(
         "n_test": len(test_ds),
         "lambda_uncertainty": lambda_uncertainty,
         "beta_nll": 0.5,
+        "size_logvar_bounds": list(SIZE_LOGVAR_BOUNDS),
+        "polar_logvar_bounds": list(POLAR_LOGVAR_BOUNDS),
+        "sigma_size_mean_std": _agg_mean_std([r["sigma_size_mean"] for r in seed_records]),
+        "sigma_polar_mean_std": _agg_mean_std([r["sigma_polar_mean"] for r in seed_records]),
         "elapsed_sec": round(elapsed, 2),
         "regression_summary": reg_summary,
         "size_abstention": _agg_curve("size_abstention"),
@@ -365,10 +372,12 @@ def _export_uncertainty_artifacts(
     output_tex.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     _configure_academic_rcparams()
-    fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.2))
+    fig, axes = plt.subplots(2, 2, figsize=(11.0, 7.2))
     panels = (
-        (axes[0], "vn", "size_abstention", "(a) VN Size Risk-Coverage (MSLE)", "Cascade Size MSLE"),
-        (axes[1], "pheme", "size_abstention", "(b) PHEME Size Risk-Coverage (MSLE)", "Cascade Size MSLE"),
+        (axes[0, 0], "vn", "size_abstention", "(a) VN Size Risk-Coverage (MSLE)", "Cascade Size MSLE"),
+        (axes[0, 1], "pheme", "size_abstention", "(b) PHEME Size Risk-Coverage (MSLE)", "Cascade Size MSLE"),
+        (axes[1, 0], "vn", "polar_abstention", "(c) VN Polarization Risk-Coverage (RMSE)", "Polarization RMSE"),
+        (axes[1, 1], "pheme", "polar_abstention", "(d) PHEME Polarization Risk-Coverage (RMSE)", "Polarization RMSE"),
     )
     for ax, ds_k, t_k, title, ylabel in panels:
         c = results["datasets"][ds_k][t_k]
@@ -386,7 +395,7 @@ def _export_uncertainty_artifacts(
         ax.set_xlabel("Coverage (% Retained Predictions)")
         ax.set_ylabel(ylabel)
         ax.set_title(title)
-        ax.legend(loc="upper right", frameon=False, fontsize=8.5)
+        ax.legend(loc="best", frameon=False, fontsize=8.5)
         ax.grid(True, alpha=0.25, linestyle="--")
 
     fig.tight_layout()
