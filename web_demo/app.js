@@ -2364,7 +2364,12 @@
     const desc = $("social-guide-desc");
     if (!box) return;
     if (ttl) {
-      ttl.textContent = `Đã đọc tiêu đề từ ${articleMeta?.hostname || "trang báo"} — hãy dán bình luận bạn đọc để phân tích`;
+      const rawTitle = String(articleMeta?.title || "").trim();
+      const shortTitle = rawTitle.length > 72 ? `${rawTitle.slice(0, 71).trim()}…` : rawTitle;
+      const hostLabel = articleMeta?.hostname || "trang báo";
+      ttl.textContent = shortTitle
+        ? `Đã đọc tiêu đề từ ${hostLabel}: "${shortTitle}" — hãy dán bình luận bạn đọc để phân tích`
+        : `Đã đọc tiêu đề từ ${hostLabel} — hãy dán bình luận bạn đọc để phân tích`;
     }
     if (desc) {
       desc.textContent =
@@ -2444,8 +2449,16 @@
       if (progBox) progBox.hidden = true;
       if (err?.payload?.needs_manual_comments && err.payload.article_meta) {
         const am = err.payload.article_meta;
+        const rawTitle = String(am.title || "").trim();
+        const shortTitle = rawTitle.length > 72 ? `${rawTitle.slice(0, 71).trim()}…` : rawTitle;
         if ($("sb-title") && am.title) $("sb-title").value = am.title;
         if ($("sb-root-text") && am.description) $("sb-root-text").value = am.description;
+        if ($("sb-raw-lines")) {
+          if (shortTitle) {
+            $("sb-raw-lines").placeholder =
+              `Đã giữ sẵn tiêu đề: "${shortTitle}" — chỉ cần Ctrl+V dán bình luận bạn đọc vào đây rồi bấm Phân tích...`;
+          }
+        }
         if ($("paste-drawer")) $("paste-drawer").open = true;
         if ($("sb-reddit-url")) $("sb-reddit-url").value = "";
         showNewsMetaGuide(am, err.message);
