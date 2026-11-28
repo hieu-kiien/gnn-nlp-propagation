@@ -82,10 +82,10 @@
                 <div class="link-hero-row">
                   <input
                     id="sb-reddit-url"
-                    type="url"
+                    type="text"
                     class="text-input link-hero-input"
-                    aria-label="Dán link bài viết cần phân tích"
-                    placeholder="Dán link bài viết (ví dụ: https://www.reddit.com/r/vozforums/comments/...)">
+                    aria-label="Dán link bài báo VnExpress hoặc link Reddit"
+                    placeholder="Dán link bài báo VnExpress hoặc link Reddit (/comments/...) vào đây...">
                   <button type="submit" id="btn-run-custom" class="btn-primary btn-hero">Phân tích</button>
                 </div>
 
@@ -93,21 +93,32 @@
                   <div>
                     <strong id="social-guide-title">Facebook / Threads yêu cầu đăng nhập nên công cụ không tự lấy link được</strong>
                     <p class="social-guide-text" id="social-guide-desc">
-                      Hãy bôi đen bài viết + bình luận trên trang đó, nhấn <code>Ctrl+C</code> rồi dán vào mục bên dưới.
+                      Hãy bôi đen bài viết + bình luận trên trang đó, nhấn <code>Ctrl+C</code> rồi dán vào mục bên dưới (hoặc dùng trình dựng nhánh để chỉ rõ ai trả lời ai).
                     </p>
                   </div>
                   <button type="button" id="btn-open-paste-drawer" class="btn-outline btn-sm">Mở ô dán nội dung</button>
                 </div>
 
                 <details id="paste-drawer" class="inline-alt-drawer">
-                  <summary class="inline-alt-summary">Hoặc dán trực tiếp nội dung / tải tệp (.json, .jsonl, .txt)</summary>
+                  <summary class="inline-alt-summary">Hoặc dán trực tiếp nội dung / dựng cây trả lời / tải tệp (.json, .txt)</summary>
                   <div class="inline-alt-body">
+                    <div class="reply-builder-row" aria-label="Thêm nhanh bình luận theo nhánh">
+                      <select id="rb-parent-select" class="select-control rb-select" aria-label="Chọn bình luận được trả lời">
+                        <option value="root">Trả lời: Bài gốc</option>
+                      </select>
+                      <input
+                        id="rb-text-input"
+                        type="text"
+                        class="text-input rb-input"
+                        placeholder="Gõ nhanh 1 bình luận để nối đúng nhánh trả lời...">
+                      <button type="button" id="btn-rb-add" class="btn-outline btn-sm">+ Thêm vào cây</button>
+                    </div>
                     <textarea
                       id="sb-raw-lines"
                       class="textarea-input hero-textarea"
                       rows="4"
                       aria-label="Dán nội dung bài viết và bình luận"
-                      placeholder="Dán bài gốc và các bình luận (dòng đầu là bài gốc, các dòng sau là bình luận)..."></textarea>
+                      placeholder="Dán bài gốc và các bình luận (hỗ trợ @Tên để giữ đúng nhánh trả lời)..."></textarea>
                     <div class="mega-file-row">
                       <input id="mega-json-file" type="file" accept=".json,.jsonl,.txt,application/json,text/plain" aria-label="Tải tệp JSON hoặc TXT" class="file-input-control">
                       <button type="button" id="btn-mega-clear-file" class="btn-outline btn-sm" hidden>Bỏ tệp</button>
@@ -295,6 +306,7 @@
                   <div class="fc-box-val tabular"><span id="kpi-actual-replies">—</span> <small>BL</small></div>
                 </div>
               </div>
+              <p class="kpi-sub" id="forecast-honesty-note" hidden>Văn bản thiếu giờ đăng thật nên tắt dự báo quy mô tương lai.</p>
             </article>
 
             <article class="card verdict-card">
@@ -370,7 +382,13 @@
                 <span class="legend-item"><span class="swatch swatch-oppose"></span>Phản đối</span>
                 <span class="legend-item"><span class="swatch swatch-neutral"></span>Trung lập</span>
                 <span class="legend-item"><span class="swatch swatch-relink"></span>Nhánh nối lại</span>
+                <span class="pill" id="topology-status-pill" hidden>—</span>
               </div>
+
+              <details id="gnn-proof-drawer" class="gnn-proof-drawer" hidden>
+                <summary class="gnn-proof-summary">Kiểm chứng: GNN có thực sự dùng cấu trúc cây?</summary>
+                <div id="gnn-proof-body" class="gnn-proof-body"></div>
+              </details>
 
               <div id="hotspot-branch-bar" class="hotspot-branch-bar" hidden></div>
 

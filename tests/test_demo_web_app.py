@@ -585,3 +585,139 @@ def test_reddit_shortlink_and_arctic_posts_ids_primary(monkeypatch: pytest.Monke
     assert not any(u.endswith("/posts/search") for u in called_urls)
     assert post["title"] == "Bai VN lon"
     assert len(comments) == 1
+
+
+def test_vnexpress_live_adapter_reddit_share_and_gnn_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify VnExpress multi-level reply parser, Reddit /s/ redirect + SSRF guard, @mention recovery, and GNN probe."""
+    import torch
+    from scripts import predict_live_thread as plt_mod
+    from scripts.demo_web_app import parse_sandbox_raw_text
+    from src.models.sbi_fagat import SBiFAGAT
+
+    assert plt_mod.is_vnexpress_url("https://vnexpress.net/dau-tu-chung-khoan-5149672.html") is True
+    assert plt_mod.is_vnexpress_url("https://www.reddit.com/r/vozforums/comments/1ndfgzf/") is False
+
+    # 1. Mock Reddit /s/ redirect resolver (302 -> /comments/1ndfgzf/ + SSRF rejection)
+    class _RedirectResp:
+        def __init__(self, status_code: int, headers: dict[str, str] | None = None, text: str = "") -> None:
+            self.status_code = status_code
+            self.headers = headers or {}
+            self.text = text
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {}
+
+    def _mock_share_ok(url: str, allow_redirects: bool = False, timeout: int = 8, headers: Any = None):
+        del allow_redirects, timeout, headers
+        if "/s/htBgMuGWSv" in url:
+            return _RedirectResp(302, {"location": "/r/vozforums/comments/1ndfgzf/title_slug/"})
+        return _RedirectResp(200)
+
+    monkeypatch.setattr(plt_mod.requests, "get", _mock_share_ok)
+    assert plt_mod._extract_post_id_from_url("https://www.reddit.com/r/vozforums/s/htBgMuGWSv") == "1ndfgzf"
+
+    def _mock_share_ssrf(url: str, allow_redirects: bool = False, timeout: int = 8, headers: Any = None):
+        del url, allow_redirects, timeout, headers
+        return _RedirectResp(302, {"location": "http://127.0.0.1:8765/internal"})
+
+    monkeypatch.setattr(plt_mod.requests, "get", _mock_share_ssrf)
+    with pytest.raises(ValueError):
+        plt_mod._extract_post_id_from_url("https://www.reddit.com/r/vozforums/s/htBgMuGWSv")
+
+    # 2. Mock VnExpress nested article + get + getreplay
+    def _mock_vne_get(url: str, params: Any = None, headers: Any = None, timeout: int = 15, allow_redirects: bool = True):
+        del headers, timeout, allow_redirects
+
+        class _VneResp:
+            status_code = 200
+            headers: dict[str, str] = {}
+
+            def __init__(self, text: str = "", json_data: Any = None) -> None:
+                self.text = text
+                self._json = json_data or {}
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> Any:
+                return self._json
+
+        if "index/getreplay" in url:
+            return _VneResp(
+                json_data={
+                    "data": {
+                        "items": [
+                            {
+                                "comment_id": 202,
+                                "parent_id": 101,
+                                "content": "Phản đối ý kiến trên vì chưa hợp lý.",
+                                "userid": 9902,
+                                "creation_time": 1760000200,
+                            }
+                        ]
+                    }
+                }
+            )
+        if "usi-saas.vnexpress.net/index/get" in url:
+            return _VneResp(
+                json_data={
+                    "data": {
+                        "total": 1,
+                        "totalitem": 2,
+                        "items": [
+                            {
+                                "comment_id": 101,
+                                "parent_id": 101,
+                                "content": "Đồng ý nên thử nghiệm trước.",
+                                "userid": 9901,
+                                "creation_time": 1760000100,
+                                "replys": {"total": 1, "items": []},
+                            }
+                        ],
+                    }
+                }
+            )
+        return _VneResp(text='<title>Tranh luận chính sách mới - VnExpress</title><meta name="description" content="Mô tả bài viết thử nghiệm."/>')
+
+    monkeypatch.setattr(plt_mod.requests, "get", _mock_vne_get)
+    vne_post, vne_cmts = plt_mod.fetch_url_thread("https://vnexpress.net/tranh-luan-chinh-sach-moi-5149672.html")
+    assert vne_post["title"] == "Tranh luận chính sách mới"
+    assert len(vne_cmts) == 2
+    assert vne_cmts[0]["parent_id"] == "t3_vne_5149672"
+    assert vne_cmts[1]["parent_id"] == "t1_101"
+
+    # 3. Deterministic explicit @mention reply recovery in parse_sandbox_raw_text
+    raw_fb = (
+        "minhanh.99 · 3 giờ\n"
+        "Không đồng ý tăng phí gửi xe.\n"
+        "tuan_dev · 2 giờ\n"
+        "@minhanh.99 Đồng ý với bạn ở điểm này.\n"
+        "hong_ha · 1 giờ\n"
+        "Tôi thấy bình thường.\n"
+    )
+    parsed = parse_sandbox_raw_text(raw_fb, post_id="p1", base_ts=1763400000.0)
+    assert len(parsed) == 3
+    assert parsed[0]["parent_id"] == "t3_p1"
+    assert parsed[1]["parent_id"] == parsed[0]["fullname"]
+    assert parsed[2]["parent_id"] == "t3_p1"
+
+    # 4. GNN counterfactual structural probe on real tensor
+    from torch_geometric.data import Data
+
+    d_probe = Data(
+        x=torch.zeros((3, 778), dtype=torch.float32),
+        edge_index_td=torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        edge_index_bu=torch.tensor([[1, 2], [0, 1]], dtype=torch.long),
+        edge_attr=torch.tensor([[0.6, 0.1], [-0.8, 0.2]], dtype=torch.float32),
+        cascade_stats=torch.zeros((1, 8), dtype=torch.float32),
+    )
+    gnn = SBiFAGAT(in_dim=778, hidden_dim=16, edge_dim=2, use_cascade_stats=True, predict_uncertainty=False)
+    probe_res = plt_mod.compute_gnn_structural_probe(gnn, d_probe, checkpoint_loaded=True)
+    assert probe_res["available"] is True
+    assert probe_res["has_multi_hop"] is True
+    assert probe_res["multi_hop_edges"] == 1
+    assert "delta_polar_structure" in probe_res and "delta_polar_stance" in probe_res
+    assert plt_mod.compute_gnn_structural_probe(gnn, d_probe, checkpoint_loaded=False)["available"] is False

@@ -361,23 +361,48 @@
       }
     }
 
+    const topo = payload.input_topology || {};
+    const hasRealTs = topo.has_real_timestamps !== false;
     const predReplies = Number(fc.predicted_total_replies || 0);
     const actReplies = Number(fc.actual_total_replies || 0);
-    $("kpi-pred-replies").textContent = `~${predReplies.toFixed(0)}`;
     $("kpi-actual-replies").textContent = fmtInt(actReplies);
 
     const proofBadge = $("forecast-proof-badge");
-    if (proofBadge) {
-      if (fc.has_future_replies && actReplies > 0) {
-        const diff = Math.round(predReplies - actReplies);
-        const absDiff = Math.abs(diff);
-        proofBadge.textContent = absDiff <= 8 ? `Khớp sát (lệch ${absDiff} BL)` : `Dự báo vs Thực tế: ${diff >= 0 ? "+" : ""}${diff} BL`;
-        proofBadge.className = `badge-tag ${absDiff <= 8 ? "badge-support" : "badge-neutral"}`;
-      } else {
-        proofBadge.textContent = `Đang xem ${fmtInt(fc.k_observed ?? actReplies)} bình luận`;
+    const honestyNote = $("forecast-honesty-note");
+    if (!hasRealTs) {
+      $("kpi-pred-replies").textContent = "—";
+      if (proofBadge) {
+        proofBadge.textContent = "Chưa có giờ đăng";
         proofBadge.className = "badge-tag badge-neutral";
       }
+      if (honestyNote) honestyNote.hidden = false;
+    } else {
+      $("kpi-pred-replies").textContent = `~${predReplies.toFixed(0)}`;
+      if (honestyNote) honestyNote.hidden = true;
+      if (proofBadge) {
+        if (fc.has_future_replies && actReplies > 0) {
+          const diff = Math.round(predReplies - actReplies);
+          const absDiff = Math.abs(diff);
+          proofBadge.textContent = absDiff <= 8 ? `Khớp sát (lệch ${absDiff} BL)` : `Dự báo vs Thực tế: ${diff >= 0 ? "+" : ""}${diff} BL`;
+          proofBadge.className = `badge-tag ${absDiff <= 8 ? "badge-support" : "badge-neutral"}`;
+        } else {
+          proofBadge.textContent = `Đang xem ${fmtInt(fc.k_observed ?? actReplies)} bình luận`;
+          proofBadge.className = "badge-tag badge-neutral";
+        }
+      }
     }
+
+    const topoPill = $("topology-status-pill");
+    if (topoPill) {
+      if (topo.source_label_vi) {
+        topoPill.textContent = topo.source_label_vi;
+        topoPill.className = `pill ${topo.mode === "flat_star" ? "badge-relink" : "badge-support"}`;
+        topoPill.hidden = false;
+      } else {
+        topoPill.hidden = true;
+      }
+    }
+    renderGnnStructuralProof(payload);
 
     const displayPolar = fc.predicted_polarization_score ?? fc.early_y_polar;
     const tier = polarTierInfo(displayPolar);
@@ -430,6 +455,42 @@
     $("root-text-display").textContent = meta.root_text || "—";
   }
 
+  function renderGnnStructuralProof(payload) {
+    const drawer = $("gnn-proof-drawer");
+    const body = $("gnn-proof-body");
+    if (!drawer || !body) return;
+    const probe = payload?.gnn_structural_probe;
+    if (!probe || !probe.available) {
+      drawer.hidden = true;
+      return;
+    }
+    drawer.hidden = false;
+    clearEl(body);
+
+    const p0 = Math.round(Number(probe.base_polar || 0) * 100);
+    const pFlat = Math.round(Number(probe.flat_polar || 0) * 100);
+    const pZero = Math.round(Number(probe.zero_stance_polar || 0) * 100);
+
+    const lead = probe.has_multi_hop
+      ? `Mô hình đang xét ${fmtInt(probe.multi_hop_edges)}/${fmtInt(probe.total_gnn_edges)} cạnh đối đáp giữa bình luận với nhau (không phải phẳng 1 tầng).`
+      : "Bài hiện tại chỉ có bình luận trực tiếp về bài gốc (1 tầng), nên phá cấu trúc không tạo chênh lệch.";
+    body.appendChild(el("p", { className: "muted-note" }, lead));
+
+    const grid = el("div", { className: "gnn-proof-grid" });
+    const cards = [
+      ["Cây thật (SBi-FAGAT)", `${p0} / 100`, `${fmtNum(probe.base_replies, 0)} BL`],
+      ["Khi duỗi phẳng về gốc", `${pFlat} / 100`, `${fmtSigned(probe.delta_polar_structure, 3)} điểm`],
+      ["Khi xóa nhãn tán/phản đối", `${pZero} / 100`, `${fmtSigned(probe.delta_polar_stance, 3)} điểm`],
+    ];
+    for (const [k, v, sub] of cards) {
+      const cell = el("div", { className: "kv-cell" });
+      cell.appendChild(el("div", { className: "kv-k" }, k));
+      cell.appendChild(el("div", { className: "kv-v tabular" }, `${v} (${sub})`));
+      grid.appendChild(cell);
+    }
+    body.appendChild(grid);
+  }
+
   function renderContractionStrip(payload) {
     const strip = $("contraction-strip");
     const stats = payload.junk_filter_stats;
@@ -437,8 +498,16 @@
       strip.hidden = true;
       return;
     }
+    const totalActivity =
+      Number(stats.dropped_leaves || 0) +
+      Number(stats.contracted_nodes || 0) +
+      Number(stats.relinked_edges || 0);
+    if (totalActivity === 0) {
+      strip.hidden = true;
+      return;
+    }
     strip.hidden = false;
-    $("contraction-mode-tag").textContent = `mode: ${stats.mode || "contract"}`;
+    $("contraction-mode-tag").textContent = stats.mode === "prune" ? "cắt nhánh" : "nối nhánh";
     $("cs-raw").textContent = fmtInt(stats.raw_comments);
     $("cs-kept").textContent = fmtInt(stats.kept_comments);
     $("cs-dropped").textContent = fmtInt(stats.dropped_leaves);
@@ -447,8 +516,8 @@
     const plainSum = $("contraction-plain-summary");
     if (plainSum) {
       plainSum.textContent =
-        `Từ ${fmtInt(stats.raw_comments)} bình luận gốc, hệ thống dọn ${fmtInt(stats.dropped_leaves)} bình luận rác ` +
-        `và tự động nối lại ${fmtInt(stats.relinked_edges)} nhánh trả lời bên dưới để không đứt mạch tranh luận.`;
+        `Đã dọn ${fmtInt(stats.dropped_leaves)} bình luận rác ` +
+        `và tự động nối lại ${fmtInt(stats.relinked_edges)} nhánh trả lời bên dưới.`;
     }
 
     const pills = $("preserved-stances-pills");
@@ -1967,19 +2036,21 @@
           }
           if (st.status === "cancelled" || st.status === "failed") {
             setMegaButtonsBusy(false);
+            if (progBox) progBox.hidden = true;
             if (st.error) showError(st.error);
-            if (progLbl) progLbl.textContent = st.status === "cancelled" ? "Đã hủy." : "Không thể tải hoặc xử lý bài viết.";
             return;
           }
           state.megaPollTimer = setTimeout(poll, 450);
         } catch (err) {
           setMegaButtonsBusy(false);
+          if (progBox) progBox.hidden = true;
           showError(err.message);
         }
       };
       await poll();
     } catch (err) {
       setMegaButtonsBusy(false);
+      if (progBox) progBox.hidden = true;
       showError(err.message);
     }
   }
@@ -2077,6 +2148,7 @@
 
     rawLinesEl.addEventListener("input", () => {
       rawLinesEl.removeAttribute("aria-invalid");
+      showError("");
       const trimmed = rawLinesEl.value.trim();
       const socialInText = detectUnsupportedSocialUrl(trimmed);
       if (socialInText) {
@@ -2087,9 +2159,43 @@
     });
     urlInputEl.addEventListener("input", () => {
       urlInputEl.removeAttribute("aria-invalid");
+      showError("");
       const socialPlatform = detectUnsupportedSocialUrl(urlInputEl.value);
       showSocialUrlGuide(socialPlatform);
     });
+
+    const rbParentSel = $("rb-parent-select");
+    const rbTextInput = $("rb-text-input");
+    const rbAddBtn = $("btn-rb-add");
+    let rbSeq = 0;
+    const appendReplyNode = () => {
+      if (!rbTextInput || !rbParentSel) return;
+      const msg = rbTextInput.value.trim();
+      if (!msg) return;
+      const parentVal = rbParentSel.value || "root";
+      const curLines = rawLinesEl.value.split(/\r?\n/).filter((ln) => ln.trim().length > 0);
+      if (curLines.length === 0) {
+        const curTitle = titleEl && titleEl.value.trim() ? titleEl.value.trim() : "Thảo luận mới từ người dùng";
+        rawLinesEl.value = `${curTitle}\n`;
+      } else if (!rawLinesEl.value.endsWith("\n")) {
+        rawLinesEl.value += "\n";
+      }
+      rbSeq += 1;
+      const cid = `c${rbSeq}`;
+      rawLinesEl.value += `${cid} (trả lời ${parentVal}): ${msg}\n`;
+      rbParentSel.appendChild(el("option", { value: cid }, `Trả lời: BL #${rbSeq} (${truncText(msg, 28)})`));
+      rbTextInput.value = "";
+      rbTextInput.focus();
+    };
+    if (rbAddBtn) rbAddBtn.addEventListener("click", appendReplyNode);
+    if (rbTextInput) {
+      rbTextInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          appendReplyNode();
+        }
+      });
+    }
     if (titleEl) {
       titleEl.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && (e.isComposing || e.keyCode === 229)) e.preventDefault();

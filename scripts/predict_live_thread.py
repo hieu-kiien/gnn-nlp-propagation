@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import html as html_lib
 import json
 import math
 import re
@@ -28,7 +29,7 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import numpy as np
 import requests
@@ -81,6 +82,22 @@ from src.nlp.topic_post_analyzer import (
 )
 
 _REDDIT_POST_ID_RE = re.compile(r"/comments/([^/?#]+)")
+_REDDIT_SHARE_PATH_RE = re.compile(r"/(?:r|u|user)/[^/?#]+/s/[A-Za-z0-9_-]{4,32}", re.IGNORECASE)
+_REDDIT_ALLOWED_HOSTS: frozenset[str] = frozenset(
+    {
+        "reddit.com",
+        "www.reddit.com",
+        "old.reddit.com",
+        "m.reddit.com",
+        "np.reddit.com",
+        "redd.it",
+        "www.redd.it",
+    }
+)
+_VNEXPRESS_URL_RE = re.compile(
+    r"^https?://(?:[a-z0-9-]+\.)?vnexpress\.net/.+-(\d{6,9})\.html(?:[?#].*)?$",
+    re.IGNORECASE,
+)
 _VALID_POST_ID_RE = re.compile(r"[A-Za-z0-9]{4,12}")
 _REQUIRED_CE_FILES: tuple[str, ...] = (
     "dual_head_weights.pt",
@@ -184,14 +201,61 @@ def _validate_reddit_post_id(post_id: str, *, source: str = "input") -> str:
     return cleaned
 
 
+def is_vnexpress_url(url: str) -> bool:
+    """Return True if URL points to a public VnExpress article page."""
+    return bool(_VNEXPRESS_URL_RE.match(str(url or "").strip()))
+
+
+def _resolve_reddit_share_url(url: str, timeout: int = 8) -> str:
+    """Resolve Reddit /r/.../s/<token> share links safely with strict host allowlist (anti-SSRF)."""
+    cur = str(url or "").strip()
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SBiFAGAT/2.1"}
+    for _hop in range(4):
+        parsed = urlparse(cur)
+        host = (parsed.hostname or "").lower()
+        if host not in _REDDIT_ALLOWED_HOSTS:
+            raise ValueError(f"Tên miền chuyển hướng không nằm trong danh sách Reddit hợp lệ: {host!r}")
+        if _REDDIT_POST_ID_RE.search(cur):
+            return cur
+        try:
+            resp = requests.get(cur, allow_redirects=False, timeout=timeout, headers=headers)
+        except Exception as exc:
+            raise ValueError(
+                "Link chia sẻ rút gọn (/s/...) của Reddit cần chuyển hướng qua reddit.com nhưng kết nối bị nhà mạng chặn "
+                "hoặc quá thời gian. Hãy mở link đó trên trình duyệt rồi copy địa chỉ đầy đủ có '/comments/<mã_bài>/', "
+                "hoặc dán link bài báo VnExpress."
+            ) from exc
+        if resp.status_code in (301, 302, 303, 307, 308):
+            loc = resp.headers.get("location") or resp.headers.get("Location")
+            if not loc:
+                break
+            cur = urljoin(cur, loc.strip())
+            continue
+        m_rel = re.search(r"https?://(?:www\.|old\.|m\.)?reddit\.com/r/[^\"'\s>]+/comments/[A-Za-z0-9]{4,12}", resp.text or "")
+        if m_rel:
+            return m_rel.group(0)
+        break
+    raise ValueError(
+        "Không tự giải mã được link chia sẻ Reddit (/s/...) này do Reddit chặn truy cập tự động. "
+        "Hãy mở link trên trình duyệt để lấy đường dẫn đầy đủ chứa '/comments/<mã_bài>/', "
+        "hoặc dán trực tiếp link bài báo VnExpress."
+    )
+
+
 def _extract_post_id_from_url(url: str) -> str:
     raw = str(url or "").strip()
     if not raw or "\\" in raw or any(ch.isspace() for ch in raw):
-        raise ValueError(f"Invalid Reddit URL or post ID: {url!r}")
+        raise ValueError("Đường dẫn hoặc mã bài viết không hợp lệ (chứa khoảng trắng hoặc ký tự lỗi).")
 
     m = _REDDIT_POST_ID_RE.search(raw)
     if m:
         return _validate_reddit_post_id(m.group(1), source=raw)
+
+    if _REDDIT_SHARE_PATH_RE.search(raw):
+        resolved = _resolve_reddit_share_url(raw)
+        m_res = _REDDIT_POST_ID_RE.search(resolved)
+        if m_res:
+            return _validate_reddit_post_id(m_res.group(1), source=resolved)
 
     if "://" in raw:
         try:
@@ -204,7 +268,11 @@ def _extract_post_id_from_url(url: str) -> str:
             pass
 
     if "/" in raw or "://" in raw or ".." in raw:
-        raise ValueError(f"Reddit URL missing valid /comments/<post_id> segment: {url!r}")
+        raise ValueError(
+            "Link chưa đúng định dạng bài viết được hỗ trợ. "
+            "Hãy dán link bài báo VnExpress (...html), link Reddit đầy đủ (/comments/<mã_bài>/), "
+            "link rút gọn redd.it/<mã_bài>, hoặc mở mục 'Hoặc dán trực tiếp nội dung'."
+        )
 
     candidate = raw[3:] if raw.startswith("t3_") else raw
     return _validate_reddit_post_id(candidate, source=raw)
@@ -569,6 +637,303 @@ def _fetch_reddit_thread(
         post_id, headers=headers, timeout=timeout, cap=int(max_comments)
     )
     return post_raw, flat_comments
+
+
+def _strip_html_text(raw_html: str) -> str:
+    txt = re.sub(r"<br\s*/?>", "\n", str(raw_html or ""), flags=re.IGNORECASE)
+    txt = re.sub(r"<[^>]+>", " ", txt)
+    return " ".join(html_lib.unescape(txt).split())
+
+
+def fetch_vnexpress_thread(
+    url: str,
+    *,
+    max_comments: int = 2000,
+    timeout: int = 15,
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Fetch a public VnExpress article and its multi-level reply tree with real parent_id and timestamps."""
+    clean_url = str(url or "").strip()
+    m_vne = _VNEXPRESS_URL_RE.match(clean_url)
+    if not m_vne:
+        raise ValueError(f"Link VnExpress không hợp lệ: {url!r}")
+    article_id = m_vne.group(1)
+    cap = max(1, min(5000, int(max_comments)))
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SBiFAGAT/2.1"}
+
+    title = f"Bài viết VnExpress #{article_id}"
+    selftext = ""
+    site_id = "1000000"
+    try:
+        page_resp = requests.get(clean_url, headers=headers, timeout=timeout)
+        page_resp.raise_for_status()
+        page_html = page_resp.text or ""
+        m_title = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.IGNORECASE | re.DOTALL)
+        if m_title:
+            raw_t = _strip_html_text(m_title.group(1))
+            raw_t = re.sub(r"\s*[-|–]\s*(?:Báo\s+)?VnExpress.*$", "", raw_t, flags=re.IGNORECASE).strip()
+            if raw_t:
+                title = raw_t
+        m_desc = re.search(
+            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+            page_html,
+            re.IGNORECASE,
+        ) or re.search(
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
+            page_html,
+            re.IGNORECASE,
+        )
+        if m_desc:
+            selftext = _strip_html_text(m_desc.group(1))
+        m_site = re.search(r'tt_site_id["\']?\s*(?:content=|[:=])\s*["\']?(\d+)', page_html, re.IGNORECASE)
+        if m_site:
+            site_id = m_site.group(1)
+    except Exception:
+        pass
+
+    post_id = f"vne_{article_id}"
+    comments: list[dict[str, Any]] = []
+    seen_cids: set[str] = set()
+    reply_parents: list[tuple[str, int]] = []
+    offset = 0
+    total_reported: int | None = None
+
+    while len(comments) < cap:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelledError("Đã hủy tác vụ tải bình luận VnExpress.")
+        limit = min(100, cap - len(comments))
+        payload = _http_get_json_with_backoff(
+            "https://usi-saas.vnexpress.net/index/get",
+            params={
+                "offset": offset,
+                "limit": limit,
+                "objectid": article_id,
+                "objecttype": 1,
+                "siteid": site_id,
+                "sort_by": "like",
+            },
+            headers=headers,
+            timeout=timeout,
+            max_retries=3,
+            cancel_event=cancel_event,
+        )
+        data = (payload or {}).get("data") or {}
+        if total_reported is None:
+            try:
+                total_reported = int(data.get("totalitem") or data.get("total") or cap)
+            except (TypeError, ValueError):
+                total_reported = cap
+        items = data.get("items") or []
+        if not items:
+            break
+        for it in items:
+            if not isinstance(it, Mapping):
+                continue
+            cid = str(it.get("comment_id") or "").strip()
+            body = _strip_html_text(str(it.get("content") or ""))
+            if not cid or cid in seen_cids or not body:
+                continue
+            seen_cids.add(cid)
+            author_raw = str(it.get("userid") or it.get("full_name") or f"vne_u_{cid}")
+            ts_val = float(it.get("creation_time") or time.time())
+            comments.append(
+                {
+                    "fullname": f"t1_{cid}",
+                    "id": cid,
+                    "link_id": f"t3_{post_id}",
+                    "parent_id": f"t3_{post_id}",
+                    "body": body,
+                    "text": body,
+                    "created_utc": ts_val,
+                    "author": author_raw,
+                    "author_is_bot": False,
+                    "author_hash": hash_author_sha256(author_raw),
+                }
+            )
+            rep_obj = it.get("replys") or {}
+            try:
+                rep_tot = int(rep_obj.get("total") or 0) if isinstance(rep_obj, Mapping) else 0
+            except (TypeError, ValueError):
+                rep_tot = 0
+            if rep_tot > 0:
+                reply_parents.append((cid, rep_tot))
+            if len(comments) >= cap:
+                break
+
+        if progress_cb is not None:
+            denom = max(1, min(cap, int(total_reported or cap)))
+            progress_cb(
+                {
+                    "stage": "fetching_comments",
+                    "processed": len(comments),
+                    "total": denom,
+                    "percent": min(95.0, round(100.0 * len(comments) / denom, 1)),
+                }
+            )
+        offset += len(items)
+        if len(items) < limit or (total_reported and offset >= int(data.get("total") or total_reported)):
+            break
+
+    for root_cid, rep_tot in reply_parents:
+        if len(comments) >= cap:
+            break
+        rep_offset = 0
+        while rep_offset < min(rep_tot, 200) and len(comments) < cap:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelledError("Đã hủy tác vụ tải phản hồi VnExpress.")
+            try:
+                rep_payload = _http_get_json_with_backoff(
+                    "https://usi-saas.vnexpress.net/index/getreplay",
+                    params={
+                        "id": root_cid,
+                        "objectid": article_id,
+                        "objecttype": 1,
+                        "siteid": site_id,
+                        "limit": 100,
+                        "offset": rep_offset,
+                    },
+                    headers=headers,
+                    timeout=timeout,
+                    max_retries=2,
+                    cancel_event=cancel_event,
+                )
+            except ScanCancelledError:
+                raise
+            except Exception:
+                break
+            rep_items = ((rep_payload or {}).get("data") or {}).get("items") or []
+            if not rep_items:
+                break
+            for rit in rep_items:
+                if not isinstance(rit, Mapping):
+                    continue
+                rcid = str(rit.get("comment_id") or "").strip()
+                rbody = _strip_html_text(str(rit.get("content") or ""))
+                if not rcid or rcid in seen_cids or not rbody:
+                    continue
+                seen_cids.add(rcid)
+                raw_pid = str(rit.get("parent_id") or root_cid).strip()
+                pid_norm = raw_pid if (raw_pid and raw_pid != rcid and raw_pid in seen_cids) else root_cid
+                author_raw = str(rit.get("userid") or rit.get("full_name") or f"vne_u_{rcid}")
+                ts_val = float(rit.get("creation_time") or time.time())
+                comments.append(
+                    {
+                        "fullname": f"t1_{rcid}",
+                        "id": rcid,
+                        "link_id": f"t3_{post_id}",
+                        "parent_id": f"t1_{pid_norm}",
+                        "body": rbody,
+                        "text": rbody,
+                        "created_utc": ts_val,
+                        "author": author_raw,
+                        "author_is_bot": False,
+                        "author_hash": hash_author_sha256(author_raw),
+                    }
+                )
+                if len(comments) >= cap:
+                    break
+            rep_offset += len(rep_items)
+            if len(rep_items) < 100:
+                break
+
+    if not comments:
+        raise ValueError("Bài báo VnExpress này chưa có bình luận công khai để phân tích.")
+
+    comments.sort(key=lambda c: float(c.get("created_utc") or 0.0))
+    earliest_ts = float(comments[0].get("created_utc") or time.time())
+    post = {
+        "id": post_id,
+        "title": title,
+        "selftext": selftext or title,
+        "subreddit": "vnexpress",
+        "author": "vnexpress_editorial",
+        "created_utc": earliest_ts - 60.0,
+        "source_platform": "vnexpress",
+    }
+    return post, comments
+
+
+def fetch_url_thread(
+    url: str,
+    *,
+    max_comments: int = 2000,
+    timeout: int = 20,
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Unified public URL dispatcher supporting VnExpress nested threads and Reddit/Arctic Shift threads."""
+    clean_url = str(url or "").strip()
+    if is_vnexpress_url(clean_url):
+        return fetch_vnexpress_thread(
+            clean_url,
+            max_comments=max_comments,
+            timeout=timeout,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+        )
+    post_id = _extract_post_id_from_url(clean_url)
+    return fetch_reddit_thread_paginated(
+        post_id,
+        max_comments=max_comments,
+        timeout=timeout,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+    )
+
+
+def compute_gnn_structural_probe(
+    gnn_model: SBiFAGAT,
+    data: Any,
+    *,
+    checkpoint_loaded: bool,
+) -> dict[str, Any]:
+    """Run a fast (<15 ms) live counterfactual probe testing whether SBiFAGAT uses tree structure and signed stance."""
+    if not checkpoint_loaded:
+        return {"available": False, "reason": "Chưa nạp checkpoint GNN đã huấn luyện."}
+    edge_td = getattr(data, "edge_index_td", None)
+    num_edges = int(edge_td.size(1)) if edge_td is not None and edge_td.numel() > 0 else 0
+    if num_edges == 0:
+        return {"available": False, "reason": "Bài viết chưa có đủ bình luận."}
+    multi_hop_edges = int((edge_td[0] != 0).sum().item())
+
+    with torch.no_grad():
+        d_base = gnn_model.predict_with_diagnostics(data, top_k_edges=1)
+
+        data_flat = data.clone()
+        flat_td = data_flat.edge_index_td.clone()
+        flat_td[0] = 0
+        data_flat.edge_index_td = flat_td
+        data_flat.edge_index_bu = flat_td.flip(0)
+        d_flat = gnn_model.predict_with_diagnostics(data_flat, top_k_edges=1)
+
+        data_no_stance = data.clone()
+        if getattr(data_no_stance, "edge_attr", None) is not None and data_no_stance.edge_attr.numel() > 0:
+            ea = data_no_stance.edge_attr.clone()
+            ea[:, 0] = 0.0
+            data_no_stance.edge_attr = ea
+        d_zero = gnn_model.predict_with_diagnostics(data_no_stance, top_k_edges=1)
+
+    base_polar = round(float(d_base["y_polar_pred"].view(-1)[0].item()), 4)
+    flat_polar = round(float(d_flat["y_polar_pred"].view(-1)[0].item()), 4)
+    zero_polar = round(float(d_zero["y_polar_pred"].view(-1)[0].item()), 4)
+    base_rep = round(float(d_base["predicted_total_replies"].view(-1)[0].item()), 1)
+    flat_rep = round(float(d_flat["predicted_total_replies"].view(-1)[0].item()), 1)
+
+    return {
+        "available": True,
+        "has_multi_hop": multi_hop_edges > 0,
+        "multi_hop_edges": multi_hop_edges,
+        "total_gnn_edges": num_edges,
+        "base_polar": base_polar,
+        "flat_polar": flat_polar,
+        "zero_stance_polar": zero_polar,
+        "delta_polar_structure": round(base_polar - flat_polar, 4),
+        "delta_polar_stance": round(base_polar - zero_polar, 4),
+        "base_replies": base_rep,
+        "flat_replies": flat_rep,
+        "delta_replies_structure": round(base_rep - flat_rep, 1),
+    }
 
 
 def _coerce_finite_float(val: Any, *, field_name: str, source_name: str) -> float:
@@ -1532,6 +1897,9 @@ def predict_live_cascade(
 
     with (inference_lock if inference_lock is not None else contextlib.nullcontext()):
         diag = gnn_model.predict_with_diagnostics(data, top_k_edges=5)
+        gnn_structural_probe = compute_gnn_structural_probe(
+            gnn_model, data, checkpoint_loaded=checkpoint_loaded
+        )
 
     behavior_counts = {lbl: 0 for lbl in _UNIFIED_BEHAVIOR_LABELS}
     for d in gnn_edge_details:
@@ -1776,6 +2144,7 @@ def predict_live_cascade(
         "topic_analysis": topic_analysis,
         "large_thread_analysis": large_thread_analysis,
         "mega_scan_summary": mega_scan_summary,
+        "gnn_structural_probe": gnn_structural_probe,
         "actual_post_hoc_comparison": {
             "has_future_replies": has_future,
             "actual_total_replies": actual_total_replies,

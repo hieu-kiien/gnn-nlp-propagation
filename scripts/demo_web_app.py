@@ -50,7 +50,10 @@ from scripts.predict_live_thread import (  # noqa: E402
     _extract_post_id_from_url,
     _fetch_reddit_thread,
     _make_demo_offline_thread,
+    compute_gnn_structural_probe,
     fetch_reddit_thread_paginated,
+    fetch_url_thread,
+    is_vnexpress_url,
     load_thread_from_json_payload,
     load_thread_from_text,
     predict_live_cascade,
@@ -632,8 +635,16 @@ def _split_root_and_comments_from_raw(raw_text: str) -> tuple[str, str, str]:
     return _clean_title_snippet(root_line, 100), root_line, "\n".join(remaining_lines)
 
 
+_EXPLICIT_MENTION_PREFIX_RE = re.compile(
+    r"^\s*(?:đang\s+trả\s+lời|trả\s+lời|replying\s+to|reply\s+to)\s+@?([A-Za-zÀ-ỹ0-9_. ]{2,40}?)(?:\s*[:\-–—]\s*|\s+)(.+)$",
+    re.IGNORECASE,
+)
+_EXPLICIT_AT_MENTION_RE = re.compile(r"^\s*@([A-Za-z0-9_.]{2,32})(?:\s*[:,]\s*|\s+)(.+)$")
+_EXPLICIT_QUOTE_RE = re.compile(r"^\s*>\s*(.+)$")
+
+
 def parse_sandbox_raw_text(raw_text: str, post_id: str, base_ts: float) -> list[dict[str, Any]]:
-    """Parse pasted multi-line Vietnamese thread text (including raw FB/Threads copy-paste) cleanly."""
+    """Parse pasted multi-line Vietnamese thread text (preserving explicit @mentions/replies without inventing fake edges)."""
     raw_lines = [ln.rstrip("\r\n") for ln in str(raw_text or "").splitlines() if ln.strip()]
     has_social_chrome = any(
         _is_social_chrome_line(ln.strip()) or bool(_THREADS_AUTHOR_HEADER_RE.match(ln.strip()))
@@ -652,7 +663,9 @@ def parse_sandbox_raw_text(raw_text: str, post_id: str, base_ts: float) -> list[
     comments: list[dict[str, Any]] = []
     indent_stack: list[tuple[int, str]] = [(-1, f"t3_{post_id}")]
     known_ids: set[str] = {f"t3_{post_id}"}
+    author_to_last_fullname: dict[str, str] = {}
     pending_author: str | None = None
+    last_fullname: str | None = None
     comment_seq = 0
 
     for line_idx, line in enumerate(lines):
@@ -722,6 +735,34 @@ def parse_sandbox_raw_text(raw_text: str, post_id: str, base_ts: float) -> list[
                     indent_stack.pop()
                 parent_ref = indent_stack[-1][1]
 
+                # Deterministic explicit mention / reply-to recovery (only when parent is still root)
+                if parent_ref == f"t3_{post_id}":
+                    m_quote = _EXPLICIT_QUOTE_RE.match(body)
+                    m_rep = _EXPLICIT_MENTION_PREFIX_RE.match(body)
+                    m_at = _EXPLICIT_AT_MENTION_RE.match(body)
+                    if m_quote and last_fullname is not None:
+                        parent_ref = last_fullname
+                        body = m_quote.group(1).strip() or body
+                    elif m_rep:
+                        mentioned = m_rep.group(1).strip().lower()
+                        if mentioned in author_to_last_fullname:
+                            parent_ref = author_to_last_fullname[mentioned]
+                            body = m_rep.group(2).strip() or body
+                    elif m_at:
+                        handle_key = m_at.group(1).strip().lower()
+                        if handle_key in author_to_last_fullname:
+                            parent_ref = author_to_last_fullname[handle_key]
+                    elif author_to_last_fullname:
+                        body_low = body.lower()
+                        for a_key in sorted(author_to_last_fullname, key=len, reverse=True):
+                            if len(a_key) >= 4 and (
+                                body_low.startswith(f"{a_key} ")
+                                or body_low.startswith(f"{a_key}:")
+                                or body_low.startswith(f"{a_key},")
+                            ):
+                                parent_ref = author_to_last_fullname[a_key]
+                                break
+
         fullname = f"t1_{cid}"
         if fullname in known_ids:
             cid = f"{cid}_{idx}"
@@ -734,9 +775,11 @@ def parse_sandbox_raw_text(raw_text: str, post_id: str, base_ts: float) -> list[
             author = None
         elif pending_author:
             author = pending_author
+            author_to_last_fullname[pending_author.strip().lower().lstrip("@")] = fullname
         else:
             author = f"custom_u_{idx}"
         pending_author = None
+        last_fullname = fullname
 
         comments.append(
             {
@@ -762,6 +805,8 @@ def _format_live_result_payload(
     post: Mapping[str, Any],
     res: Mapping[str, Any],
     is_synthetic_fallback: bool,
+    has_real_timestamps: bool = True,
+    is_api_tree: bool = False,
 ) -> dict[str, Any]:
     """Convert `predict_live_cascade` output into unified Tab-1 visualization JSON."""
     raw_nodes = list(res.get("kept_nodes") or [])
@@ -921,6 +966,22 @@ def _format_live_result_payload(
     user_graph = _build_thread_user_graph(tree_nodes, tree_edges)
     kept_texts_short = [n["text"] for n in tree_nodes[1:] if len(n["text"].split()) <= 3][:24]
 
+    root_nid_s = str(tree_nodes[0]["node_id"]) if tree_nodes else ""
+    max_depth_seen = max((int(n.get("depth", 0)) for n in tree_nodes), default=0)
+    multi_hop_cnt = sum(1 for e in tree_edges if str(e.get("source_id")) != root_nid_s)
+    if is_api_tree and multi_hop_cnt > 0:
+        topo_mode = "real_tree"
+        topo_label_vi = f"Cây trả lời thật ({max_depth_seen} tầng · {multi_hop_cnt} đối đáp)"
+    elif is_api_tree:
+        topo_mode = "real_tree"
+        topo_label_vi = "Cây thật từ nguồn (1 tầng)"
+    elif multi_hop_cnt > 0:
+        topo_mode = "reconstructed_tree"
+        topo_label_vi = f"Cây khôi phục ({max_depth_seen} tầng · {multi_hop_cnt} đối đáp)"
+    else:
+        topo_mode = "flat_star"
+        topo_label_vi = "Văn bản phẳng 1 tầng (chỉ nối về bài gốc)"
+
     return {
         "meta": {
             "cascade_id": cascade_id,
@@ -936,6 +997,15 @@ def _format_live_result_payload(
             "junk_mode": str(res.get("junk_mode") or "contract"),
             "author_count": len(authors_seen),
         },
+        "input_topology": {
+            "mode": topo_mode,
+            "has_real_tree": topo_mode != "flat_star",
+            "has_real_timestamps": bool(has_real_timestamps),
+            "max_depth": max_depth_seen,
+            "multi_hop_edges": multi_hop_cnt,
+            "source_label_vi": topo_label_vi,
+        },
+        "gnn_structural_probe": dict(res.get("gnn_structural_probe") or {"available": False}),
         "forecast": {
             "gnn_k_horizon": int(res.get("gnn_k_horizon", res.get("k_observed", max(0, len(tree_nodes) - 1)))),
             "forecast_scope": str(res.get("forecast_scope") or "early_k_in_distribution"),
@@ -1517,6 +1587,9 @@ class DemoBackend:
             tid = str(d.topic_id)
             diag = self._gnn_model.predict_with_diagnostics(d, top_k_edges=5)
             gates = self._gnn_model.extract_edge_gates(d)
+            gnn_probe = compute_gnn_structural_probe(
+                self._gnn_model, d, checkpoint_loaded=True
+            )
 
             gamma_td_list = gates["gamma_td"].detach().cpu().tolist()
             edge_attr_cpu = d.edge_attr.detach().cpu()
@@ -1772,6 +1845,9 @@ class DemoBackend:
             }
             summaries.append(summary)
 
+            root_nid_cache = str(tree_nodes[0]["node_id"]) if tree_nodes else ""
+            cache_max_depth = max((int(n.get("depth", 0)) for n in tree_nodes), default=0)
+            cache_multi_hop = sum(1 for e in tree_edges if str(e.get("source_id")) != root_nid_cache)
             threads_by_id[cid] = {
                 "meta": {
                     "cascade_id": cid,
@@ -1785,6 +1861,19 @@ class DemoBackend:
                     "nlp_backend": "preextracted_full_2d_ce",
                     "author_count": len(authors_seen),
                 },
+                "input_topology": {
+                    "mode": "real_tree",
+                    "has_real_tree": cache_multi_hop > 0,
+                    "has_real_timestamps": True,
+                    "max_depth": cache_max_depth,
+                    "multi_hop_edges": cache_multi_hop,
+                    "source_label_vi": (
+                        f"Cây trả lời thật ({cache_max_depth} tầng · {cache_multi_hop} đối đáp)"
+                        if cache_multi_hop > 0
+                        else "Cây thật từ nguồn (1 tầng)"
+                    ),
+                },
+                "gnn_structural_probe": gnn_probe,
                 "forecast": {
                     "k_observed": len(tree_nodes) - 1,
                     "predicted_total_replies": round(pred_replies, 1),
@@ -1989,10 +2078,9 @@ class DemoBackend:
                 raise ValueError(
                     f"{social_platform} yêu cầu đăng nhập và chặn truy cập tự động từ công cụ bên ngoài. "
                     f"Vui lòng mở bài viết trên {social_platform}, sao chép (Ctrl+C) bài gốc cùng bình luận "
-                    "rồi dán thẳng vào ô Văn bản, hoặc tải lên tệp .txt/.json/.jsonl."
+                    "rồi dán thẳng vào mục 'Hoặc dán trực tiếp nội dung', hoặc tải lên tệp .txt/.json/.jsonl."
                 )
-            post_id = _extract_post_id_from_url(reddit_url)
-            post, comments = _fetch_reddit_thread(post_id)
+            post, comments = fetch_url_thread(reddit_url, max_comments=max_full_comments)
             is_demo = False
         elif mode == "custom":
             post_id = "sandbox_custom"
@@ -2043,12 +2131,20 @@ class DemoBackend:
             inference_lock=self._inference_lock,
         )
         cid = f"vn_{str(post.get('id') or 'sandbox').removeprefix('t3_')}"
+        has_real_ts = (
+            mode == "reddit_url"
+            or (mode == "custom" and any(isinstance(c, Mapping) and c.get("time_delay_sec") is not None for c in (payload.get("comments") or [])))
+            or mode in {"preset_junk_1", "preset_junk_2", "preset_large_1"}
+        )
+        is_api_tree = mode == "reddit_url"
         out = _format_live_result_payload(
             cascade_id=cid,
             topic_id=f"sandbox_{mode}",
             post=post,
             res=res,
             is_synthetic_fallback=not bool(res.get("cross_encoder_loaded", False)),
+            has_real_timestamps=bool(has_real_ts),
+            is_api_tree=is_api_tree,
         )
         out["sandbox_mode"] = mode
         if mode in {"preset_junk_1", "preset_junk_2", "preset_large_1"}:
@@ -2330,6 +2426,7 @@ class DemoBackend:
         base_ts = 1763500000.0
 
         post_id_for_url: str | None = None
+        source_url_for_job: str | None = None
         prepared_post: dict[str, Any] | None = None
         prepared_comments: list[dict[str, Any]] | None = None
         is_demo = bool(payload.get("is_demo", mode in {"preset_mega_stress", "custom"}))
@@ -2342,9 +2439,11 @@ class DemoBackend:
                 raise ValueError(
                     f"{social_platform} yêu cầu đăng nhập và chặn truy cập tự động từ công cụ bên ngoài. "
                     f"Vui lòng mở bài viết trên {social_platform}, sao chép (Ctrl+C) bài gốc cùng bình luận "
-                    "rồi dán thẳng vào ô Văn bản, hoặc tải lên tệp .txt/.json/.jsonl."
+                    "rồi dán thẳng vào mục 'Hoặc dán trực tiếp nội dung', hoặc tải lên tệp .txt/.json/.jsonl."
                 )
-            post_id_for_url = _extract_post_id_from_url(reddit_url)
+            source_url_for_job = reddit_url
+            if not is_vnexpress_url(reddit_url):
+                post_id_for_url = _extract_post_id_from_url(reddit_url)
         elif mode == "json_upload":
             raw_thread_json = payload.get("thread_json")
             if raw_thread_json is None:
@@ -2459,9 +2558,9 @@ class DemoBackend:
                 if cancel_ev.is_set():
                     raise ScanCancelledError("Đã hủy tác vụ.")
                 if mode == "reddit_url":
-                    assert post_id_for_url is not None
-                    post_obj, cmt_list = fetch_reddit_thread_paginated(
-                        post_id_for_url,
+                    assert source_url_for_job is not None
+                    post_obj, cmt_list = fetch_url_thread(
+                        source_url_for_job,
                         max_comments=max_full_comments,
                         progress_cb=_on_progress,
                         cancel_event=cancel_ev,
@@ -2495,12 +2594,16 @@ class DemoBackend:
                     inference_lock=self._inference_lock,
                 )
                 cid = f"vn_{str(post_obj.get('id') or 'mega').removeprefix('t3_')}"
+                has_real_ts = mode in {"reddit_url", "json_upload", "preset_mega_stress"}
+                is_api_tree = mode in {"reddit_url", "json_upload"}
                 full_out = _format_live_result_payload(
                     cascade_id=cid,
                     topic_id=f"scan_{mode}",
                     post=post_obj,
                     res=res,
                     is_synthetic_fallback=not bool(res.get("cross_encoder_loaded", False)),
+                    has_real_timestamps=has_real_ts,
+                    is_api_tree=is_api_tree,
                 )
                 full_out["sandbox_mode"] = mode
                 compact_out, comment_rows, branch_trees = _build_scan_job_artifacts(full_out)
