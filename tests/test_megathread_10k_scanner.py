@@ -576,3 +576,22 @@ def test_scan_job_queue_full_429_and_branch_chars(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_predict_live_early_mode_caps_full_edge_scoring() -> None:
+    """Calling analysis_mode='early' with scan_strategy='full' must cap scored edges at max_full_comments."""
+    post, comments = build_megathread_stress_preset(40)
+    res = predict_live_cascade(
+        post,
+        comments,
+        k_horizon=10,
+        analysis_mode="early",
+        max_full_comments=15,
+        scan_strategy="full",
+        topic_backend="lexical",
+        allow_untrained=True,
+        is_demo=True,
+    )
+    assert res["mega_scan_summary"]["kept_comments"] > 15
+    assert res["mega_scan_summary"]["scored_edges"] <= 15
+    assert res["actual_post_hoc_comparison"]["actual_full_polarization_mode"] == "capped_full_future_only"

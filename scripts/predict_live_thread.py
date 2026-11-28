@@ -1195,12 +1195,18 @@ def predict_live_cascade(
     root_text_str = str(root_row["text"])
     live_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Select edges to score (100% in full mode; stratified sampling when budget < edges in stratified mode)
+    # Select edges to score (capped cleanly in early/full non-stratified runs; stratified sampling when budget < edges)
     if analysis_mode == "full":
         display_id_set = {str(n["node_id"]) for n in display_nodes}
         scope_edges = [
             e for e in edge_records
             if str(e["source_id"]) in display_id_set and str(e["target_id"]) in display_id_set
+        ]
+    elif scan_strategy == "full" and len(non_roots) > max_full_comments:
+        capped_id_set = {root_id} | {str(n["node_id"]) for n in non_roots[:max_full_comments]}
+        scope_edges = [
+            e for e in edge_records
+            if str(e["source_id"]) in capped_id_set and str(e["target_id"]) in capped_id_set
         ]
     else:
         scope_edges = list(edge_records)
