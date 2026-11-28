@@ -1072,3 +1072,89 @@ def test_vnexpress_component_config_fallback_probe_and_ui_state(monkeypatch: pyt
     assert "overscroll-behavior: contain" in styles_css
 
 
+def test_fetch_generic_article_meta_blocks_ssrf_redirects_and_closes_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify fetch_generic_article_meta blocks SSRF redirects across hops and always closes streaming responses."""
+    import scripts.predict_live_thread as plt_mod
+
+    def _mock_getaddrinfo(host: str, port: Any = None, *args: Any, **kwargs: Any) -> list[Any]:
+        del port, args, kwargs
+        if host == "public.example.com":
+            return [(2, 1, 6, "", ("93.184.216.34", 0))]
+        if host == "internal.example":
+            return [(2, 1, 6, "", ("169.254.169.254", 0))]
+        if host in {"127.0.0.1", "localhost"}:
+            return [(2, 1, 6, "", ("127.0.0.1", 0))]
+        raise OSError(f"unexpected host {host}")
+
+    opened: list[Any] = []
+
+    class _StreamResp:
+        def __init__(self, *, status_code: int = 200, headers: dict[str, str] | None = None, body: bytes = b"") -> None:
+            self.status_code = status_code
+            self.headers = headers or {}
+            self._body = body
+            self.encoding = "utf-8"
+            self.closed = False
+
+        def __enter__(self) -> "_StreamResp":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            del exc_type, exc, tb
+            self.closed = True
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        def iter_content(self, chunk_size: int = 32768):
+            for i in range(0, len(self._body), chunk_size):
+                yield self._body[i : i + chunk_size]
+
+    monkeypatch.setattr(plt_mod.socket, "getaddrinfo", _mock_getaddrinfo)
+
+    # Case A: 302 redirect to loopback 127.0.0.1 must be blocked with allow_redirects=False and closed
+    def _mock_redirect_loopback(url: str, **kwargs: Any) -> _StreamResp:
+        assert kwargs.get("allow_redirects") is False
+        r = _StreamResp(status_code=302, headers={"Location": "http://127.0.0.1:8765/api/health"})
+        opened.append(r)
+        return r
+
+    monkeypatch.setattr(plt_mod.requests, "get", _mock_redirect_loopback)
+    with pytest.raises(ValueError, match="nội bộ"):
+        plt_mod.fetch_generic_article_meta("https://public.example.com/news")
+    assert len(opened) == 1 and opened[0].closed is True
+
+    # Case B: 302 redirect to domain resolving to link-local 169.254.169.254 must be blocked
+    opened.clear()
+
+    def _mock_redirect_linklocal(url: str, **kwargs: Any) -> _StreamResp:
+        assert kwargs.get("allow_redirects") is False
+        r = _StreamResp(status_code=302, headers={"Location": "http://internal.example/latest/meta-data/"})
+        opened.append(r)
+        return r
+
+    monkeypatch.setattr(plt_mod.requests, "get", _mock_redirect_linklocal)
+    with pytest.raises(ValueError, match="IP nội bộ"):
+        plt_mod.fetch_generic_article_meta("https://public.example.com/news")
+    assert len(opened) == 1 and opened[0].closed is True
+
+    # Case C: 200 public HTML parses title and closes streaming response
+    opened.clear()
+
+    def _mock_ok(url: str, **kwargs: Any) -> _StreamResp:
+        assert kwargs.get("allow_redirects") is False
+        r = _StreamResp(
+            status_code=200,
+            body="<html><head><title>Bài báo công khai</title></head><body>Nội dung</body></html>".encode("utf-8"),
+        )
+        opened.append(r)
+        return r
+
+    monkeypatch.setattr(plt_mod.requests, "get", _mock_ok)
+    meta = plt_mod.fetch_generic_article_meta("https://public.example.com/ok")
+    assert meta["title"] == "Bài báo công khai"
+    assert len(opened) == 1 and opened[0].closed is True
+
+
+

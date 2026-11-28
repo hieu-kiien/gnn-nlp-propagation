@@ -152,12 +152,12 @@ python -m scripts.human_audit_ui
 python -m scripts.human_audit_ui --lock-role annotator_1 --port 8765
 
 # Nếu dùng quy trình 2 người chấm độc lập + hòa giải:
-python -m scripts.compute_kappa --input data/interim/human_audit_vi_120.csv --strict-adjudication --output-json results/results_human_audit_vi.json
-python -m scripts.audit_vn_50_trees --evaluate --strict-adjudication --audit-csv data/interim/human_audit_vn_30_trees.csv --output-json results/results_human_audit_vn_30_trees.json
+python -m scripts.compute_kappa --input data/interim/human_audit_vi_120.csv --strict-adjudication --output-json results/human_audit_vi_summary.json
+python -m scripts.audit_vn_50_trees --evaluate --strict-adjudication --audit-csv data/interim/human_audit_vn_30_trees.csv --output-json results/human_audit_vn_30_trees_summary.json
 
 # Nếu dùng quy trình tiền chú thích AI + tác giả duyệt vàng đơn lẻ:
-python -m scripts.compute_kappa --input data/interim/human_audit_vi_120.csv --allow-single-gold --output-json results/results_human_audit_vi.json
-python -m scripts.audit_vn_50_trees --evaluate --allow-single-gold --audit-csv data/interim/human_audit_vn_30_trees.csv --output-json results/results_human_audit_vn_30_trees.json
+python -m scripts.compute_kappa --input data/interim/human_audit_vi_120.csv --allow-single-gold --output-json results/human_audit_vi_summary.json
+python -m scripts.audit_vn_50_trees --evaluate --allow-single-gold --audit-csv data/interim/human_audit_vn_30_trees.csv --output-json results/human_audit_vn_30_trees_summary.json
 ```
 
 ### Đánh giá Mở rộng: Chủ đề Zero-Shot & Động lực Bài Lớn (`results_large_post_topic.json`)

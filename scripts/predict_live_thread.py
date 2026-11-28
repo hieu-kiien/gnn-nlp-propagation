@@ -856,6 +856,7 @@ def fetch_vnexpress_thread(
     site_id = "1000000"
     category_id = ""
     object_type = 1
+    found_object_type = False
     try:
         page_resp = requests.get(clean_url, headers=headers, timeout=timeout)
         page_resp.raise_for_status()
@@ -870,6 +871,7 @@ def fetch_vnexpress_thread(
         site_id = str(vne_cfg["site_id"])
         category_id = str(vne_cfg["category_id"])
         object_type = int(vne_cfg["object_type"])
+        found_object_type = bool(vne_cfg.get("found_object_type"))
     except Exception:
         pass
 
@@ -879,7 +881,6 @@ def fetch_vnexpress_thread(
     offset = 0
     total_reported: int | None = None
     sort_mode = "time"
-    prefetched_first_payload: Mapping[str, Any] | None = None
 
     def _query_vne_page(cur_offset: int, cur_limit: int, cur_ot: int, cur_sid: str, cur_sort: str) -> Any:
         params: dict[str, Any] = {
@@ -971,38 +972,36 @@ def fetch_vnexpress_thread(
         if cancel_event is not None and cancel_event.is_set():
             raise ScanCancelledError("Đã hủy tác vụ tải bình luận VnExpress.")
         limit = min(50, cap - len(comments))
-        if prefetched_first_payload is not None and offset == 0:
-            payload = prefetched_first_payload
-            prefetched_first_payload = None
-        else:
-            payload = _query_vne_page(offset, limit, object_type, site_id, sort_mode)
+        payload = _query_vne_page(offset, limit, object_type, site_id, sort_mode)
         data = (payload or {}).get("data") or {}
         if offset == 0 and not (data.get("items") or []):
             if sort_mode == "time":
                 sort_mode = "like"
                 continue
-            # Fallback probe across known VnExpress objecttype & siteid pairs when page HTML lacked box config
-            candidates: list[tuple[int, str]] = []
-            for ot_cand in (1, 8, 3, 4, 2, 5, 7):
-                pair = (ot_cand, site_id)
-                if pair != (object_type, site_id) and pair not in candidates:
-                    candidates.append(pair)
-            if site_id != "1000000":
-                for ot_cand in (object_type, 1, 3, 8):
-                    pair = (ot_cand, "1000000")
-                    if pair not in candidates:
+            primary_ok = isinstance(payload, Mapping) and str(payload.get("error", "")) in {"0", ""}
+            if not (found_object_type and primary_ok):
+                # Fallback probe across known VnExpress objecttype & siteid pairs when page HTML lacked box config
+                candidates: list[tuple[int, str]] = []
+                for ot_cand in (1, 8, 3, 4, 2, 5, 7):
+                    pair = (ot_cand, site_id)
+                    if pair != (object_type, site_id) and pair not in candidates:
                         candidates.append(pair)
-            for cand_ot, cand_sid in candidates:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise ScanCancelledError("Đã hủy tác vụ dò cấu hình VnExpress.")
-                cand_payload = _query_vne_page(0, limit, cand_ot, cand_sid, "like")
-                cand_data = (cand_payload or {}).get("data") or {}
-                if cand_data.get("items"):
-                    object_type = cand_ot
-                    site_id = cand_sid
-                    sort_mode = "like"
-                    data = cand_data
-                    break
+                if site_id != "1000000":
+                    for ot_cand in (object_type, 1, 3, 8):
+                        pair = (ot_cand, "1000000")
+                        if pair not in candidates:
+                            candidates.append(pair)
+                for cand_ot, cand_sid in candidates:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ScanCancelledError("Đã hủy tác vụ dò cấu hình VnExpress.")
+                    cand_payload = _query_vne_page(0, limit, cand_ot, cand_sid, "like")
+                    cand_data = (cand_payload or {}).get("data") or {}
+                    if cand_data.get("items"):
+                        object_type = cand_ot
+                        site_id = cand_sid
+                        sort_mode = "like"
+                        data = cand_data
+                        break
         if total_reported is None:
             try:
                 total_reported = int(data.get("totalitem") or data.get("total") or cap)
@@ -1493,8 +1492,8 @@ def fetch_tuoitre_thread(
     return post, comments
 
 
-def fetch_generic_article_meta(url: str, *, timeout: int = 8) -> dict[str, Any]:
-    """Safely fetch public article title/description from any external HTTP(S) URL with SSRF protection."""
+def _validate_public_http_url(url: str) -> tuple[str, str]:
+    """Validate that *url* is a public HTTP(S) URL whose resolved IPs are all globally routable."""
     clean_url = str(url or "").strip()
     if not clean_url or "\\" in clean_url or any(ch.isspace() for ch in clean_url):
         raise ValueError("Đường dẫn bài báo không hợp lệ.")
@@ -1508,38 +1507,65 @@ def fetch_generic_article_meta(url: str, *, timeout: int = 8) -> dict[str, Any]:
         addr_infos = socket.getaddrinfo(host, None)
     except Exception as exc:
         raise ValueError(f"Không thể phân giải tên miền {host!r}.") from exc
+    if not addr_infos:
+        raise ValueError(f"Không thể phân giải tên miền {host!r}.")
     for info in addr_infos:
         ip_str = str(info[4][0]).split("%")[0]
         try:
             ip_obj = ipaddress.ip_address(ip_str)
-            if not ip_obj.is_global:
-                raise ValueError(f"Không cho phép truy cập địa chỉ IP nội bộ ({ip_str}).")
-        except ValueError as exc:
-            if "Không cho phép" in str(exc):
-                raise
+        except ValueError:
             continue
+        if not ip_obj.is_global:
+            raise ValueError(f"Không cho phép truy cập địa chỉ IP nội bộ ({ip_str}).")
+    return clean_url, host
 
+
+def fetch_generic_article_meta(url: str, *, timeout: int = 8) -> dict[str, Any]:
+    """Safely fetch public article title/description from any external HTTP(S) URL with SSRF protection."""
+    current_url, host = _validate_public_http_url(url)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0 Safari/537.36"}
-    resp = requests.get(clean_url, headers=headers, timeout=timeout, stream=True)
-    resp.raise_for_status()
-    chunks: list[bytes] = []
-    total_read = 0
-    for chunk in resp.iter_content(chunk_size=32768):
-        if not chunk:
-            continue
-        chunks.append(chunk)
-        total_read += len(chunk)
-        if total_read >= 524288:
-            break
-    html_text = b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
-    title, desc, pub_ts = _extract_html_article_meta(html_text, default_title=f"Bài viết từ {host}")
-    return {
-        "url": clean_url,
-        "hostname": host,
-        "title": title,
-        "description": desc,
-        "published_ts": pub_ts,
-    }
+    max_redirects = 4
+
+    for hop in range(max_redirects + 1):
+        with requests.get(
+            current_url,
+            headers=headers,
+            timeout=timeout,
+            stream=True,
+            allow_redirects=False,
+        ) as resp:
+            if resp.status_code in {301, 302, 303, 307, 308}:
+                location = str(resp.headers.get("Location") or "").strip()
+                if not location:
+                    resp.raise_for_status()
+                if hop >= max_redirects:
+                    raise ValueError("Quá số lần chuyển hướng cho phép khi đọc bài báo.")
+                next_url = urljoin(current_url, location)
+                current_url, host = _validate_public_http_url(next_url)
+                continue
+
+            resp.raise_for_status()
+            chunks: list[bytes] = []
+            total_read = 0
+            for chunk in resp.iter_content(chunk_size=32768):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total_read += len(chunk)
+                if total_read >= 524288:
+                    break
+            encoding = resp.encoding or "utf-8"
+            html_text = b"".join(chunks).decode(encoding, errors="replace")
+            title, desc, pub_ts = _extract_html_article_meta(html_text, default_title=f"Bài viết từ {host}")
+            return {
+                "url": current_url,
+                "hostname": host,
+                "title": title,
+                "description": desc,
+                "published_ts": pub_ts,
+            }
+
+    raise ValueError("Quá số lần chuyển hướng cho phép khi đọc bài báo.")
 
 
 def fetch_url_thread(
