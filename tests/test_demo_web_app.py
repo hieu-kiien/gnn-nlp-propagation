@@ -548,3 +548,40 @@ def test_sandbox_and_scan_jobs_social_url_guard_and_auto_split(tmp_path: Path) -
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_reddit_shortlink_and_arctic_posts_ids_primary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify redd.it shortlinks parse cleanly and Arctic Shift fetches via /posts/ids first."""
+    from scripts import predict_live_thread as plt_mod
+
+    assert plt_mod._extract_post_id_from_url("https://redd.it/1ndfgzf") == "1ndfgzf"
+    called_urls: list[str] = []
+
+    class _Resp:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return self._payload
+
+    def _mock_get(url: str, params: Any = None, headers: Any = None, timeout: int = 20):
+        del params, headers, timeout
+        called_urls.append(url)
+        if url.endswith("/posts/ids"):
+            return _Resp({"data": [{"id": "1ndfgzf", "title": "Bai VN lon", "selftext": "Noi dung", "author": "op", "created_utc": 1760000000}]})
+        if url.endswith("/comments/search"):
+            return _Resp({"data": [{"id": "c1", "parent_id": "t3_1ndfgzf", "body": "Dong y", "author": "u1", "created_utc": 1760000010}]})
+        return _Resp({"data": []})
+
+    monkeypatch.setattr(plt_mod.requests, "get", _mock_get)
+    post, comments = plt_mod.fetch_reddit_thread_paginated("1ndfgzf", max_comments=200)
+    assert any(u.endswith("/posts/ids") for u in called_urls)
+    assert not any(u.endswith("/posts/search") for u in called_urls)
+    assert post["title"] == "Bai VN lon"
+    assert len(comments) == 1

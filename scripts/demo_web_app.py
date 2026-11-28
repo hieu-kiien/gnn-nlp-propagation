@@ -1297,8 +1297,8 @@ def _select_diverse_indices(cascades: Sequence[Any], count: int = 10) -> list[in
     while len(chosen) < count:
         _pick(by_polar)
 
-    # Order cleanly from low -> high polarization for intuitive browsing
-    chosen.sort(key=lambda idx_i: (meta_by_idx[idx_i]["y_polar"], meta_by_idx[idx_i]["n_rep"], meta_by_idx[idx_i]["cid"]))
+    # Order descending by reply count so largest real debates appear first in selector & initial showcase
+    chosen.sort(key=lambda idx_i: (-meta_by_idx[idx_i]["n_rep"], -meta_by_idx[idx_i]["y_polar"], meta_by_idx[idx_i]["cid"]))
     return chosen[:count]
 
 

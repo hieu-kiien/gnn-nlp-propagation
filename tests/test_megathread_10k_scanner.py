@@ -189,7 +189,7 @@ def test_fetch_reddit_thread_paginated_backoff_and_dedup(monkeypatch: pytest.Mon
         nonlocal rate_limited_once
         del headers, timeout
         calls.append({"url": url, "params": dict(params or {})})
-        if url.endswith("/posts/search"):
+        if url.endswith(("/posts/ids", "/posts/search")):
             return _FakeResp(
                 200,
                 {

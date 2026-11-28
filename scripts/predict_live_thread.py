@@ -28,6 +28,7 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
+from urllib.parse import urlparse
 
 import numpy as np
 import requests
@@ -191,6 +192,16 @@ def _extract_post_id_from_url(url: str) -> str:
     m = _REDDIT_POST_ID_RE.search(raw)
     if m:
         return _validate_reddit_post_id(m.group(1), source=raw)
+
+    if "://" in raw:
+        try:
+            parsed = urlparse(raw)
+            host = (parsed.hostname or "").lower()
+            parts = [p for p in (parsed.path or "").split("/") if p]
+            if host in {"redd.it", "www.redd.it"} and len(parts) == 1 and ".." not in parts[0]:
+                return _validate_reddit_post_id(parts[0], source=raw)
+        except Exception:
+            pass
 
     if "/" in raw or "://" in raw or ".." in raw:
         raise ValueError(f"Reddit URL missing valid /comments/<post_id> segment: {url!r}")
@@ -375,22 +386,24 @@ def fetch_reddit_thread_paginated(
     comments: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
 
-    try:
-        sub_payload = _http_get_json_with_backoff(
-            f"{ARCTIC_SHIFT_API_BASE}/posts/search",
-            params={"ids": post_id},
-            headers=headers,
-            timeout=timeout,
-            max_retries=3,
-            cancel_event=cancel_event,
-        )
-        sub_data = (sub_payload or {}).get("data") or []
-        if sub_data:
-            post = sub_data[0]
-    except ScanCancelledError:
-        raise
-    except Exception:
-        post = None
+    for endpoint in ("/posts/ids", "/posts/search"):
+        try:
+            sub_payload = _http_get_json_with_backoff(
+                f"{ARCTIC_SHIFT_API_BASE}{endpoint}",
+                params={"ids": post_id},
+                headers=headers,
+                timeout=timeout,
+                max_retries=3 if endpoint == "/posts/ids" else 1,
+                cancel_event=cancel_event,
+            )
+            sub_data = (sub_payload or {}).get("data") or []
+            if sub_data:
+                post = sub_data[0]
+                break
+        except ScanCancelledError:
+            raise
+        except Exception:
+            continue
 
     if post is not None:
         cursor_after: int | None = None
@@ -521,14 +534,20 @@ def _fetch_reddit_thread(
     post_id = _validate_reddit_post_id(post_id, source="fetch")
     headers = {"User-Agent": "SBi-FAGAT-LiveCheck/2.0"}
     try:
-        sub_resp = requests.get(
-            f"{ARCTIC_SHIFT_API_BASE}/posts/search",
-            params={"ids": post_id},
-            headers=headers,
-            timeout=timeout,
-        )
-        sub_resp.raise_for_status()
-        sub_data = sub_resp.json().get("data") or []
+        sub_data: list[Any] = []
+        for endpoint in ("/posts/ids", "/posts/search"):
+            sub_resp = requests.get(
+                f"{ARCTIC_SHIFT_API_BASE}{endpoint}",
+                params={"ids": post_id},
+                headers=headers,
+                timeout=timeout,
+            )
+            if sub_resp.status_code == 400 and endpoint == "/posts/ids":
+                continue
+            sub_resp.raise_for_status()
+            sub_data = sub_resp.json().get("data") or []
+            if sub_data:
+                break
         if sub_data:
             post = sub_data[0]
             com_resp = requests.get(

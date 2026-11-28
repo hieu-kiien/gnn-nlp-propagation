@@ -22,30 +22,15 @@
 
   const MAX_SVG_NODES = 120;
 
-  const FB_DEMO_SAMPLE_TEXT = [
-    "Đề xuất lắp camera AI phạt nguội xe máy vượt đèn đỏ tại các ngã tư lớn từ tháng tới",
-    "Nguyễn Minh Tuấn",
-    "Ủng hộ mạnh, chứ ra đường thấy vượt đèn đỏ tạt đầu nguy hiểm quá nhiều.",
-    "Thích · Phản hồi · 2 giờ",
-    "Trần Thu Hà",
-    "hóng",
-    "Thích · Phản hồi · 1 giờ",
-    "Lê Quốc Bảo",
-    "Không đồng ý phạt cào bằng ngay, phải sửa lại nhịp đèn vàng và vạch kẻ đường mờ đã.",
-    "Thích · Phản hồi · 55 phút",
-    "Phạm Ngọc Anh",
-    "Đồng ý",
-    "Thích · Phản hồi · 40 phút",
-    "Hoàng Đức Mạnh",
-    "Phản đối, hạ tầng đường hẹp giờ cao điểm dễ gây ùn ứ oan khi nhường xe cứu thương.",
-    "Thích · Phản hồi · 28 phút",
-    "Vũ Thảo Vy",
-    "Chính xác, nên thí điểm trước ở 5 ngã tư trọng điểm rồi công khai tiền phạt minh bạch.",
-    "Thích · Phản hồi · 15 phút",
-    "Đỗ Văn Hùng",
-    "chấm hóng kết quả",
-    "Thích · Phản hồi · 10 phút",
-  ].join("\n");
+  const STAGE_LABELS_VI = {
+    queued: "Đang đưa vào hàng đợi...",
+    fetching_comments: "Đang tải bình luận từ bài viết...",
+    filtering_junk: "Đang dọn bình luận rác...",
+    scoring_edges: "AI đang đọc và chấm lập trường...",
+    running_gnn: "Đang tổng hợp mạng và dự báo...",
+    building_summary: "Đang trích xuất 2 luồng ý kiến...",
+    completed: "Hoàn tất!",
+  };
 
   const state = {
     activeTab: "tier1",
@@ -1926,12 +1911,10 @@
   function setMegaButtonsBusy(busy) {
     const btnStress = $("btn-mega-stress");
     const btnRun = $("btn-mega-run");
-    const btnQuickMega = $("btn-quick-mega");
     const btnMainRun = $("btn-run-custom");
     const btnCancel = $("btn-mega-cancel");
     if (btnStress) btnStress.disabled = busy;
     if (btnRun) btnRun.disabled = busy;
-    if (btnQuickMega) btnQuickMega.disabled = busy;
     if (btnMainRun) btnMainRun.disabled = busy;
     if (btnCancel) btnCancel.hidden = !busy;
   }
@@ -1949,7 +1932,7 @@
     const progMeta = $("mega-progress-meta");
     if (progBox) progBox.hidden = false;
     if (progBar) progBar.value = 0;
-    if (progLbl) progLbl.textContent = "Đang đưa job quét vào hàng đợi...";
+    if (progLbl) progLbl.textContent = STAGE_LABELS_VI.queued;
     if (progPct) progPct.textContent = "0%";
     if (progMeta) progMeta.textContent = "";
     setMegaButtonsBusy(true);
@@ -1965,26 +1948,27 @@
           const pct = Math.max(0, Math.min(100, Number(st.percent || 0)));
           if (progBar) progBar.value = pct;
           if (progPct) progPct.textContent = `${pct.toFixed(1)}%`;
-          if (progLbl) progLbl.textContent = `Giai đoạn: ${st.stage || st.status}`;
+          const stageKey = st.stage || st.status || "queued";
+          if (progLbl) progLbl.textContent = STAGE_LABELS_VI[stageKey] || `Đang xử lý (${stageKey})...`;
           if (progMeta) {
-            const etaTxt = st.eta_sec !== null && st.eta_sec !== undefined ? ` · ETA ${st.eta_sec}s` : "";
-            progMeta.textContent = `Đã chấm ${fmtInt(st.processed_edges)}/${fmtInt(st.total_edges)} cạnh (${st.edges_per_sec || 0} cạnh/s)${etaTxt} · Đã chạy ${st.elapsed_sec || 0}s`;
+            const etaTxt = st.eta_sec !== null && st.eta_sec !== undefined ? ` · còn ~${st.eta_sec}s` : "";
+            progMeta.textContent = `${fmtInt(st.processed_edges)} / ${fmtInt(st.total_edges)} bình luận${etaTxt}`;
           }
           if (st.status === "completed") {
             setMegaButtonsBusy(false);
             if (!st.result) {
-              showError("Job đã hoàn tất nhưng thiếu dữ liệu kết quả.");
+              showError("Tác vụ đã hoàn tất nhưng thiếu dữ liệu kết quả.");
               return;
             }
             renderPayload(st.result);
             const ms = st.result.mega_scan_summary || {};
-            announce(`Hoàn tất quét Mega-Thread (${fmtInt(ms.kept_comments)} bình luận hợp lệ, ${fmtInt(ms.scored_edges)} cạnh đã chấm).`);
+            announce(`Hoàn tất phân tích (${fmtInt(ms.kept_comments)} bình luận hợp lệ).`);
             return;
           }
           if (st.status === "cancelled" || st.status === "failed") {
             setMegaButtonsBusy(false);
             if (st.error) showError(st.error);
-            if (progLbl) progLbl.textContent = st.status === "cancelled" ? "Đã hủy job." : "Job thất bại.";
+            if (progLbl) progLbl.textContent = st.status === "cancelled" ? "Đã hủy." : "Không thể tải hoặc xử lý bài viết.";
             return;
           }
           state.megaPollTimer = setTimeout(poll, 450);
@@ -2009,32 +1993,9 @@
       return;
     }
     if (ttl) {
-      ttl.textContent = `${platform} yêu cầu đăng nhập nên công cụ không tự cào link trực tiếp được`;
+      ttl.textContent = `${platform} yêu cầu đăng nhập nên công cụ không tự lấy link được`;
     }
     box.hidden = false;
-  }
-
-  function runFacebookDemoSample() {
-    showSocialUrlGuide(null);
-    showError("");
-    state.tier1Mode = "sandbox";
-    const urlInput = $("sb-reddit-url");
-    if (urlInput) urlInput.value = "";
-    const titleEl = $("sb-title");
-    const rootEl = $("sb-root-text");
-    if (titleEl) titleEl.value = "";
-    if (rootEl) rootEl.value = "";
-    const rawEl = $("sb-raw-lines");
-    if (rawEl) rawEl.value = FB_DEMO_SAMPLE_TEXT;
-    runSandboxRequest({
-      mode: "custom",
-      title: "",
-      root_text: "",
-      raw_indented_text: FB_DEMO_SAMPLE_TEXT,
-      auto_split_root: true,
-      analysis_mode: "full",
-      junk_mode: getSelectedJunkMode(),
-    });
   }
 
   function initControls() {
@@ -2085,24 +2046,16 @@
         });
       });
     }
-    if ($("btn-demo-fb")) {
-      $("btn-demo-fb").addEventListener("click", runFacebookDemoSample);
-    }
-    if ($("btn-try-fb-sample")) {
-      $("btn-try-fb-sample").addEventListener("click", runFacebookDemoSample);
-    }
-    if ($("btn-quick-mega")) {
-      $("btn-quick-mega").addEventListener("click", () => {
-        state.tier1Mode = "sandbox";
-        const maxC = getSelectedMegaMaxComments();
-        startMegaScanJob({
-          mode: "preset_mega_stress",
-          stress_n_comments: maxC,
-          max_full_comments: maxC,
-          scan_strategy: getSelectedMegaStrategy(),
-          junk_mode: getSelectedJunkMode(),
-          custom_topics: getLiveTopics() || undefined,
-        });
+    const btnOpenPaste = $("btn-open-paste-drawer");
+    if (btnOpenPaste) {
+      btnOpenPaste.addEventListener("click", () => {
+        const drawer = $("paste-drawer");
+        if (drawer) drawer.open = true;
+        const urlIn = $("sb-reddit-url");
+        if (urlIn) urlIn.value = "";
+        showSocialUrlGuide(null);
+        const rawEl = $("sb-raw-lines");
+        if (rawEl) rawEl.focus();
       });
     }
 

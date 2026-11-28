@@ -69,64 +69,51 @@
             <div class="mode-row">
               <div class="segmented-group" role="group" aria-label="Chọn nguồn dữ liệu">
                 <button type="button" id="mode-sandbox-btn" class="seg-btn" aria-pressed="true">
-                  Dán bài viết / Link
+                  Dán link bài viết
                 </button>
                 <button type="button" id="mode-real-btn" class="seg-btn" aria-pressed="false">
-                  10 bài mẫu thật
+                  10 bài thật (nhiều bình luận)
                 </button>
               </div>
             </div>
 
             <div id="sandbox-controls-block" class="sandbox-block">
               <form id="sandbox-form" class="unified-form">
-                <div class="field-stack">
-                  <label for="sb-raw-lines" class="hero-field-label">
-                    Dán bài viết và bình luận (Facebook, Threads hoặc diễn đàn)
-                  </label>
-                  <textarea
-                    id="sb-raw-lines"
-                    class="textarea-input hero-textarea"
-                    rows="4"
-                    placeholder="Dán nguyên bài viết và bình luận từ Facebook hoặc Threads vào đây..."></textarea>
-                </div>
-
-                <div class="secondary-input-row">
-                  <div class="field-stack">
-                    <label for="sb-reddit-url" class="field-label">Hoặc dán link bài viết</label>
-                    <input
-                      id="sb-reddit-url"
-                      type="url"
-                      class="text-input"
-                      placeholder="https://www.reddit.com/r/...">
-                  </div>
-
-                  <div class="field-stack">
-                    <label for="mega-json-file" class="field-label">Hoặc tải tệp (.json / .jsonl / .txt)</label>
-                    <div class="mega-file-row">
-                      <input id="mega-json-file" type="file" accept=".json,.jsonl,.txt,application/json,text/plain" class="file-input-control">
-                      <button type="button" id="btn-mega-clear-file" class="btn-outline btn-sm" hidden>Bỏ tệp</button>
-                    </div>
-                  </div>
+                <div class="link-hero-row">
+                  <input
+                    id="sb-reddit-url"
+                    type="url"
+                    class="text-input link-hero-input"
+                    aria-label="Dán link bài viết cần phân tích"
+                    placeholder="Dán link bài viết (ví dụ: https://www.reddit.com/r/vozforums/comments/...)">
+                  <button type="submit" id="btn-run-custom" class="btn-primary btn-hero">Phân tích</button>
                 </div>
 
                 <div id="social-url-guide" class="social-guide-box" role="status" hidden>
                   <div>
                     <strong id="social-guide-title">Facebook / Threads yêu cầu đăng nhập nên công cụ không tự lấy link được</strong>
                     <p class="social-guide-text" id="social-guide-desc">
-                      Hãy bôi đen bài viết + bình luận trên trang đó rồi nhấn <code>Ctrl+C</code> và dán vào ô phía trên.
+                      Hãy bôi đen bài viết + bình luận trên trang đó, nhấn <code>Ctrl+C</code> rồi dán vào mục bên dưới.
                     </p>
                   </div>
-                  <button type="button" id="btn-try-fb-sample" class="btn-outline btn-sm">Thử mẫu Facebook</button>
+                  <button type="button" id="btn-open-paste-drawer" class="btn-outline btn-sm">Mở ô dán nội dung</button>
                 </div>
 
-                <div class="primary-action-bar">
-                  <button type="submit" id="btn-run-custom" class="btn-primary btn-hero">Phân tích</button>
-                  <div class="quick-demos-row" aria-label="Mẫu dùng thử nhanh">
-                    <button type="button" id="btn-demo-fb" class="chip-btn">Mẫu Facebook</button>
-                    <button type="button" id="btn-preset-large" class="chip-btn">Mẫu 42 BL</button>
-                    <button type="button" id="btn-quick-mega" class="chip-btn">Mẫu 2.000 BL</button>
+                <details id="paste-drawer" class="inline-alt-drawer">
+                  <summary class="inline-alt-summary">Hoặc dán trực tiếp nội dung / tải tệp (.json, .jsonl, .txt)</summary>
+                  <div class="inline-alt-body">
+                    <textarea
+                      id="sb-raw-lines"
+                      class="textarea-input hero-textarea"
+                      rows="4"
+                      aria-label="Dán nội dung bài viết và bình luận"
+                      placeholder="Dán bài gốc và các bình luận (dòng đầu là bài gốc, các dòng sau là bình luận)..."></textarea>
+                    <div class="mega-file-row">
+                      <input id="mega-json-file" type="file" accept=".json,.jsonl,.txt,application/json,text/plain" aria-label="Tải tệp JSON hoặc TXT" class="file-input-control">
+                      <button type="button" id="btn-mega-clear-file" class="btn-outline btn-sm" hidden>Bỏ tệp</button>
+                    </div>
                   </div>
-                </div>
+                </details>
               </form>
 
               <div id="mega-progress-box" class="mega-progress-box" hidden>
@@ -196,6 +183,7 @@
 
                 <div class="preset-actions">
                   <span class="field-label">Mẫu kiểm thử:</span>
+                  <button type="button" id="btn-preset-large" class="btn-outline btn-sm">Mẫu 42 BL (AI)</button>
                   <button type="button" id="btn-preset-1" class="btn-outline btn-sm">Mẫu 1: Camera AI</button>
                   <button type="button" id="btn-preset-2" class="btn-outline btn-sm">Mẫu 2: Văn phòng 5 ngày</button>
                 </div>
