@@ -24,6 +24,7 @@
 
   const STAGE_LABELS_VI = {
     queued: "Đang đưa vào hàng đợi...",
+    building_graph: "Đang dựng cấu trúc cây bình luận...",
     fetching_comments: "Đang tải bình luận từ bài viết...",
     filtering_junk: "Đang dọn bình luận rác...",
     scoring_edges: "AI đang đọc và chấm lập trường...",
@@ -93,21 +94,45 @@
     return /^https?:\/\/\S+$/i.test(raw);
   }
 
-  function polarTierInfo(val) {
+  function polarTierInfo(val, thresholds = null, stanceCounts = null) {
+    const sc = stanceCounts || {};
+    const sup = Number(sc.support || 0);
+    const opp = Number(sc.oppose || 0);
+    const neu = Number(sc.neutral || 0);
+    const scoredN = sup + opp + neu;
+    if (scoredN >= 5 && opp / scoredN >= 0.60 && sup / scoredN <= 0.15) {
+      return {
+        label: "Phản biện áp đảo (1 chiều)",
+        badgeClass: "badge-relink",
+        color: "#D97706",
+        oneSidedNote: "Đa số cùng phản biện nên điểm chia đôi 2 phe thấp",
+      };
+    }
+    if (scoredN >= 5 && sup / scoredN >= 0.60 && opp / scoredN <= 0.15) {
+      return {
+        label: "Đồng thuận ủng hộ",
+        badgeClass: "badge-support",
+        color: "#059669",
+        oneSidedNote: "Đa số cùng tán thành quan điểm bài viết",
+      };
+    }
     if (val === null || val === undefined || Number.isNaN(Number(val))) {
-      return { label: "Chưa rõ", badgeClass: "badge-neutral", color: "#64748B" };
+      return { label: "Chưa rõ", badgeClass: "badge-neutral", color: "#64748B", oneSidedNote: "" };
     }
+    const q50 = Number(thresholds?.q50 ?? 0.0928);
+    const q75 = Number(thresholds?.q75 ?? 0.1202);
+    const q90 = Number(thresholds?.q90 ?? 0.1504);
     const v = Number(val);
-    if (v >= 0.4) {
-      return { label: "Chia rẽ rất cao", badgeClass: "badge-oppose", color: "#DC2626" };
+    if (v >= q90) {
+      return { label: "Chia rẽ rất cao (>= Q90)", badgeClass: "badge-oppose", color: "#DC2626", oneSidedNote: "" };
     }
-    if (v >= 0.25) {
-      return { label: "Tranh cãi cao", badgeClass: "badge-relink", color: "#D97706" };
+    if (v >= q75) {
+      return { label: "Tranh cãi cao (Q75–Q90)", badgeClass: "badge-relink", color: "#D97706", oneSidedNote: "" };
     }
-    if (v >= 0.12) {
-      return { label: "Tranh luận vừa", badgeClass: "badge-neutral", color: "#1D4ED8" };
+    if (v >= q50) {
+      return { label: "Tranh luận vừa (Q50–Q75)", badgeClass: "badge-neutral", color: "#1D4ED8", oneSidedNote: "" };
     }
-    return { label: "Ít chia rẽ / Đồng thuận", badgeClass: "badge-support", color: "#059669" };
+    return { label: "Ít chia rẽ (< Q50)", badgeClass: "badge-support", color: "#059669", oneSidedNote: "" };
   }
 
   // Safe DOM builders using textContent exclusively (zero dynamic HTML strings)
@@ -228,7 +253,10 @@
     });
     const data = await resp.json();
     if (!resp.ok) {
-      throw new Error(data.error || `HTTP ${resp.status}`);
+      const err = new Error(data.error || `HTTP ${resp.status}`);
+      err.status = resp.status;
+      err.payload = data;
+      throw err;
     }
     return data;
   }
@@ -350,14 +378,34 @@
   function renderTier1KPIs(payload) {
     const fc = payload.forecast || {};
     const meta = payload.meta || {};
+    const largeInfo = payload.large_thread_analysis || {};
+    const isNewsPortal = meta.domain_type === "news_portal";
+
     const srcBadge = $("result-source-badge");
     if (srcBadge) {
-      if (payload.scan_job_id) {
-        srcBadge.textContent = "Kết quả quét bài lớn (Job nền)";
+      srcBadge.hidden = false;
+      if (meta.source_platform === "vnexpress") {
+        srcBadge.textContent = "Nguồn: VnExpress (Cây trả lời thật)";
+      } else if (meta.source_platform === "dantri") {
+        srcBadge.textContent = "Nguồn: Báo Dân Trí (Cây trả lời thật)";
+      } else if (meta.source_platform === "tuoitre") {
+        srcBadge.textContent = "Nguồn: Báo Tuổi Trẻ (Cây trả lời thật)";
+      } else if (payload.scan_job_id) {
+        srcBadge.textContent = "Quét đầy đủ bài viết";
       } else if (state.tier1Mode === "sandbox") {
-        srcBadge.textContent = "Kết quả bài bạn vừa dán / thử nhanh";
+        srcBadge.textContent = "Dữ liệu bạn vừa nhập";
       } else {
-        srcBadge.textContent = "Mẫu kiểm chứng thật (Có đáp án đối chiếu)";
+        srcBadge.textContent = "Mẫu kiểm chứng thật (Reddit VN)";
+      }
+    }
+
+    const domainBadge = $("domain-shift-badge");
+    if (domainBadge) {
+      if (isNewsPortal) {
+        domainBadge.hidden = false;
+        domainBadge.textContent = "Ngoài miền học (Báo chí · Mô hình học trên Reddit VN)";
+      } else {
+        domainBadge.hidden = true;
       }
     }
 
@@ -365,14 +413,27 @@
     const hasRealTs = topo.has_real_timestamps !== false;
     const predReplies = Number(fc.predicted_total_replies || 0);
     const actReplies = Number(fc.actual_total_replies || 0);
+    const kObsVal = Number(fc.k_observed ?? actReplies);
+    const gnnKVal = Number(fc.gnn_k_horizon ?? Math.min(20, kObsVal));
     $("kpi-actual-replies").textContent = fmtInt(actReplies);
+
+    const fcLbl = $("verdict-forecast-label");
+    if (fcLbl) {
+      fcLbl.textContent = `Dự báo quy mô (từ ${Math.min(gnnKVal, Math.max(1, kObsVal))} BL đầu)`;
+    }
+    const actLbl = $("kpi-actual-label");
+    if (actLbl) {
+      if (!hasRealTs) actLbl.textContent = "Đã nhập";
+      else if (payload.scan_job_id) actLbl.textContent = "Hiện đã tải";
+      else actLbl.textContent = "Thực tế sau cùng";
+    }
 
     const proofBadge = $("forecast-proof-badge");
     const honestyNote = $("forecast-honesty-note");
     if (!hasRealTs) {
       $("kpi-pred-replies").textContent = "—";
       if (proofBadge) {
-        proofBadge.textContent = "Chưa có giờ đăng";
+        proofBadge.textContent = "Chưa có giờ đăng thật";
         proofBadge.className = "badge-tag badge-neutral";
       }
       if (honestyNote) honestyNote.hidden = false;
@@ -383,10 +444,19 @@
         if (fc.has_future_replies && actReplies > 0) {
           const diff = Math.round(predReplies - actReplies);
           const absDiff = Math.abs(diff);
-          proofBadge.textContent = absDiff <= 8 ? `Khớp sát (lệch ${absDiff} BL)` : `Dự báo vs Thực tế: ${diff >= 0 ? "+" : ""}${diff} BL`;
-          proofBadge.className = `badge-tag ${absDiff <= 8 ? "badge-support" : "badge-neutral"}`;
+          const relErr = absDiff / Math.max(1, actReplies);
+          if (absDiff <= 10 || relErr <= 0.25) {
+            proofBadge.textContent = `Khớp sát (lệch ${absDiff} BL)`;
+            proofBadge.className = "badge-tag badge-support";
+          } else if (isNewsPortal) {
+            proofBadge.textContent = "Ước tính tham khảo (báo chí khác nhịp Reddit)";
+            proofBadge.className = "badge-tag badge-neutral";
+          } else {
+            proofBadge.textContent = diff < 0 ? `Thấp hơn ${absDiff} BL` : `Cao hơn ${absDiff} BL`;
+            proofBadge.className = "badge-tag badge-neutral";
+          }
         } else {
-          proofBadge.textContent = `Đang xem ${fmtInt(fc.k_observed ?? actReplies)} bình luận`;
+          proofBadge.textContent = `Đang xem ${fmtInt(kObsVal)} bình luận`;
           proofBadge.className = "badge-tag badge-neutral";
         }
       }
@@ -404,20 +474,47 @@
     }
     renderGnnStructuralProof(payload);
 
-    const displayPolar = fc.predicted_polarization_score ?? fc.early_y_polar;
-    const tier = polarTierInfo(displayPolar);
-    const score100 = displayPolar !== null && displayPolar !== undefined && !Number.isNaN(Number(displayPolar))
-      ? Math.max(0, Math.min(100, Math.round(Number(displayPolar) * 100)))
-      : 0;
+    const sc = fc.stance_counts || { support: 0, oppose: 0, neutral: 0, unscored: 0 };
+    const isFullView = meta.analysis_mode === "full" && largeInfo.full_y_polar !== undefined && largeInfo.full_y_polar !== null;
+    const displayPolar = isFullView
+      ? Number(largeInfo.full_y_polar)
+      : Number(fc.predicted_polarization_score ?? fc.early_y_polar ?? 0);
+    const thresholds = fc.regime_thresholds || { q50: 0.0928, q75: 0.1202, q90: 0.1504 };
+    const tier = polarTierInfo(displayPolar, thresholds, sc);
+    const polarTitleEl = $("verdict-polar-label");
+    if (polarTitleEl) {
+      polarTitleEl.textContent = isFullView
+        ? "Mức độ chia rẽ 2 phe (toàn bài)"
+        : "Dự báo chia rẽ 2 phe (từ 20 BL đầu)";
+    }
+
+    const q90Ref = Number(thresholds.q90 ?? 0.1504);
+    const meterScaleMax = Math.max(0.30, q90Ref * 2.0);
+    const meterPct = Math.max(4, Math.min(100, Math.round((displayPolar / meterScaleMax) * 100)));
     const lvlEl = $("verdict-polar-level");
     if (lvlEl) {
       lvlEl.textContent = tier.label;
       lvlEl.className = `badge-tag ${tier.badgeClass}`;
     }
-    if ($("verdict-polar-100")) $("verdict-polar-100").textContent = String(score100);
+    if ($("verdict-polar-100")) $("verdict-polar-100").textContent = fmtNum(displayPolar, 3);
+    if ($("verdict-polar-unit")) {
+      $("verdict-polar-unit").textContent = `trên thang [0–1] (Q90 VN = ${Number(q90Ref).toFixed(2)})`;
+    }
+    const polarSubEl = $("verdict-polar-sub");
+    if (polarSubEl) {
+      if (tier.oneSidedNote) {
+        polarSubEl.textContent = tier.oneSidedNote;
+      } else if (isFullView && fc.predicted_polarization_score !== undefined) {
+        polarSubEl.textContent = `Dự báo sớm từ 20 BL đầu: ${fmtNum(fc.predicted_polarization_score, 3)}`;
+      } else if (fc.has_future_replies && fc.actual_y_polar !== null && fc.actual_y_polar !== undefined) {
+        polarSubEl.textContent = `Thực tế hậu kỳ: ${fmtNum(fc.actual_y_polar, 3)}`;
+      } else {
+        polarSubEl.textContent = "Đo độ cân bằng đối đầu 2 phía";
+      }
+    }
     const meterEl = $("verdict-polar-meter");
     if (meterEl) {
-      meterEl.style.setProperty("--polar-pct", `${Math.max(4, score100)}%`);
+      meterEl.style.setProperty("--polar-pct", `${meterPct}%`);
       meterEl.style.setProperty("--polar-color", tier.color);
     }
 
@@ -432,27 +529,50 @@
     $("kpi-confidence").textContent =
       fc.confidence_score !== null && fc.confidence_score !== undefined && fc.uncertainty_available !== false
         ? fmtPct(fc.confidence_score, 1)
-        : "N/A (disabled)";
+        : "Chưa bật · N/A (disabled)";
     $("kpi-authors").textContent = fmtInt(meta.author_count);
 
-    const sc = fc.stance_counts || { support: 0, oppose: 0, neutral: 0, unscored: 0 };
     const scoredTotal = Math.max(1, (sc.support || 0) + (sc.neutral || 0) + (sc.oppose || 0));
     $("bar-support").style.width = `${((sc.support || 0) / scoredTotal) * 100}%`;
     $("bar-neutral").style.width = `${((sc.neutral || 0) / scoredTotal) * 100}%`;
     $("bar-oppose").style.width = `${((sc.oppose || 0) / scoredTotal) * 100}%`;
 
-    const kObsVal = fc.k_observed ?? 0;
-    const gnnKVal = fc.gnn_k_horizon ?? kObsVal;
     $("kpi-k-obs").textContent =
       meta.analysis_mode === "full" && kObsVal !== gnnKVal
         ? `GNN K=${gnnKVal} · Hiển thị N=${kObsVal}`
         : `GNN K=${gnnKVal}`;
     const unscoredPart = sc.unscored ? ` · Chưa chấm: ${fmtInt(sc.unscored)}` : "";
-    $("kpi-stance-counts").textContent =
-      `Tán thành: ${sc.support || 0} · Trung lập: ${sc.neutral || 0} · Phản đối: ${sc.oppose || 0}${unscoredPart}`;
+    $("kpi-stance-counts").textContent = isNewsPortal
+      ? `Ủng hộ: ${sc.support || 0} · Trung lập: ${sc.neutral || 0} · Phản biện: ${sc.oppose || 0}${unscoredPart}`
+      : `Tán thành: ${sc.support || 0} · Trung lập: ${sc.neutral || 0} · Phản đối: ${sc.oppose || 0}${unscoredPart}`;
+    const scopeEl = $("verdict-stance-scope");
+    if (scopeEl) {
+      const scoredCntNum = (sc.support || 0) + (sc.neutral || 0) + (sc.oppose || 0);
+      if (state.tier1Mode === "real") {
+        scopeEl.textContent = `Tính trong ${fmtInt(scoredCntNum)} bình luận đầu (mẫu có ${fmtInt(actReplies)} BL — xem đủ bên dưới)`;
+      } else if (sc.unscored) {
+        scopeEl.textContent = `Đã chấm ${fmtInt(scoredCntNum)} bình luận phân tầng (chọn Quét sâu 100% để chấm hết)`;
+      } else {
+        scopeEl.textContent = `Tính trên ${fmtInt(scoredCntNum)} bình luận đã chấm (so với bình luận cha trực tiếp)`;
+      }
+    }
 
-    $("root-title-display").textContent = meta.root_title || "—";
-    $("root-text-display").textContent = meta.root_text || "—";
+    const cleanTitle = String(meta.root_title || "—").trim();
+    let cleanBody = String(meta.root_text || "").trim();
+    if (cleanBody && cleanTitle !== "—" && cleanBody.startsWith(cleanTitle)) {
+      cleanBody = cleanBody.slice(cleanTitle.length).trim();
+    }
+    $("root-title-display").textContent = cleanTitle;
+    const bodyEl = $("root-text-display");
+    if (bodyEl) {
+      if (!cleanBody || cleanBody === cleanTitle) {
+        bodyEl.hidden = true;
+        bodyEl.textContent = "";
+      } else {
+        bodyEl.hidden = false;
+        bodyEl.textContent = cleanBody;
+      }
+    }
   }
 
   function renderGnnStructuralProof(payload) {
@@ -460,6 +580,7 @@
     const body = $("gnn-proof-body");
     if (!drawer || !body) return;
     const probe = payload?.gnn_structural_probe;
+    const topo = payload?.input_topology || {};
     if (!probe || !probe.available) {
       drawer.hidden = true;
       return;
@@ -467,20 +588,27 @@
     drawer.hidden = false;
     clearEl(body);
 
-    const p0 = Math.round(Number(probe.base_polar || 0) * 100);
-    const pFlat = Math.round(Number(probe.flat_polar || 0) * 100);
-    const pZero = Math.round(Number(probe.zero_stance_polar || 0) * 100);
-
-    const lead = probe.has_multi_hop
-      ? `Mô hình đang xét ${fmtInt(probe.multi_hop_edges)}/${fmtInt(probe.total_gnn_edges)} cạnh đối đáp giữa bình luận với nhau (không phải phẳng 1 tầng).`
-      : "Bài hiện tại chỉ có bình luận trực tiếp về bài gốc (1 tầng), nên phá cấu trúc không tạo chênh lệch.";
+    const kWin = fmtInt(probe.k_window_evaluated || 20);
+    let lead = "";
+    if (probe.has_multi_hop) {
+      lead =
+        `Kiểm chứng trong cửa sổ sớm ${kWin} bình luận đầu: mô hình GNN đang xét ` +
+        `${fmtInt(probe.multi_hop_edges)}/${fmtInt(probe.total_gnn_edges)} cạnh đối đáp giữa bình luận với nhau (không phải phẳng 1 tầng).`;
+    } else if (Number(topo.multi_hop_edges || 0) > 0) {
+      lead =
+        `${kWin} bình luận đầu tiên theo thời gian đều phản hồi trực tiếp bài gốc (` +
+        `${fmtInt(topo.multi_hop_edges)} đối đáp tầng 2+ xuất hiện ở các bình luận đến sau), ` +
+        `nên phép thử duỗi phẳng cửa sổ đầu chưa tạo độ lệch.`;
+    } else {
+      lead = `Cửa sổ ${kWin} bình luận đầu chỉ có phản hồi trực tiếp về bài gốc (1 tầng).`;
+    }
     body.appendChild(el("p", { className: "muted-note" }, lead));
 
     const grid = el("div", { className: "gnn-proof-grid" });
     const cards = [
-      ["Cây thật (SBi-FAGAT)", `${p0} / 100`, `${fmtNum(probe.base_replies, 0)} BL`],
-      ["Khi duỗi phẳng về gốc", `${pFlat} / 100`, `${fmtSigned(probe.delta_polar_structure, 3)} điểm`],
-      ["Khi xóa nhãn tán/phản đối", `${pZero} / 100`, `${fmtSigned(probe.delta_polar_stance, 3)} điểm`],
+      ["Cây thật (SBi-FAGAT)", fmtNum(probe.base_polar, 3), `dự báo ~${fmtNum(probe.base_replies, 0)} BL`],
+      ["Khi duỗi phẳng về gốc", fmtNum(probe.flat_polar, 3), `lệch ${fmtSigned(probe.delta_polar_structure, 3)}`],
+      ["Khi xóa nhãn tán/phản đối", fmtNum(probe.zero_stance_polar, 3), `lệch ${fmtSigned(probe.delta_polar_stance, 3)}`],
     ];
     for (const [k, v, sub] of cards) {
       const cell = el("div", { className: "kv-cell" });
@@ -498,10 +626,10 @@
       strip.hidden = true;
       return;
     }
-    const totalActivity =
-      Number(stats.dropped_leaves || 0) +
-      Number(stats.contracted_nodes || 0) +
-      Number(stats.relinked_edges || 0);
+    const dropped = Number(stats.dropped_leaves || 0);
+    const contracted = Number(stats.contracted_nodes || 0);
+    const relinked = Number(stats.relinked_edges || 0);
+    const totalActivity = dropped + contracted + relinked;
     if (totalActivity === 0) {
       strip.hidden = true;
       return;
@@ -510,21 +638,26 @@
     $("contraction-mode-tag").textContent = stats.mode === "prune" ? "cắt nhánh" : "nối nhánh";
     $("cs-raw").textContent = fmtInt(stats.raw_comments);
     $("cs-kept").textContent = fmtInt(stats.kept_comments);
-    $("cs-dropped").textContent = fmtInt(stats.dropped_leaves);
-    $("cs-contracted").textContent = fmtInt(stats.contracted_nodes);
-    $("cs-relinked").textContent = fmtInt(stats.relinked_edges);
+    $("cs-dropped").textContent = fmtInt(dropped);
+    $("cs-contracted").textContent = fmtInt(contracted);
+    $("cs-relinked").textContent = fmtInt(relinked);
     const plainSum = $("contraction-plain-summary");
     if (plainSum) {
-      plainSum.textContent =
-        `Đã dọn ${fmtInt(stats.dropped_leaves)} bình luận rác ` +
-        `và tự động nối lại ${fmtInt(stats.relinked_edges)} nhánh trả lời bên dưới.`;
+      const totalRemoved = dropped + contracted;
+      if (stats.mode === "prune") {
+        plainSum.textContent = `Đã xóa ${fmtInt(totalRemoved)} bình luận rác cùng nhánh phụ thuộc bên dưới.`;
+      } else {
+        plainSum.textContent =
+          `Đã dọn ${fmtInt(totalRemoved)} bình luận rác ` +
+          `và tự động nối lại ${fmtInt(relinked)} nhánh trả lời bên dưới.`;
+      }
     }
 
     const pills = $("preserved-stances-pills");
     clearEl(pills);
     const shortList = payload.preserved_short_stances || [];
     if (!shortList.length) {
-      pills.appendChild(el("span", { className: "muted-note" }, "Không có bình luận <= 3 từ trong mẫu này."));
+      pills.appendChild(el("span", { className: "muted-note" }, "Không có câu ngắn (<= 3 từ) trong mẫu này."));
     } else {
       for (const txt of shortList) {
         pills.appendChild(el("span", { className: "stance-chip" }, `"${txt}"`));
@@ -569,8 +702,8 @@
           renderTreeNodeInspector({
             node_id: tr.target_id,
             parent_id: tr.source_id,
-            author_hash: "Ngoài nhánh đang xem",
-            depth: "1..K",
+            author_hash: "Ngoài vùng đang thu gọn",
+            depth: 1,
             time_delay_sec: 0,
             text: tr.reply_text_snippet || tr.target_id,
             stance_class: tr.stance_class || "neutral",
@@ -621,7 +754,7 @@
     techDetails.appendChild(el("summary", {}, "Thông số kỹ thuật"));
     const kv = el("div", { className: "detail-kv-grid" });
     const entries = [
-      ["Mã ẩn danh", node.author_hash || "—"],
+      ["Mã giả danh", node.author_hash || "—"],
       ["Tầng / Độ trễ", `Tầng ${node.depth} · +${Math.round(node.time_delay_sec || 0)}s`],
       ["Điểm lập trường", node.is_root ? "Bài gốc (+1.0)" : fmtSigned(node.s_uv, 3)],
       ["Độ gay gắt", node.is_root ? "—" : fmtNum(node.h_uv, 3)],
@@ -649,8 +782,8 @@
     const displayName = uMap.get(userNode.user_id) || "Người dùng";
 
     const tags = el("div", { className: "meta-pills" });
-    const campBadgeClass = userNode.camp === 0 ? "badge-support" : "badge-oppose";
-    const campLabel = userNode.camp === 0 ? "Phe Đồng thuận" : "Phe Phản biện";
+    const campBadgeClass = userNode.camp === 0 ? "badge-support" : (userNode.camp === 1 ? "badge-oppose" : "badge-neutral");
+    const campLabel = userNode.camp === 0 ? "Phe Đồng thuận" : (userNode.camp === 1 ? "Phe Phản biện" : "Trung lập");
     tags.appendChild(el("span", { className: `badge-tag ${campBadgeClass}` }, campLabel));
     tags.appendChild(el("span", { className: "pill" }, `${displayName} · ${userNode.reply_count} lượt`));
     if (state.showProfanityBadge && userNode.is_uncivil) {
@@ -658,24 +791,26 @@
     }
     box.appendChild(tags);
 
-    const nodes = (state.currentPayload?.tree?.nodes || []).filter(
-      (n) => n.author_hash === userNode.user_id
-    );
-    if (nodes.length) {
-      for (const n of nodes) {
+    const sampleNodes = Array.isArray(userNode.sample_comments) && userNode.sample_comments.length
+      ? userNode.sample_comments
+      : (state.currentPayload?.tree?.nodes || []).filter((n) => n.author_hash === userNode.user_id);
+    if (sampleNodes.length) {
+      for (const n of sampleNodes) {
         const stInfo = STANCE_COLORS[n.stance_class] || STANCE_COLORS.neutral;
         box.appendChild(el("div", { className: "detail-quote" }, `[${stInfo.label}] ${n.text}`));
       }
+    } else {
+      box.appendChild(el("p", { className: "muted-note" }, "Xem thêm bình luận của người dùng này trong danh sách bên dưới."));
     }
 
     const techDetails = el("details", { className: "mini-tech-details" });
     techDetails.appendChild(el("summary", {}, "Thông số kỹ thuật"));
     const kv = el("div", { className: "detail-kv-grid" });
     const entries = [
-      ["Mã ẩn danh", userNode.user_id],
-      ["Số bình luận", `${userNode.reply_count} nút`],
+      ["Mã giả danh", userNode.user_id],
+      ["Số bình luận", `${userNode.reply_count} bình luận`],
       ["Cân bằng", fmtSigned(userNode.stance_balance, 3)],
-      ["Nhóm cụm", `Phe ${userNode.camp}`],
+      ["Nhóm cụm", campLabel],
     ];
     for (const [k, v] of entries) {
       const cell = el("div", { className: "kv-cell" });
@@ -981,21 +1116,23 @@
   function renderUserGraphSvg(payload) {
     const svg = $("graph-svg");
     clearEl(svg);
-    const ug = payload.user_graph || { nodes: [], edges: [], camp_counts: { camp0: 0, camp1: 0 } };
+    const ug = payload.user_graph || { nodes: [], edges: [], camp_counts: { camp0: 0, camp1: 0, camp2: 0 } };
     const uNodes = ug.nodes || [];
     const uEdges = ug.edges || [];
 
     const svgW = 900;
     const camp0 = uNodes.filter((u) => u.camp === 0);
     const camp1 = uNodes.filter((u) => u.camp === 1);
-    const maxCampLen = Math.max(camp0.length, camp1.length, 1);
+    const camp2 = uNodes.filter((u) => u.camp === 2);
+    const hasNeutral = camp2.length > 0;
+    const maxCampLen = Math.max(camp0.length, camp1.length, camp2.length, 1);
     const svgH = Math.max(460, 120 + maxCampLen * 62);
 
     svg.setAttribute("viewBox", `0 0 ${svgW} ${svgH}`);
     svg.style.minWidth = "720px";
     svg.setAttribute(
       "aria-label",
-      `Đồ thị tương tác người dùng trong thread: ${camp0.length} người phe 0, ${camp1.length} người phe 1`
+      `Đồ thị tương tác người dùng: ${camp0.length} đồng thuận, ${camp2.length} trung lập, ${camp1.length} phản biện`
     );
 
     const defs = svgEl("defs");
@@ -1018,60 +1155,75 @@
     }
     svg.appendChild(defs);
 
-    // Camp divider & labels
     const bgLayer = svgEl("g");
-    bgLayer.appendChild(
-      svgEl("line", {
-        x1: svgW / 2,
-        y1: 24,
-        x2: svgW / 2,
-        y2: svgH - 20,
-        stroke: "#CBD5E1",
-        "stroke-width": 1.5,
-        "stroke-dasharray": "5 5",
-      })
-    );
+    const c0X = hasNeutral ? 165 : 225;
+    const c2X = 450;
+    const c1X = hasNeutral ? 735 : 675;
+    if (hasNeutral) {
+      for (const divX of [305, 595]) {
+        bgLayer.appendChild(
+          svgEl("line", {
+            x1: divX,
+            y1: 24,
+            x2: divX,
+            y2: svgH - 20,
+            stroke: "#CBD5E1",
+            "stroke-width": 1.4,
+            "stroke-dasharray": "5 5",
+          })
+        );
+      }
+    } else {
+      bgLayer.appendChild(
+        svgEl("line", {
+          x1: svgW / 2,
+          y1: 24,
+          x2: svgW / 2,
+          y2: svgH - 20,
+          stroke: "#CBD5E1",
+          "stroke-width": 1.5,
+          "stroke-dasharray": "5 5",
+        })
+      );
+    }
 
-    const lTitle = svgEl("text", {
-      x: 225,
-      y: 34,
-      "text-anchor": "middle",
-      "font-size": "13",
-      "font-weight": "700",
-      fill: "#065F46",
-    });
-    lTitle.textContent = `Phe 0 · Gốc / Đồng thuận (${camp0.length} người)`;
-    bgLayer.appendChild(lTitle);
-
-    const rTitle = svgEl("text", {
-      x: 675,
-      y: 34,
-      "text-anchor": "middle",
-      "font-size": "13",
-      "font-weight": "700",
-      fill: "#991B1B",
-    });
-    rTitle.textContent = `Phe 1 · Đối lập / Phản biện (${camp1.length} người)`;
-    bgLayer.appendChild(rTitle);
+    const mkTitle = (xPos, fillCol, textVal) => {
+      const t = svgEl("text", {
+        x: xPos,
+        y: 34,
+        "text-anchor": "middle",
+        "font-size": "13",
+        "font-weight": "700",
+        fill: fillCol,
+      });
+      t.textContent = textVal;
+      bgLayer.appendChild(t);
+    };
+    mkTitle(c0X, "#065F46", `Đồng thuận / Gốc (${camp0.length})`);
+    if (hasNeutral) {
+      mkTitle(c2X, "#475569", `Trung lập (${camp2.length})`);
+    }
+    mkTitle(c1X, "#991B1B", `Phản biện / Đối lập (${camp1.length})`);
     svg.appendChild(bgLayer);
 
     const pos = new Map();
-    function layoutCamp(arr, baseCenterX, bendDir) {
+    function layoutCamp(arr, baseCenterX, bendDir, bendSpan) {
       const topY = 78;
       const botY = svgH - 52;
       const span = Math.max(1, botY - topY);
       arr.forEach((u, i) => {
         const frac = arr.length <= 1 ? 0.5 : i / (arr.length - 1);
         const y = topY + frac * span;
-        const arc = Math.sin(frac * Math.PI) * 90 * bendDir;
+        const arc = Math.sin(frac * Math.PI) * bendSpan * bendDir;
         const x = baseCenterX + arc;
         const r = 16 + Math.min(11, (u.reply_count || 1) * 2.4);
         pos.set(u.user_id, { x, y, r });
       });
     }
 
-    layoutCamp(camp0, 250, -1);
-    layoutCamp(camp1, 650, 1);
+    layoutCamp(camp0, c0X, -1, hasNeutral ? 45 : 90);
+    if (hasNeutral) layoutCamp(camp2, c2X, 0, 0);
+    layoutCamp(camp1, c1X, 1, hasNeutral ? 45 : 90);
 
     const edgeLayer = svgEl("g");
     const nodeLayer = svgEl("g");
@@ -1116,16 +1268,17 @@
     for (const u of uNodes) {
       const p = pos.get(u.user_id);
       if (!p) continue;
-      const fill = u.camp === 0 ? "#ECFDF5" : "#FEF2F2";
-      const stroke = u.is_op ? "#0F172A" : (u.camp === 0 ? "#059669" : "#DC2626");
-      const textCol = u.camp === 0 ? "#065F46" : "#991B1B";
+      const fill = u.camp === 0 ? "#ECFDF5" : (u.camp === 1 ? "#FEF2F2" : "#F8FAFC");
+      const stroke = u.is_op ? "#0F172A" : (u.camp === 0 ? "#059669" : (u.camp === 1 ? "#DC2626" : "#64748B"));
+      const textCol = u.camp === 0 ? "#065F46" : (u.camp === 1 ? "#991B1B" : "#334155");
+      const campDesc = u.camp === 0 ? "Phe Đồng thuận" : (u.camp === 1 ? "Phe Phản biện" : "Trung lập");
       const friendlyName = uMap.get(u.user_id) || "Người dùng";
 
       const g = svgEl("g", {
         class: `svg-node-group${state.selectedUserId === u.user_id ? " is-selected" : ""}`,
         tabindex: "0",
         role: "button",
-        "aria-label": `${friendlyName}, Phe ${u.camp}, ${u.reply_count} bình luận`,
+        "aria-label": `${friendlyName}, ${campDesc}, ${u.reply_count} bình luận`,
         "data-user-id": u.user_id,
       });
 
@@ -1309,15 +1462,15 @@
         fill: "#64748b",
         "font-size": 12,
       });
-      empty.textContent = "Chưa đủ mốc bình luận để vẽ quỹ đạo phân cực.";
+      empty.textContent = "Chưa đủ mốc bình luận để vẽ diễn biến chia rẽ.";
       svg.appendChild(empty);
-      if (caption) caption.textContent = "Chưa có dữ liệu quỹ đạo.";
+      if (caption) caption.textContent = "Chưa có dữ liệu diễn biến.";
       return;
     }
 
     const W = 420;
-    const H = 156;
-    const padL = 40;
+    const H = 160;
+    const padL = 44;
     const padR = 16;
     const padT = 16;
     const padB = 28;
@@ -1326,8 +1479,14 @@
 
     svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
 
-    [0, 0.5, 1].forEach((val) => {
-      const y = padT + (1 - val) * plotH;
+    const rawYVals = points.map((p) => Math.max(0, Math.min(1, Number(p.y_polar ?? p.polar ?? 0))));
+    const rawMaxY = Math.max(0.16, ...rawYVals);
+    const yCeil = Math.min(1.0, Math.max(0.25, Math.ceil((rawMaxY * 1.25) / 0.05) * 0.05));
+    const yTicks = [0, yCeil * 0.5, yCeil];
+
+    yTicks.forEach((val) => {
+      const ratio = val / Math.max(1e-6, yCeil);
+      const y = padT + (1 - ratio) * plotH;
       svg.appendChild(
         createSvgNode("line", {
           x1: padL,
@@ -1346,9 +1505,25 @@
         fill: "#64748b",
         "font-size": 10,
       });
-      lbl.textContent = val.toFixed(1);
+      lbl.textContent = val.toFixed(2);
       svg.appendChild(lbl);
     });
+
+    // Subtle VN Q90 reference line if within visible Y range
+    if (0.1504 <= yCeil) {
+      const q90Y = padT + (1 - 0.1504 / yCeil) * plotH;
+      svg.appendChild(
+        createSvgNode("line", {
+          x1: padL,
+          y1: q90Y,
+          x2: W - padR,
+          y2: q90Y,
+          stroke: "#fca5a5",
+          "stroke-width": 1,
+          "stroke-dasharray": "4 4",
+        })
+      );
+    }
 
     const kVals = points.map((p, idx) => Number(p.k ?? p.milestone_k ?? p.n_replies ?? idx + 1));
     const minK = Math.min(...kVals);
@@ -1359,13 +1534,13 @@
     const maxT = Math.max(minT + 1e-6, tx(maxK));
     const coords = points.map((p, idx) => {
       const kVal = kVals[idx];
-      const yVal = Math.max(0, Math.min(1, Number(p.y_polar ?? p.polar ?? 0)));
+      const yVal = rawYVals[idx];
       const x =
         points.length === 1
           ? padL + plotW / 2
           : padL + ((tx(kVal) - minT) / Math.max(1e-6, maxT - minT)) * plotW;
-      const y = padT + (1 - yVal) * plotH;
-      return { x, y, kVal, yVal, label: p.label || `K=${kVal}` };
+      const y = padT + (1 - Math.min(1, yVal / yCeil)) * plotH;
+      return { x, y, kVal, yVal, label: `${kVal} BL` };
     });
 
     if (coords.length >= 2) {
@@ -1390,19 +1565,19 @@
       const dot = createSvgNode("circle", {
         cx: c.x.toFixed(1),
         cy: c.y.toFixed(1),
-        r: 4.5,
+        r: 4.2,
         fill: "#1d4ed8",
         stroke: "#ffffff",
         "stroke-width": 1.5,
       });
       const title = createSvgNode("title");
-      title.textContent = `${c.label}: y_polar = ${c.yVal.toFixed(3)} (max K=${maxK})`;
+      title.textContent = `Mốc ${c.label}: điểm chia rẽ ${c.yVal.toFixed(3)} (tổng ${maxK} BL)`;
       dot.appendChild(title);
       svg.appendChild(dot);
 
       const isEdgeTick = idx === 0 || idx === coords.length - 1;
-      if ((isEdgeTick || idx % labelStep === 0) && (c.x - lastLblX >= 38 || isEdgeTick)) {
-        if (!isEdgeTick || c.x - lastLblX >= 28) {
+      if ((isEdgeTick || idx % labelStep === 0) && (c.x - lastLblX >= 42 || isEdgeTick)) {
+        if (!isEdgeTick || c.x - lastLblX >= 32) {
           lastLblX = c.x;
           const xLbl = createSvgNode("text", {
             x: c.x.toFixed(1),
@@ -1411,7 +1586,7 @@
             fill: "#475569",
             "font-size": 10,
           });
-          xLbl.textContent = c.kVal >= 1000 ? `K=${(c.kVal / 1000).toFixed(c.kVal % 1000 === 0 ? 0 : 1)}k` : `K=${c.kVal}`;
+          xLbl.textContent = c.kVal >= 1000 ? `${(c.kVal / 1000).toFixed(c.kVal % 1000 === 0 ? 0 : 1)}k BL` : `${c.kVal} BL`;
           svg.appendChild(xLbl);
         }
       }
@@ -1420,14 +1595,38 @@
     if (caption) {
       const first = coords[0];
       const last = coords[coords.length - 1];
-      const p0 = Math.round(first.yVal * 100);
-      const p1 = Math.round(last.yVal * 100);
-      const dirWord = p1 > p0 + 3 ? "tăng lên" : p1 < p0 - 3 ? "giảm nhẹ" : "khá ổn định";
-      caption.textContent = `Mức chia rẽ ${dirWord}: từ ${p0}/100 (lúc ${first.kVal} BL) đến ${p1}/100 (lúc ${last.kVal} BL).`;
+      if (coords.length === 1) {
+        caption.textContent = `Điểm chia rẽ tại mốc ${first.kVal} bình luận: ${first.yVal.toFixed(3)} (vạch đỏ đứt là mức Q90 = 0.150).`;
+      } else {
+        const diff = last.yVal - first.yVal;
+        const dirWord =
+          diff >= 0.05 ? "tăng mạnh" : diff >= 0.025 ? "tăng nhẹ" : diff <= -0.05 ? "giảm mạnh" : diff <= -0.025 ? "giảm nhẹ" : "khá ổn định";
+        const scaleNote = useLogScale ? " · trục ngang theo thang log" : "";
+        caption.textContent =
+          `Mức chia rẽ ${dirWord}: từ ${first.yVal.toFixed(3)} (lúc ${first.kVal} BL) ` +
+          `đến ${last.yVal.toFixed(3)} (lúc ${last.kVal} BL)${scaleNote}.`;
+      }
     }
   }
 
-  function appendArgumentGroup(container, titleText, items, emptyText, openByDefault, tone = "neutral") {
+  function jumpToCommentsWithStance(stanceVal) {
+    const sel = $("mega-stance-filter");
+    const sec = $("mega-comments-section");
+    if (sel) {
+      sel.value = stanceVal;
+    }
+    state.megaPage = 1;
+    if (state.activeScanJobId || state.tier1Mode === "real") {
+      loadMegaCommentsPage(1).catch(() => {});
+    } else if (Array.isArray(state.currentPayload?.comment_rows)) {
+      renderClientCommentsPage(1);
+    }
+    if (sec && !sec.hidden) {
+      sec.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }
+
+  function appendArgumentGroup(container, titleText, items, emptyText, openByDefault, tone = "neutral", jumpInfo = null) {
     const buildList = () => {
       if (items.length === 0) {
         return createNode("p", "arguments-empty", emptyText);
@@ -1462,6 +1661,16 @@
     panel.dataset.tone = tone;
     panel.appendChild(createNode("h3", "arg-panel-title", titleText));
     panel.appendChild(buildList());
+    if (jumpInfo && jumpInfo.count > 0) {
+      const jBtn = createNode(
+        "button",
+        "arg-jump-btn",
+        `Xem toàn bộ ${fmtInt(jumpInfo.count)} bình luận phe này ↓`
+      );
+      jBtn.type = "button";
+      jBtn.addEventListener("click", () => jumpToCommentsWithStance(jumpInfo.stance));
+      panel.appendChild(jBtn);
+    }
     container.appendChild(panel);
   }
 
@@ -1471,28 +1680,31 @@
 
     const scopePill = $("large-scope-pill");
     if (scopePill) {
+      scopePill.hidden = false;
       if (largeInfo.scope === "full_analysis") {
-        scopePill.textContent = "Phân tích toàn chuỗi (Full)";
+        scopePill.textContent = "Đọc toàn chuỗi";
       } else if (largeInfo.scope === "early_post_hoc") {
-        scopePill.textContent = "Hậu kiểm toàn bài (Post-hoc)";
+        scopePill.textContent = "Đối chứng toàn bài";
       } else {
-        scopePill.textContent = "Tiền tố sớm (Early K)";
+        scopePill.textContent = "Cửa sổ sớm";
       }
     }
 
     const scaleBadge = $("large-scale-badge");
     if (scaleBadge) {
       scaleBadge.hidden = false;
-      scaleBadge.textContent = `${largeInfo.scale_label_vi || largeInfo.scale_tier || "Chuỗi"} · ${largeInfo.total_replies_analyzed ?? 0} bình luận`;
+      scaleBadge.textContent = `${largeInfo.scale_label_vi || largeInfo.scale_tier || "Chuỗi"} · ${fmtInt(largeInfo.total_replies_analyzed ?? 0)} BL`;
     }
 
     const archBadge = $("large-archetype-badge");
     if (archBadge) {
+      archBadge.hidden = false;
       archBadge.textContent = largeInfo.post_archetype_label_vi || largeInfo.post_archetype || "Thảo luận";
     }
 
     const trendBadge = $("large-trend-badge");
     if (trendBadge) {
+      trendBadge.hidden = false;
       const delta = Number(largeInfo.polar_delta ?? 0);
       const sign = delta >= 0 ? "+" : "";
       trendBadge.textContent = `${largeInfo.evolution_trend_label_vi || largeInfo.evolution_trend || "Ổn định"} (${sign}${delta.toFixed(3)})`;
@@ -1505,28 +1717,28 @@
       oodBadge.hidden = !isOod;
       if (isOod) {
         const refMax = fc.training_max_replies_ref || payload.mega_scan_summary?.training_max_replies_ref || 345;
-        oodBadge.textContent = `Cảnh báo ngoại suy (> ${refMax} bình luận train)`;
+        oodBadge.textContent = `Bài quy mô lớn (> ${refMax} BL trong tập học)`;
       }
     }
 
     const covBadge = $("mega-coverage-badge");
     const ms = payload.mega_scan_summary || {};
     if (covBadge) {
-      const hasCoverage = ms.total_edges && ms.scored_edges;
-      covBadge.hidden = !hasCoverage;
-      if (hasCoverage) {
+      const isPartial = Boolean(ms.is_stratified_subsampled && ms.total_edges && ms.scored_edges);
+      covBadge.hidden = !isPartial;
+      if (isPartial) {
         const pct = Math.round(Number(ms.coverage_ratio ?? 1) * 100);
         const ci = Array.isArray(ms.bootstrap_ci_95) ? ` · CI 95% [${ms.bootstrap_ci_95[0].toFixed(3)}, ${ms.bootstrap_ci_95[1].toFixed(3)}]` : "";
-        covBadge.textContent = `Chấm ${fmtInt(ms.scored_edges)}/${fmtInt(ms.total_edges)} cạnh (${pct}%)${ci}`;
+        covBadge.textContent = `Lấy mẫu phân tầng ${fmtInt(ms.scored_edges)}/${fmtInt(ms.total_edges)} (${pct}%)${ci}`;
       }
     }
 
     const sem = largeInfo.semantic_understanding || {};
     const summaryEl = $("large-summary-text");
     if (summaryEl) {
-      summaryEl.textContent =
-        sem.summary_vi ||
-        "Chưa có tóm tắt ngữ nghĩa cho bài đăng này.";
+      const txt = sem.summary_vi || "";
+      summaryEl.hidden = !txt;
+      summaryEl.textContent = txt;
     }
 
     renderTrajectorySvg(largeInfo);
@@ -1549,8 +1761,26 @@
         : Array.isArray(sem.flashpoints)
           ? sem.flashpoints
           : [];
-      appendArgumentGroup(cols, "Phe Tán thành nói gì?", proItems, "Chưa ghi nhận bình luận tán thành nổi bật.", true, "pro");
-      appendArgumentGroup(cols, "Phe Phản đối nói gì?", antiItems, "Chưa ghi nhận bình luận phản đối nổi bật.", true, "anti");
+      const sc = payload?.forecast?.stance_counts || {};
+      const isNews = payload?.meta?.domain_type === "news_portal";
+      appendArgumentGroup(
+        cols,
+        isNews ? "Luồng Ủng hộ / Tích cực" : "Phe Tán thành nói gì?",
+        proItems,
+        "Không có bình luận ủng hộ rõ rệt trong bài viết này.",
+        true,
+        "pro",
+        { stance: "support", count: Number(sc.support || 0) }
+      );
+      appendArgumentGroup(
+        cols,
+        isNews ? "Luồng Phản biện / Bức xúc" : "Phe Phản đối nói gì?",
+        antiItems,
+        "Không có bình luận phản đối rõ rệt.",
+        true,
+        "anti",
+        { stance: "oppose", count: Number(sc.oppose || 0) }
+      );
       appendArgumentGroup(cols, "Điểm nóng / Bình luận đảo chiều", flashItems, "Chưa phát hiện điểm đảo chiều xung đột.", false, "flash");
     }
   }
@@ -1568,9 +1798,9 @@
       return;
     }
     bar.hidden = false;
-    bar.appendChild(el("span", { className: "field-label" }, "Top nhánh tranh cãi nóng:"));
+    bar.appendChild(el("span", { className: "field-label" }, "Lọc nhánh sơ đồ:"));
 
-    const activeBid = payload?.tree_view_meta?.active_branch_id || state.activeBranchId || branches[0].branch_id;
+    const activeBid = payload?.tree_view_meta?.active_branch_id || state.activeBranchId || "_all_top";
     const mkBtn = (bid, label) => {
       const btn = el(
         "button",
@@ -1584,12 +1814,16 @@
       btn.addEventListener("click", () => switchMegaBranch(jobId, bid));
       return btn;
     };
+    const totalN = payload?.tree_view_meta?.total_nodes ? Math.max(0, Number(payload.tree_view_meta.total_nodes) - 1) : null;
+    bar.appendChild(
+      mkBtn("_all_top", totalN ? `Toàn cảnh (${fmtInt(totalN)} BL)` : "Toàn cảnh (tất cả)")
+    );
     branches.forEach((b, idx) => {
+      const snip = b.lead_text ? `: "${truncText(b.lead_text, 24)}"` : "";
       bar.appendChild(
-        mkBtn(b.branch_id, `#${idx + 1} (${b.size} cmt · phản đối ${Math.round((b.oppose_ratio || 0) * 100)}%)`)
+        mkBtn(b.branch_id, `Nhánh #${idx + 1} (${b.size} BL · ${Math.round((b.oppose_ratio || 0) * 100)}% phản đối)${snip}`)
       );
     });
-    bar.appendChild(mkBtn("_all_top", "120 nút đầu"));
   }
 
   async function switchMegaBranch(jobId, branchId) {
@@ -1615,41 +1849,60 @@
     }
   }
 
-  async function loadMegaCommentsPage(pageNum = 1) {
-    const sec = $("mega-comments-section");
-    const tbody = $("mega-comments-tbody");
-    const jobId = state.activeScanJobId;
-    if (!sec || !tbody || !jobId) {
-      if (sec) sec.hidden = true;
-      return;
+  function renderStanceFilterChips(stanceTotals, currentVal) {
+    const row = $("stance-filter-chips");
+    if (!row) return;
+    clearEl(row);
+    const t = stanceTotals || {};
+    const chips = [
+      ["all", `Tất cả (${fmtInt(t.all ?? 0)})`],
+      ["support", `Tán thành (${fmtInt(t.support ?? 0)})`],
+      ["oppose", `Phản đối (${fmtInt(t.oppose ?? 0)})`],
+      ["neutral", `Trung lập (${fmtInt(t.neutral ?? 0)})`],
+      ["uncivil", `Công kích (${fmtInt(t.uncivil ?? 0)})`],
+    ];
+    if (Number(t.unscored || 0) > 0) {
+      chips.push(["unscored", `Chưa chấm (${fmtInt(t.unscored)})`]);
     }
-    const reqSeq = ++state.megaCommentsReqSeq;
-    const stance = $("mega-stance-filter") ? $("mega-stance-filter").value : "all";
-    const q = $("mega-search-input") ? $("mega-search-input").value.trim() : "";
-    const qs = new URLSearchParams({
-      page: String(pageNum),
-      page_size: "50",
-      stance,
-      q,
-    });
-    if (state.activeBranchId && state.activeBranchId !== "_all_top") {
-      qs.set("branch_id", state.activeBranchId);
+    for (const [val, label] of chips) {
+      const btn = el(
+        "button",
+        { type: "button", className: "stance-filter-chip", "aria-pressed": String(currentVal === val) },
+        label
+      );
+      btn.addEventListener("click", () => {
+        if ($("mega-stance-filter")) $("mega-stance-filter").value = val;
+        state.megaPage = 1;
+        if (state.activeScanJobId || state.tier1Mode === "real") {
+          loadMegaCommentsPage(1).catch((e) => showError(e.message));
+        } else {
+          renderClientCommentsPage(1);
+        }
+      });
+      row.appendChild(btn);
     }
-    const data = await apiGet(`/api/tier1/scan_jobs/${encodeURIComponent(jobId)}/comments?${qs.toString()}`);
-    if (reqSeq !== state.megaCommentsReqSeq || state.activeScanJobId !== jobId) {
-      return;
-    }
-    sec.hidden = false;
-    state.megaPage = data.page || 1;
-    state.megaTotalPages = data.total_pages || 1;
-    $("mega-comments-total-pill").textContent = `${fmtInt(data.total_items)} bình luận khớp`;
-    $("mega-page-info").textContent = `Trang ${state.megaPage} / ${state.megaTotalPages}`;
-    $("mega-prev-page").disabled = state.megaPage <= 1;
-    $("mega-next-page").disabled = state.megaPage >= state.megaTotalPages;
+  }
 
+  function renderActiveBranchBanner() {
+    const note = $("active-branch-note");
+    if (!note) return;
+    clearEl(note);
+    if (!state.activeScanJobId || !state.activeBranchId || state.activeBranchId === "_all_top") {
+      note.hidden = true;
+      return;
+    }
+    note.hidden = false;
+    note.appendChild(
+      el("span", {}, "Đang lọc danh sách bình luận theo nhánh nóng đã chọn.")
+    );
+    const resetBtn = el("button", { type: "button", className: "btn-outline btn-sm" }, "Hiện tất cả bình luận");
+    resetBtn.addEventListener("click", () => switchMegaBranch(state.activeScanJobId, "_all_top"));
+    note.appendChild(resetBtn);
+  }
+
+  function renderCommentsTableRows(items, startIdx) {
+    const tbody = $("mega-comments-tbody");
     clearEl(tbody);
-    const startIdx = (state.megaPage - 1) * 50;
-    const items = data.items || [];
     if (!items.length) {
       const tr = el("tr");
       const td = el("td", { colSpan: "3" }, "Không tìm thấy bình luận nào phù hợp bộ lọc.");
@@ -1667,13 +1920,120 @@
         el(
           "span",
           { className: `badge-tag badge-${stanceKey === "unscored" ? "neutral" : stanceKey}` },
-          item.is_uncivil ? `${stInfo.label} · Gay gắt` : stInfo.label
+          stInfo.label
         )
       );
+      const metaRow = el("div", { className: "comment-row-meta" });
+      metaRow.appendChild(el("span", { className: "pill tabular" }, `Tầng ${item.depth ?? 1}`));
+      if (item.is_early_k) {
+        metaRow.appendChild(el("span", { className: "pill" }, "20 BL đầu"));
+      }
+      if (state.showProfanityBadge && item.is_uncivil) {
+        metaRow.appendChild(el("span", { className: "badge-tag badge-uncivil" }, "Gay gắt"));
+      }
+      stTd.appendChild(metaRow);
       tr.appendChild(stTd);
-      tr.appendChild(el("td", {}, item.text || ""));
+
+      const textTd = el("td");
+      if (item.parent_snippet && Number(item.depth || 1) >= 2) {
+        textTd.appendChild(
+          el("div", { className: "comment-parent-ctx" }, `Trả lời: "${item.parent_snippet}"`)
+        );
+      }
+      textTd.appendChild(el("div", {}, item.text || ""));
+      tr.appendChild(textTd);
       tbody.appendChild(tr);
     });
+  }
+
+  function renderClientCommentsPage(pageNum = 1) {
+    const sec = $("mega-comments-section");
+    const rows = Array.isArray(state.currentPayload?.comment_rows) ? state.currentPayload.comment_rows : [];
+    if (!sec) return;
+    if (!rows.length) {
+      sec.hidden = true;
+      return;
+    }
+    const stance = $("mega-stance-filter") ? $("mega-stance-filter").value : "all";
+    const q = $("mega-search-input") ? $("mega-search-input").value.trim().toLowerCase() : "";
+    const stanceTotals = {
+      all: rows.length,
+      support: rows.filter((r) => r.is_scored !== false && r.stance_class === "support").length,
+      oppose: rows.filter((r) => r.is_scored !== false && r.stance_class === "oppose").length,
+      neutral: rows.filter((r) => r.is_scored !== false && r.stance_class === "neutral").length,
+      uncivil: rows.filter((r) => Boolean(r.is_uncivil)).length,
+      unscored: rows.filter((r) => r.is_scored === false || r.stance_class === "unscored").length,
+    };
+    renderStanceFilterChips(stanceTotals, stance);
+    renderActiveBranchBanner();
+
+    const filtered = rows.filter((r) => {
+      if (stance === "uncivil" && !r.is_uncivil) return false;
+      if (stance === "unscored" && r.is_scored !== false && r.stance_class !== "unscored") return false;
+      if (["support", "oppose", "neutral"].includes(stance) && (r.is_scored === false || r.stance_class !== stance)) return false;
+      if (q && !String(r.text || "").toLowerCase().includes(q)) return false;
+      return true;
+    });
+
+    const pageSize = 50;
+    const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+    const curPage = Math.max(1, Math.min(totalPages, Number(pageNum || 1)));
+    const startIdx = (curPage - 1) * pageSize;
+    sec.hidden = false;
+    state.megaPage = curPage;
+    state.megaTotalPages = totalPages;
+    $("mega-comments-total-pill").textContent = `${fmtInt(filtered.length)} / ${fmtInt(rows.length)} bình luận`;
+    $("mega-page-info").textContent = `Trang ${curPage} / ${totalPages}`;
+    $("mega-prev-page").disabled = curPage <= 1;
+    $("mega-next-page").disabled = curPage >= totalPages;
+    renderCommentsTableRows(filtered.slice(startIdx, startIdx + pageSize), startIdx);
+  }
+
+  async function loadMegaCommentsPage(pageNum = 1) {
+    const sec = $("mega-comments-section");
+    const tbody = $("mega-comments-tbody");
+    const jobId = state.activeScanJobId;
+    const realCid = state.tier1Mode === "real" ? (state.currentThreadId || state.currentPayload?.meta?.cascade_id) : null;
+    if (!sec || !tbody || (!jobId && !realCid)) {
+      if (Array.isArray(state.currentPayload?.comment_rows) && state.currentPayload.comment_rows.length) {
+        renderClientCommentsPage(pageNum);
+      } else if (sec) {
+        sec.hidden = true;
+      }
+      return;
+    }
+    const reqSeq = ++state.megaCommentsReqSeq;
+    const stance = $("mega-stance-filter") ? $("mega-stance-filter").value : "all";
+    const q = $("mega-search-input") ? $("mega-search-input").value.trim() : "";
+    const qs = new URLSearchParams({
+      page: String(pageNum),
+      page_size: "50",
+      stance,
+      q,
+    });
+    if (jobId && state.activeBranchId && state.activeBranchId !== "_all_top") {
+      qs.set("branch_id", state.activeBranchId);
+    }
+    const endpoint = jobId
+      ? `/api/tier1/scan_jobs/${encodeURIComponent(jobId)}/comments?${qs.toString()}`
+      : `/api/tier1/thread/comments?id=${encodeURIComponent(realCid)}&${qs.toString()}`;
+    const data = await apiGet(endpoint);
+    if (reqSeq !== state.megaCommentsReqSeq) {
+      return;
+    }
+    sec.hidden = false;
+    state.megaPage = data.page || 1;
+    state.megaTotalPages = data.total_pages || 1;
+    $("mega-comments-total-pill").textContent = `${fmtInt(data.total_items)} bình luận khớp`;
+    $("mega-page-info").textContent = `Trang ${state.megaPage} / ${state.megaTotalPages}`;
+    $("mega-prev-page").disabled = state.megaPage <= 1;
+    $("mega-next-page").disabled = state.megaPage >= state.megaTotalPages;
+    if (data.stance_totals) {
+      renderStanceFilterChips(data.stance_totals, stance);
+    }
+    renderActiveBranchBanner();
+    const startIdx = (state.megaPage - 1) * 50;
+    renderCommentsTableRows(data.items || [], startIdx);
   }
 
   function renderPayload(payload) {
@@ -1687,12 +2047,10 @@
     state.selectedUserId = null;
     if (payload.scan_job_id) {
       state.activeScanJobId = payload.scan_job_id;
-      state.activeBranchId = payload.tree_view_meta?.active_branch_id || null;
+      state.activeBranchId = payload.tree_view_meta?.active_branch_id || "_all_top";
     } else {
       state.activeScanJobId = null;
       state.activeBranchId = null;
-      const sec = $("mega-comments-section");
-      if (sec) sec.hidden = true;
     }
     renderHonestyBanner(payload);
     renderTier1KPIs(payload);
@@ -1702,8 +2060,10 @@
     renderTriggerEdges(payload);
     renderHotspotBranches(payload);
     renderCurrentGraph();
-    if (state.activeScanJobId) {
-      loadMegaCommentsPage(1).catch(() => {});
+    if (state.activeScanJobId || state.tier1Mode === "real") {
+      loadMegaCommentsPage(1).catch((err) => showError(err.message));
+    } else {
+      renderClientCommentsPage(1);
     }
   }
 
@@ -1733,9 +2093,10 @@
     if ($("thread-count-label")) $("thread-count-label").textContent = String(idx.count || 0);
 
     (idx.threads || []).forEach((item, i) => {
+      const topicPart = item.primary_topic ? ` · ${item.primary_topic}` : "";
       const label =
-        `Bài #${i + 1} · ${item.actual_total_replies} BL (đoán sớm ~${Math.round(item.predicted_total_replies)}) — ` +
-        `${truncText(item.title_snippet, 68)}`;
+        `Bài #${i + 1} · ${fmtInt(item.actual_total_replies)} BL${topicPart} — ` +
+        `${truncText(item.title_snippet, 64)}`;
       select.appendChild(el("option", { value: item.cascade_id }, label));
     });
 
@@ -1858,27 +2219,36 @@
       (activeUsers ? Number(m.largest_signed_wcc_nodes || 0) / Number(activeUsers) : m.largest_signed_wcc_ratio);
 
     if ($("tier2-source-pill")) {
-      $("tier2-source-pill").textContent = `edge_label_source: ${m.edge_label_source || "teacher"}`;
+      $("tier2-source-pill").textContent = `nguồn nhãn cạnh: ${m.edge_label_source || "teacher"}`;
     }
     if ($("tier2-wcc-pill")) {
       $("tier2-wcc-pill").textContent =
-        `WCC: ${fmtInt(m.largest_signed_wcc_nodes)} / ${fmtInt(activeUsers)} active (${fmtPct(wccRatioActive, 1)})`;
+        `WCC: ${fmtInt(m.largest_signed_wcc_nodes)} / ${fmtInt(activeUsers)} hoạt động (${fmtPct(wccRatioActive, 1)})`;
     }
 
+    const nullQ = Number(pol.null_signed_modularity_mean ?? pol.null_q_signed ?? (corpusKey === "vn" ? 0.1977 : 0.4716));
+    const qPval = pol.q_signed_p_value ?? (corpusKey === "vn" ? 0.333 : 1.0);
     $("t2-q-signed").textContent = fmtNum(pol.signed_modularity, 3);
-    $("t2-q-sub").textContent = "Càng gần 1 càng chia rẽ 2 phe";
+    $("t2-q-sub").textContent =
+      corpusKey === "vn"
+        ? `Đối chứng ngẫu nhiên: ${fmtNum(nullQ, 3)} (p=${Number(qPval).toFixed(2)}, chưa vượt ngẫu nhiên)`
+        : `Đối chứng ngẫu nhiên: ${fmtNum(nullQ, 3)} (tách cụm theo sự kiện, không phải phòng vang)`;
 
     $("t2-rwc").textContent = fmtNum(pol.rwc, 3);
     const camps = m.camp_sizes || [0, 0];
-    $("t2-camps").textContent = `Hai nhóm: ${fmtInt(camps[0])} vs ${fmtInt(camps[1])} người`;
+    const rwcMeaning = Number(pol.rwc || 0) < 0 ? "Âm = tranh luận chéo mở" : "Dương = thiên hướng khép kín";
+    $("t2-camps").textContent = `${rwcMeaning} · 2 nhóm WCC: ${fmtInt(camps[0])} vs ${fmtInt(camps[1])} người`;
 
     $("t2-z-score").textContent = fmtSigned(sb.balance_z_score, 2);
-    $("t2-triads").textContent = `Tam giác cân bằng: ${fmtPct(sb.balanced_ratio, 1)}`;
+    const davisPct = sb.weak_balance_davis_ratio ?? (corpusKey === "vn" ? 0.9405 : 0.8774);
+    $("t2-triads").textContent =
+      `Cân bằng yếu Davis: ${fmtPct(davisPct, 1)} (Tam giác 2 phe chặt: ${fmtPct(sb.balanced_ratio, 1)})`;
 
     const withinNeg = Number(pol.within_camp_neg_rate || 0);
     const crossNeg = Number(pol.cross_camp_neg_rate || 0);
     const deltaPp = (crossNeg - withinNeg) * 100;
-    $("t2-cross-delta").textContent = `${deltaPp >= 0 ? "+" : ""}${deltaPp.toFixed(1)} pp`;
+    const negRatio = withinNeg > 1e-6 ? (crossNeg / withinNeg).toFixed(1) : "nhiều";
+    $("t2-cross-delta").textContent = `${deltaPp >= 0 ? "+" : ""}${deltaPp.toFixed(1)} điểm %`;
     $("t2-neg-rates").textContent = `Liên phe ${fmtPct(crossNeg, 1)} · Trong phe ${fmtPct(withinNeg, 1)}`;
 
     const plainSum = $("tier2-plain-summary-text");
@@ -1888,13 +2258,13 @@
       if (corpusKey === "vn") {
         plainSum.appendChild(
           document.createTextNode(
-            `Cộng đồng Việt Nam không đóng kín thành 2 "phòng vang" biệt lập, mà tranh luận chéo rất mạnh (${fmtPct(crossNeg, 1)} tương tác đối đầu nằm giữa các phe).`
+            `Cộng đồng Việt Nam không đóng kín thành 2 "phòng vang" biệt lập (RWC = ${fmtNum(pol.rwc, 3)}), mà tranh luận chéo rất mạnh (${fmtPct(crossNeg, 1)} tương tác đối đầu nằm giữa các nhóm).`
           )
         );
       } else {
         plainSum.appendChild(
           document.createTextNode(
-            `Trên Twitter (PHEME), người dùng phân hóa 2 phe rõ rệt hơn nhiều (đối đầu liên phe ${fmtPct(crossNeg, 1)} gấp 10 lần trong phe ${fmtPct(withinNeg, 1)}).`
+            `Trên Twitter (PHEME), các nhóm sự kiện tách cụm rõ rệt hơn nhiều (đối đầu liên phe ${fmtPct(crossNeg, 1)}, gấp ${negRatio} lần trong phe ${fmtPct(withinNeg, 1)}).`
           )
         );
       }
@@ -1988,6 +2358,22 @@
     if (btnCancel) btnCancel.hidden = !busy;
   }
 
+  function showNewsMetaGuide(articleMeta, messageText) {
+    const box = $("social-url-guide");
+    const ttl = $("social-guide-title");
+    const desc = $("social-guide-desc");
+    if (!box) return;
+    if (ttl) {
+      ttl.textContent = `Đã đọc tiêu đề từ ${articleMeta?.hostname || "trang báo"} — hãy dán bình luận bạn đọc để phân tích`;
+    }
+    if (desc) {
+      desc.textContent =
+        messageText ||
+        "Mở bài báo, quét khối (Ctrl+C) phần bình luận bên dưới bài viết rồi dán vào ô văn bản vừa mở ở dưới (hệ thống tự lọc chữ thừa).";
+    }
+    box.hidden = false;
+  }
+
   async function startMegaScanJob(reqBody) {
     showError("");
     if (state.megaPollTimer) {
@@ -2020,11 +2406,16 @@
           const stageKey = st.stage || st.status || "queued";
           if (progLbl) progLbl.textContent = STAGE_LABELS_VI[stageKey] || `Đang xử lý (${stageKey})...`;
           if (progMeta) {
-            const etaTxt = st.eta_sec !== null && st.eta_sec !== undefined ? ` · còn ~${st.eta_sec}s` : "";
-            progMeta.textContent = `${fmtInt(st.processed_edges)} / ${fmtInt(st.total_edges)} bình luận${etaTxt}`;
+            if (stageKey === "fetching_comments") {
+              progMeta.textContent = `Đã tải ${fmtInt(st.processed_edges)} bình luận...`;
+            } else {
+              const etaTxt = st.eta_sec !== null && st.eta_sec !== undefined ? ` · còn ~${st.eta_sec}s` : "";
+              progMeta.textContent = `${fmtInt(st.processed_edges)} / ${fmtInt(st.total_edges)} bình luận${etaTxt}`;
+            }
           }
           if (st.status === "completed") {
             setMegaButtonsBusy(false);
+            if (progBox) progBox.hidden = true;
             if (!st.result) {
               showError("Tác vụ đã hoàn tất nhưng thiếu dữ liệu kết quả.");
               return;
@@ -2051,6 +2442,16 @@
     } catch (err) {
       setMegaButtonsBusy(false);
       if (progBox) progBox.hidden = true;
+      if (err?.payload?.needs_manual_comments && err.payload.article_meta) {
+        const am = err.payload.article_meta;
+        if ($("sb-title") && am.title) $("sb-title").value = am.title;
+        if ($("sb-root-text") && am.description) $("sb-root-text").value = am.description;
+        if ($("paste-drawer")) $("paste-drawer").open = true;
+        if ($("sb-reddit-url")) $("sb-reddit-url").value = "";
+        showNewsMetaGuide(am, err.message);
+        if ($("sb-raw-lines")) $("sb-raw-lines").focus();
+        return;
+      }
       showError(err.message);
     }
   }
@@ -2058,6 +2459,7 @@
   function showSocialUrlGuide(platform) {
     const box = $("social-url-guide");
     const ttl = $("social-guide-title");
+    const desc = $("social-guide-desc");
     if (!box) return;
     if (!platform) {
       box.hidden = true;
@@ -2065,6 +2467,10 @@
     }
     if (ttl) {
       ttl.textContent = `${platform} yêu cầu đăng nhập nên công cụ không tự lấy link được`;
+    }
+    if (desc) {
+      desc.textContent =
+        `Hãy bôi đen bài viết + bình luận trên ${platform}, nhấn Ctrl+C rồi dán vào mục "Hoặc dán trực tiếp nội dung" ở ngay bên dưới.`;
     }
     box.hidden = false;
   }
@@ -2302,9 +2708,11 @@
         const socialPlatform = detectUnsupportedSocialUrl(effectiveUrl);
         if (socialPlatform) {
           showSocialUrlGuide(socialPlatform);
+          if ($("paste-drawer")) $("paste-drawer").open = true;
           showError(
-            `${socialPlatform} chặn cào link tự động do yêu cầu đăng nhập. Vui lòng copy bài viết + bình luận trên ${socialPlatform} rồi dán vào ô văn bản phía trên.`
+            `${socialPlatform} chặn cào link tự động do yêu cầu đăng nhập. Vui lòng copy bài viết + bình luận trên ${socialPlatform} rồi dán vào mục 'Hoặc dán trực tiếp nội dung' ở ngay bên dưới.`
           );
+          rawLinesEl.focus();
           return;
         }
         startMegaScanJob({
@@ -2321,7 +2729,7 @@
       const effectiveText = rawLinesInput || state.megaUploadedTxt || "";
       if (!effectiveText) {
         rawLinesEl.setAttribute("aria-invalid", "true");
-        showError("Vui lòng dán nội dung bài viết + bình luận (FB/Threads), dán link Reddit hoặc chọn tệp.");
+        showError("Vui lòng dán link bài báo (VnExpress, Dân Trí, Tuổi Trẻ, VietnamNet...), dán nội dung bình luận hoặc chọn tệp (.txt, .json).");
         rawLinesEl.focus();
         return;
       }
@@ -2488,8 +2896,15 @@
     const searchInputEl = $("mega-search-input");
     const prevPageBtn = $("mega-prev-page");
     const nextPageBtn = $("mega-next-page");
+    const reloadComments = (p) => {
+      if (state.activeScanJobId || state.tier1Mode === "real") {
+        return loadMegaCommentsPage(p).catch((e) => showError(e.message));
+      }
+      renderClientCommentsPage(p);
+      return Promise.resolve();
+    };
     if (stanceFilterEl) {
-      stanceFilterEl.addEventListener("change", () => loadMegaCommentsPage(1).catch((e) => showError(e.message)));
+      stanceFilterEl.addEventListener("change", () => reloadComments(1));
     }
     if (searchInputEl) {
       searchInputEl.addEventListener("input", () => {
@@ -2497,15 +2912,15 @@
           clearTimeout(state.megaSearchDebounceTimer);
         }
         state.megaSearchDebounceTimer = setTimeout(() => {
-          loadMegaCommentsPage(1).catch((e) => showError(e.message));
+          reloadComments(1);
         }, 250);
       });
     }
     if (prevPageBtn) {
-      prevPageBtn.addEventListener("click", () => loadMegaCommentsPage(Math.max(1, state.megaPage - 1)).catch((e) => showError(e.message)));
+      prevPageBtn.addEventListener("click", () => reloadComments(Math.max(1, state.megaPage - 1)));
     }
     if (nextPageBtn) {
-      nextPageBtn.addEventListener("click", () => loadMegaCommentsPage(Math.min(state.megaTotalPages, state.megaPage + 1)).catch((e) => showError(e.message)));
+      nextPageBtn.addEventListener("click", () => reloadComments(Math.min(state.megaTotalPages, state.megaPage + 1)));
     }
 
     $("corpus-vn-btn").addEventListener("click", () => renderTier2Corpus("vn"));
@@ -2564,6 +2979,7 @@
         txt.textContent = "Chế độ mẫu thử";
       }
       await loadRealThreads();
+      switchTier1Mode("real");
     } catch (err) {
       showError(`Không thể kết nối máy chủ cục bộ: ${err.message}`);
       $("health-text").textContent = "Lỗi kết nối";

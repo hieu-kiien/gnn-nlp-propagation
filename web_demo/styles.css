@@ -653,6 +653,27 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 .mega-comments-table td:last-child, .mega-comments-table th:last-child { text-align: left; white-space: normal; min-width: 280px; }
 .mega-comments-table td:not(:last-child), .mega-comments-table th:not(:last-child) { text-align: left; }
 
+.post-context-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; flex-shrink: 0; }
+.summary-lead-box {
+  margin: 0 0 var(--space-3);
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  font-size: 13.5px;
+  color: var(--ink-soft);
+  line-height: 1.5;
+}
+.arg-jump-btn { margin-top: 8px; padding: 0; border: none; background: transparent; color: var(--primary); font-size: 12.5px; font-weight: 600; cursor: pointer; }
+.arg-jump-btn:hover { text-decoration: underline; }
+.stance-filter-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; }
+.stance-filter-chip { border: 1px solid var(--border-strong); background: var(--surface); color: var(--ink-soft); border-radius: 999px; padding: 4px 11px; font-size: 12px; font-weight: 600; cursor: pointer; }
+.stance-filter-chip[aria-pressed="true"] { background: var(--primary); color: #FFFFFF; border-color: var(--primary); }
+.active-branch-note { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 8px; background: #EFF6FF; border: 1px solid #BFDBFE; font-size: 12.5px; color: #1E40AF; }
+.comment-parent-ctx { font-size: 11.5px; color: var(--muted); margin-bottom: 4px; padding-left: 8px; border-left: 2px solid var(--border-strong); }
+.comment-row-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 4px; }
+.scope-banner-t2 { padding: 8px 12px; border-radius: 8px; border: 1px solid #E2E8F0; background: #F8FAFC; font-size: 12.5px; color: var(--ink-soft); }
+
 .sort-btn { border: none; background: transparent; padding: 4px 6px; font-weight: 700; color: inherit; min-block-size: 32px; }
 .table-footnote { margin: var(--space-2) 0 0; font-size: 12px; color: var(--muted); }
 

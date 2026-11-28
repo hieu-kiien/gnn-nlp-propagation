@@ -721,3 +721,198 @@ def test_vnexpress_live_adapter_reddit_share_and_gnn_probe(monkeypatch: pytest.M
     assert probe_res["multi_hop_edges"] == 1
     assert "delta_polar_structure" in probe_res and "delta_polar_stance" in probe_res
     assert plt_mod.compute_gnn_structural_probe(gnn, d_probe, checkpoint_loaded=False)["available"] is False
+
+
+def test_vn_news_adapters_stance_consistency_and_full_comments(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Verify Dan Tri / Tuoi Tre / VnExpress pagination, SSRF generic meta, probe leakage fix, quote consistency & default all-comments."""
+    import scripts.predict_live_thread as plt_mod
+    from src.nlp.topic_post_analyzer import analyze_large_thread_dynamics, extract_hotspot_branches
+
+    class _MockResp:
+        def __init__(self, *, text: str = "", json_data: Any = None, status_code: int = 200) -> None:
+            self.text = text
+            self._json = json_data
+            self.status_code = status_code
+            self.encoding = "utf-8"
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise requests.HTTPError(f"HTTP {self.status_code}")
+
+        def json(self) -> Any:
+            return self._json
+
+        def iter_content(self, chunk_size: int = 32768):
+            del chunk_size
+            yield self.text.encode("utf-8")
+
+    # 1. Dan Tri nested adapter + 0-comment friendly error
+    def _mock_dt_get(url: str, params: dict[str, Any] | None = None, headers: Any = None, timeout: int = 15, **kwargs: Any) -> _MockResp:
+        del headers, timeout, kwargs
+        if "listcomment" in url:
+            if (params or {}).get("isReply") == "true":
+                return _MockResp(
+                    json_data={
+                        "count": 1,
+                        "items": [
+                            {
+                                "commentId": "9002",
+                                "parentId": "9001",
+                                "commentContent": "Đúng vậy, đồng tình với ý kiến này.",
+                                "userId": "u2",
+                                "createdDate": "2026-11-28T08:34:57",
+                            }
+                        ],
+                    }
+                )
+            if str((params or {}).get("objectId")) == "20261128152439984":
+                return _MockResp(json_data={"count": 0, "items": []})
+            return _MockResp(
+                json_data={
+                    "count": 1,
+                    "items": [
+                        {
+                            "commentId": "9001",
+                            "parentId": None,
+                            "commentContent": "Bình luận gốc trên Dân Trí.",
+                            "userId": "u1",
+                            "replyCount": 1,
+                            "createdDate": "2026-11-28T08:05:28",
+                        }
+                    ],
+                }
+            )
+        return _MockResp(
+            text='<title>Tin thử nghiệm | Báo Dân trí</title><meta name="description" content="Mô tả Dân Trí."/><meta property="article:published_time" content="2026-11-28T07:00:00+07:00"/>'
+        )
+
+    monkeypatch.setattr(plt_mod.requests, "get", _mock_dt_get)
+    dt_post, dt_cmts = plt_mod.fetch_url_thread("https://dantri.com.vn/xa-hoi/bai-thu-nghiem-20261127105443160.htm")
+    assert dt_post["source_platform"] == "dantri"
+    assert dt_post["has_real_publish_time"] is True
+    assert len(dt_cmts) == 2
+    assert dt_cmts[1]["parent_id"] == "t1_9001"
+    with pytest.raises(ValueError, match="0 bình luận"):
+        plt_mod.fetch_url_thread("https://dantri.com.vn/noi-vu/bai-0-cmt-20261128152439984.htm")
+
+    # 2. Tuoi Tre recursive child_comments adapter
+    def _mock_tt_get(url: str, params: dict[str, Any] | None = None, headers: Any = None, timeout: int = 15, **kwargs: Any) -> _MockResp:
+        del headers, timeout, kwargs
+        if "getlist-comment.api" in url:
+            if int((params or {}).get("pageindex") or 1) > 1:
+                return _MockResp(json_data={"Success": True, "Data": "[]"})
+            items = [
+                {
+                    "id": "501",
+                    "parent_id": "0",
+                    "content": "Ý kiến mở đầu Tuổi Trẻ.",
+                    "user_id": "tt_u1",
+                    "published_date": "2026-11-28T09:00:00",
+                    "child_comments": [
+                        {
+                            "id": "502",
+                            "parent_id": "501",
+                            "content": "Phản hồi tầng 2 Tuổi Trẻ.",
+                            "user_id": "tt_u2",
+                            "published_date": "2026-11-28T09:10:00",
+                            "child_comments": [],
+                        }
+                    ],
+                }
+            ]
+            return _MockResp(json_data={"Success": True, "Data": json.dumps(items, ensure_ascii=False)})
+        return _MockResp(text='<title>Bài báo mẫu - Tuổi Trẻ Online</title><meta name="description" content="Mô tả Tuổi Trẻ."/>')
+
+    monkeypatch.setattr(plt_mod.requests, "get", _mock_tt_get)
+    tt_post, tt_cmts = plt_mod.fetch_url_thread("https://tuoitre.vn/bai-bao-mau-100261128095247352.htm")
+    assert tt_post["source_platform"] == "tuoitre"
+    assert len(tt_cmts) == 2 and tt_cmts[1]["parent_id"] == "t1_501"
+
+    # 3. VnExpress continues past server-capped <50 page and uses article:published_time
+    def _mock_vne_paged(url: str, params: dict[str, Any] | None = None, headers: Any = None, timeout: int = 15, **kwargs: Any) -> _MockResp:
+        del headers, timeout, kwargs
+        if "index/getreplay" in url:
+            return _MockResp(json_data={"data": {"items": []}})
+        if "usi-saas.vnexpress.net/index/get" in url:
+            off = int((params or {}).get("offset") or 0)
+            if off == 0:
+                return _MockResp(
+                    json_data={
+                        "data": {
+                            "total": 25,
+                            "totalitem": 25,
+                            "items": [
+                                {"comment_id": str(i), "content": f"Bình luận VNE {i}", "userid": f"u{i}", "creation_time": 1760000100 + i}
+                                for i in range(1, 21)
+                            ],
+                        }
+                    }
+                )
+            return _MockResp(
+                json_data={
+                    "data": {
+                        "total": 25,
+                        "totalitem": 25,
+                        "items": [
+                            {"comment_id": str(i), "content": f"Bình luận VNE {i}", "userid": f"u{i}", "creation_time": 1760000100 + i}
+                            for i in range(21, 26)
+                        ],
+                    }
+                }
+            )
+        return _MockResp(
+            text='<title>Tin VnExpress nhiều trang - VnExpress</title><meta property="article:published_time" content="2025-10-09T09:00:00+07:00"/>'
+        )
+
+    monkeypatch.setattr(plt_mod.requests, "get", _mock_vne_paged)
+    vne_p2, vne_c2 = plt_mod.fetch_url_thread("https://vnexpress.net/tin-nhieu-trang-5149999.html")
+    assert len(vne_c2) == 25
+    assert vne_p2["has_real_publish_time"] is True
+
+    # 4. Generic SSRF block + No depth-2 double-negation fake pro quotes + hotspot oppose matches s_uv
+    with pytest.raises(ValueError):
+        plt_mod.fetch_generic_article_meta("http://127.0.0.1:8765/api/health")
+
+    root_n = {"node_id": "r0", "author_hash": "op", "text": "Bài viết thử nghiệm."}
+    n1 = {"node_id": "c1", "parent_id": "r0", "author_hash": "u1", "text": "Tôi không đồng tình chút nào với bài viết này.", "created_at_utc": 10.0}
+    n2 = {"node_id": "c2", "parent_id": "c1", "author_hash": "u2", "text": "Tôi cũng phản đối mạnh mẽ bình luận trên vì vô lý.", "created_at_utc": 20.0}
+    e1 = {"edge_id": "r0->c1", "source_id": "r0", "target_id": "c1", "s_uv": -0.35, "h_uv": 0.1}
+    e2 = {"edge_id": "c1->c2", "source_id": "c1", "target_id": "c2", "s_uv": -0.40, "h_uv": 0.2}
+    dyn = analyze_large_thread_dynamics(
+        root_node=root_n,
+        all_nodes=[root_n, n1, n2],
+        all_edges=[e1, e2],
+        edge_scores={"r0->c1": {"s_uv": -0.35, "h_uv": 0.1}, "c1->c2": {"s_uv": -0.40, "h_uv": 0.2}},
+        depth_map={"r0": 0, "c1": 1, "c2": 2},
+        lang="vi",
+    )
+    assert dyn["semantic_understanding"]["top_pro_arguments"] == []
+    hbs = extract_hotspot_branches(
+        root_id="r0",
+        all_nodes=[root_n, n1, n2],
+        all_edges=[e1, e2],
+        edge_scores={"r0->c1": {"s_uv": -0.35, "h_uv": 0.1}, "c1->c2": {"s_uv": -0.40, "h_uv": 0.2}},
+        depth_map={"r0": 0, "c1": 1, "c2": 2},
+    )
+    assert hbs[0]["oppose_ratio"] == pytest.approx(1.0)
+
+    # 5. Server returns full comment_rows for sandbox and defaults scan_jobs branch to _all_top
+    server, thread = _start_server(data_dir=tmp_path / "missing_vn", ckpt_path=tmp_path / "missing.pt", ce_dir=tmp_path / "missing_ce")
+    port = server.server_address[1]
+    try:
+        st_l, _, raw_l = _raw_http_get(port, "/api/tier1/threads")
+        assert st_l == 200
+        first_cid = json.loads(raw_l.decode("utf-8"))["threads"][0]["cascade_id"]
+        st_tc, _, raw_tc = _raw_http_get(port, f"/api/tier1/thread/comments?id={first_cid}&page=1")
+        assert st_tc == 200
+        tc_body = json.loads(raw_tc.decode("utf-8"))
+        assert tc_body["total_items"] >= 10
+        assert "stance_totals" in tc_body
+
+        st_sb, _, sb_body = _http_json_post(port, "/api/tier1/sandbox", {"mode": "preset_junk_1", "junk_mode": "contract"})
+        assert st_sb == 200
+        assert len(sb_body.get("comment_rows") or []) >= 5
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

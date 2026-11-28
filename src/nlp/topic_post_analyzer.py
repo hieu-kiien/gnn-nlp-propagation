@@ -724,10 +724,9 @@ def extract_hotspot_branches(
             if nid not in scored_target_ids:
                 continue
             s_uv, h_uv = edge_score_by_target.get(nid, (0.0, 0.0))
-            ori = float(ori_map.get(nid, s_uv))
-            if ori > 0.1:
+            if s_uv > 0.1:
                 sup_c += 1
-            elif ori < -0.1:
+            elif s_uv < -0.1:
                 opp_c += 1
             else:
                 neu_c += 1
@@ -876,11 +875,6 @@ def analyze_large_thread_dynamics(
         else 0.0
     )
 
-    milestone_grid = (5, 10, 20, 35, 50, 75, 100, 150, 200, 300, 500, 1000, 2000, 3500, 5000, 7500, 10000)
-    milestones = [m for m in milestone_grid if m < total_replies]
-    if total_replies > 0:
-        milestones.append(total_replies)
-
     # Bucket scored edges by max chronological node rank on the full tree for true-k O(N) incremental milestones.
     node_rank: dict[str, int] = {root_id: 0}
     for idx_r, n_r in enumerate(full_non_roots, start=1):
@@ -893,6 +887,18 @@ def analyze_large_thread_dynamics(
             continue
         r_max = r_src if r_src >= r_dst else r_dst
         edges_by_rank.setdefault(r_max, []).append((src, dst, e_row))
+
+    max_scored_rank = max(edges_by_rank.keys(), default=0)
+    # Use total_replies when stratified sampling spans the tree (>=50% span); cap only if strictly an early prefix was scored.
+    traj_end_k = (
+        max_scored_rank
+        if (0 < max_scored_rank < int(0.5 * total_replies) and len(all_edges) < len(struct_edges))
+        else total_replies
+    )
+    milestone_grid = (5, 10, 20, 35, 50, 75, 100, 150, 200, 300, 500, 1000, 2000, 3500, 5000, 7500, 10000)
+    milestones = [m for m in milestone_grid if m < traj_end_k]
+    if traj_end_k > 0:
+        milestones.append(traj_end_k)
 
     pref_adj: dict[str, list[str]] = {}
     pref_lookup: dict[tuple[str, str], dict[str, str]] = {}
@@ -1005,27 +1011,45 @@ def analyze_large_thread_dynamics(
     anti_candidates: list[tuple[float, dict[str, Any]]] = []
     flash_candidates: list[tuple[float, dict[str, Any]]] = []
     imp_map = trigger_importance_by_target or {}
+    full_children_count: Counter[str] = Counter()
+    for fe in struct_edges:
+        full_children_count[str(fe["source_id"])] += 1
+
+    sup_edge_cnt = opp_edge_cnt = neu_edge_cnt = hos_edge_cnt = 0
     all_authors: set[str] = {
         str(root_node.get("author_hash") or root_node.get("user_id_hash") or "root")
     }
+    node_author_map: dict[str, str] = {}
 
     for idx_n, n in enumerate(full_non_roots):
         nid = str(n["node_id"])
         txt = " ".join(str(n.get("text") or "").split())
-        ah = n.get("author_hash") or n.get("user_id_hash") or f"anon_{idx_n}"
-        all_authors.add(str(ah))
-        if nid not in scored_target_ids or not txt or _JUNK_LIKE_RE.fullmatch(txt):
+        ah = str(n.get("author_hash") or n.get("user_id_hash") or f"anon_{idx_n}")
+        all_authors.add(ah)
+        node_author_map[nid] = ah
+        if nid not in scored_target_ids:
+            continue
+        s_uv, h_uv = edge_score_by_target.get(nid, (0.0, 0.0))
+        if s_uv > 0.1:
+            sup_edge_cnt += 1
+        elif s_uv < -0.1:
+            opp_edge_cnt += 1
+        else:
+            neu_edge_cnt += 1
+        if h_uv >= 0.5:
+            hos_edge_cnt += 1
+        if not txt or _JUNK_LIKE_RE.fullmatch(txt):
             continue
         ori = float(node_orientations.get(nid, 0.0))
-        s_uv, h_uv = edge_score_by_target.get(nid, (0.0, 0.0))
         word_cnt = len(txt.split())
         if word_cnt < 4:
             continue
         len_factor = min(1.8, math.log1p(word_cnt) / 3.0)
         imp = float(imp_map.get(nid, 0.0))
-        subtree_deg = len(children_adj.get(nid, ()))
+        subtree_deg = int(full_children_count.get(nid, len(children_adj.get(nid, ()))))
         entry = {
             "node_id": nid,
+            "author_hash": ah,
             "aligned_stance": round(ori, 4),
             "s_uv": round(s_uv, 4),
             "h_uv": round(h_uv, 4),
@@ -1033,18 +1057,53 @@ def analyze_large_thread_dynamics(
             "child_replies": subtree_deg,
             "text": txt[:240] + ("…" if len(txt) > 240 else ""),
         }
-        if ori > 0.1:
+        # Depth-2 negative replies to an opposing parent must NOT appear as "Phe Tán thành nói gì?".
+        if ori > 0.1 and s_uv > 0.0:
             pro_candidates.append((ori * len_factor * (1.0 + imp) * (1.0 - 0.35 * h_uv), entry))
-        elif ori < -0.1:
-            anti_candidates.append((abs(ori) * len_factor * (1.0 + imp) * (1.0 - 0.25 * h_uv), entry))
+        elif ori < -0.1 or (int(depth_map.get(nid, 1)) <= 1 and s_uv < -0.1):
+            anti_candidates.append((max(abs(ori), abs(s_uv)) * len_factor * (1.0 + imp) * (1.0 - 0.25 * h_uv), entry))
 
         flash_score = 0.5 * h_uv + 0.3 * abs(s_uv) + 0.2 * min(1.0, math.log1p(subtree_deg) / 2.0)
-        if h_uv >= 0.45 or (abs(s_uv) >= 0.35 and subtree_deg >= 1):
+        if h_uv >= 0.45 or (abs(s_uv) >= 0.35 and subtree_deg >= 1) or (int(depth_map.get(nid, 1)) >= 2 and s_uv < -0.1):
             flash_candidates.append((flash_score, entry))
 
     pro_candidates.sort(key=lambda pair: (-pair[0], pair[1]["depth"], pair[1]["node_id"]))
     anti_candidates.sort(key=lambda pair: (-pair[0], pair[1]["depth"], pair[1]["node_id"]))
     flash_candidates.sort(key=lambda pair: (-pair[0], pair[1]["depth"], pair[1]["node_id"]))
+
+    def _pick_diverse(cands: Sequence[tuple[float, dict[str, Any]]], *, limit: int = 3, exclude_ids: set[str] | None = None) -> list[dict[str, Any]]:
+        chosen_items: list[dict[str, Any]] = []
+        seen_ids = set(exclude_ids or ())
+        used_authors: set[str] = set()
+        for _, item in cands:
+            nid_c = str(item["node_id"])
+            ah_c = str(item.get("author_hash") or "")
+            if nid_c in seen_ids or (ah_c and ah_c in used_authors):
+                continue
+            chosen_items.append(item)
+            seen_ids.add(nid_c)
+            if ah_c:
+                used_authors.add(ah_c)
+            if len(chosen_items) >= limit:
+                return chosen_items
+        for _, item in cands:
+            nid_c = str(item["node_id"])
+            if nid_c in seen_ids:
+                continue
+            chosen_items.append(item)
+            seen_ids.add(nid_c)
+            if len(chosen_items) >= limit:
+                break
+        return chosen_items
+
+    top_pro_list = _pick_diverse(pro_candidates, limit=3)
+    top_anti_list = _pick_diverse(
+        anti_candidates,
+        limit=3,
+        exclude_ids={str(x["node_id"]) for x in top_pro_list},
+    )
+    used_quote_ids = {str(x["node_id"]) for x in top_pro_list + top_anti_list}
+    top_flash_list = _pick_diverse(flash_candidates, limit=3, exclude_ids=used_quote_ids)
 
     primary_topic = str((topic_analysis or {}).get("primary_topic") or "Chưa phân loại")
     primary_conf = float((topic_analysis or {}).get("primary_confidence") or 0.0)
@@ -1052,25 +1111,39 @@ def analyze_large_thread_dynamics(
 
     if total_replies == 0:
         summary_vi = (
-            f"Tổng hợp trích xuất: Bài viết thuộc chủ đề \"{primary_topic}\" hiện chưa có bình luận phản hồi hợp lệ."
+            f"Bài viết thuộc chủ đề \"{primary_topic}\" hiện chưa có bình luận phản hồi hợp lệ."
         )
         summary_en = (
             f"Extractive synthesis: Post under topic \"{primary_topic}\" currently has no valid replies."
         )
     else:
+        edge_scored_n = max(1, sup_edge_cnt + opp_edge_cnt + neu_edge_cnt)
+        sup_pct = round(100.0 * sup_edge_cnt / float(edge_scored_n))
+        opp_pct = round(100.0 * opp_edge_cnt / float(edge_scored_n))
+        neu_pct = max(0, 100 - sup_pct - opp_pct)
+        q50_ref, q75_ref, q90_ref = get_polar_quantiles(lang_norm)
+        if opp_pct >= 60 and sup_pct <= 15:
+            polar_desc_vi = "thảo luận nghiêng mạnh về phản biện / bức xúc một chiều"
+        elif full_y_polar >= q90_ref:
+            polar_desc_vi = f"mức chia rẽ 2 phe rất cao ({full_y_polar:.3f}, thuộc nhóm cao nhất tập VN)"
+        elif full_y_polar >= q75_ref:
+            polar_desc_vi = f"mức chia rẽ 2 phe khá cao ({full_y_polar:.3f})"
+        elif full_y_polar >= q50_ref:
+            polar_desc_vi = f"mức tranh luận vừa ({full_y_polar:.3f})"
+        else:
+            polar_desc_vi = f"ít chia đôi 2 cực ({full_y_polar:.3f})"
+
         trend_phrase_vi = (
-            f"xu hướng {(_TREND_LABELS_VI.get(evolution_trend, evolution_trend)).lower()} "
-            f"(y_polar từ {early_ref_polar:.3f} ở K={ref_k} "
-            f"đến {full_y_polar:.3f} toàn cây)"
+            f"Diễn biến mức chia rẽ {(_TREND_LABELS_VI.get(evolution_trend, evolution_trend)).lower()} "
+            f"(từ {early_ref_polar:.3f} ở K={ref_k} bình luận đầu chuyển sang {full_y_polar:.3f} toàn bài)."
             if evolution_trend != "single_window"
-            else f"độ phân cực quan sát y_polar = {full_y_polar:.3f}"
+            else f"Điểm chia rẽ quan sát trên bài: {full_y_polar:.3f}."
         )
         summary_vi = (
-            f"Tổng hợp trích xuất — Chủ đề chính: {primary_topic} (độ tin cậy {primary_conf:.1%}). "
-            f"Cấu trúc quy mô \"{scale_label_vi}\" gồm {total_replies} bình luận từ {len(all_authors)} tác giả "
-            f"(độ sâu tối đa {max_depth} tầng), hình thái \"{archetype_label_vi}\" "
-            f"(Tán thành {final_pt['support_ratio']:.0%}, Phản đối {final_pt['oppose_ratio']:.0%}, "
-            f"Gay gắt {final_pt['hostile_ratio']:.0%}) với {trend_phrase_vi}."
+            f"Chủ đề \"{primary_topic}\" · {total_replies} bình luận từ {len(all_authors)} người tham gia "
+            f"(sâu {max_depth} tầng). Trong số bình luận đã chấm: {sup_edge_cnt} tán thành ({sup_pct}%), "
+            f"{opp_edge_cnt} phản đối ({opp_pct}%), {neu_edge_cnt} trung lập ({neu_pct}%) — {polar_desc_vi}. "
+            f"{trend_phrase_vi}"
         )
         trend_phrase_en = (
             f"{_TREND_LABELS_EN.get(evolution_trend, evolution_trend).lower()} "
@@ -1130,8 +1203,8 @@ def analyze_large_thread_dynamics(
             "summary": summary_en if lang_norm == "en" else summary_vi,
             "summary_vi": summary_vi,
             "summary_en": summary_en,
-            "top_pro_arguments": [item[1] for item in pro_candidates[:3]],
-            "top_anti_arguments": [item[1] for item in anti_candidates[:3]],
-            "flashpoint_comments": [item[1] for item in flash_candidates[:3]],
+            "top_pro_arguments": top_pro_list,
+            "top_anti_arguments": top_anti_list,
+            "flashpoint_comments": top_flash_list,
         },
     }

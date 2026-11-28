@@ -84,8 +84,8 @@
                     id="sb-reddit-url"
                     type="text"
                     class="text-input link-hero-input"
-                    aria-label="Dán link bài báo VnExpress hoặc link Reddit"
-                    placeholder="Dán link bài báo VnExpress hoặc link Reddit (/comments/...) vào đây...">
+                    aria-label="Dán link bài báo Việt Nam hoặc link Reddit"
+                    placeholder="Dán link bài báo (VnExpress, Dân Trí, Tuổi Trẻ, VietnamNet...) hoặc link Reddit...">
                   <button type="submit" id="btn-run-custom" class="btn-primary btn-hero">Phân tích</button>
                 </div>
 
@@ -271,51 +271,57 @@
                 <h2 id="root-title-display" class="post-title-main">—</h2>
                 <p id="root-text-display" class="root-preview-text">—</p>
               </div>
-              <span class="badge-tag badge-ood" id="ood-scale-badge" hidden>Ngoại suy quy mô lớn</span>
+              <div class="post-context-badges">
+                <span class="pill" id="result-source-badge" hidden>—</span>
+                <span class="badge-tag badge-neutral" id="domain-shift-badge" hidden>—</span>
+                <span class="badge-tag badge-ood" id="ood-scale-badge" hidden>Bài quy mô lớn</span>
+              </div>
             </div>
           </section>
 
           <section class="verdict-grid" aria-label="Kết luận nhanh">
             <article class="card verdict-card">
               <div class="verdict-card-head">
-                <h2 class="kpi-label">Mức độ tranh cãi</h2>
+                <h2 class="kpi-label" id="verdict-polar-label">Mức độ chia rẽ 2 phe</h2>
                 <span class="badge-tag badge-neutral" id="verdict-polar-level">—</span>
               </div>
               <div class="verdict-big-row">
                 <span class="verdict-big-num tabular" id="verdict-polar-100">—</span>
-                <span class="verdict-unit">/ 100</span>
+                <span class="verdict-unit" id="verdict-polar-unit">điểm</span>
               </div>
               <div class="polar-meter-track" aria-hidden="true">
                 <div class="polar-meter-fill" id="verdict-polar-meter"></div>
               </div>
+              <div class="kpi-sub" id="verdict-polar-sub">—</div>
             </article>
 
             <article class="card verdict-card">
               <div class="verdict-card-head">
-                <h2 class="kpi-label">Dự báo sớm (từ 20 BL đầu)</h2>
+                <h2 class="kpi-label" id="verdict-forecast-label">Dự báo quy mô (từ 20 BL đầu)</h2>
                 <span class="badge-tag badge-neutral" id="forecast-proof-badge">—</span>
               </div>
               <div class="forecast-compare-row">
                 <div class="fc-box">
                   <span class="fc-box-lbl">AI dự báo</span>
-                  <div class="fc-box-val tabular"><span id="kpi-pred-replies">—</span> <small>BL</small></div>
+                  <div class="fc-box-val tabular"><span id="kpi-pred-replies">—</span> <small>bình luận</small></div>
                 </div>
                 <div class="fc-vs" aria-hidden="true">vs</div>
                 <div class="fc-box">
-                  <span class="fc-box-lbl">Thực tế</span>
-                  <div class="fc-box-val tabular"><span id="kpi-actual-replies">—</span> <small>BL</small></div>
+                  <span class="fc-box-lbl" id="kpi-actual-label">Thực tế</span>
+                  <div class="fc-box-val tabular"><span id="kpi-actual-replies">—</span> <small>bình luận</small></div>
                 </div>
               </div>
-              <p class="kpi-sub" id="forecast-honesty-note" hidden>Văn bản thiếu giờ đăng thật nên tắt dự báo quy mô tương lai.</p>
+              <p class="kpi-sub" id="forecast-honesty-note" hidden>Bài dán thiếu mốc thời gian thật nên chưa thể dự báo tốc độ tăng trưởng.</p>
             </article>
 
             <article class="card verdict-card">
               <div class="verdict-card-head">
-                <h2 class="kpi-label">Tỷ lệ 2 phe &amp; Chủ đề</h2>
+                <h2 class="kpi-label">Phân bổ lập trường &amp; Chủ đề</h2>
                 <span class="kpi-sub"><strong id="kpi-authors" class="tabular">—</strong> người</span>
               </div>
               <div class="topic-primary-row">
                 <span class="badge-tag badge-topic-primary" id="topic-primary-label">—</span>
+                <span class="pill tabular" id="topic-primary-conf" hidden>—</span>
               </div>
               <div class="stance-bar-wrap" aria-hidden="true">
                 <div class="stance-bar-seg seg-support" id="bar-support"></div>
@@ -323,6 +329,7 @@
                 <div class="stance-bar-seg seg-oppose" id="bar-oppose"></div>
               </div>
               <div class="kpi-sub" id="kpi-stance-counts">Tán thành: 0 · Trung lập: 0 · Phản đối: 0</div>
+              <div class="kpi-sub" id="verdict-stance-scope">—</div>
             </article>
           </section>
 
@@ -330,7 +337,7 @@
             <div class="contraction-header">
               <span id="contraction-plain-summary">Đã lọc bình luận thừa và giữ nguyên mạch trả lời.</span>
               <span class="contraction-inline-nums tabular">
-                Gốc <strong id="cs-raw">0</strong> · Giữ <strong id="cs-kept">0</strong> · Xóa <strong id="cs-dropped">0</strong> · Rút gọn <strong id="cs-contracted">0</strong> · Nối <strong id="cs-relinked">0</strong> (<span id="contraction-mode-tag">contract</span>)
+                Gốc <strong id="cs-raw">0</strong> · Giữ <strong id="cs-kept">0</strong> · Xóa ngọn <strong id="cs-dropped">0</strong> · Gỡ nút giữa <strong id="cs-contracted">0</strong> · Nối mạch <strong id="cs-relinked">0</strong> (<span id="contraction-mode-tag">nối nhánh</span>)
               </span>
             </div>
             <div class="preserved-row">
@@ -342,13 +349,22 @@
           <section class="card understanding-card" id="ai-understanding-card" aria-label="Hai luồng ý kiến và diễn biến">
             <div class="panel-heading-row">
               <h2 class="section-heading">Hai luồng ý kiến chính</h2>
+              <div class="meta-pills">
+                <span class="pill" id="large-scope-pill" hidden>—</span>
+                <span class="pill tabular" id="large-scale-badge" hidden>—</span>
+                <span class="badge-tag badge-neutral" id="large-archetype-badge" hidden>—</span>
+                <span class="pill tabular" id="large-trend-badge" hidden>—</span>
+                <span class="pill tabular" id="mega-coverage-badge" hidden>—</span>
+              </div>
             </div>
+
+            <p id="large-summary-text" class="summary-lead-box" hidden></p>
 
             <div class="understanding-grid">
               <div id="arguments-columns" class="arguments-columns"></div>
 
               <div>
-                <h3 class="arg-group-title">Diễn biến mức chia rẽ</h3>
+                <h3 class="arg-group-title">Diễn biến mức chia rẽ qua từng mốc bình luận</h3>
                 <figure class="trajectory-figure">
                   <svg id="trajectory-svg" class="trajectory-svg" role="img" aria-label="Biểu đồ diễn biến tranh cãi"></svg>
                   <figcaption id="trajectory-caption" class="trajectory-caption">—</figcaption>
@@ -366,7 +382,7 @@
                     Luồng trả lời
                   </button>
                   <button type="button" id="view-user-btn" class="seg-btn" aria-pressed="false">
-                    Nhóm 2 phe
+                    Nhóm theo phe
                   </button>
                 </div>
 
@@ -386,7 +402,7 @@
               </div>
 
               <details id="gnn-proof-drawer" class="gnn-proof-drawer" hidden>
-                <summary class="gnn-proof-summary">Kiểm chứng: GNN có thực sự dùng cấu trúc cây?</summary>
+                <summary class="gnn-proof-summary">Kiểm chứng: Mô hình có thực sự dùng cấu trúc nhánh trả lời không?</summary>
                 <div id="gnn-proof-body" class="gnn-proof-body"></div>
               </details>
 
@@ -406,7 +422,7 @@
               </div>
 
               <div class="inspector-divider">
-                <h2 class="section-heading">Bình luận nổi bật</h2>
+                <h2 class="section-heading">Bình luận tác động mạnh ở cửa sổ đầu</h2>
                 <ol id="trigger-edges-list" class="trigger-list"></ol>
               </div>
             </aside>
@@ -414,9 +430,12 @@
 
           <section class="card mega-comments-card" id="mega-comments-section" hidden aria-label="Danh sách bình luận">
             <div class="panel-heading-row">
-              <h2 class="section-heading">Danh sách bình luận đã quét</h2>
+              <h2 class="section-heading">Danh sách toàn bộ bình luận</h2>
               <span class="pill tabular" id="mega-comments-total-pill">0 bình luận</span>
             </div>
+
+            <div id="active-branch-note" class="active-branch-note" hidden></div>
+            <div id="stance-filter-chips" class="stance-filter-chips" role="group" aria-label="Lọc nhanh lập trường"></div>
 
             <search>
               <div class="mega-filter-bar">
@@ -428,7 +447,7 @@
                   <option value="uncivil">Công kích</option>
                   <option value="unscored">Chưa chấm</option>
                 </select>
-                <input id="mega-search-input" type="search" class="text-input mega-search-input" placeholder="Tìm theo từ khóa...">
+                <input id="mega-search-input" type="search" class="text-input mega-search-input" placeholder="Tìm theo từ khóa trong bình luận...">
                 <div class="mega-pager">
                   <button type="button" id="mega-prev-page" class="btn-outline btn-sm">Trước</button>
                   <span id="mega-page-info" class="tabular field-label">1 / 1</span>
@@ -442,7 +461,7 @@
                 <thead>
                   <tr>
                     <th scope="col">#</th>
-                    <th scope="col">Lập trường</th>
+                    <th scope="col">Lập trường &amp; Tầng</th>
                     <th scope="col">Nội dung bình luận</th>
                   </tr>
                 </thead>
@@ -459,6 +478,9 @@
         <div class="panel-body">
 
           <section class="card control-header-card">
+            <div class="scope-banner-t2">
+              <strong>Lưu ý phạm vi:</strong> Tab này hiển thị kết quả thực nghiệm vĩ mô (Tầng 2) cố định trên toàn bộ tập dữ liệu <em>Reddit VN (r/vozforums)</em> và <em>Twitter PHEME</em>, độc lập với bài viết đang phân tích ở Tab 1.
+            </div>
             <div class="mode-row">
               <div class="segmented-group" role="group" aria-label="Chọn tập dữ liệu">
                 <button type="button" id="corpus-vn-btn" class="seg-btn" aria-pressed="true">
@@ -477,19 +499,19 @@
 
           <section class="kpi-grid" aria-label="Chỉ số cộng đồng toàn cục">
             <article class="card kpi-card">
-              <h2 class="kpi-label">Mức độ chia phe</h2>
+              <h2 class="kpi-label">Tách cụm 2 phe (Q_signed)</h2>
               <div class="kpi-value tabular" id="t2-q-signed">—</div>
               <div class="kpi-sub" id="t2-q-sub">—</div>
             </article>
 
             <article class="card kpi-card">
-              <h2 class="kpi-label">Độ khép kín nhóm</h2>
+              <h2 class="kpi-label">Độ khép kín "phòng vang" (RWC)</h2>
               <div class="kpi-value tabular" id="t2-rwc">—</div>
               <div class="kpi-sub" id="t2-camps">—</div>
             </article>
 
             <article class="card kpi-card">
-              <h2 class="kpi-label">Cân bằng tam giác</h2>
+              <h2 class="kpi-label">Cân bằng tam giác &amp; Davis</h2>
               <div class="kpi-value tabular" id="t2-z-score">—</div>
               <div class="kpi-sub" id="t2-triads">—</div>
             </article>
@@ -547,7 +569,7 @@
               <p class="table-footnote tabular" id="signed-link-splits-note"></p>
               <ul class="caveat-list" id="tier2-caveats-list"></ul>
               <div class="meta-pills">
-                <span class="pill tabular" id="tier2-source-pill">edge_label_source: —</span>
+                <span class="pill tabular" id="tier2-source-pill">nguồn nhãn cạnh: —</span>
                 <span class="pill tabular" id="tier2-wcc-pill">WCC: —</span>
               </div>
             </div>
@@ -566,7 +588,7 @@
     </dialog>
 
     <footer class="site-footer">
-      SBi-FAGAT · Nhóm 11 SIC-AI-N05 · Chạy cục bộ, ẩn danh người dùng bằng băm SHA-256.
+      SBi-FAGAT · Nhóm 11 SIC-AI-N05 · Chạy cục bộ, giả danh hóa người dùng bằng mã băm SHA-256.
     </footer>
   </div>
 

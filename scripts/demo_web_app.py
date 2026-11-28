@@ -51,8 +51,12 @@ from scripts.predict_live_thread import (  # noqa: E402
     _fetch_reddit_thread,
     _make_demo_offline_thread,
     compute_gnn_structural_probe,
+    fetch_generic_article_meta,
     fetch_reddit_thread_paginated,
     fetch_url_thread,
+    is_dantri_url,
+    is_supported_news_url,
+    is_tuoitre_url,
     is_vnexpress_url,
     load_thread_from_json_payload,
     load_thread_from_text,
@@ -107,6 +111,14 @@ _VALID_BRANCH_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 class QueueFullError(RuntimeError):
     """Raised when active background scan queue capacity is saturated (HTTP 429)."""
 
+
+class ManualCommentsNeededError(ValueError):
+    """Raised when a public news URL has extracted article metadata but needs pasted reader comments (HTTP 422)."""
+
+    def __init__(self, message: str, article_meta: Mapping[str, Any]) -> None:
+        super().__init__(message)
+        self.article_meta = dict(article_meta)
+
 _EXPLICIT_REPLY_RE = re.compile(
     r"^\s*[-*]?\s*([A-Za-z0-9_]+)\s*\(\s*(?:trả\s*lời|tra\s*loi|reply(?:\s+to)?|->)\s*([A-Za-z0-9_]+)\s*\)\s*:\s*(.+)$",
     re.IGNORECASE,
@@ -130,6 +142,13 @@ _CHROME_TOKEN_PART = (
 )
 _SOCIAL_CHROME_LINE_RE = re.compile(
     rf"^\s*{_CHROME_TOKEN_PART}(?:\s*[·•|,\-]\s*{_CHROME_TOKEN_PART})*\s*$",
+    re.IGNORECASE,
+)
+_VN_NEWS_CHROME_LINE_RE = re.compile(
+    r"^\s*(?:quan\s*tâm\s*nhất|mới\s*nhất|nổi\s*bật|xem\s*thêm\s+ý\s*kiến|ý\s*kiến\s*của\s*bạn|"
+    r"gửi\s*bình\s*luận|bình\s*luận(?:\s*\(\d+\))?|chia\s*sẻ|báo\s*cáo|vi\s*phạm|"
+    r"xem\s+thêm\s+\d+\s+(?:trả\s*lời|câu\s*trả\s*lời|phản\s*hồi)|"
+    r"\d{1,2}[:h]\d{2}(?:\s+\d{1,2}/\d{1,2}(?:/\d{2,4})?)?|\d{1,2}/\d{1,2}/\d{2,4})\s*$",
     re.IGNORECASE,
 )
 _SOCIAL_VIEW_REPLIES_RE = re.compile(
@@ -210,7 +229,7 @@ def _build_thread_user_graph(
 ) -> dict[str, Any]:
     """Project a single cascade reply tree into a signed thread-level user graph."""
     if not nodes:
-        return {"nodes": [], "edges": [], "camp_counts": {"camp0": 0, "camp1": 0}}
+        return {"nodes": [], "edges": [], "camp_counts": {"camp0": 0, "camp1": 0, "camp2": 0}}
 
     node_by_id: dict[str, Mapping[str, Any]] = {str(n["node_id"]): n for n in nodes}
     root_node = next((n for n in nodes if bool(n.get("is_root"))), nodes[0])
@@ -219,6 +238,7 @@ def _build_thread_user_graph(
     children_adj: dict[str, list[str]] = {str(n["node_id"]): [] for n in nodes}
     edge_lookup: dict[tuple[str, str], Mapping[str, Any]] = {}
     stance_map: dict[str, float] = {}
+    edge_by_dst_local: dict[str, Mapping[str, Any]] = {}
     for idx, e in enumerate(edges):
         src = str(e["source_id"])
         dst = str(e["target_id"])
@@ -226,6 +246,7 @@ def _build_thread_user_graph(
         children_adj.setdefault(src, []).append(dst)
         edge_lookup[(src, dst)] = {"edge_id": eid}
         stance_map[eid] = float(e.get("s_uv", 0.0))
+        edge_by_dst_local[dst] = e
 
     _, node_orientations = _compute_root_aligned_stances_and_orientations(
         root_id=root_id,
@@ -249,6 +270,7 @@ def _build_thread_user_graph(
                 "reply_count": 0,
                 "is_op": False,
                 "uncivil_count": 0,
+                "sample_comments": [],
             },
         )
         if bool(n.get("is_root")):
@@ -259,6 +281,17 @@ def _build_thread_user_graph(
             slot["orientations"].append(float(node_orientations.get(nid, 0.0)))
             if bool(n.get("is_uncivil")):
                 slot["uncivil_count"] += 1
+        if len(slot["sample_comments"]) < 6:
+            e_m = edge_by_dst_local.get(nid) or {}
+            st_lbl = "root" if bool(n.get("is_root")) else str(n.get("stance_class") or e_m.get("stance_class") or "neutral")
+            slot["sample_comments"].append(
+                {
+                    "node_id": nid,
+                    "text": str(n.get("text") or ""),
+                    "stance_class": st_lbl,
+                    "depth": int(n.get("depth", 0 if bool(n.get("is_root")) else 1)),
+                }
+            )
 
     pair_acc: dict[tuple[str, str], dict[str, Any]] = {}
     for e in edges:
@@ -277,17 +310,19 @@ def _build_thread_user_graph(
         slot["max_h"] = max(slot["max_h"], float(e.get("h_uv", 0.0)))
         slot["count"] += 1
 
-    # Initial camp assignment by root-aligned stance balance; refine undecided neutral users via neighbors
+    # Assign 3 clear user stances: 0 = Support/OP, 1 = Oppose/Critique, 2 = Neutral (never mislabel neutrals as Camp 0)
     camp_map: dict[str, int] = {}
     balance_map: dict[str, float] = {}
     for uid, st in user_stats.items():
         oris = st["orientations"]
         bal = sum(oris) / float(len(oris)) if oris else 0.0
         balance_map[uid] = float(bal)
-        if st["is_op"] or bal >= -0.05:
+        if st["is_op"] or bal > 0.10:
             camp_map[uid] = 0
-        else:
+        elif bal < -0.10:
             camp_map[uid] = 1
+        else:
+            camp_map[uid] = 2
 
     adj_pairs: dict[str, list[tuple[str, float]]] = defaultdict(list)
     for (u_a, u_b), acc in pair_acc.items():
@@ -296,12 +331,14 @@ def _build_thread_user_graph(
         adj_pairs[u_b].append((u_a, mean_s))
 
     for uid, bal in balance_map.items():
-        if user_stats[uid]["is_op"] or abs(bal) > 0.05:
+        if user_stats[uid]["is_op"] or abs(bal) > 0.10:
             continue
         vote_c0 = 0.0
         vote_c1 = 0.0
         for other, mean_s in adj_pairs.get(uid, ()):
-            other_camp = camp_map.get(other, 0)
+            other_camp = camp_map.get(other, 2)
+            if other_camp not in (0, 1):
+                continue
             if mean_s > 0.1:
                 if other_camp == 0:
                     vote_c0 += 1.0
@@ -312,7 +349,9 @@ def _build_thread_user_graph(
                     vote_c1 += 1.0
                 else:
                     vote_c0 += 1.0
-        if vote_c1 > vote_c0:
+        if vote_c0 > vote_c1:
+            camp_map[uid] = 0
+        elif vote_c1 > vote_c0:
             camp_map[uid] = 1
 
     graph_nodes: list[dict[str, Any]] = []
@@ -330,6 +369,7 @@ def _build_thread_user_graph(
                 "reply_count": int(st["reply_count"] + (1 if st["is_op"] else 0)),
                 "is_op": bool(st["is_op"]),
                 "is_uncivil": st["uncivil_count"] > 0,
+                "sample_comments": list(st["sample_comments"]),
             }
         )
 
@@ -352,10 +392,11 @@ def _build_thread_user_graph(
 
     camp0_n = sum(1 for n in graph_nodes if n["camp"] == 0)
     camp1_n = sum(1 for n in graph_nodes if n["camp"] == 1)
+    camp2_n = sum(1 for n in graph_nodes if n["camp"] == 2)
     return {
         "nodes": graph_nodes,
         "edges": graph_edges,
-        "camp_counts": {"camp0": camp0_n, "camp1": camp1_n},
+        "camp_counts": {"camp0": camp0_n, "camp1": camp1_n, "camp2": camp2_n},
     }
 
 
@@ -573,7 +614,7 @@ def _detect_unsupported_social_url(url: str) -> str | None:
 
 
 def _is_social_chrome_line(text: str) -> bool:
-    """Return True for copy-pasted Facebook/Threads UI chrome lines (never drop real short stances)."""
+    """Return True for copy-pasted social or VN news UI chrome lines (never drop real short stances)."""
     s = str(text or "").strip()
     if not s:
         return True
@@ -584,6 +625,8 @@ def _is_social_chrome_line(text: str) -> bool:
     if _SOCIAL_TIME_ONLY_RE.match(s):
         return True
     if _SOCIAL_CHROME_LINE_RE.match(s):
+        return True
+    if _VN_NEWS_CHROME_LINE_RE.match(s):
         return True
     return False
 
@@ -987,6 +1030,9 @@ def _format_live_result_payload(
             "cascade_id": cascade_id,
             "topic_id": topic_id,
             "lang": str(res.get("lang") or "vi"),
+            "source_platform": str(post.get("source_platform") or ""),
+            "domain_type": str(post.get("domain_type") or "social_forum"),
+            "has_real_publish_time": bool(post.get("has_real_publish_time", True)),
             "root_title": title,
             "root_text": root_full_text,
             "analysis_mode": str(res.get("analysis_mode") or "early"),
@@ -1131,6 +1177,79 @@ def build_megathread_stress_preset(n_comments: int = 2000) -> tuple[dict[str, An
     return post, comments
 
 
+def _comment_stance_totals(rows: Sequence[Mapping[str, Any]], branch_id: str = "") -> dict[str, int]:
+    b_norm = str(branch_id or "").strip()
+    sup = opp = neu = unc = un_sc = all_c = 0
+    for r in rows:
+        if b_norm and b_norm != "_all_top" and str(r.get("branch_id")) != b_norm:
+            continue
+        all_c += 1
+        if r.get("is_uncivil"):
+            unc += 1
+        if not r.get("is_scored", True) or str(r.get("stance_class")) == "unscored":
+            un_sc += 1
+        else:
+            st_c = str(r.get("stance_class") or "neutral")
+            if st_c == "support":
+                sup += 1
+            elif st_c == "oppose":
+                opp += 1
+            else:
+                neu += 1
+    return {
+        "all": all_c,
+        "support": sup,
+        "oppose": opp,
+        "neutral": neu,
+        "uncivil": unc,
+        "unscored": un_sc,
+    }
+
+
+def _paginate_comment_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    page: int = 1,
+    page_size: int = 50,
+    stance: str = "all",
+    q: str = "",
+    branch_id: str = "",
+) -> dict[str, Any]:
+    st_norm = str(stance or "all").strip().lower()
+    q_norm = str(q or "").strip().lower()
+    b_norm = str(branch_id or "").strip()
+    filtered: list[Mapping[str, Any]] = []
+    for r in rows:
+        if b_norm and b_norm != "_all_top" and str(r.get("branch_id")) != b_norm:
+            continue
+        if st_norm == "uncivil":
+            if not r.get("is_uncivil"):
+                continue
+        elif st_norm in {"support", "oppose", "neutral", "unscored"}:
+            if st_norm == "unscored":
+                if r.get("is_scored", True) and str(r.get("stance_class")) != "unscored":
+                    continue
+            elif not r.get("is_scored", True) or str(r.get("stance_class")) != st_norm:
+                continue
+        if q_norm and q_norm not in str(r.get("text") or "").lower():
+            continue
+        filtered.append(r)
+
+    p_sz = max(1, min(200, int(page_size)))
+    total_items = len(filtered)
+    total_pages = max(1, math.ceil(total_items / float(p_sz)))
+    p_idx = max(1, min(total_pages, int(page)))
+    start = (p_idx - 1) * p_sz
+    return {
+        "page": p_idx,
+        "page_size": p_sz,
+        "total_items": total_items,
+        "total_pages": total_pages,
+        "stance_totals": _comment_stance_totals(rows, branch_id=b_norm),
+        "items": list(filtered[start : start + p_sz]),
+    }
+
+
 def _build_scan_job_artifacts(full_payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Slice a full scan payload into a lightweight summary (<120 SVG nodes), paginated rows, and branch subtrees."""
     tree_nodes = list((full_payload.get("tree") or {}).get("nodes") or [])
@@ -1167,19 +1286,29 @@ def _build_scan_job_artifacts(full_payload: dict[str, Any]) -> tuple[dict[str, A
     for e in tree_edges:
         edge_scored_by_dst[str(e["target_id"])] = bool(e.get("is_scored", True))
 
+    non_root_nodes = [n for n in tree_nodes if not n.get("is_root")]
+    early_sorted_ids = {
+        str(n["node_id"])
+        for n in sorted(non_root_nodes, key=lambda x: (float(x.get("time_delay_sec", 0.0)), str(x.get("node_id"))))[:20]
+    }
     comment_rows: list[dict[str, Any]] = []
-    for n in tree_nodes:
-        if n.get("is_root"):
-            continue
+    for n in non_root_nodes:
         nid = str(n["node_id"])
+        pid_raw = str(n.get("parent_id") or "")
+        p_node = node_by_id.get(pid_raw)
+        p_snip = ""
+        if p_node is not None and not p_node.get("is_root"):
+            p_snip = _clean_title_snippet(str(p_node.get("text") or ""), 90)
         comment_rows.append(
             {
                 "node_id": nid,
-                "parent_id": n.get("parent_id"),
+                "parent_id": pid_raw or None,
+                "parent_snippet": p_snip,
                 "branch_id": branch_of.get(nid, ""),
                 "author_hash": n.get("author_hash"),
                 "depth": int(n.get("depth", 1)),
                 "time_delay_sec": float(n.get("time_delay_sec", 0.0)),
+                "is_early_k": nid in early_sorted_ids,
                 "text": str(n.get("text") or ""),
                 "stance_class": str(n.get("stance_class") or "neutral"),
                 "behavior_label": str(n.get("behavior_label") or "neutral"),
@@ -1234,8 +1363,9 @@ def _build_scan_job_artifacts(full_payload: dict[str, Any]) -> tuple[dict[str, A
         )
 
     top_default_ids = [str(n["node_id"]) for n in tree_nodes[:_MAX_TREE_RENDER_NODES]]
-    branch_trees["_all_top"] = _subset_tree(top_default_ids, branch_id="_all_top", lead_text="Tổng quan sớm từ gốc")
-    default_branch_key = hotspots[0]["branch_id"] if hotspots and str(hotspots[0].get("branch_id") or "") in branch_trees else "_all_top"
+    branch_trees["_all_top"] = _subset_tree(top_default_ids, branch_id="_all_top", lead_text="Toàn cảnh từ gốc")
+    # Default to _all_top so users immediately see the full overview & ALL scanned comments rather than 1 hidden branch.
+    default_branch_key = "_all_top"
     default_view = branch_trees[default_branch_key]
 
     compact = dict(full_payload)
@@ -1259,6 +1389,7 @@ def _build_scan_job_artifacts(full_payload: dict[str, Any]) -> tuple[dict[str, A
         ug["camp_counts"] = {
             "camp0": sum(1 for u in kept_u if int(u.get("camp", 0)) == 0),
             "camp1": sum(1 for u in kept_u if int(u.get("camp", 0)) == 1),
+            "camp2": sum(1 for u in kept_u if int(u.get("camp", 0)) == 2),
         }
         compact["user_graph"] = ug
 
@@ -1403,6 +1534,7 @@ class DemoBackend:
         self._is_synthetic_fallback = False
         self._thread_summaries: list[dict[str, Any]] = []
         self._threads_by_id: dict[str, dict[str, Any]] = {}
+        self._real_thread_comments: dict[str, list[dict[str, Any]]] = {}
         self._sandbox_preset_cache: dict[tuple[str, ...], dict[str, Any]] = {}
         self._macro_cache: dict[str, Any] | None = None
         self._scan_jobs: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -1524,7 +1656,7 @@ class DemoBackend:
             "notes": notes,
         }
 
-    def _build_real_vn_test_cache(self) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    def _build_real_vn_test_cache(self) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
         import pyarrow as pa
         import pyarrow.compute as pc
         import pyarrow.parquet as pq
@@ -1576,10 +1708,11 @@ class DemoBackend:
         cached_ce = self._get_cached_cross_encoder()
         topic_enc = cached_ce[0].encoder if cached_ce is not None else None
         topic_tok = cached_ce[1] if cached_ce is not None else None
-        topic_backend_choice: Literal["embedding", "lexical"] = "embedding" if cached_ce is not None else "lexical"
+        topic_backend_choice: Literal["auto", "nli", "embedding", "lexical"] = "lexical"
 
         summaries: list[dict[str, Any]] = []
         threads_by_id: dict[str, dict[str, Any]] = {}
+        comments_by_id: dict[str, list[dict[str, Any]]] = {}
 
         for idx_ds in selected_indices:
             d = dataset.data_list[idx_ds]
@@ -1759,11 +1892,12 @@ class DemoBackend:
             stats_vec = d.cascade_stats.view(-1).tolist()
 
             root_full_text = str(d.node_texts[0])
-            title_snip = _clean_title_snippet(root_full_text, 120)
+            first_line = next((ln.strip() for ln in root_full_text.splitlines() if ln.strip()), root_full_text)
+            title_snip = _clean_title_snippet(first_line, 120)
             user_graph = _build_thread_user_graph(tree_nodes, tree_edges)
 
             # Classify topic strictly on root + early replies in V_K (zero future leakage).
-            # Reuse cached Transformer encoder (and NLI if locally cached) instead of dropping to lexical.
+            # Reuse cached NLI/encoder instead of forcing low-accuracy cosine embedding.
             topic_analysis = classify_post_topics(
                 title_snip,
                 root_full_text,
@@ -1790,12 +1924,16 @@ class DemoBackend:
             ]
             full_children_adj: dict[str, list[str]] = defaultdict(list)
             full_edge_scores: dict[str, dict[str, Any]] = {}
+            full_edge_by_dst: dict[str, tuple[str, float, float]] = {}
             for fe in full_edges_list:
                 eid_f = str(fe.get("edge_id") or f"{fe['source_id']}->{fe['target_id']}")
                 s_f = float(pt_stance.get(eid_f, fe.get("s_uv", 0.0)))
                 h_f = float(pt_hostility.get(eid_f, fe.get("h_uv", 0.0)))
-                full_children_adj[str(fe["source_id"])].append(str(fe["target_id"]))
+                src_f = str(fe["source_id"])
+                dst_f = str(fe["target_id"])
+                full_children_adj[src_f].append(dst_f)
                 full_edge_scores[eid_f] = {"s_uv": s_f, "h_uv": h_f}
+                full_edge_by_dst[dst_f] = (src_f, s_f, h_f)
 
             full_depth_map: dict[str, int] = {root_id: 0}
             dq_full: deque[str] = deque([root_id])
@@ -1805,6 +1943,53 @@ class DemoBackend:
                     if ch_f not in full_depth_map:
                         full_depth_map[ch_f] = full_depth_map[cur_f] + 1
                         dq_full.append(ch_f)
+
+            def _node_ts_num(row: Mapping[str, Any]) -> float:
+                ts_v = row.get("created_at_utc")
+                if hasattr(ts_v, "timestamp"):
+                    return float(ts_v.timestamp())
+                try:
+                    return float(ts_v) if ts_v is not None else float(row.get("time_delay_sec", 0.0))
+                except (TypeError, ValueError):
+                    return 0.0
+
+            root_ts_num = _node_ts_num(raw_meta.get(root_id) or {})
+            early_id_set = {str(n["node_id"]) for n in tree_nodes[1:]}
+            sorted_full_non_roots = sorted(
+                [n for n in full_nodes_list if str(n["node_id"]) != root_id],
+                key=lambda r: (_node_ts_num(r), int(full_depth_map.get(str(r["node_id"]), 999)), str(r["node_id"])),
+            )
+            full_rows_cid: list[dict[str, Any]] = []
+            for r_idx, fn in enumerate(sorted_full_non_roots):
+                fnid = str(fn["node_id"])
+                f_src, s_f, h_f = full_edge_by_dst.get(fnid, (str(fn.get("parent_id") or root_id), 0.0, 0.0))
+                p_obj = full_nodes_dict.get(f_src)
+                p_snip = ""
+                if p_obj is not None and f_src != root_id:
+                    p_snip = _clean_title_snippet(str(p_obj.get("text") or ""), 90)
+                fah, _ = _safe_short_author_hash(fn.get("user_id_hash") or fn.get("author_hash"), r_idx + 1, is_root=False)
+                f_delay = max(0.0, _node_ts_num(fn) - root_ts_num) if root_ts_num > 0 else float(fn.get("time_delay_sec", 0.0))
+                full_rows_cid.append(
+                    {
+                        "node_id": fnid,
+                        "parent_id": f_src,
+                        "parent_snippet": p_snip,
+                        "branch_id": "",
+                        "author_hash": fah,
+                        "depth": int(full_depth_map.get(fnid, 1)),
+                        "time_delay_sec": round(f_delay, 1),
+                        "is_early_k": fnid in early_id_set,
+                        "text": str(fn.get("text") or ""),
+                        "stance_class": _stance_class_from_score(s_f),
+                        "behavior_label": _behavior_from_2d(s_f, h_f),
+                        "s_uv": round(s_f, 4),
+                        "h_uv": round(h_f, 4),
+                        "is_uncivil": h_f >= 0.5,
+                        "relinked": False,
+                        "is_scored": True,
+                    }
+                )
+            comments_by_id[cid] = full_rows_cid
 
             imp_by_target = {str(t["target_id"]): float(t.get("importance", 0.0)) for t in top_triggers}
             root_meta_obj = raw_meta.get(root_id) or tree_nodes[0]
@@ -1852,6 +2037,9 @@ class DemoBackend:
                 "meta": {
                     "cascade_id": cid,
                     "topic_id": tid,
+                    "source_platform": "reddit_vozforums",
+                    "domain_type": "social_forum",
+                    "has_real_publish_time": True,
                     "root_title": title_snip,
                     "root_text": root_full_text,
                     "analysis_mode": "early",
@@ -1919,9 +2107,9 @@ class DemoBackend:
                 "large_thread_analysis": large_thread_analysis,
             }
 
-        return summaries, threads_by_id
+        return summaries, threads_by_id, comments_by_id
 
-    def _build_synthetic_fallback_cache(self) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    def _build_synthetic_fallback_cache(self) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
         presets = [
             ("vn_demo_01", "topic_demo_01", *_make_demo_offline_thread()),
             ("vn_demo_02", "topic_demo_02", *_make_synthetic_polarized_preset()),
@@ -1931,6 +2119,7 @@ class DemoBackend:
 
         summaries: list[dict[str, Any]] = []
         threads_by_id: dict[str, dict[str, Any]] = {}
+        comments_by_id: dict[str, list[dict[str, Any]]] = {}
         for cid, tid, post, comments in presets:
             res = predict_live_cascade(
                 post,
@@ -1976,8 +2165,36 @@ class DemoBackend:
                 }
             )
             threads_by_id[cid] = payload
+            syn_nodes = list((payload.get("tree") or {}).get("nodes") or [])
+            syn_by_id = {str(n["node_id"]): n for n in syn_nodes}
+            comments_by_id[cid] = [
+                {
+                    "node_id": str(n["node_id"]),
+                    "parent_id": n.get("parent_id"),
+                    "parent_snippet": (
+                        _clean_title_snippet(str(syn_by_id[str(n["parent_id"])].get("text") or ""), 90)
+                        if str(n.get("parent_id") or "") in syn_by_id and not syn_by_id[str(n["parent_id"])].get("is_root")
+                        else ""
+                    ),
+                    "branch_id": "",
+                    "author_hash": n.get("author_hash"),
+                    "depth": int(n.get("depth", 1)),
+                    "time_delay_sec": float(n.get("time_delay_sec", 0.0)),
+                    "is_early_k": True,
+                    "text": str(n.get("text") or ""),
+                    "stance_class": str(n.get("stance_class") or "neutral"),
+                    "behavior_label": str(n.get("behavior_label") or "neutral"),
+                    "s_uv": float(n.get("s_uv", 0.0)),
+                    "h_uv": float(n.get("h_uv", 0.0)),
+                    "is_uncivil": bool(n.get("is_uncivil", False)),
+                    "relinked": bool(n.get("relinked", False)),
+                    "is_scored": True,
+                }
+                for n in syn_nodes
+                if not n.get("is_root")
+            ]
 
-        return summaries, threads_by_id
+        return summaries, threads_by_id, comments_by_id
 
     def _ensure_tier1_threads_loaded(self) -> None:
         with self._lock:
@@ -1985,16 +2202,17 @@ class DemoBackend:
                 return
             if self.real_vn_data_available and self._gnn_ckpt_loaded:
                 try:
-                    summaries, by_id = self._build_real_vn_test_cache()
+                    summaries, by_id, comments_by_id = self._build_real_vn_test_cache()
                     self._is_synthetic_fallback = False
                 except Exception:
-                    summaries, by_id = self._build_synthetic_fallback_cache()
+                    summaries, by_id, comments_by_id = self._build_synthetic_fallback_cache()
                     self._is_synthetic_fallback = True
             else:
-                summaries, by_id = self._build_synthetic_fallback_cache()
+                summaries, by_id, comments_by_id = self._build_synthetic_fallback_cache()
                 self._is_synthetic_fallback = True
             self._thread_summaries = summaries
             self._threads_by_id = by_id
+            self._real_thread_comments = comments_by_id
             self._threads_ready = True
 
     def list_tier1_threads(self) -> dict[str, Any]:
@@ -2011,6 +2229,23 @@ class DemoBackend:
         if not cid or cid not in self._threads_by_id:
             raise KeyError(f"Unknown cascade_id {cascade_id!r}")
         return self._threads_by_id[cid]
+
+    def get_tier1_thread_comments(
+        self,
+        cascade_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        stance: str = "all",
+        q: str = "",
+    ) -> dict[str, Any]:
+        self._ensure_tier1_threads_loaded()
+        cid = str(cascade_id or "").strip()
+        if not cid or cid not in self._threads_by_id:
+            raise KeyError(f"Unknown cascade_id {cascade_id!r}")
+        rows = self._real_thread_comments.get(cid) or []
+        res = _paginate_comment_rows(rows, page=page, page_size=page_size, stance=stance, q=q)
+        return {"cascade_id": cid, **res}
 
     def run_sandbox(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, Mapping):
@@ -2121,6 +2356,7 @@ class DemoBackend:
             analysis_mode=analysis_mode,
             max_full_comments=max_full_comments,
             custom_topics=custom_topics,
+            topic_backend="auto",
             cross_encoder_ckpt=ce_ckpt,
             preloaded_ce=cached_ce,
             gnn_ckpt=gnn_ckpt,
@@ -2147,6 +2383,38 @@ class DemoBackend:
             is_api_tree=is_api_tree,
         )
         out["sandbox_mode"] = mode
+        sb_nodes = list((out.get("tree") or {}).get("nodes") or [])
+        sb_by_id = {str(n["node_id"]): n for n in sb_nodes}
+        sb_non_roots = [n for n in sb_nodes if not n.get("is_root")]
+        sb_early_ids = {
+            str(n["node_id"])
+            for n in sorted(sb_non_roots, key=lambda x: (float(x.get("time_delay_sec", 0.0)), str(x.get("node_id"))))[:20]
+        }
+        out["comment_rows"] = [
+            {
+                "node_id": str(n["node_id"]),
+                "parent_id": n.get("parent_id"),
+                "parent_snippet": (
+                    _clean_title_snippet(str(sb_by_id[str(n["parent_id"])].get("text") or ""), 90)
+                    if str(n.get("parent_id") or "") in sb_by_id and not sb_by_id[str(n["parent_id"])].get("is_root")
+                    else ""
+                ),
+                "branch_id": "",
+                "author_hash": n.get("author_hash"),
+                "depth": int(n.get("depth", 1)),
+                "time_delay_sec": float(n.get("time_delay_sec", 0.0)),
+                "is_early_k": str(n["node_id"]) in sb_early_ids,
+                "text": str(n.get("text") or ""),
+                "stance_class": str(n.get("stance_class") or "neutral"),
+                "behavior_label": str(n.get("behavior_label") or "neutral"),
+                "s_uv": float(n.get("s_uv", 0.0)),
+                "h_uv": float(n.get("h_uv", 0.0)),
+                "is_uncivil": bool(n.get("is_uncivil", False)),
+                "relinked": bool(n.get("relinked", False)),
+                "is_scored": bool(n.get("is_scored", True)),
+            }
+            for n in sb_non_roots
+        ]
         if mode in {"preset_junk_1", "preset_junk_2", "preset_large_1"}:
             cache_key = (
                 mode,
@@ -2177,8 +2445,11 @@ class DemoBackend:
         if backend_raw not in {"auto", "nli", "embedding", "lexical"}:
             raise ValueError(f"topic_backend không hợp lệ: {backend_raw!r}")
         backend_lit: Literal["auto", "nli", "embedding", "lexical"] = backend_raw  # type: ignore[assignment]
+        import torch
+
         cached_ce = self._get_cached_cross_encoder()
         allow_nli_dl = bool(payload.get("allow_nli_download", False))
+        topic_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         with self._inference_lock:
             return classify_post_topics(
                 title,
@@ -2189,6 +2460,7 @@ class DemoBackend:
                 backend=backend_lit,
                 node_encoder=cached_ce[0].encoder if cached_ce is not None else None,
                 node_tokenizer=cached_ce[1] if cached_ce is not None else None,
+                device=topic_device,
                 allow_nli_download=allow_nli_dl,
             )
 
@@ -2442,7 +2714,33 @@ class DemoBackend:
                     "rồi dán thẳng vào mục 'Hoặc dán trực tiếp nội dung', hoặc tải lên tệp .txt/.json/.jsonl."
                 )
             source_url_for_job = reddit_url
-            if not is_vnexpress_url(reddit_url):
+            if not is_supported_news_url(reddit_url):
+                parsed_u = urlparse(reddit_url)
+                host_u = (parsed_u.hostname or "").lower()
+                is_reddit_like = (
+                    host_u == "reddit.com"
+                    or host_u.endswith(".reddit.com")
+                    or host_u in {"redd.it", "www.redd.it"}
+                    or "://" not in reddit_url
+                )
+                if not is_reddit_like and parsed_u.scheme.lower() in {"http", "https"} and host_u:
+                    try:
+                        art_meta = fetch_generic_article_meta(reddit_url)
+                    except ValueError:
+                        raise
+                    except Exception:
+                        art_meta = {
+                            "url": reddit_url,
+                            "hostname": host_u,
+                            "title": "",
+                            "description": "",
+                            "published_ts": None,
+                        }
+                    raise ManualCommentsNeededError(
+                        f"Trang {host_u} chưa hỗ trợ tải bình luận tự động qua API công khai. "
+                        "Tiêu đề/mô tả bài báo (nếu đọc được) đã được điền sẵn; bạn chỉ cần copy phần bình luận trên báo và dán vào ô bên dưới.",
+                        art_meta,
+                    )
                 post_id_for_url = _extract_post_id_from_url(reddit_url)
         elif mode == "json_upload":
             raw_thread_json = payload.get("thread_json")
@@ -2451,12 +2749,14 @@ class DemoBackend:
             if raw_thread_json is None:
                 raise ValueError("Thiếu dữ liệu thread_json khi mode='json_upload'.")
             if isinstance(raw_thread_json, str):
+                json_has_ts = any(k in raw_thread_json for k in ("created_utc", "creation_time", "createdDate", "timestamp"))
                 prepared_post, prepared_comments = load_thread_from_text(
                     raw_thread_json,
                     max_comments=max_full_comments,
                     source_name="json_upload",
                 )
             else:
+                json_has_ts = True
                 prepared_post, prepared_comments = load_thread_from_json_payload(
                     raw_thread_json,
                     max_comments=max_full_comments,
@@ -2465,6 +2765,7 @@ class DemoBackend:
             if not prepared_comments:
                 raise ValueError("Tệp JSON/JSONL không chứa bình luận hợp lệ nào.")
         elif mode == "preset_mega_stress":
+            json_has_ts = False
             stress_n = self._coerce_int_bound(
                 payload.get("stress_n_comments"),
                 field="stress_n_comments",
@@ -2474,6 +2775,7 @@ class DemoBackend:
             )
             prepared_post, prepared_comments = build_megathread_stress_preset(stress_n)
         else:
+            json_has_ts = False
             post_id = "mega_custom"
             title = str(payload.get("title") or "").strip()
             root_text = str(payload.get("root_text") or "").strip()
@@ -2498,6 +2800,9 @@ class DemoBackend:
             prepared_comments = self._parse_custom_comments_payload(effective_payload, post_id=post_id, base_ts=base_ts)
             if not prepared_comments:
                 raise ValueError("Cần ít nhất 1 bình luận để dựng cây hội thoại.")
+
+        if mode == "reddit_url":
+            json_has_ts = True
 
         job_id = uuid.uuid4().hex[:16]
         cancel_ev = threading.Event()
@@ -2583,7 +2888,7 @@ class DemoBackend:
                     progress_cb=_on_progress,
                     cancel_event=cancel_ev,
                     custom_topics=custom_topics,
-                    topic_backend="embedding" if (is_demo or ce_ckpt is not None) else "auto",
+                    topic_backend="auto",
                     cross_encoder_ckpt=ce_ckpt,
                     preloaded_ce=cached_ce,
                     gnn_ckpt=gnn_ckpt,
@@ -2594,7 +2899,7 @@ class DemoBackend:
                     inference_lock=self._inference_lock,
                 )
                 cid = f"vn_{str(post_obj.get('id') or 'mega').removeprefix('t3_')}"
-                has_real_ts = mode in {"reddit_url", "json_upload", "preset_mega_stress"}
+                has_real_ts = bool(mode == "reddit_url" or (mode == "json_upload" and json_has_ts))
                 is_api_tree = mode in {"reddit_url", "json_upload"}
                 full_out = _format_live_result_payload(
                     cascade_id=cid,
@@ -2708,39 +3013,15 @@ class DemoBackend:
                 raise KeyError(f"Unknown scan job {job_id!r}")
             rows = list(rec.get("comment_rows") or [])
 
-        st_norm = str(stance or "all").strip().lower()
-        q_norm = str(q or "").strip().lower()
-        b_norm = str(branch_id or "").strip()
-        filtered: list[dict[str, Any]] = []
-        for r in rows:
-            if b_norm and b_norm != "_all_top" and str(r.get("branch_id")) != b_norm:
-                continue
-            if st_norm == "uncivil":
-                if not r.get("is_uncivil"):
-                    continue
-            elif st_norm in {"support", "oppose", "neutral", "unscored"}:
-                if st_norm == "unscored":
-                    if r.get("is_scored", True) and str(r.get("stance_class")) != "unscored":
-                        continue
-                elif not r.get("is_scored", True) or str(r.get("stance_class")) != st_norm:
-                    continue
-            if q_norm and q_norm not in str(r.get("text") or "").lower():
-                continue
-            filtered.append(r)
-
-        p_sz = max(1, min(200, int(page_size)))
-        total_items = len(filtered)
-        total_pages = max(1, math.ceil(total_items / float(p_sz)))
-        p_idx = max(1, min(total_pages, int(page)))
-        start = (p_idx - 1) * p_sz
-        return {
-            "job_id": clean_id,
-            "page": p_idx,
-            "page_size": p_sz,
-            "total_items": total_items,
-            "total_pages": total_pages,
-            "items": filtered[start : start + p_sz],
-        }
+        res = _paginate_comment_rows(
+            rows,
+            page=page,
+            page_size=page_size,
+            stance=stance,
+            q=q,
+            branch_id=branch_id,
+        )
+        return {"job_id": clean_id, **res}
 
     def get_scan_job_branch(self, job_id: str, branch_id: str) -> dict[str, Any]:
         clean_id = str(job_id or "").strip()
@@ -2866,6 +3147,30 @@ def make_handler(backend: DemoBackend):
                 self._send_json(HTTPStatus.OK, payload)
                 return
 
+            if path == "/api/tier1/thread/comments":
+                qs = parse_qs(parsed.query)
+                cid = (qs.get("id") or [""])[0]
+                if not cid:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Missing query parameter 'id'"})
+                    return
+                try:
+                    page_v = int((qs.get("page") or ["1"])[0])
+                    size_v = int((qs.get("page_size") or ["50"])[0])
+                except ValueError:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid pagination query parameters"})
+                    return
+                stance_v = (qs.get("stance") or ["all"])[0]
+                q_v = (qs.get("q") or [""])[0]
+                try:
+                    payload = backend.get_tier1_thread_comments(
+                        cid, page=page_v, page_size=size_v, stance=stance_v, q=q_v
+                    )
+                except KeyError as exc:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, payload)
+                return
+
             if path == "/api/tier2/macro":
                 try:
                     payload = backend.get_tier2_macro()
@@ -2940,7 +3245,7 @@ def make_handler(backend: DemoBackend):
                 and parsed.path.endswith("/cancel")
                 and len([p for p in parsed.path.removeprefix("/api/tier1/scan_jobs/").strip("/").split("/") if p]) == 2
             )
-            if parsed.path not in {"/api/tier1/sandbox", "/api/tier1/classify_topic"} and not is_scan_create and not is_scan_cancel:
+            if parsed.path not in {"/api/tier1/sandbox", "/api/tier1/classify_topic", "/api/tier1/fetch_article_meta"} and not is_scan_create and not is_scan_cancel:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
                 return
 
@@ -2965,12 +3270,24 @@ def make_handler(backend: DemoBackend):
                         return
                     self._send_json(HTTPStatus.OK, result)
                     return
-                if parsed.path == "/api/tier1/classify_topic":
+                if parsed.path == "/api/tier1/fetch_article_meta":
+                    result = fetch_generic_article_meta(str(body.get("url") or ""))
+                elif parsed.path == "/api/tier1/classify_topic":
                     result = backend.classify_topic(body)
                 else:
                     result = backend.run_sandbox(body)
             except QueueFullError as exc:
                 self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": str(exc)})
+                return
+            except ManualCommentsNeededError as exc:
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": str(exc),
+                        "needs_manual_comments": True,
+                        "article_meta": exc.article_meta,
+                    },
+                )
                 return
             except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})

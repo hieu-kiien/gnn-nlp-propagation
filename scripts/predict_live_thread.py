@@ -19,9 +19,11 @@ import argparse
 import contextlib
 import hashlib
 import html as html_lib
+import ipaddress
 import json
 import math
 import re
+import socket
 import sys
 import threading
 import time
@@ -96,6 +98,14 @@ _REDDIT_ALLOWED_HOSTS: frozenset[str] = frozenset(
 )
 _VNEXPRESS_URL_RE = re.compile(
     r"^https?://(?:[a-z0-9-]+\.)?vnexpress\.net/.+-(\d{6,9})\.html(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+_DANTRI_URL_RE = re.compile(
+    r"^https?://(?:[a-z0-9-]+\.)?dantri\.com\.vn/.+-(\d{12,20})\.htm(?:l)?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+_TUOITRE_URL_RE = re.compile(
+    r"^https?://(?:[a-z0-9-]+\.)?tuoitre\.vn/.+-(\d{12,20})\.htm(?:l)?(?:[?#].*)?$",
     re.IGNORECASE,
 )
 _VALID_POST_ID_RE = re.compile(r"[A-Za-z0-9]{4,12}")
@@ -206,6 +216,95 @@ def is_vnexpress_url(url: str) -> bool:
     return bool(_VNEXPRESS_URL_RE.match(str(url or "").strip()))
 
 
+def is_dantri_url(url: str) -> bool:
+    """Return True if URL points to a public Dan Tri article page."""
+    return bool(_DANTRI_URL_RE.match(str(url or "").strip()))
+
+
+def is_tuoitre_url(url: str) -> bool:
+    """Return True if URL points to a public Tuoi Tre article page."""
+    return bool(_TUOITRE_URL_RE.match(str(url or "").strip()))
+
+
+def is_supported_news_url(url: str) -> bool:
+    """Return True if URL targets any supported Vietnamese news portal with a public comment API."""
+    return is_vnexpress_url(url) or is_dantri_url(url) or is_tuoitre_url(url)
+
+
+def _parse_iso_or_epoch_ts(raw_val: Any, fallback: float) -> float:
+    """Parse Unix epoch or ISO-8601 date strings (assuming UTC+7 if tz-naive) to UTC seconds."""
+    if raw_val is None or isinstance(raw_val, bool):
+        return float(fallback)
+    if isinstance(raw_val, (int, float)):
+        fv = float(raw_val)
+        return fv if math.isfinite(fv) and fv > 0 else float(fallback)
+    s = str(raw_val).strip()
+    if not s:
+        return float(fallback)
+    try:
+        fv = float(s)
+        if math.isfinite(fv) and fv > 0:
+            return fv
+    except ValueError:
+        pass
+    s_norm = s.replace("Z", "+00:00")
+    for fmt in (None, "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
+        try:
+            dt = datetime.fromisoformat(s_norm) if fmt is None else datetime.strptime(s_norm, fmt)
+            if dt.tzinfo is None:
+                from datetime import timedelta
+
+                dt = dt.replace(tzinfo=timezone(timedelta(hours=7)))
+            return float(dt.timestamp())
+        except ValueError:
+            continue
+    return float(fallback)
+
+
+def _extract_html_article_meta(
+    page_html: str,
+    *,
+    default_title: str,
+    strip_brand_re: str = "",
+) -> tuple[str, str, float | None]:
+    """Extract clean title, meta description/sapo, and publish timestamp from a news HTML document."""
+    title = default_title
+    desc = ""
+    pub_ts: float | None = None
+    m_title = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.IGNORECASE | re.DOTALL)
+    if m_title:
+        raw_t = _strip_html_text(m_title.group(1))
+        if strip_brand_re:
+            raw_t = re.sub(strip_brand_re, "", raw_t, flags=re.IGNORECASE).strip()
+        if raw_t:
+            title = raw_t
+    for pat in (
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
+        r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description["\']',
+    ):
+        m_desc = re.search(pat, page_html, re.IGNORECASE)
+        if m_desc:
+            cand = _strip_html_text(m_desc.group(1))
+            if cand:
+                desc = cand
+                break
+    for pat in (
+        r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']article:published_time["\']',
+        r'<meta[^>]+name=["\'](?:pubdate|publishdate|article_date_original)["\'][^>]+content=["\']([^"\']+)["\']',
+        r'"datePublished"\s*:\s*"([^"]+)"',
+    ):
+        m_pub = re.search(pat, page_html, re.IGNORECASE)
+        if m_pub:
+            parsed_ts = _parse_iso_or_epoch_ts(m_pub.group(1), -1.0)
+            if parsed_ts > 0:
+                pub_ts = parsed_ts
+                break
+    return title, desc, pub_ts
+
+
 def _resolve_reddit_share_url(url: str, timeout: int = 8) -> str:
     """Resolve Reddit /r/.../s/<token> share links safely with strict host allowlist (anti-SSRF)."""
     cur = str(url or "").strip()
@@ -223,7 +322,7 @@ def _resolve_reddit_share_url(url: str, timeout: int = 8) -> str:
             raise ValueError(
                 "Link chia sẻ rút gọn (/s/...) của Reddit cần chuyển hướng qua reddit.com nhưng kết nối bị nhà mạng chặn "
                 "hoặc quá thời gian. Hãy mở link đó trên trình duyệt rồi copy địa chỉ đầy đủ có '/comments/<mã_bài>/', "
-                "hoặc dán link bài báo VnExpress."
+                "hoặc dán link bài báo VnExpress / Dân Trí / Tuổi Trẻ."
             ) from exc
         if resp.status_code in (301, 302, 303, 307, 308):
             loc = resp.headers.get("location") or resp.headers.get("Location")
@@ -238,7 +337,7 @@ def _resolve_reddit_share_url(url: str, timeout: int = 8) -> str:
     raise ValueError(
         "Không tự giải mã được link chia sẻ Reddit (/s/...) này do Reddit chặn truy cập tự động. "
         "Hãy mở link trên trình duyệt để lấy đường dẫn đầy đủ chứa '/comments/<mã_bài>/', "
-        "hoặc dán trực tiếp link bài báo VnExpress."
+        "hoặc dán trực tiếp link bài báo VnExpress / Dân Trí / Tuổi Trẻ."
     )
 
 
@@ -269,9 +368,9 @@ def _extract_post_id_from_url(url: str) -> str:
 
     if "/" in raw or "://" in raw or ".." in raw:
         raise ValueError(
-            "Link chưa đúng định dạng bài viết được hỗ trợ. "
-            "Hãy dán link bài báo VnExpress (...html), link Reddit đầy đủ (/comments/<mã_bài>/), "
-            "link rút gọn redd.it/<mã_bài>, hoặc mở mục 'Hoặc dán trực tiếp nội dung'."
+            "Link chưa đúng định dạng bài viết được hỗ trợ trực tiếp. "
+            "Hãy dán link bài báo VnExpress, Dân Trí, Tuổi Trẻ, link Reddit đầy đủ (/comments/<mã_bài>/), "
+            "hoặc mở mục 'Hoặc dán trực tiếp nội dung'."
         )
 
     candidate = raw[3:] if raw.startswith("t3_") else raw
@@ -664,31 +763,24 @@ def fetch_vnexpress_thread(
 
     title = f"Bài viết VnExpress #{article_id}"
     selftext = ""
+    published_ts: float | None = None
     site_id = "1000000"
+    object_type = 1
     try:
         page_resp = requests.get(clean_url, headers=headers, timeout=timeout)
         page_resp.raise_for_status()
         page_html = page_resp.text or ""
-        m_title = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.IGNORECASE | re.DOTALL)
-        if m_title:
-            raw_t = _strip_html_text(m_title.group(1))
-            raw_t = re.sub(r"\s*[-|–]\s*(?:Báo\s+)?VnExpress.*$", "", raw_t, flags=re.IGNORECASE).strip()
-            if raw_t:
-                title = raw_t
-        m_desc = re.search(
-            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+        title, selftext, published_ts = _extract_html_article_meta(
             page_html,
-            re.IGNORECASE,
-        ) or re.search(
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
-            page_html,
-            re.IGNORECASE,
+            default_title=title,
+            strip_brand_re=r"\s*[-|–]\s*(?:Báo\s+)?VnExpress.*$",
         )
-        if m_desc:
-            selftext = _strip_html_text(m_desc.group(1))
         m_site = re.search(r'tt_site_id["\']?\s*(?:content=|[:=])\s*["\']?(\d+)', page_html, re.IGNORECASE)
         if m_site:
             site_id = m_site.group(1)
+        m_ot = re.search(r'tt_object_type["\']?\s*(?:content=|[:=])\s*["\']?(\d+)', page_html, re.IGNORECASE)
+        if m_ot:
+            object_type = max(1, int(m_ot.group(1)))
     except Exception:
         pass
 
@@ -698,20 +790,47 @@ def fetch_vnexpress_thread(
     reply_parents: list[tuple[str, int]] = []
     offset = 0
     total_reported: int | None = None
+    sort_mode = "time"
+
+    def _add_reply_item(rit: Mapping[str, Any], *, fallback_parent_cid: str) -> bool:
+        rcid = str(rit.get("comment_id") or "").strip()
+        rbody = _strip_html_text(str(rit.get("content") or ""))
+        if not rcid or rcid in seen_cids or not rbody:
+            return False
+        seen_cids.add(rcid)
+        raw_pid = str(rit.get("parent_id") or fallback_parent_cid).strip()
+        pid_norm = raw_pid if (raw_pid and raw_pid != rcid and raw_pid in seen_cids) else fallback_parent_cid
+        author_raw = str(rit.get("userid") or rit.get("full_name") or f"vne_u_{rcid}")
+        ts_val = _parse_iso_or_epoch_ts(rit.get("creation_time"), time.time())
+        comments.append(
+            {
+                "fullname": f"t1_{rcid}",
+                "id": rcid,
+                "link_id": f"t3_{post_id}",
+                "parent_id": f"t1_{pid_norm}",
+                "body": rbody,
+                "text": rbody,
+                "created_utc": ts_val,
+                "author": author_raw,
+                "author_is_bot": False,
+                "author_hash": hash_author_sha256(author_raw),
+            }
+        )
+        return True
 
     while len(comments) < cap:
         if cancel_event is not None and cancel_event.is_set():
             raise ScanCancelledError("Đã hủy tác vụ tải bình luận VnExpress.")
-        limit = min(100, cap - len(comments))
+        limit = min(50, cap - len(comments))
         payload = _http_get_json_with_backoff(
             "https://usi-saas.vnexpress.net/index/get",
             params={
                 "offset": offset,
                 "limit": limit,
                 "objectid": article_id,
-                "objecttype": 1,
+                "objecttype": object_type,
                 "siteid": site_id,
-                "sort_by": "like",
+                "sort_by": sort_mode,
             },
             headers=headers,
             timeout=timeout,
@@ -719,6 +838,9 @@ def fetch_vnexpress_thread(
             cancel_event=cancel_event,
         )
         data = (payload or {}).get("data") or {}
+        if offset == 0 and not (data.get("items") or []) and sort_mode == "time":
+            sort_mode = "like"
+            continue
         if total_reported is None:
             try:
                 total_reported = int(data.get("totalitem") or data.get("total") or cap)
@@ -727,6 +849,7 @@ def fetch_vnexpress_thread(
         items = data.get("items") or []
         if not items:
             break
+        added_top = 0
         for it in items:
             if not isinstance(it, Mapping):
                 continue
@@ -735,8 +858,9 @@ def fetch_vnexpress_thread(
             if not cid or cid in seen_cids or not body:
                 continue
             seen_cids.add(cid)
+            added_top += 1
             author_raw = str(it.get("userid") or it.get("full_name") or f"vne_u_{cid}")
-            ts_val = float(it.get("creation_time") or time.time())
+            ts_val = _parse_iso_or_epoch_ts(it.get("creation_time"), time.time())
             comments.append(
                 {
                     "fullname": f"t1_{cid}",
@@ -756,7 +880,14 @@ def fetch_vnexpress_thread(
                 rep_tot = int(rep_obj.get("total") or 0) if isinstance(rep_obj, Mapping) else 0
             except (TypeError, ValueError):
                 rep_tot = 0
-            if rep_tot > 0:
+            inline_reps = rep_obj.get("items") if isinstance(rep_obj, Mapping) else None
+            inline_added = 0
+            if isinstance(inline_reps, list):
+                for rit in inline_reps:
+                    if isinstance(rit, Mapping) and len(comments) < cap:
+                        if _add_reply_item(rit, fallback_parent_cid=cid):
+                            inline_added += 1
+            if rep_tot > inline_added:
                 reply_parents.append((cid, rep_tot))
             if len(comments) >= cap:
                 break
@@ -768,18 +899,22 @@ def fetch_vnexpress_thread(
                     "stage": "fetching_comments",
                     "processed": len(comments),
                     "total": denom,
-                    "percent": min(95.0, round(100.0 * len(comments) / denom, 1)),
+                    "percent": min(92.0, round(100.0 * len(comments) / denom, 1)),
                 }
             )
         offset += len(items)
-        if len(items) < limit or (total_reported and offset >= int(data.get("total") or total_reported)):
+        try:
+            top_total = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            top_total = 0
+        if added_top == 0 or (top_total > 0 and offset >= top_total):
             break
 
     for root_cid, rep_tot in reply_parents:
         if len(comments) >= cap:
             break
         rep_offset = 0
-        while rep_offset < min(rep_tot, 200) and len(comments) < cap:
+        while rep_offset < min(rep_tot, 500) and len(comments) < cap:
             if cancel_event is not None and cancel_event.is_set():
                 raise ScanCancelledError("Đã hủy tác vụ tải phản hồi VnExpress.")
             try:
@@ -788,9 +923,9 @@ def fetch_vnexpress_thread(
                     params={
                         "id": root_cid,
                         "objectid": article_id,
-                        "objecttype": 1,
+                        "objecttype": object_type,
                         "siteid": site_id,
-                        "limit": 100,
+                        "limit": 50,
                         "offset": rep_offset,
                     },
                     headers=headers,
@@ -805,18 +940,200 @@ def fetch_vnexpress_thread(
             rep_items = ((rep_payload or {}).get("data") or {}).get("items") or []
             if not rep_items:
                 break
+            added_rep = 0
             for rit in rep_items:
                 if not isinstance(rit, Mapping):
                     continue
-                rcid = str(rit.get("comment_id") or "").strip()
-                rbody = _strip_html_text(str(rit.get("content") or ""))
+                if _add_reply_item(rit, fallback_parent_cid=root_cid):
+                    added_rep += 1
+                if len(comments) >= cap:
+                    break
+            rep_offset += len(rep_items)
+            if added_rep == 0 or rep_offset >= rep_tot:
+                break
+
+    if not comments:
+        raise ValueError("Bài báo VnExpress này hiện chưa có bình luận công khai nào (0 bình luận) nên chưa thể phân tích tranh luận.")
+
+    comments.sort(key=lambda c: float(c.get("created_utc") or 0.0))
+    earliest_ts = float(comments[0].get("created_utc") or time.time())
+    root_ts_val = float(published_ts) if (published_ts is not None and published_ts <= earliest_ts) else (earliest_ts - 60.0)
+    post = {
+        "id": post_id,
+        "title": title,
+        "selftext": selftext or title,
+        "subreddit": "vnexpress",
+        "author": "vnexpress_editorial",
+        "created_utc": root_ts_val,
+        "source_platform": "vnexpress",
+        "domain_type": "news_portal",
+        "has_real_publish_time": published_ts is not None,
+        "api_total_reported": int(total_reported or len(comments)),
+    }
+    return post, comments
+
+
+def fetch_dantri_thread(
+    url: str,
+    *,
+    max_comments: int = 2000,
+    timeout: int = 15,
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Fetch a public Dan Tri article and its nested reader comments from webapi.dantri.com.vn."""
+    clean_url = str(url or "").strip()
+    m_dt = _DANTRI_URL_RE.match(clean_url)
+    if not m_dt:
+        raise ValueError(f"Link Dân Trí không hợp lệ: {url!r}")
+    article_id = m_dt.group(1)
+    cap = max(1, min(5000, int(max_comments)))
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36",
+        "Referer": "https://dantri.com.vn/",
+    }
+
+    title = f"Bài viết Dân Trí #{article_id}"
+    selftext = ""
+    published_ts: float | None = None
+    try:
+        page_resp = requests.get(clean_url, headers=headers, timeout=timeout)
+        page_resp.raise_for_status()
+        page_html = page_resp.text or ""
+        title, selftext, published_ts = _extract_html_article_meta(
+            page_html,
+            default_title=title,
+            strip_brand_re=r"\s*\|\s*Báo\s+Dân\s+trí.*$",
+        )
+        m_oid = re.search(r'data-objectid=["\'](\d+)["\']', page_html, re.IGNORECASE)
+        if m_oid:
+            article_id = m_oid.group(1)
+    except Exception:
+        pass
+
+    post_id = f"dt_{article_id}"
+    comments: list[dict[str, Any]] = []
+    seen_cids: set[str] = set()
+    reply_parents: list[tuple[str, int]] = []
+    offset = 0
+    total_reported: int | None = None
+
+    while len(comments) < cap:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelledError("Đã hủy tác vụ tải bình luận Dân Trí.")
+        limit = min(50, cap - len(comments))
+        payload = _http_get_json_with_backoff(
+            "https://webapi.dantri.com.vn/listcomment",
+            params={"objectId": article_id, "objectType": 1, "offset": offset, "limit": limit},
+            headers=headers,
+            timeout=timeout,
+            max_retries=3,
+            cancel_event=cancel_event,
+        )
+        if not isinstance(payload, Mapping):
+            break
+        if total_reported is None:
+            try:
+                total_reported = int(payload.get("count") or 0)
+            except (TypeError, ValueError):
+                total_reported = 0
+        items = payload.get("items") or []
+        if not items:
+            break
+        added = 0
+        for it in items:
+            if not isinstance(it, Mapping):
+                continue
+            cid = str(it.get("commentId") or "").strip()
+            body = _strip_html_text(str(it.get("commentContent") or it.get("content") or ""))
+            if not cid or cid in seen_cids or not body:
+                continue
+            seen_cids.add(cid)
+            added += 1
+            user_obj = it.get("user") if isinstance(it.get("user"), Mapping) else {}
+            author_raw = str(it.get("userId") or user_obj.get("name") or f"dt_u_{cid}")
+            ts_val = _parse_iso_or_epoch_ts(it.get("createdDate"), time.time())
+            comments.append(
+                {
+                    "fullname": f"t1_{cid}",
+                    "id": cid,
+                    "link_id": f"t3_{post_id}",
+                    "parent_id": f"t3_{post_id}",
+                    "body": body,
+                    "text": body,
+                    "created_utc": ts_val,
+                    "author": author_raw,
+                    "author_is_bot": False,
+                    "author_hash": hash_author_sha256(author_raw),
+                }
+            )
+            try:
+                rep_tot = int(it.get("replyCount") or 0)
+            except (TypeError, ValueError):
+                rep_tot = 0
+            if rep_tot > 0:
+                reply_parents.append((cid, rep_tot))
+            if len(comments) >= cap:
+                break
+
+        if progress_cb is not None:
+            denom = max(1, min(cap, int(total_reported or cap)))
+            progress_cb(
+                {
+                    "stage": "fetching_comments",
+                    "processed": len(comments),
+                    "total": denom,
+                    "percent": min(92.0, round(100.0 * len(comments) / denom, 1)),
+                }
+            )
+        offset += len(items)
+        if added == 0 or (total_reported and offset >= total_reported):
+            break
+
+    for root_cid, rep_tot in reply_parents:
+        if len(comments) >= cap:
+            break
+        rep_offset = 0
+        while rep_offset < min(rep_tot, 500) and len(comments) < cap:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelledError("Đã hủy tác vụ tải phản hồi Dân Trí.")
+            try:
+                rep_payload = _http_get_json_with_backoff(
+                    "https://webapi.dantri.com.vn/listcomment",
+                    params={
+                        "objectId": root_cid,
+                        "objectType": 1,
+                        "offset": rep_offset,
+                        "limit": 50,
+                        "isReply": "true",
+                    },
+                    headers=headers,
+                    timeout=timeout,
+                    max_retries=2,
+                    cancel_event=cancel_event,
+                )
+            except ScanCancelledError:
+                raise
+            except Exception:
+                break
+            rep_items = (rep_payload or {}).get("items") or [] if isinstance(rep_payload, Mapping) else []
+            if not rep_items:
+                break
+            added_rep = 0
+            for rit in rep_items:
+                if not isinstance(rit, Mapping):
+                    continue
+                rcid = str(rit.get("commentId") or "").strip()
+                rbody = _strip_html_text(str(rit.get("commentContent") or rit.get("content") or ""))
                 if not rcid or rcid in seen_cids or not rbody:
                     continue
                 seen_cids.add(rcid)
-                raw_pid = str(rit.get("parent_id") or root_cid).strip()
+                added_rep += 1
+                raw_pid = str(rit.get("parentId") or root_cid).strip()
                 pid_norm = raw_pid if (raw_pid and raw_pid != rcid and raw_pid in seen_cids) else root_cid
-                author_raw = str(rit.get("userid") or rit.get("full_name") or f"vne_u_{rcid}")
-                ts_val = float(rit.get("creation_time") or time.time())
+                user_obj = rit.get("user") if isinstance(rit.get("user"), Mapping) else {}
+                author_raw = str(rit.get("userId") or user_obj.get("name") or f"dt_u_{rcid}")
+                ts_val = _parse_iso_or_epoch_ts(rit.get("createdDate"), time.time())
                 comments.append(
                     {
                         "fullname": f"t1_{rcid}",
@@ -834,24 +1151,219 @@ def fetch_vnexpress_thread(
                 if len(comments) >= cap:
                     break
             rep_offset += len(rep_items)
-            if len(rep_items) < 100:
+            if added_rep == 0 or rep_offset >= rep_tot:
                 break
 
     if not comments:
-        raise ValueError("Bài báo VnExpress này chưa có bình luận công khai để phân tích.")
+        raise ValueError(
+            "Bài báo Dân Trí này hiện chưa có bình luận công khai nào (0 bình luận) nên chưa thể phân tích tranh luận. "
+            "Hãy thử bài báo khác đã có bình luận bạn đọc."
+        )
 
     comments.sort(key=lambda c: float(c.get("created_utc") or 0.0))
     earliest_ts = float(comments[0].get("created_utc") or time.time())
+    root_ts_val = float(published_ts) if (published_ts is not None and published_ts <= earliest_ts) else (earliest_ts - 60.0)
     post = {
         "id": post_id,
         "title": title,
         "selftext": selftext or title,
-        "subreddit": "vnexpress",
-        "author": "vnexpress_editorial",
-        "created_utc": earliest_ts - 60.0,
-        "source_platform": "vnexpress",
+        "subreddit": "dantri",
+        "author": "dantri_editorial",
+        "created_utc": root_ts_val,
+        "source_platform": "dantri",
+        "domain_type": "news_portal",
+        "has_real_publish_time": published_ts is not None,
+        "api_total_reported": int(total_reported or len(comments)),
     }
     return post, comments
+
+
+def fetch_tuoitre_thread(
+    url: str,
+    *,
+    max_comments: int = 2000,
+    timeout: int = 15,
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Fetch a public Tuoi Tre article and its nested comment tree from id.tuoitre.vn."""
+    clean_url = str(url or "").strip()
+    m_tt = _TUOITRE_URL_RE.match(clean_url)
+    if not m_tt:
+        raise ValueError(f"Link Tuổi Trẻ không hợp lệ: {url!r}")
+    article_id = m_tt.group(1)
+    cap = max(1, min(5000, int(max_comments)))
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0 Safari/537.36"}
+
+    title = f"Bài viết Tuổi Trẻ #{article_id}"
+    selftext = ""
+    published_ts: float | None = None
+    try:
+        page_resp = requests.get(clean_url, headers=headers, timeout=timeout)
+        page_resp.raise_for_status()
+        title, selftext, published_ts = _extract_html_article_meta(
+            page_resp.text or "",
+            default_title=title,
+            strip_brand_re=r"\s*[-|–]\s*Tuổi\s*Trẻ\s*Online.*$",
+        )
+    except Exception:
+        pass
+
+    post_id = f"tt_{article_id}"
+    comments: list[dict[str, Any]] = []
+    seen_cids: set[str] = set()
+
+    def _collect_item(it: Mapping[str, Any], *, fallback_parent_ref: str) -> int:
+        if len(comments) >= cap:
+            return 0
+        cid = str(it.get("id") or "").strip()
+        body = _strip_html_text(str(it.get("content") or ""))
+        added_here = 0
+        node_ref = fallback_parent_ref
+        if cid and cid not in seen_cids and body:
+            seen_cids.add(cid)
+            raw_pid = str(it.get("parent_id") or "").strip()
+            if raw_pid and raw_pid not in {"0", cid} and raw_pid in seen_cids:
+                parent_ref = f"t1_{raw_pid}"
+            else:
+                parent_ref = fallback_parent_ref
+            author_raw = str(it.get("user_id") or it.get("sender_fullname") or f"tt_u_{cid}")
+            ts_val = _parse_iso_or_epoch_ts(it.get("published_date") or it.get("created_date"), time.time())
+            comments.append(
+                {
+                    "fullname": f"t1_{cid}",
+                    "id": cid,
+                    "link_id": f"t3_{post_id}",
+                    "parent_id": parent_ref,
+                    "body": body,
+                    "text": body,
+                    "created_utc": ts_val,
+                    "author": author_raw,
+                    "author_is_bot": False,
+                    "author_hash": hash_author_sha256(author_raw),
+                }
+            )
+            node_ref = f"t1_{cid}"
+            added_here += 1
+        children = it.get("child_comments") or []
+        if isinstance(children, list):
+            for ch in children:
+                if isinstance(ch, Mapping) and len(comments) < cap:
+                    added_here += _collect_item(ch, fallback_parent_ref=node_ref)
+        return added_here
+
+    page_idx = 1
+    while len(comments) < cap and page_idx <= 40:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelledError("Đã hủy tác vụ tải bình luận Tuổi Trẻ.")
+        payload = _http_get_json_with_backoff(
+            "https://id.tuoitre.vn/api/getlist-comment.api",
+            params={"objId": article_id, "objType": 1, "pageindex": page_idx, "pagesize": 50, "sort": 2},
+            headers=headers,
+            timeout=timeout,
+            max_retries=3,
+            cancel_event=cancel_event,
+        )
+        raw_data = (payload or {}).get("Data") if isinstance(payload, Mapping) else None
+        if isinstance(raw_data, str):
+            try:
+                items = json.loads(raw_data)
+            except Exception:
+                items = []
+        elif isinstance(raw_data, list):
+            items = raw_data
+        else:
+            items = []
+        if not items:
+            break
+        added_page = 0
+        for it in items:
+            if isinstance(it, Mapping):
+                added_page += _collect_item(it, fallback_parent_ref=f"t3_{post_id}")
+        if progress_cb is not None:
+            progress_cb(
+                {
+                    "stage": "fetching_comments",
+                    "processed": len(comments),
+                    "total": cap,
+                    "percent": min(92.0, round(min(92.0, float(page_idx) * 15.0), 1)),
+                }
+            )
+        if added_page == 0 or len(items) < 20:
+            break
+        page_idx += 1
+
+    if not comments:
+        raise ValueError(
+            "Bài báo Tuổi Trẻ này hiện chưa có bình luận công khai nào (0 bình luận) nên chưa thể phân tích tranh luận. "
+            "Hãy thử bài báo khác đã có bình luận bạn đọc."
+        )
+
+    comments.sort(key=lambda c: float(c.get("created_utc") or 0.0))
+    earliest_ts = float(comments[0].get("created_utc") or time.time())
+    root_ts_val = float(published_ts) if (published_ts is not None and published_ts <= earliest_ts) else (earliest_ts - 60.0)
+    post = {
+        "id": post_id,
+        "title": title,
+        "selftext": selftext or title,
+        "subreddit": "tuoitre",
+        "author": "tuoitre_editorial",
+        "created_utc": root_ts_val,
+        "source_platform": "tuoitre",
+        "domain_type": "news_portal",
+        "has_real_publish_time": published_ts is not None,
+        "api_total_reported": len(comments),
+    }
+    return post, comments
+
+
+def fetch_generic_article_meta(url: str, *, timeout: int = 8) -> dict[str, Any]:
+    """Safely fetch public article title/description from any external HTTP(S) URL with SSRF protection."""
+    clean_url = str(url or "").strip()
+    if not clean_url or "\\" in clean_url or any(ch.isspace() for ch in clean_url):
+        raise ValueError("Đường dẫn bài báo không hợp lệ.")
+    parsed = urlparse(clean_url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Đường dẫn phải bắt đầu bằng http:// hoặc https://.")
+    host = parsed.hostname.lower().strip(".")
+    if host in {"localhost", "127.0.0.1", "::1"} or host.endswith((".local", ".internal")):
+        raise ValueError("Không cho phép truy cập địa chỉ nội bộ.")
+    try:
+        addr_infos = socket.getaddrinfo(host, None)
+    except Exception as exc:
+        raise ValueError(f"Không thể phân giải tên miền {host!r}.") from exc
+    for info in addr_infos:
+        ip_str = str(info[4][0]).split("%")[0]
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+            if not ip_obj.is_global:
+                raise ValueError(f"Không cho phép truy cập địa chỉ IP nội bộ ({ip_str}).")
+        except ValueError as exc:
+            if "Không cho phép" in str(exc):
+                raise
+            continue
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0 Safari/537.36"}
+    resp = requests.get(clean_url, headers=headers, timeout=timeout, stream=True)
+    resp.raise_for_status()
+    chunks: list[bytes] = []
+    total_read = 0
+    for chunk in resp.iter_content(chunk_size=32768):
+        if not chunk:
+            continue
+        chunks.append(chunk)
+        total_read += len(chunk)
+        if total_read >= 524288:
+            break
+    html_text = b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
+    title, desc, pub_ts = _extract_html_article_meta(html_text, default_title=f"Bài viết từ {host}")
+    return {
+        "url": clean_url,
+        "hostname": host,
+        "title": title,
+        "description": desc,
+        "published_ts": pub_ts,
+    }
 
 
 def fetch_url_thread(
@@ -862,10 +1374,26 @@ def fetch_url_thread(
     progress_cb: Callable[[dict[str, Any]], None] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Unified public URL dispatcher supporting VnExpress nested threads and Reddit/Arctic Shift threads."""
+    """Unified public URL dispatcher supporting VN news portals (VnExpress, Dan Tri, Tuoi Tre) and Reddit threads."""
     clean_url = str(url or "").strip()
     if is_vnexpress_url(clean_url):
         return fetch_vnexpress_thread(
+            clean_url,
+            max_comments=max_comments,
+            timeout=timeout,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+        )
+    if is_dantri_url(clean_url):
+        return fetch_dantri_thread(
+            clean_url,
+            max_comments=max_comments,
+            timeout=timeout,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+        )
+    if is_tuoitre_url(clean_url):
+        return fetch_tuoitre_thread(
             clean_url,
             max_comments=max_comments,
             timeout=timeout,
@@ -887,6 +1415,9 @@ def compute_gnn_structural_probe(
     data: Any,
     *,
     checkpoint_loaded: bool,
+    k_horizon: int = 20,
+    gnn_nodes: Sequence[Mapping[str, Any]] | None = None,
+    delays_gnn: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     """Run a fast (<15 ms) live counterfactual probe testing whether SBiFAGAT uses tree structure and signed stance."""
     if not checkpoint_loaded:
@@ -905,6 +1436,57 @@ def compute_gnn_structural_probe(
         flat_td[0] = 0
         data_flat.edge_index_td = flat_td
         data_flat.edge_index_bu = flat_td.flip(0)
+        eff_k = max(1, int(k_horizon))
+        flat_d_norm = min(1.0, 1.0 / float(eff_k))
+        if getattr(data_flat, "x", None) is not None and data_flat.x.size(0) > 1 and data_flat.x.size(1) >= 770:
+            x_flat = data_flat.x.clone()
+            x_flat[1:, 769] = flat_d_norm
+            data_flat.x = x_flat
+        if gnn_nodes is not None and delays_gnn is not None and len(gnn_nodes) > 0:
+            root_nid = str(gnn_nodes[0]["node_id"])
+            flat_nodes = [
+                {**dict(n), "parent_id": None if bool(n.get("is_root")) else root_nid}
+                for n in gnn_nodes
+            ]
+            flat_depth = {str(n["node_id"]): (0 if idx == 0 else 1) for idx, n in enumerate(flat_nodes)}
+            data_flat.struct_x = compute_causal_structural_node_features(
+                kept_nodes=flat_nodes,
+                delays_k=delays_gnn,
+                depth_map=flat_depth,
+                k_horizon=eff_k,
+            )
+            ea_rows = (
+                data_flat.edge_attr[:, :2].detach().cpu().tolist()
+                if getattr(data_flat, "edge_attr", None) is not None and data_flat.edge_attr.numel() > 0
+                else []
+            )
+            data_flat.cascade_stats = compute_early_cascade_burst_stats(
+                kept_nodes=flat_nodes,
+                delays_k=delays_gnn,
+                depth_map=flat_depth,
+                edge_attr_rows=ea_rows,
+                k_horizon=eff_k,
+            )
+        else:
+            if getattr(data_flat, "struct_x", None) is not None and data_flat.struct_x.size(0) > 1:
+                sx = data_flat.struct_x.clone()
+                if sx.size(1) > 7:
+                    sx[1:, 4] = flat_d_norm
+                    sx[0, 6] = min(1.0, float(num_edges) / float(eff_k))
+                    sx[1:, 6] = 0.0
+                    sx[0, 7] = 0.0
+                    sx[1:, 7] = 1.0
+                data_flat.struct_x = sx
+            if getattr(data_flat, "cascade_stats", None) is not None and data_flat.cascade_stats.numel() >= 5:
+                cs = data_flat.cascade_stats.clone().view(1, -1)
+                cs[:, 3] = 1.0
+                cs[:, 4] = flat_d_norm
+                data_flat.cascade_stats = cs.view_as(data_flat.cascade_stats)
+        if getattr(data_flat, "edge_attr", None) is not None and data_flat.edge_attr.numel() > 0:
+            raw_s_list = data_flat.edge_attr[:, 0].detach().cpu().tolist()
+            flat_early_polar = float(_compute_full_tree_polarization(raw_s_list, lambda_polar=0.5))
+            if getattr(data_flat, "early_y_polar", None) is not None:
+                data_flat.early_y_polar = torch.full_like(data_flat.early_y_polar, flat_early_polar)
         d_flat = gnn_model.predict_with_diagnostics(data_flat, top_k_edges=1)
 
         data_no_stance = data.clone()
@@ -912,6 +1494,10 @@ def compute_gnn_structural_probe(
             ea = data_no_stance.edge_attr.clone()
             ea[:, 0] = 0.0
             data_no_stance.edge_attr = ea
+        if getattr(data_no_stance, "edge_stance", None) is not None and data_no_stance.edge_stance.numel() > 0:
+            data_no_stance.edge_stance = torch.zeros_like(data_no_stance.edge_stance)
+        if getattr(data_no_stance, "early_y_polar", None) is not None:
+            data_no_stance.early_y_polar = torch.zeros_like(data_no_stance.early_y_polar)
         d_zero = gnn_model.predict_with_diagnostics(data_no_stance, top_k_edges=1)
 
     base_polar = round(float(d_base["y_polar_pred"].view(-1)[0].item()), 4)
@@ -925,6 +1511,7 @@ def compute_gnn_structural_probe(
         "has_multi_hop": multi_hop_edges > 0,
         "multi_hop_edges": multi_hop_edges,
         "total_gnn_edges": num_edges,
+        "k_window_evaluated": int(k_horizon),
         "base_polar": base_polar,
         "flat_polar": flat_polar,
         "zero_stance_polar": zero_polar,
@@ -1527,7 +2114,7 @@ def predict_live_cascade(
         stats_out=junk_stats,
     )
     if built is None:
-        raise ValueError("Thread has insufficient valid comments after spam/deleted filtering.")
+        raise ValueError("Bài viết không có đủ bình luận hợp lệ sau khi lọc bình luận rác/đã xóa.")
     node_records, edge_records, _meta = built
 
     node_by_id = {str(n["node_id"]): n for n in node_records}
@@ -1898,7 +2485,12 @@ def predict_live_cascade(
     with (inference_lock if inference_lock is not None else contextlib.nullcontext()):
         diag = gnn_model.predict_with_diagnostics(data, top_k_edges=5)
         gnn_structural_probe = compute_gnn_structural_probe(
-            gnn_model, data, checkpoint_loaded=checkpoint_loaded
+            gnn_model,
+            data,
+            checkpoint_loaded=checkpoint_loaded,
+            k_horizon=k_horizon,
+            gnn_nodes=gnn_nodes,
+            delays_gnn=delays_gnn,
         )
 
     behavior_counts = {lbl: 0 for lbl in _UNIFIED_BEHAVIOR_LABELS}
@@ -2039,6 +2631,7 @@ def predict_live_cascade(
             node_encoder=frozen_node_encoder,
             node_tokenizer=frozen_node_tok,
             allow_nli_download=allow_nli_topic_download,
+            device=live_device,
         )
 
     if is_partial_scoring:
@@ -2317,17 +2910,15 @@ def main() -> None:
         post, comments = _make_demo_offline_thread()
     elif args.input_json is not None:
         post, comments = load_thread_from_file(args.input_json, max_comments=args.max_full_comments)
-    elif args.reddit_url or args.thread_id:
-        pid = (
-            _validate_reddit_post_id(args.thread_id, source="--thread-id")
-            if args.thread_id
-            else _extract_post_id_from_url(str(args.reddit_url))
-        )
+    elif args.thread_id:
+        pid = _validate_reddit_post_id(args.thread_id, source="--thread-id")
         post, comments = (
             fetch_reddit_thread_paginated(pid, max_comments=args.max_full_comments)
             if args.max_full_comments > 500
             else _fetch_reddit_thread(pid)
         )
+    elif args.reddit_url:
+        post, comments = fetch_url_thread(str(args.reddit_url), max_comments=args.max_full_comments)
     else:
         raise ValueError("Provide one of --demo-offline, --input-json, --reddit-url, or --thread-id")
 
