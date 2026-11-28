@@ -564,6 +564,51 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 .workspace-grid { display: grid; grid-template-columns: minmax(0, 1.85fr) minmax(300px, 1fr); gap: var(--space-4); align-items: start; }
 .graph-stage-card { display: flex; flex-direction: column; gap: var(--space-3); }
 .stage-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-3); }
+.stage-toolbar-right { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+
+.graph-zoom-toolbar {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+}
+.graph-zoom-toolbar > [role="group"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.toolbar-sep {
+  width: 1px;
+  height: 20px;
+  background: var(--border-strong);
+  border-left: 1px solid transparent;
+  margin: 0 2px;
+}
+.zoom-btn { min-inline-size: 32px; min-block-size: 32px; padding: 3px 9px; font-size: 14px; }
+.zoom-pct-btn { min-inline-size: 52px; min-block-size: 32px; padding: 3px 8px; font-size: 12px; }
+
+.inline-help-tip {
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+  margin-top: 2px;
+}
+.inline-help-tip summary {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--primary);
+  cursor: pointer;
+  user-select: none;
+}
+.inline-help-body {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-soft);
+}
 
 .safety-toggle-wrap { display: inline-flex; align-items: center; gap: var(--space-2); padding: 5px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-subtle); }
 .safety-toggle-wrap input[type="checkbox"] { accent-color: var(--oppose); width: 16px; height: 16px; flex-shrink: 0; }
@@ -582,8 +627,9 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 .hotspot-btn { border: 1px solid var(--border-strong); background: var(--surface); color: var(--ink-soft); border-radius: 999px; padding: 4px 11px; font-size: 12px; font-weight: 600; }
 .hotspot-btn[aria-pressed="true"] { background: var(--primary); color: #FFFFFF; border-color: var(--primary); }
 
-.svg-viewport { border: 1px solid var(--border); border-radius: 8px; background: #FAFBFC; min-height: 420px; overflow: auto; }
-.graph-svg { display: block; width: 100%; min-height: 420px; }
+.svg-viewport { border: 1px solid var(--border); border-radius: 8px; background: #FAFBFC; height: 480px; max-height: 62vh; min-height: 360px; overflow: auto; cursor: grab; }
+.svg-viewport.is-panning { cursor: grabbing; user-select: none; }
+.graph-svg { display: block; width: auto; height: auto; min-height: 360px; }
 .svg-node-group { cursor: pointer; }
 .svg-node-group:focus-visible .node-box { stroke: var(--primary); stroke-width: 3px; }
 .svg-node-group.is-selected .node-box { stroke: var(--ink); stroke-width: 2.5px; }
@@ -689,10 +735,26 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 
 /* Dialog */
 dialog { width: min(94vw, 1140px); max-height: 92vh; border: 1px solid var(--border-strong); border-radius: var(--radius); padding: var(--space-4); background: var(--surface); color: var(--ink); }
-dialog::backdrop { background: rgba(15, 23, 42, 0.52); }
-.dialog-header { display: flex; justify-content: space-between; align-items: center; gap: var(--space-3); margin-bottom: var(--space-3); }
-.dialog-header h2 { margin: 0; font-size: 16px; }
+dialog:modal { overscroll-behavior: contain; }
+dialog::backdrop { background: rgba(15, 23, 42, 0.54); overflow: hidden; overscroll-behavior: contain; }
+dialog.graph-modal-dialog { width: min(96vw, 1480px); height: 90vh; max-height: 92vh; }
+dialog.graph-modal-dialog[open] { display: flex; flex-direction: column; gap: var(--space-3); }
+.dialog-header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }
+.dialog-header h1, .dialog-header h2 { margin: 0; font-size: 16px; font-weight: 700; }
+.dialog-actions-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
 .dialog-img { width: 100%; height: auto; display: block; }
+.modal-svg-viewport { flex: 1 1 auto; height: auto; max-height: none; min-height: 320px; }
+.modal-node-preview {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+  font-size: 13px;
+  color: var(--ink-soft);
+  line-height: 1.45;
+  max-height: 84px;
+  overflow-y: auto;
+}
 
 .site-footer { text-align: center; font-size: 12.5px; color: var(--muted); padding-top: var(--space-1); }
 

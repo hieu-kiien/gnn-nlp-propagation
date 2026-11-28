@@ -37,6 +37,10 @@
     activeTab: "tier1",
     tier1Mode: "real", // "real" | "sandbox"
     viewMode: "tree", // "tree" | "user_graph"
+    graphZoom: 1.0,
+    modalZoom: 1.0,
+    graphBaseSize: { w: 900, h: 460 },
+    graphRootXRatio: 0.5,
     showProfanityBadge: false,
     threadsIndex: null,
     currentThreadId: null,
@@ -48,6 +52,9 @@
     sortMetric: null,
     sortDir: "desc",
     activeScanJobId: null,
+    pendingScanJobId: null,
+    scanRunSeq: 0,
+    prefilledNewsMeta: false,
     activeBranchId: null,
     megaPage: 1,
     megaTotalPages: 1,
@@ -100,39 +107,107 @@
     const opp = Number(sc.oppose || 0);
     const neu = Number(sc.neutral || 0);
     const scoredN = sup + opp + neu;
+    const q50 = Number(thresholds?.q50 ?? 0.0928);
+    const q75 = Number(thresholds?.q75 ?? 0.1202);
+    const q90 = Number(thresholds?.q90 ?? 0.1504);
+    const hasVal = val !== null && val !== undefined && !Number.isNaN(Number(val));
+    const v = hasVal ? Number(val) : 0;
+
+    let rankShort = "Chưa rõ";
+    if (hasVal) {
+      if (v >= q90) rankShort = "Top 10% cao nhất VN";
+      else if (v >= q75) rankShort = "Top 25% khá cao ở VN";
+      else if (v >= q50) rankShort = "Mức trung bình ở VN";
+      else rankShort = "Nhóm 50% thấp nhất VN";
+    }
+
     if (scoredN >= 5 && opp / scoredN >= 0.60 && sup / scoredN <= 0.15) {
+      const oppPct = Math.round((opp / scoredN) * 100);
+      const supPct = Math.round((sup / scoredN) * 100);
+      let detail = `Chỉ số chia rẽ thực đo: ${v.toFixed(3)} (${rankShort}).`;
+      if (v >= q90) {
+        detail = `Chỉ số chia rẽ thực đo: ${v.toFixed(3)} (Top 10% VN — bức xúc tập trung 1 chiều, ít ý kiến đối trọng).`;
+      } else if (v >= q75) {
+        detail = `Chỉ số chia rẽ thực đo: ${v.toFixed(3)} (mức khá cao — phần lớn bình luận cùng phản biện).`;
+      } else if (hasVal) {
+        detail = `Chỉ số chia rẽ thực đo: ${v.toFixed(3)} (thấp vì đa số đứng cùng một phía, không chia đôi 50/50).`;
+      }
       return {
-        label: "Phản biện áp đảo (1 chiều)",
+        label: "Phản biện 1 chiều (áp đảo)",
         badgeClass: "badge-relink",
         color: "#D97706",
-        oneSidedNote: "Đa số cùng phản biện nên điểm chia đôi 2 phe thấp",
+        bigText: `${oppPct}%`,
+        unitText: `phản biện · ${supPct}% ủng hộ`,
+        oneSidedNote: detail,
+        rankShort,
       };
     }
     if (scoredN >= 5 && sup / scoredN >= 0.60 && opp / scoredN <= 0.15) {
+      const supPct = Math.round((sup / scoredN) * 100);
+      const oppPct = Math.round((opp / scoredN) * 100);
       return {
         label: "Đồng thuận ủng hộ",
         badgeClass: "badge-support",
         color: "#059669",
-        oneSidedNote: "Đa số cùng tán thành quan điểm bài viết",
+        bigText: `${supPct}%`,
+        unitText: `ủng hộ · ${oppPct}% phản biện`,
+        oneSidedNote: `Chỉ số chia rẽ thực đo: ${v.toFixed(3)} (đa số tán thành quan điểm bài viết).`,
+        rankShort,
       };
     }
-    if (val === null || val === undefined || Number.isNaN(Number(val))) {
-      return { label: "Chưa rõ", badgeClass: "badge-neutral", color: "#64748B", oneSidedNote: "" };
+    if (!hasVal) {
+      return {
+        label: "Chưa rõ",
+        badgeClass: "badge-neutral",
+        color: "#64748B",
+        bigText: "—",
+        unitText: "chưa có số liệu",
+        oneSidedNote: "",
+        rankShort,
+      };
     }
-    const q50 = Number(thresholds?.q50 ?? 0.0928);
-    const q75 = Number(thresholds?.q75 ?? 0.1202);
-    const q90 = Number(thresholds?.q90 ?? 0.1504);
-    const v = Number(val);
     if (v >= q90) {
-      return { label: "Chia rẽ rất cao (>= Q90)", badgeClass: "badge-oppose", color: "#DC2626", oneSidedNote: "" };
+      return {
+        label: "Chia rẽ rất cao (Top 10%)",
+        badgeClass: "badge-oppose",
+        color: "#DC2626",
+        bigText: v.toFixed(3),
+        unitText: `${rankShort} (mốc Top 10% = ${q90.toFixed(2)})`,
+        oneSidedNote: "",
+        rankShort,
+      };
     }
     if (v >= q75) {
-      return { label: "Tranh cãi cao (Q75–Q90)", badgeClass: "badge-relink", color: "#D97706", oneSidedNote: "" };
+      return {
+        label: "Tranh cãi khá cao (Top 25%)",
+        badgeClass: "badge-relink",
+        color: "#D97706",
+        bigText: v.toFixed(3),
+        unitText: `${rankShort} (mốc Top 10% = ${q90.toFixed(2)})`,
+        oneSidedNote: "",
+        rankShort,
+      };
     }
     if (v >= q50) {
-      return { label: "Tranh luận vừa (Q50–Q75)", badgeClass: "badge-neutral", color: "#1D4ED8", oneSidedNote: "" };
+      return {
+        label: "Tranh luận vừa",
+        badgeClass: "badge-neutral",
+        color: "#1D4ED8",
+        bigText: v.toFixed(3),
+        unitText: `${rankShort} (mốc Top 10% = ${q90.toFixed(2)})`,
+        oneSidedNote: "",
+        rankShort,
+      };
     }
-    return { label: "Ít chia rẽ (< Q50)", badgeClass: "badge-support", color: "#059669", oneSidedNote: "" };
+    return {
+      label: "Ít chia rẽ (Đồng thuận)",
+      badgeClass: "badge-support",
+      color: "#059669",
+      bigText: v.toFixed(3),
+      unitText: `${rankShort} (mốc Top 10% = ${q90.toFixed(2)})`,
+      oneSidedNote: "",
+      rankShort,
+    };
   }
 
   // Safe DOM builders using textContent exclusively (zero dynamic HTML strings)
@@ -185,6 +260,9 @@
     } else {
       box.textContent = msg;
       box.hidden = false;
+      if (typeof box.scrollIntoView === "function") {
+        box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
     }
   }
 
@@ -418,30 +496,54 @@
     $("kpi-actual-replies").textContent = fmtInt(actReplies);
 
     const fcLbl = $("verdict-forecast-label");
-    if (fcLbl) {
-      fcLbl.textContent = `Dự báo quy mô (từ ${Math.min(gnnKVal, Math.max(1, kObsVal))} BL đầu)`;
-    }
+    const predLbl = $("kpi-pred-label");
     const actLbl = $("kpi-actual-label");
-    if (actLbl) {
-      if (!hasRealTs) actLbl.textContent = "Đã nhập";
-      else if (payload.scan_job_id) actLbl.textContent = "Hiện đã tải";
-      else actLbl.textContent = "Thực tế sau cùng";
-    }
-
     const proofBadge = $("forecast-proof-badge");
     const honestyNote = $("forecast-honesty-note");
+    const explainNote = $("forecast-explain-note");
+    const effK = Math.min(gnnKVal, Math.max(1, kObsVal));
     if (!hasRealTs) {
+      if (fcLbl) fcLbl.textContent = "Phân tích nội dung (bài dán tay)";
+      if (predLbl) predLbl.textContent = "Dự báo tăng trưởng";
+      if (actLbl) actLbl.textContent = "Đã nhập";
       $("kpi-pred-replies").textContent = "—";
       if (proofBadge) {
         proofBadge.textContent = "Chưa có giờ đăng thật";
         proofBadge.className = "badge-tag badge-neutral";
       }
       if (honestyNote) honestyNote.hidden = false;
+      if (explainNote) explainNote.hidden = true;
     } else {
+      const hasFutureCheck = Boolean(fc.has_future_replies && actReplies > effK);
+      if (fcLbl) {
+        fcLbl.textContent = hasFutureCheck
+          ? `Kiểm chứng Dự báo sớm (che từ BL #${effK + 1})`
+          : `Dự báo sớm bài mới (từ ${effK} BL đầu)`;
+      }
+      if (predLbl) {
+        predLbl.textContent = hasFutureCheck ? `SBi-FAGAT dự báo (${effK} BL đầu)` : "AI dự báo tổng quy mô";
+      }
+      if (actLbl) {
+        if (hasFutureCheck) {
+          actLbl.textContent = payload.scan_job_id ? "Thực tế đã thu thập" : "Thực tế sau cùng";
+        } else {
+          actLbl.textContent = "Hiện tại mới có";
+        }
+      }
       $("kpi-pred-replies").textContent = `~${predReplies.toFixed(0)}`;
       if (honestyNote) honestyNote.hidden = true;
+      if (explainNote) {
+        explainNote.hidden = false;
+        if (hasFutureCheck) {
+          explainNote.textContent = isNewsPortal
+            ? `Mô hình chỉ nhìn ${effK} bình luận đầu tiên để ước lượng quy mô (dữ liệu huấn luyện từ Reddit VN nên trên báo chí chỉ mang tính tham khảo).`
+            : `Mô hình chỉ nhìn ${effK} bình luận sớm nhất (che hoàn toàn phần sau) để dự báo tổng quy mô và đối chứng với thực tế.`;
+        } else {
+          explainNote.textContent = `Bài viết mới có ${effK} bình luận. AI ước lượng tổng bình luận dự kiến khi lan truyền tiếp (chuẩn tối ưu là đủ 20 BL đầu).`;
+        }
+      }
       if (proofBadge) {
-        if (fc.has_future_replies && actReplies > 0) {
+        if (hasFutureCheck && actReplies > 0) {
           const diff = Math.round(predReplies - actReplies);
           const absDiff = Math.abs(diff);
           const relErr = absDiff / Math.max(1, actReplies);
@@ -455,6 +557,9 @@
             proofBadge.textContent = diff < 0 ? `Thấp hơn ${absDiff} BL` : `Cao hơn ${absDiff} BL`;
             proofBadge.className = "badge-tag badge-neutral";
           }
+        } else if (kObsVal < 20) {
+          proofBadge.textContent = `Bài mới (${fmtInt(kObsVal)}/20 BL đầu · tham khảo)`;
+          proofBadge.className = "badge-tag badge-neutral";
         } else {
           proofBadge.textContent = `Đang xem ${fmtInt(kObsVal)} bình luận`;
           proofBadge.className = "badge-tag badge-neutral";
@@ -484,8 +589,8 @@
     const polarTitleEl = $("verdict-polar-label");
     if (polarTitleEl) {
       polarTitleEl.textContent = isFullView
-        ? "Mức độ chia rẽ 2 phe (toàn bài)"
-        : "Dự báo chia rẽ 2 phe (từ 20 BL đầu)";
+        ? "Kết luận toàn bài: Mức độ chia rẽ"
+        : `Dự báo sớm (${effK} BL đầu): Mức chia rẽ`;
     }
 
     const q90Ref = Number(thresholds.q90 ?? 0.1504);
@@ -496,16 +601,16 @@
       lvlEl.textContent = tier.label;
       lvlEl.className = `badge-tag ${tier.badgeClass}`;
     }
-    if ($("verdict-polar-100")) $("verdict-polar-100").textContent = fmtNum(displayPolar, 3);
+    if ($("verdict-polar-100")) $("verdict-polar-100").textContent = tier.bigText || fmtNum(displayPolar, 3);
     if ($("verdict-polar-unit")) {
-      $("verdict-polar-unit").textContent = `trên thang [0–1] (Q90 VN = ${Number(q90Ref).toFixed(2)})`;
+      $("verdict-polar-unit").textContent = tier.unitText || `mốc Top 10% = ${Number(q90Ref).toFixed(2)}`;
     }
     const polarSubEl = $("verdict-polar-sub");
     if (polarSubEl) {
       if (tier.oneSidedNote) {
         polarSubEl.textContent = tier.oneSidedNote;
       } else if (isFullView && fc.predicted_polarization_score !== undefined) {
-        polarSubEl.textContent = `Dự báo sớm từ 20 BL đầu: ${fmtNum(fc.predicted_polarization_score, 3)}`;
+        polarSubEl.textContent = `Dự báo sớm từ ${effK} BL đầu: ${fmtNum(fc.predicted_polarization_score, 3)}`;
       } else if (fc.has_future_replies && fc.actual_y_polar !== null && fc.actual_y_polar !== undefined) {
         polarSubEl.textContent = `Thực tế hậu kỳ: ${fmtNum(fc.actual_y_polar, 3)}`;
       } else {
@@ -541,10 +646,13 @@
       meta.analysis_mode === "full" && kObsVal !== gnnKVal
         ? `GNN K=${gnnKVal} · Hiển thị N=${kObsVal}`
         : `GNN K=${gnnKVal}`;
+    const supPctStr = `${Math.round(((sc.support || 0) / scoredTotal) * 100)}%`;
+    const neuPctStr = `${Math.round(((sc.neutral || 0) / scoredTotal) * 100)}%`;
+    const oppPctStr = `${Math.round(((sc.oppose || 0) / scoredTotal) * 100)}%`;
     const unscoredPart = sc.unscored ? ` · Chưa chấm: ${fmtInt(sc.unscored)}` : "";
     $("kpi-stance-counts").textContent = isNewsPortal
-      ? `Ủng hộ: ${sc.support || 0} · Trung lập: ${sc.neutral || 0} · Phản biện: ${sc.oppose || 0}${unscoredPart}`
-      : `Tán thành: ${sc.support || 0} · Trung lập: ${sc.neutral || 0} · Phản đối: ${sc.oppose || 0}${unscoredPart}`;
+      ? `Ủng hộ: ${sc.support || 0} (${supPctStr}) · Trung lập: ${sc.neutral || 0} (${neuPctStr}) · Phản biện: ${sc.oppose || 0} (${oppPctStr})${unscoredPart}`
+      : `Tán thành: ${sc.support || 0} (${supPctStr}) · Trung lập: ${sc.neutral || 0} (${neuPctStr}) · Phản đối: ${sc.oppose || 0} (${oppPctStr})${unscoredPart}`;
     const scopeEl = $("verdict-stance-scope");
     if (scopeEl) {
       const scoredCntNum = (sc.support || 0) + (sc.neutral || 0) + (sc.oppose || 0);
@@ -822,31 +930,80 @@
     box.appendChild(techDetails);
   }
 
+  function updateZoomIndicators() {
+    if ($("btn-graph-zoom-reset")) {
+      $("btn-graph-zoom-reset").textContent = `${Math.round(state.graphZoom * 100)}%`;
+    }
+    if ($("btn-modal-zoom-reset")) {
+      $("btn-modal-zoom-reset").textContent = `${Math.round(state.modalZoom * 100)}%`;
+    }
+  }
+
+  function applySvgZoomSizing(svg, viewport, baseW, baseH, zoomScale, rootRatio = 0.5, resetScroll = false) {
+    if (!svg) return;
+    const z = Math.max(0.25, Math.min(2.5, Number(zoomScale || 1.0)));
+    const scaledW = Math.round(baseW * z);
+    const scaledH = Math.round(baseH * z);
+    svg.style.minWidth = "0";
+    svg.style.width = `${scaledW}px`;
+    svg.style.height = `${scaledH}px`;
+    if (viewport && resetScroll) {
+      const targetLeft = Math.max(0, Math.round(scaledW * rootRatio - viewport.clientWidth / 2));
+      viewport.scrollLeft = targetLeft;
+      viewport.scrollTop = 0;
+    }
+  }
+
+  function formatModalNodePreview(item, isUser = false) {
+    const box = $("modal-node-preview");
+    if (!box) return;
+    if (!item) {
+      box.textContent = "Nhấn vào bất kỳ ô bình luận nào để đọc nội dung đầy đủ (kéo chuột để trượt, giữ Ctrl + lăn chuột để thu phóng).";
+      return;
+    }
+    if (isUser) {
+      const campLabel = item.camp === 0 ? "Phe Đồng thuận" : (item.camp === 1 ? "Phe Phản biện" : "Trung lập");
+      const firstCmt = Array.isArray(item.sample_comments) && item.sample_comments.length ? item.sample_comments[0].text : "";
+      box.textContent = `[${campLabel} · ${item.reply_count} lượt] ${firstCmt || item.label}`;
+      return;
+    }
+    const stInfo = STANCE_COLORS[item.stance_class] || STANCE_COLORS.neutral;
+    box.textContent = item.is_root
+      ? `[Bài gốc] ${item.text}`
+      : `[${stInfo.label} · Tầng ${item.depth} · ${fmtHumanDelay(item.time_delay_sec)}] ${item.text}`;
+  }
+
   function selectTreeNode(nodeId) {
     state.selectedNodeId = nodeId;
-    const svg = $("graph-svg");
-    svg.querySelectorAll(".svg-node-group").forEach((g) => {
+    document.querySelectorAll(".graph-svg .svg-node-group").forEach((g) => {
       g.classList.toggle("is-selected", g.dataset.nodeId === nodeId);
     });
     const node = (state.currentPayload?.tree?.nodes || []).find((n) => n.node_id === nodeId);
     renderTreeNodeInspector(node || null);
+    formatModalNodePreview(node || null, false);
   }
 
   function selectUserNode(userId) {
     state.selectedUserId = userId;
-    const svg = $("graph-svg");
-    svg.querySelectorAll(".svg-node-group").forEach((g) => {
+    document.querySelectorAll(".graph-svg .svg-node-group").forEach((g) => {
       g.classList.toggle("is-selected", g.dataset.userId === userId);
     });
     const userNode = (state.currentPayload?.user_graph?.nodes || []).find((u) => u.user_id === userId);
     renderUserInspector(userNode || null);
+    formatModalNodePreview(userNode || null, true);
   }
 
   // =========================================================================
   // Pure Vanilla SVG Renderers (Tree Layout + Thread User Graph)
   // =========================================================================
-  function renderTreeSvg(payload) {
-    const svg = $("graph-svg");
+  function renderTreeSvg(
+    payload,
+    svg = $("graph-svg"),
+    viewport = document.querySelector("#panel-tier1 .graph-stage-card .svg-viewport"),
+    zoomScale = state.graphZoom,
+    resetScroll = false
+  ) {
+    if (!svg) return;
     clearEl(svg);
     const tree = payload.tree || { nodes: [], edges: [] };
     const rawNodes = tree.nodes || [];
@@ -948,8 +1105,13 @@
 
     const svgW = Math.max(880, totalSlots * SLOT_W + PAD_X * 2);
     const svgH = Math.max(440, (maxDepth + 1) * LEVEL_H + PAD_Y * 2);
+    const rootPos = pos.get(root.node_id);
+    const rootRatio = rootPos ? rootPos.cx / Math.max(1, svgW) : 0.5;
+    state.graphBaseSize = { w: svgW, h: svgH };
+    state.graphRootXRatio = rootRatio;
+
     svg.setAttribute("viewBox", `0 0 ${svgW} ${svgH}`);
-    svg.style.minWidth = `${Math.min(svgW, 1100)}px`;
+    applySvgZoomSizing(svg, viewport, svgW, svgH, zoomScale, rootRatio, resetScroll);
     svg.setAttribute(
       "aria-label",
       `Sơ đồ cây thảo luận gồm ${nodes.length} nút với ${edges.length} cạnh`
@@ -1113,8 +1275,14 @@
     }
   }
 
-  function renderUserGraphSvg(payload) {
-    const svg = $("graph-svg");
+  function renderUserGraphSvg(
+    payload,
+    svg = $("graph-svg"),
+    viewport = document.querySelector("#panel-tier1 .graph-stage-card .svg-viewport"),
+    zoomScale = state.graphZoom,
+    resetScroll = false
+  ) {
+    if (!svg) return;
     clearEl(svg);
     const ug = payload.user_graph || { nodes: [], edges: [], camp_counts: { camp0: 0, camp1: 0, camp2: 0 } };
     const uNodes = ug.nodes || [];
@@ -1128,8 +1296,10 @@
     const maxCampLen = Math.max(camp0.length, camp1.length, camp2.length, 1);
     const svgH = Math.max(460, 120 + maxCampLen * 62);
 
+    state.graphBaseSize = { w: svgW, h: svgH };
+    state.graphRootXRatio = 0.5;
     svg.setAttribute("viewBox", `0 0 ${svgW} ${svgH}`);
-    svg.style.minWidth = "720px";
+    applySvgZoomSizing(svg, viewport, svgW, svgH, zoomScale, 0.5, resetScroll);
     svg.setAttribute(
       "aria-label",
       `Đồ thị tương tác người dùng: ${camp0.length} đồng thuận, ${camp2.length} trung lập, ${camp1.length} phản biện`
@@ -1349,13 +1519,110 @@
     }
   }
 
-  function renderCurrentGraph() {
+  function renderCurrentGraph(resetScroll = false) {
     if (!state.currentPayload) return;
+    const inlineVp = document.querySelector("#panel-tier1 .graph-stage-card .svg-viewport");
     if (state.viewMode === "tree") {
-      renderTreeSvg(state.currentPayload);
+      renderTreeSvg(state.currentPayload, $("graph-svg"), inlineVp, state.graphZoom, resetScroll);
     } else {
-      renderUserGraphSvg(state.currentPayload);
+      renderUserGraphSvg(state.currentPayload, $("graph-svg"), inlineVp, state.graphZoom, resetScroll);
     }
+    const modalDlg = $("graph-fullscreen-dialog");
+    if (modalDlg && modalDlg.open) {
+      const modalVp = $("modal-svg-viewport");
+      if (state.viewMode === "tree") {
+        renderTreeSvg(state.currentPayload, $("modal-graph-svg"), modalVp, state.modalZoom, resetScroll);
+      } else {
+        renderUserGraphSvg(state.currentPayload, $("modal-graph-svg"), modalVp, state.modalZoom, resetScroll);
+      }
+    }
+    updateZoomIndicators();
+  }
+
+  function setGraphZoom(nextZoom, isModal = false, resetScroll = false) {
+    const clamped = Math.max(0.25, Math.min(2.5, Math.round(Number(nextZoom) * 100) / 100));
+    if (isModal) {
+      state.modalZoom = clamped;
+      applySvgZoomSizing(
+        $("modal-graph-svg"),
+        $("modal-svg-viewport"),
+        state.graphBaseSize.w,
+        state.graphBaseSize.h,
+        clamped,
+        state.graphRootXRatio,
+        resetScroll
+      );
+    } else {
+      state.graphZoom = clamped;
+      applySvgZoomSizing(
+        $("graph-svg"),
+        document.querySelector("#panel-tier1 .graph-stage-card .svg-viewport"),
+        state.graphBaseSize.w,
+        state.graphBaseSize.h,
+        clamped,
+        state.graphRootXRatio,
+        resetScroll
+      );
+    }
+    updateZoomIndicators();
+  }
+
+  function fitGraphZoom(isModal = false) {
+    const vp = isModal
+      ? $("modal-svg-viewport")
+      : document.querySelector("#panel-tier1 .graph-stage-card .svg-viewport");
+    const availW = vp ? Math.max(320, vp.clientWidth - 28) : 900;
+    const fitRatio = Math.max(0.25, Math.min(1.0, availW / Math.max(1, state.graphBaseSize.w)));
+    setGraphZoom(fitRatio, isModal, true);
+  }
+
+  function wirePanAndWheel(viewport, isModal = false) {
+    if (!viewport) return;
+    let dragging = false;
+    let dragged = false;
+    let startX = 0;
+    let startY = 0;
+    let origLeft = 0;
+    let origTop = 0;
+
+    viewport.addEventListener("pointerdown", (ev) => {
+      if (ev.button !== 0) return;
+      if (ev.target.closest && ev.target.closest(".svg-node-group")) return;
+      dragging = true;
+      dragged = false;
+      startX = ev.clientX;
+      startY = ev.clientY;
+      origLeft = viewport.scrollLeft;
+      origTop = viewport.scrollTop;
+      viewport.classList.add("is-panning");
+    });
+    viewport.addEventListener("pointermove", (ev) => {
+      if (!dragging) return;
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      if (Math.abs(dx) > 4 || Math.abs(dy) > 4) dragged = true;
+      viewport.scrollLeft = origLeft - dx;
+      viewport.scrollTop = origTop - dy;
+    });
+    const endPan = () => {
+      if (!dragging) return;
+      dragging = false;
+      viewport.classList.remove("is-panning");
+      if (dragged) {
+        // swallow accidental click right after pan
+        const suppress = (ce) => { ce.stopPropagation(); };
+        viewport.addEventListener("click", suppress, { capture: true, once: true });
+      }
+    };
+    viewport.addEventListener("pointerup", endPan);
+    viewport.addEventListener("pointercancel", endPan);
+    viewport.addEventListener("wheel", (ev) => {
+      if (!ev.ctrlKey && !ev.metaKey) return;
+      ev.preventDefault();
+      const cur = isModal ? state.modalZoom : state.graphZoom;
+      const delta = ev.deltaY < 0 ? 0.15 : -0.15;
+      setGraphZoom(cur + delta, isModal, false);
+    }, { passive: false });
   }
 
   function createNode(tag, className, text) {
@@ -2040,7 +2307,11 @@
     if (!payload.scan_job_id && state.megaPollTimer) {
       clearTimeout(state.megaPollTimer);
       state.megaPollTimer = null;
+      state.pendingScanJobId = null;
       setMegaButtonsBusy(false);
+    }
+    if (payload.scan_job_id || payload.sandbox_mode) {
+      state.tier1Mode = "sandbox";
     }
     state.currentPayload = payload;
     state.selectedNodeId = null;
@@ -2059,7 +2330,7 @@
     renderContractionStrip(payload);
     renderTriggerEdges(payload);
     renderHotspotBranches(payload);
-    renderCurrentGraph();
+    renderCurrentGraph(true);
     if (state.activeScanJobId || state.tier1Mode === "real") {
       loadMegaCommentsPage(1).catch((err) => showError(err.message));
     } else {
@@ -2071,7 +2342,7 @@
     state.viewMode = mode;
     $("view-tree-btn").setAttribute("aria-pressed", String(mode === "tree"));
     $("view-user-btn").setAttribute("aria-pressed", String(mode === "user_graph"));
-    renderCurrentGraph();
+    renderCurrentGraph(true);
   }
 
   // =========================================================================
@@ -2162,6 +2433,8 @@
   }
 
   function switchTier1Mode(mode, runDefaultIfEmpty = false) {
+    state.scanRunSeq += 1;
+    state.pendingScanJobId = null;
     if (state.megaPollTimer) {
       clearTimeout(state.megaPollTimer);
       state.megaPollTimer = null;
@@ -2358,6 +2631,18 @@
     if (btnCancel) btnCancel.hidden = !busy;
   }
 
+  function clearPrefilledNewsMeta() {
+    state.prefilledNewsMeta = false;
+    if ($("sb-title")) $("sb-title").value = "";
+    if ($("sb-root-text")) $("sb-root-text").value = "";
+    if ($("sb-raw-lines")) {
+      $("sb-raw-lines").placeholder = "Dán bài gốc và các bình luận (hỗ trợ @Tên để giữ đúng nhánh trả lời)...";
+    }
+    if ($("prefilled-meta-bar")) $("prefilled-meta-bar").hidden = true;
+    if ($("prefilled-meta-label")) $("prefilled-meta-label").textContent = "";
+    showSocialUrlGuide(null);
+  }
+
   function showNewsMetaGuide(articleMeta, messageText) {
     const box = $("social-url-guide");
     const ttl = $("social-guide-title");
@@ -2381,10 +2666,12 @@
 
   async function startMegaScanJob(reqBody) {
     showError("");
+    const runSeq = ++state.scanRunSeq;
     if (state.megaPollTimer) {
       clearTimeout(state.megaPollTimer);
       state.megaPollTimer = null;
     }
+    state.pendingScanJobId = null;
     const progBox = $("mega-progress-box");
     const progBar = $("mega-progress-bar");
     const progLbl = $("mega-progress-label");
@@ -2399,12 +2686,21 @@
 
     try {
       const created = await apiPost("/api/tier1/scan_jobs", reqBody);
+      if (runSeq !== state.scanRunSeq) {
+        return;
+      }
       const jobId = created.job_id;
-      state.activeScanJobId = jobId;
+      state.pendingScanJobId = jobId;
 
       const poll = async () => {
+        if (runSeq !== state.scanRunSeq) {
+          return;
+        }
         try {
           const st = await apiGet(`/api/tier1/scan_jobs/${encodeURIComponent(jobId)}`);
+          if (runSeq !== state.scanRunSeq) {
+            return;
+          }
           const pct = Math.max(0, Math.min(100, Number(st.percent || 0)));
           if (progBar) progBar.value = pct;
           if (progPct) progPct.textContent = `${pct.toFixed(1)}%`;
@@ -2419,6 +2715,8 @@
             }
           }
           if (st.status === "completed") {
+            state.pendingScanJobId = null;
+            state.megaPollTimer = null;
             setMegaButtonsBusy(false);
             if (progBox) progBox.hidden = true;
             if (!st.result) {
@@ -2431,6 +2729,8 @@
             return;
           }
           if (st.status === "cancelled" || st.status === "failed") {
+            state.pendingScanJobId = null;
+            state.megaPollTimer = null;
             setMegaButtonsBusy(false);
             if (progBox) progBox.hidden = true;
             if (st.error) showError(st.error);
@@ -2438,6 +2738,11 @@
           }
           state.megaPollTimer = setTimeout(poll, 450);
         } catch (err) {
+          if (runSeq !== state.scanRunSeq) {
+            return;
+          }
+          state.pendingScanJobId = null;
+          state.megaPollTimer = null;
           setMegaButtonsBusy(false);
           if (progBox) progBox.hidden = true;
           showError(err.message);
@@ -2445,14 +2750,28 @@
       };
       await poll();
     } catch (err) {
+      if (runSeq !== state.scanRunSeq) {
+        return;
+      }
+      state.pendingScanJobId = null;
       setMegaButtonsBusy(false);
       if (progBox) progBox.hidden = true;
       if (err?.payload?.needs_manual_comments && err.payload.article_meta) {
         const am = err.payload.article_meta;
         const rawTitle = String(am.title || "").trim();
         const shortTitle = rawTitle.length > 72 ? `${rawTitle.slice(0, 71).trim()}…` : rawTitle;
+        const hostLabel = am.hostname || "trang báo";
         if ($("sb-title") && am.title) $("sb-title").value = am.title;
         if ($("sb-root-text") && am.description) $("sb-root-text").value = am.description;
+        state.prefilledNewsMeta = Boolean(am.title || am.description);
+        if ($("prefilled-meta-bar") && state.prefilledNewsMeta) {
+          if ($("prefilled-meta-label")) {
+            $("prefilled-meta-label").textContent = shortTitle
+              ? `Đang dùng tiêu đề lấy từ ${hostLabel}: "${shortTitle}"`
+              : `Đã điền sẵn mô tả từ ${hostLabel}`;
+          }
+          $("prefilled-meta-bar").hidden = false;
+        }
         if ($("sb-raw-lines")) {
           if (shortTitle) {
             $("sb-raw-lines").placeholder =
@@ -2511,20 +2830,17 @@
 
     if ($("btn-preset-1")) {
       $("btn-preset-1").addEventListener("click", () => {
-        state.tier1Mode = "sandbox";
         runSandboxRequest({ mode: "preset_junk_1", junk_mode: getSelectedJunkMode() });
       });
     }
     if ($("btn-preset-2")) {
       $("btn-preset-2").addEventListener("click", () => {
-        state.tier1Mode = "sandbox";
         runSandboxRequest({ mode: "preset_junk_2", junk_mode: getSelectedJunkMode() });
       });
     }
     const presetLargeBtn = $("btn-preset-large");
     if (presetLargeBtn) {
       presetLargeBtn.addEventListener("click", () => {
-        state.tier1Mode = "sandbox";
         const fullRadio = $("analysis-full");
         if (fullRadio) fullRadio.checked = true;
         runSandboxRequest({
@@ -2534,6 +2850,13 @@
           k_horizon: 20,
           max_full_comments: 500,
         });
+      });
+    }
+    const btnClearPrefilled = $("btn-clear-prefilled-meta");
+    if (btnClearPrefilled) {
+      btnClearPrefilled.addEventListener("click", () => {
+        clearPrefilledNewsMeta();
+        announce("Đã xóa tiêu đề bài báo điền sẵn.");
       });
     }
     const btnOpenPaste = $("btn-open-paste-drawer");
@@ -2696,12 +3019,12 @@
 
     $("sandbox-form").addEventListener("submit", (e) => {
       e.preventDefault();
-      state.tier1Mode = "sandbox";
       const junkMode = getSelectedJunkMode();
       const customTopics = getLiveTopics() || undefined;
       const maxC = getSelectedMegaMaxComments();
 
       if (state.megaUploadedJson) {
+        if (state.prefilledNewsMeta) clearPrefilledNewsMeta();
         startMegaScanJob({
           mode: "json_upload",
           thread_json: state.megaUploadedJson,
@@ -2718,6 +3041,7 @@
       const effectiveUrl = urlFieldVal || (looksLikeSingleUrl(rawLinesInput) ? rawLinesInput : "");
 
       if (effectiveUrl) {
+        if (state.prefilledNewsMeta) clearPrefilledNewsMeta();
         const socialPlatform = detectUnsupportedSocialUrl(effectiveUrl);
         if (socialPlatform) {
           showSocialUrlGuide(socialPlatform);
@@ -2820,7 +3144,6 @@
     const btnMegaStress = $("btn-mega-stress");
     if (btnMegaStress) {
       btnMegaStress.addEventListener("click", () => {
-        state.tier1Mode = "sandbox";
         const maxC = getSelectedMegaMaxComments();
         startMegaScanJob({
           mode: "preset_mega_stress",
@@ -2836,12 +3159,12 @@
     const btnMegaRun = $("btn-mega-run");
     if (btnMegaRun) {
       btnMegaRun.addEventListener("click", () => {
-        state.tier1Mode = "sandbox";
         const maxC = getSelectedMegaMaxComments();
         const strat = getSelectedMegaStrategy();
         const junkMode = getSelectedJunkMode();
         const customTopics = getLiveTopics() || undefined;
         if (state.megaUploadedJson) {
+          if (state.prefilledNewsMeta) clearPrefilledNewsMeta();
           startMegaScanJob({
             mode: "json_upload",
             thread_json: state.megaUploadedJson,
@@ -2854,6 +3177,7 @@
         }
         const urlVal = urlInputEl.value.trim();
         if (urlVal) {
+          if (state.prefilledNewsMeta) clearPrefilledNewsMeta();
           const socialPlatform = detectUnsupportedSocialUrl(urlVal);
           if (socialPlatform) {
             showSocialUrlGuide(socialPlatform);
@@ -2896,9 +3220,10 @@
     const btnMegaCancel = $("btn-mega-cancel");
     if (btnMegaCancel) {
       btnMegaCancel.addEventListener("click", async () => {
-        if (!state.activeScanJobId) return;
+        const targetJobId = state.pendingScanJobId;
+        if (!targetJobId) return;
         try {
-          await apiPost(`/api/tier1/scan_jobs/${encodeURIComponent(state.activeScanJobId)}/cancel`, {});
+          await apiPost(`/api/tier1/scan_jobs/${encodeURIComponent(targetJobId)}/cancel`, {});
         } catch (err) {
           showError(err.message);
         }
@@ -2939,6 +3264,64 @@
     $("corpus-vn-btn").addEventListener("click", () => renderTier2Corpus("vn"));
     $("corpus-pheme-btn").addEventListener("click", () => renderTier2Corpus("pheme"));
 
+    // Graph zoom, fit, drag-pan & fullscreen modal controls
+    const inlineVp = document.querySelector("#panel-tier1 .graph-stage-card .svg-viewport");
+    const modalVp = $("modal-svg-viewport");
+    wirePanAndWheel(inlineVp, false);
+    wirePanAndWheel(modalVp, true);
+
+    if ($("btn-graph-zoom-in")) $("btn-graph-zoom-in").addEventListener("click", () => setGraphZoom(state.graphZoom + 0.2, false));
+    if ($("btn-graph-zoom-out")) $("btn-graph-zoom-out").addEventListener("click", () => setGraphZoom(state.graphZoom - 0.2, false));
+    if ($("btn-graph-zoom-reset")) $("btn-graph-zoom-reset").addEventListener("click", () => setGraphZoom(1.0, false, true));
+    if ($("btn-graph-zoom-fit")) $("btn-graph-zoom-fit").addEventListener("click", () => fitGraphZoom(false));
+
+    if ($("btn-modal-zoom-in")) $("btn-modal-zoom-in").addEventListener("click", () => setGraphZoom(state.modalZoom + 0.2, true));
+    if ($("btn-modal-zoom-out")) $("btn-modal-zoom-out").addEventListener("click", () => setGraphZoom(state.modalZoom - 0.2, true));
+    if ($("btn-modal-zoom-reset")) $("btn-modal-zoom-reset").addEventListener("click", () => setGraphZoom(1.0, true, true));
+    if ($("btn-modal-zoom-fit")) $("btn-modal-zoom-fit").addEventListener("click", () => fitGraphZoom(true));
+
+    const graphDialog = $("graph-fullscreen-dialog");
+    if ($("btn-graph-fullscreen") && graphDialog) {
+      $("btn-graph-fullscreen").addEventListener("click", () => {
+        if (!state.currentPayload) return;
+        state.modalZoom = 1.0;
+        graphDialog.showModal();
+        renderCurrentGraph(true);
+        announce("Đã mở cửa sổ phóng to sơ đồ hội thoại.");
+      });
+    }
+    if ($("btn-close-graph-dialog") && graphDialog) {
+      $("btn-close-graph-dialog").addEventListener("click", () => graphDialog.close("dismiss"));
+    }
+
+    // Toolbar roving-tabindex fallback only when native focusgroup is unsupported
+    if (!("focusGroup" in HTMLElement.prototype)) {
+      document.querySelectorAll('[role="toolbar"][focusgroup]').forEach((bar) => {
+        const items = Array.from(bar.querySelectorAll("button"));
+        if (!items.length) return;
+        items.forEach((b, idx) => { b.tabIndex = idx === 0 ? 0 : -1; });
+        bar.addEventListener("focusin", ({ target }) => {
+          if (items.includes(target)) {
+            items.forEach((b) => { b.tabIndex = b === target ? 0 : -1; });
+          }
+        });
+        bar.addEventListener("keydown", (ev) => {
+          const curIdx = items.indexOf(document.activeElement);
+          if (curIdx < 0) return;
+          const rtl = getComputedStyle(bar).direction === "rtl";
+          let nextIdx = null;
+          if (ev.key === "ArrowRight") nextIdx = (curIdx + (rtl ? -1 : 1) + items.length) % items.length;
+          else if (ev.key === "ArrowLeft") nextIdx = (curIdx + (rtl ? 1 : -1) + items.length) % items.length;
+          else if (ev.key === "Home") nextIdx = 0;
+          else if (ev.key === "End") nextIdx = items.length - 1;
+          if (nextIdx !== null) {
+            ev.preventDefault();
+            items[nextIdx].focus();
+          }
+        });
+      });
+    }
+
     document.querySelectorAll(".sort-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
         const m = btn.dataset.metric;
@@ -2954,25 +3337,29 @@
       });
     });
 
-    // Native <dialog> modal with Safari closedBy pointer fallback
-    const dialog = $("figure-dialog");
-    $("btn-zoom-fig5").addEventListener("click", () => dialog.showModal());
-    $("btn-close-dialog").addEventListener("click", () => dialog.close("dismiss"));
-    dialog.addEventListener("close", () => {
-      dialog.returnValue = "";
+    // Native <dialog> modal with closedby="any" progressive fallback for all dialogs
+    const figDialog = $("figure-dialog");
+    $("btn-zoom-fig5").addEventListener("click", () => figDialog.showModal());
+    $("btn-close-dialog").addEventListener("click", () => figDialog.close("dismiss"));
+    document.querySelectorAll("dialog").forEach((dlg) => {
+      dlg.addEventListener("close", () => {
+        dlg.returnValue = "";
+      });
     });
     if (!("closedBy" in HTMLDialogElement.prototype)) {
-      let pressedOut = false;
-      const isOutside = (ev) => {
-        const r = dialog.getBoundingClientRect();
+      const outside = (ev, dlg) => {
+        const r = dlg.getBoundingClientRect();
         return ev.clientX < r.left || ev.clientX > r.right || ev.clientY < r.top || ev.clientY > r.bottom;
       };
-      dialog.addEventListener("pointerdown", (ev) => {
-        pressedOut = isOutside(ev);
-      });
-      dialog.addEventListener("pointerup", (ev) => {
-        if (pressedOut && isOutside(ev)) dialog.close("backdrop");
-        pressedOut = false;
+      document.querySelectorAll('dialog[closedby="any"]').forEach((dlg) => {
+        let pressedOut = false;
+        dlg.addEventListener("pointerdown", (ev) => {
+          pressedOut = outside(ev, dlg);
+        });
+        dlg.addEventListener("pointerup", (ev) => {
+          if (pressedOut && outside(ev, dlg)) dlg.close("backdrop");
+          pressedOut = false;
+        });
       });
     }
   }

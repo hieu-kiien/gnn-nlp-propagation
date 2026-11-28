@@ -113,6 +113,10 @@
                         placeholder="Gõ nhanh 1 bình luận để nối đúng nhánh trả lời...">
                       <button type="button" id="btn-rb-add" class="btn-outline btn-sm">+ Thêm vào cây</button>
                     </div>
+                    <div id="prefilled-meta-bar" class="active-branch-note" hidden>
+                      <span id="prefilled-meta-label"></span>
+                      <button type="button" id="btn-clear-prefilled-meta" class="btn-outline btn-sm">Xóa tiêu đề này</button>
+                    </div>
                     <textarea
                       id="sb-raw-lines"
                       class="textarea-input hero-textarea"
@@ -292,6 +296,13 @@
                 <div class="polar-meter-fill" id="verdict-polar-meter"></div>
               </div>
               <div class="kpi-sub" id="verdict-polar-sub">—</div>
+              <details class="inline-help-tip">
+                <summary>Giải thích chỉ số này &amp; mốc Top 10% (Q90)</summary>
+                <p class="inline-help-body">
+                  Thang <code>[0–1]</code> đo đồng thời độ phân tán lập trường và độ cân bằng hai phe nên ngoài thực tế hiếm khi vượt <code>0.30</code>.
+                  Trên tập chuẩn Việt Nam, 50% bài dưới <code>0.093</code> (Q50), 75% dưới <code>0.120</code> (Q75) và chỉ 10% bài tranh cãi gay gắt nhất đạt từ <code>0.150</code> trở lên (Q90).
+                </p>
+              </details>
             </article>
 
             <article class="card verdict-card">
@@ -301,7 +312,7 @@
               </div>
               <div class="forecast-compare-row">
                 <div class="fc-box">
-                  <span class="fc-box-lbl">AI dự báo</span>
+                  <span class="fc-box-lbl" id="kpi-pred-label">AI dự báo</span>
                   <div class="fc-box-val tabular"><span id="kpi-pred-replies">—</span> <small>bình luận</small></div>
                 </div>
                 <div class="fc-vs" aria-hidden="true">vs</div>
@@ -310,6 +321,7 @@
                   <div class="fc-box-val tabular"><span id="kpi-actual-replies">—</span> <small>bình luận</small></div>
                 </div>
               </div>
+              <p class="kpi-sub" id="forecast-explain-note" hidden></p>
               <p class="kpi-sub" id="forecast-honesty-note" hidden>Bài dán thiếu mốc thời gian thật nên chưa thể dự báo tốc độ tăng trưởng.</p>
             </article>
 
@@ -385,10 +397,25 @@
                   </button>
                 </div>
 
-                <label class="safety-toggle-wrap">
-                  <input type="checkbox" id="toggle-profanity-badge">
-                  <span class="safety-label">Đánh dấu công kích</span>
-                </label>
+                <div class="stage-toolbar-right">
+                  <div class="graph-zoom-toolbar" role="toolbar" focusgroup="toolbar wrap" aria-label="Điều khiển phóng to sơ đồ" aria-controls="graph-svg">
+                    <div role="group" aria-label="Thu phóng">
+                      <button type="button" id="btn-graph-zoom-out" class="btn-outline btn-sm zoom-btn" aria-label="Thu nhỏ sơ đồ" title="Thu nhỏ sơ đồ">−</button>
+                      <button type="button" id="btn-graph-zoom-reset" class="btn-outline btn-sm zoom-pct-btn tabular" aria-label="Đặt lại tỷ lệ 100%" title="Đặt lại 100%">100%</button>
+                      <button type="button" id="btn-graph-zoom-in" class="btn-outline btn-sm zoom-btn" aria-label="Phóng to sơ đồ" title="Phóng to sơ đồ">+</button>
+                    </div>
+                    <span role="separator" aria-orientation="vertical" class="toolbar-sep"></span>
+                    <div role="group" aria-label="Khung nhìn">
+                      <button type="button" id="btn-graph-zoom-fit" class="btn-outline btn-sm" title="Thu vừa toàn cảnh vào khung">Vừa khung</button>
+                      <button type="button" id="btn-graph-fullscreen" class="btn-primary btn-sm" title="Mở sơ đồ phóng to toàn màn hình">Phóng to toàn màn hình</button>
+                    </div>
+                  </div>
+
+                  <label class="safety-toggle-wrap">
+                    <input type="checkbox" id="toggle-profanity-badge">
+                    <span class="safety-label">Đánh dấu công kích</span>
+                  </label>
+                </div>
               </div>
 
               <div class="legend-bar" aria-label="Chú giải màu sắc">
@@ -478,7 +505,7 @@
 
           <section class="card control-header-card">
             <div class="scope-banner-t2">
-              <strong>Lưu ý phạm vi:</strong> Tab này hiển thị kết quả thực nghiệm vĩ mô (Tầng 2) cố định trên toàn bộ tập dữ liệu <em>Reddit VN (r/vozforums)</em> và <em>Twitter PHEME</em>, độc lập với bài viết đang phân tích ở Tab 1.
+              <strong>Bản đồ Cộng đồng (Tầng 2 — Vĩ mô) giải quyết bài toán gì?</strong> Khác với Tab 1 (phân tích từng bài viết lẻ), phần này ghép lịch sử bình luận xuyên suốt hàng nghìn bài viết thành một mạng lưới người dùng (cạnh xanh = hay tán thành, cạnh đỏ = hay phản đối) để kiểm chứng 2 câu hỏi lớn: <strong>(1) Cộng đồng có bị đóng kín thành 2 "phòng vang" thù địch cố định hay không?</strong> và <strong>(2) AI có dự đoán trước được cặp người dùng nào dễ đối đầu nhau trong tương lai không?</strong> (Số liệu cố định trên tập <em>r/vozforums VN</em> và <em>Twitter PHEME</em>.)
             </div>
             <div class="mode-row">
               <div class="segmented-group" role="group" aria-label="Chọn tập dữ liệu">
@@ -498,25 +525,25 @@
 
           <section class="kpi-grid" aria-label="Chỉ số cộng đồng toàn cục">
             <article class="card kpi-card">
-              <h2 class="kpi-label">Tách cụm 2 phe (Q_signed)</h2>
+              <h2 class="kpi-label">Mức tách 2 phe cố định (Q_signed)</h2>
               <div class="kpi-value tabular" id="t2-q-signed">—</div>
               <div class="kpi-sub" id="t2-q-sub">—</div>
             </article>
 
             <article class="card kpi-card">
-              <h2 class="kpi-label">Độ khép kín "phòng vang" (RWC)</h2>
+              <h2 class="kpi-label">Nguy cơ "phòng vang" khép kín (RWC)</h2>
               <div class="kpi-value tabular" id="t2-rwc">—</div>
               <div class="kpi-sub" id="t2-camps">—</div>
             </article>
 
             <article class="card kpi-card">
-              <h2 class="kpi-label">Cân bằng tam giác &amp; Davis</h2>
+              <h2 class="kpi-label">Cấu trúc đa phe dây chuyền (Davis)</h2>
               <div class="kpi-value tabular" id="t2-z-score">—</div>
               <div class="kpi-sub" id="t2-triads">—</div>
             </article>
 
             <article class="card kpi-card">
-              <h2 class="kpi-label">Đối đầu giữa 2 phe</h2>
+              <h2 class="kpi-label">Chênh lệch đối đầu giữa 2 phe</h2>
               <div class="kpi-value tabular" id="t2-cross-delta">—</div>
               <div class="kpi-sub" id="t2-neg-rates">—</div>
             </article>
@@ -580,10 +607,36 @@
 
     <dialog id="figure-dialog" closedby="any" aria-labelledby="dialog-title">
       <div class="dialog-header">
-        <h2 id="dialog-title">Bản đồ Cộng đồng 2 Phe</h2>
-        <button type="button" id="btn-close-dialog" class="btn-outline btn-sm">Đóng</button>
+        <h1 id="dialog-title">Bản đồ Cộng đồng 2 Phe</h1>
+        <button type="button" id="btn-close-dialog" class="btn-outline btn-sm" autofocus>Đóng</button>
       </div>
       <img id="dialog-fig-img" class="dialog-img" src="/assets/fig5_vn.svg" alt="Hình 5 phóng to">
+    </dialog>
+
+    <dialog id="graph-fullscreen-dialog" class="graph-modal-dialog" closedby="any" aria-labelledby="graph-dialog-title">
+      <div class="dialog-header">
+        <h1 id="graph-dialog-title">Sơ đồ luồng hội thoại (Phóng to)</h1>
+        <div class="dialog-actions-row">
+          <div class="graph-zoom-toolbar" role="toolbar" focusgroup="toolbar wrap" aria-label="Điều khiển phóng to trong cửa sổ" aria-controls="modal-graph-svg">
+            <div role="group" aria-label="Thu phóng">
+              <button type="button" id="btn-modal-zoom-out" class="btn-outline btn-sm zoom-btn" aria-label="Thu nhỏ sơ đồ" title="Thu nhỏ sơ đồ">−</button>
+              <button type="button" id="btn-modal-zoom-reset" class="btn-outline btn-sm zoom-pct-btn tabular" aria-label="Đặt lại tỷ lệ 100%" title="Đặt lại 100%">100%</button>
+              <button type="button" id="btn-modal-zoom-in" class="btn-outline btn-sm zoom-btn" aria-label="Phóng to sơ đồ" title="Phóng to sơ đồ">+</button>
+            </div>
+            <span role="separator" aria-orientation="vertical" class="toolbar-sep"></span>
+            <div role="group" aria-label="Khung nhìn">
+              <button type="button" id="btn-modal-zoom-fit" class="btn-outline btn-sm" title="Thu vừa toàn cảnh vào cửa sổ">Vừa khung</button>
+            </div>
+          </div>
+          <button type="button" id="btn-close-graph-dialog" class="btn-outline btn-sm" autofocus>Đóng</button>
+        </div>
+      </div>
+      <div id="modal-svg-viewport" class="svg-viewport modal-svg-viewport">
+        <svg id="modal-graph-svg" class="graph-svg" role="img" aria-label="Sơ đồ phóng to toàn màn hình"></svg>
+      </div>
+      <div id="modal-node-preview" class="modal-node-preview" role="status">
+        Nhấn vào bất kỳ ô bình luận nào để đọc nội dung đầy đủ (kéo chuột để trượt, giữ Ctrl + lăn chuột để thu phóng).
+      </div>
     </dialog>
 
     <footer class="site-footer">
