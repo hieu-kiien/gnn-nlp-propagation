@@ -2226,7 +2226,7 @@
         `WCC: ${fmtInt(m.largest_signed_wcc_nodes)} / ${fmtInt(activeUsers)} hoạt động (${fmtPct(wccRatioActive, 1)})`;
     }
 
-    const nullQ = Number(pol.null_signed_modularity_mean ?? pol.null_q_signed ?? (corpusKey === "vn" ? 0.1977 : 0.4716));
+    const nullQ = Number(pol.q_signed_null_mean ?? pol.null_signed_modularity_mean ?? pol.null_q_signed ?? (corpusKey === "vn" ? 0.1977 : 0.4716));
     const qPval = pol.q_signed_p_value ?? (corpusKey === "vn" ? 0.333 : 1.0);
     $("t2-q-signed").textContent = fmtNum(pol.signed_modularity, 3);
     $("t2-q-sub").textContent =
@@ -2234,15 +2234,15 @@
         ? `Đối chứng ngẫu nhiên: ${fmtNum(nullQ, 3)} (p=${Number(qPval).toFixed(2)}, chưa vượt ngẫu nhiên)`
         : `Đối chứng ngẫu nhiên: ${fmtNum(nullQ, 3)} (tách cụm theo sự kiện, không phải phòng vang)`;
 
-    $("t2-rwc").textContent = fmtNum(pol.rwc, 3);
+    $("t2-rwc").textContent = fmtNum(pol.rwc, 4);
     const camps = m.camp_sizes || [0, 0];
     const rwcMeaning = Number(pol.rwc || 0) < 0 ? "Âm = tranh luận chéo mở" : "Dương = thiên hướng khép kín";
     $("t2-camps").textContent = `${rwcMeaning} · 2 nhóm WCC: ${fmtInt(camps[0])} vs ${fmtInt(camps[1])} người`;
 
     $("t2-z-score").textContent = fmtSigned(sb.balance_z_score, 2);
-    const davisPct = sb.weak_balance_davis_ratio ?? (corpusKey === "vn" ? 0.9405 : 0.8774);
+    const davisPct = sb.weak_balance_ratio ?? sb.weak_balance_davis_ratio ?? (corpusKey === "vn" ? 0.9405 : 0.8774);
     $("t2-triads").textContent =
-      `Cân bằng yếu Davis: ${fmtPct(davisPct, 1)} (Tam giác 2 phe chặt: ${fmtPct(sb.balanced_ratio, 1)})`;
+      `Cân bằng yếu Davis: ${fmtPct(davisPct, 2)} (Tam giác 2 phe chặt: ${fmtPct(sb.balanced_ratio, 1)})`;
 
     const withinNeg = Number(pol.within_camp_neg_rate || 0);
     const crossNeg = Number(pol.cross_camp_neg_rate || 0);
@@ -2258,7 +2258,7 @@
       if (corpusKey === "vn") {
         plainSum.appendChild(
           document.createTextNode(
-            `Cộng đồng Việt Nam không đóng kín thành 2 "phòng vang" biệt lập (RWC = ${fmtNum(pol.rwc, 3)}), mà tranh luận chéo rất mạnh (${fmtPct(crossNeg, 1)} tương tác đối đầu nằm giữa các nhóm).`
+            `Cộng đồng Việt Nam không đóng kín thành 2 "phòng vang" biệt lập (RWC = ${fmtNum(pol.rwc, 4)}), mà tranh luận chéo rất mạnh (${fmtPct(crossNeg, 1)} tương tác đối đầu nằm giữa các nhóm).`
           )
         );
       } else {

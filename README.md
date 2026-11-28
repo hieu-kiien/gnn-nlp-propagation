@@ -8,7 +8,7 @@ Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional
 > **Tài sản Dự án & Kết quả Thực nghiệm (`results/` & `archive/docs_v1/`):**
 > - **Kết quả Thực nghiệm đã Kiểm chứng (`results/`):** Chứa các tệp JSON, bảng LaTeX/Markdown và biểu đồ vector sạch (`fig5_macro_signed_network.{svg,pdf}`, `fig7_uncertainty_risk_coverage.{svg,pdf}`) từ pipeline chuẩn hóa: 10 mô hình Tầng 2 VN/PHEME 5 seeds, benchmark Tầng 1 các split (`results_main_*.json` chạy kèm `include_tier2_prior=True`, còn `tier1_tabular_*.json` chạy tách `include_tier2_prior=False`), bất định $\beta$-NLL Selective Abstention 5 seeds (`results_uncertainty_abstention.json`), kiểm định người chấm VN (`human_audit_vi`), và đo hiệu năng E2E đầy đủ Dual-Head Cross-Encoder (`results_efficiency_vn.json`: `146.04 ms` trên Kaggle Tesla T4 FP16 và `efficiency_e2e.json`: `2,206.36 ms` trên GTX 1660 SUPER FP32).
 > - **Tài liệu v1 Lưu trữ Trên GitHub (`archive/docs_v1/`):** Toàn bộ bản thảo tiếng Anh (`archive/docs_v1/paper/`), báo cáo tiếng Việt 4 chương & bộ slide bảo vệ (`archive/docs_v1/reports/`), cùng tài liệu hướng dẫn v1 (`archive/docs_v1/docs/`) được lưu giữ nguyên trạng trên kho GitHub gốc (tách khỏi gói `Program Source` nộp gọn `< 25 MB`).
-> - **Giao diện Demo Web MVP Offline-First & Mega-Thread 10k Scanner (`scripts/demo_web_app.py`, `web_demo/`):** Khởi chạy cục bộ `http://127.0.0.1:8765/` (0 dependency ngoài, 0 CDN), đọc trực tiếp số liệu Tầng 2 từ `results/`, hỗ trợ bài Test VN thật từ `data/processed/vn/` + fallback ngoại tuyến trên CI, **Path Contraction** (`junk_mode="contract"`), sơ đồ cây 3 màu lập trường tách bạch chỉ báo công kích, bản đồ 2 phe Tầng 2, và **Mega-Thread 10k Scanner** bất đồng bộ (`/api/tier1/scan_jobs`, `--scan-strategy stratified|full`, `--max-full-comments 10000`) sử dụng lấy mẫu phân tầng 10 phân vị có neo tổ tiên kèm khoảng tin cậy Bootstrap 95% và cảnh báo ngoại suy quy mô (`ood_scale_warning` khi `> 345` phản hồi). Kiểm thử tải 10.000 bình luận thật trên GPU `GTX 1660 SUPER` (`stratified`, `sample_budget=600`, `DualHeadCrossEncoder` + `best_sbifagat_vn.pt`): hoàn tất trong **`39.05 s`** với **`809.79 MB`** đỉnh VRAM (`9,656` bình luận hợp lệ, `600/9,656` cạnh chấm điểm NLP, `bootstrap_ci_95=[0.1349, 0.1493]`).
+> - **Giao diện Demo Web MVP Offline-First, Báo chí Việt Nam & Mega-Thread 10k Scanner (`scripts/demo_web_app.py`, `web_demo/`):** Khởi chạy cục bộ `http://127.0.0.1:8765/` (0 dependency ngoài, 0 CDN), đọc trực tiếp số liệu Tầng 2 từ `results/`, mặc định mở `10 bài mẫu thật` từ `data/processed/vn/` + fallback ngoại tuyến trên CI, **kéo bình luận trực tiếp có phân trang & cây trả lời con cho báo chí Việt Nam (`VnExpress`, `Dân Trí`, `Tuổi Trẻ`) kèm fallback đọc metadata HTML an toàn chống SSRF (`HTTP 422`) mở sẵn ô dán cho các trang báo khác (như `VietnamNet`)**, hiển thị danh sách bình luận phân trang đầy đủ kèm chip lọc lập trường, **Path Contraction** (`junk_mode="contract"`), sơ đồ cây 3 màu lập trường tách bạch chỉ báo công kích, bản đồ 2 phe Tầng 2, và **Mega-Thread 10k Scanner** bất đồng bộ (`/api/tier1/scan_jobs`, `--scan-strategy stratified|full`, `--max-full-comments 10000`) sử dụng lấy mẫu phân tầng 10 phân vị có neo tổ tiên kèm khoảng tin cậy Bootstrap 95% và cảnh báo ngoại suy quy mô (`ood_scale_warning` khi `> 345` phản hồi). Kiểm thử tải 10.000 bình luận thật trên GPU `GTX 1660 SUPER` (`stratified`, `sample_budget=600`, `DualHeadCrossEncoder` + `best_sbifagat_vn.pt`): hoàn tất trong **`39.05 s`** với **`809.79 MB`** đỉnh VRAM (`9,656` bình luận hợp lệ, `600/9,656` cạnh chấm điểm NLP, `bootstrap_ci_95=[0.1349, 0.1493]`).
 
 > **Mới bắt đầu hoặc muốn chạy trên GPU miễn phí (Google Colab / Kaggle `T4 x 2`)?**  
 > - **Hướng dẫn thực thi Cloud trọn gói:** Đọc [notebooks/CLOUD_EXECUTION_GUIDE.md](notebooks/CLOUD_EXECUTION_GUIDE.md).
@@ -53,6 +53,7 @@ Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional
 ├── notebooks/
 │   ├── CLOUD_EXECUTION_GUIDE.md             # Hướng dẫn thực thi Colab / Kaggle T4 x 2 trọn gói
 │   ├── colab_gpu_v3_gnn_benchmarks.ipynb    # Sổ tay Colab/Kaggle T4 GPU cho Temporal, Ablation & PHEME K=10/N>=15
+│   ├── colab_kaggle_test_megathread_10k.ipynb # Kiểm thử toàn bộ suite + benchmark Mega-Thread 10k Scanner trên Colab/Kaggle GPU
 │   ├── kaggle_macro_signed_gnn_t4.ipynb     # Sổ tay Tầng 2 Macro Signed Network + Temporal Signed Link GNN (T4 GPU)
 │   ├── kaggle_member1_nlp_and_vn_t4x2.ipynb # Sổ tay Track VN (`member1_vn`)
 │   └── kaggle_member2_gnn_and_en_t4x2.ipynb # Sổ tay Track EN (`member2_en`, PHEME + RumourEval SDQC)
@@ -62,7 +63,7 @@ Kiến trúc hai tầng hợp nhất **SBi-FAGAT** (*Stance-Guided Bidirectional
 │   ├── run_m5_local_audits.py  # Kiểm chứng định lượng dữ liệu thật (RWC/Gómez/Davis/zero-rows) & validate results/
 │   ├── kaggle_parallel_runner.py # Điều phối chạy song song 4 role (kiểm tra cohort min_total_replies_extracted)
 │   ├── export_dataset_stats.py # Xuất Bảng 1 EDA LaTeX động theo cohort & Early-K Persistence Baseline
-│   ├── predict_live_thread.py  # Dự báo trực tiếp từ URL/ID bài viết thật trên mạng
+│   ├── predict_live_thread.py  # Dự báo trực tiếp từ URL/ID thật (Reddit, VnExpress, Dân Trí, Tuổi Trẻ + metadata fallback SSRF-safe)
 │   ├── run_phase2.sh           # Pipeline Dual-Teacher NLI + Hostility -> DualHeadCrossEncoder & .pt (2D)
 │   ├── run_macro_signed_network.py # Phân tích mạng người dùng có dấu vĩ mô (Balance/Q_signed/RWC) & Link GNN
 │   ├── eval_rumoureval_sdqc.py # Kiểm chứng lập trường NLI tiếng Anh trên SemEval-2019 RumourEval (--context-mode root)
@@ -112,7 +113,7 @@ pytest
 export VN_BEFORE_EPOCH=1763164800
 bash scripts/run_phase2.sh
 
-# Bước 2: Chạy pytest, 8 mô hình x 5 seeds, ablation K={10,20,30,50}, EDA, efficiency & UPFD
+# Bước 2: Chạy pytest, 17 mô hình Tầng 1 + 10 mô hình Tầng 2 x 5 seeds, ablation K={10,20,30,50}, EDA, efficiency & UPFD
 bash run_all.sh
 ```
 
@@ -128,7 +129,8 @@ python -m scripts.run_macro_signed_network --data-dir data/processed/vn --datase
 # Chạy demo dự báo luồng trực tiếp offline trên CPU không cần checkpoint (<3 giây):
 python -m scripts.predict_live_thread --demo-offline
 
-# Dự báo luồng Reddit thật (bắt buộc truyền checkpoint):
+# Dự báo luồng Reddit / Báo chí VN thật (VnExpress, Dân Trí, Tuổi Trẻ; bắt buộc truyền checkpoint):
+python -m scripts.predict_live_thread --url "https://vnexpress.net/toi-khong-muon-cham-soc-chong-khi-tuoi-gia-5149309.html" --gnn-ckpt checkpoints/best_sbifagat_vn.pt
 python -m scripts.predict_live_thread --reddit-url "https://www.reddit.com/r/VietNam/comments/..." --gnn-ckpt checkpoints/best_sbifagat_vn.pt
 
 # Quét Mega-Thread tới 10.000 bình luận với lấy mẫu phân tầng + CI 95% (giữ GNN K=20):

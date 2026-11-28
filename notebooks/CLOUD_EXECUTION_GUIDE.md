@@ -1,8 +1,8 @@
 # SBi-FAGAT Turnkey Cloud Execution Guide (Google Colab & Kaggle T4 x 2)
 
-> **Local Environment Note:** `kaggle` CLI and `~/.kaggle/kaggle.json` (or `KAGGLE_USERNAME`/`KAGGLE_KEY`) are **not** configured on this local machine, so cloud jobs cannot be pushed unattended from the terminal. All 4 notebooks under `notebooks/` and `scripts/kaggle_parallel_runner.py` have been synchronized with M1–M5 and validated cleanly (`json` + `ast.parse` + `--smoke-test`) for immediate one-click execution.
+> **Local Environment Note:** `kaggle` CLI and `~/.kaggle/kaggle.json` (or `KAGGLE_USERNAME`/`KAGGLE_KEY`) are **not** configured on this local machine, so cloud jobs cannot be pushed unattended from the terminal. All 5 notebooks under `notebooks/` (including `colab_kaggle_test_megathread_10k.ipynb`) and `scripts/kaggle_parallel_runner.py` have been synchronized with M1–M6 and validated cleanly (`json` + `ast.parse` + `--smoke-test`) for immediate one-click execution.
 >
-> **R4 Safety Guarantee:** Every cloud notebook and `kaggle_parallel_runner.py` writes outputs strictly to **`results/`** and **`checkpoints/`**—never modifying `paper/`, `reports/`, or `docs/`.
+> **R4 Safety Guarantee:** Every cloud notebook and `kaggle_parallel_runner.py` writes outputs strictly to **`results/`** and **`checkpoints/`**—never modifying `archive/docs_v1/{paper,reports,docs}/`.
 
 ---
 
@@ -15,8 +15,8 @@
 | Tier 1 5-Seed Tabular Baselines (`Early-K Persistence`, `Calibrated Early-K Persistence`, `Ridge`, `LightGBM`) across all 5 splits | **Completed locally** (`results/tier1_tabular_*.json`) | Full 15+ model tables include these + neural/SOTA models |
 | VN 1,500-Cascade Contraction Eval | **Completed locally** (`results/contraction_eval_vn.json`) | N/A (local parquet audit) |
 | Human & Tree Audits (`120` pairs, `20` pilot, `30` trees) | **Completed locally** (`results/*audit*_summary.json`) | Sealed machine keys remain excluded from main bundles |
-| Efficiency + E2E Raw-Text Latency | **Completed locally** (`results/efficiency_e2e.json`, `is_partial_without_dual_ce=true` until `dual_head_weights.pt` restored) | Re-run automatically with real CE weights in Colab/Kaggle, or locally in ~15s after unzip |
-| Missing `checkpoints/dual_ce_{vn,pheme}/dual_head_weights.pt` Distillation Recovery | **Missing locally** (queued for GPU) | **Colab Cell `colab-v3-nlp-distill-recovery`** (`RUN_NLP_DISTILL_RECOVERY = True`) or `--distill-from-features` |
+| Efficiency + E2E Raw-Text Latency | **Completed locally** (`results/efficiency_e2e.json` & `results/results_efficiency_vn.json`: `cross_encoder_loaded=true`, `is_partial_without_dual_ce=false`) | Re-run with `--include-e2e` on new hardware if needed |
+| `checkpoints/dual_ce_{vn,pheme}/dual_head_weights.pt` Distillation Recovery | **Present locally** (can also be regenerated on GPU) | **Colab Cell `colab-v3-nlp-distill-recovery`** (`RUN_NLP_DISTILL_RECOVERY = True`) or `--distill-from-features` |
 | Full 15+ Model x 5-Seed Tier 1 (`VN canonical`, `VN embedding_cluster`, `VN temporal`, `PHEME inductive`, `PHEME LOO`, `SBiFAGAT + Tier2Prior`) & Ablation + $K$-Curve | **Probed/timed locally** (`~60–140 min`/split, `~8–10h` PHEME LOO on GTX 1660 SUPER) | **`colab_gpu_v3_gnn_benchmarks.ipynb`** or **`kaggle_member1/2_*.ipynb`** |
 
 ---
@@ -80,7 +80,7 @@ python -u -m scripts.run_macro_signed_network --data-dir data/processed/pheme --
 
 ## 5. Merging Downloaded Bundles Back Locally (PowerShell, R4-Safe)
 
-After downloading the zip bundle(s) into `Downloads\`, extract strictly into `results/` and `checkpoints/` (never touching `paper/`, `reports/`, or `docs/`):
+After downloading the zip bundle(s) into `Downloads\`, extract strictly into `results/` and `checkpoints/` (never touching `archive/docs_v1/{paper,reports,docs}/`):
 
 ```powershell
 cd d:\1. LapTrinh\4_AI
