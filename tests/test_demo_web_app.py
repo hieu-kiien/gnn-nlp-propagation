@@ -916,3 +916,159 @@ def test_vn_news_adapters_stance_consistency_and_full_comments(monkeypatch: pyte
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_vnexpress_component_config_fallback_probe_and_ui_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify VnExpress data-component-input/ot probe, interleaved replies, Tuoi Tre pagination, and UI state separation."""
+    import scripts.predict_live_thread as plt_mod
+
+    class _Resp:
+        def __init__(self, *, text: str = "", json_data: Any = None, status_code: int = 200) -> None:
+            self.text = text
+            self._json = json_data
+            self.status_code = status_code
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> Any:
+            return self._json
+
+    # 1. VnExpress object_type=8 parsed from data-component-input (mirrors 5117416) + interleaved getreplay + userid=0 fallback
+    seen_ots: list[int] = []
+
+    def _mock_vne_ot8(url: str, params: Any = None, headers: Any = None, timeout: int = 15, **kwargs: Any) -> _Resp:
+        del headers, timeout, kwargs
+        if "index/getreplay" in url:
+            assert int((params or {}).get("objecttype") or 0) == 8
+            return _Resp(
+                json_data={
+                    "data": {
+                        "items": [
+                            {
+                                "comment_id": 64405901,
+                                "parent_id": 64405812,
+                                "content": "Cảm ơn em rất nhiều.",
+                                "userid": 0,
+                                "full_name": "Lan Anh",
+                                "creation_time": 1788829000,
+                            },
+                            {
+                                "comment_id": 64405902,
+                                "parent_id": 64405812,
+                                "content": "Mong các em vững bước.",
+                                "userid": 0,
+                                "full_name": "Minh Tuấn",
+                                "creation_time": 1788829100,
+                            },
+                        ]
+                    }
+                }
+            )
+        if "usi-saas.vnexpress.net/index/get" in url:
+            ot = int((params or {}).get("objecttype") or 1)
+            seen_ots.append(ot)
+            if ot != 8:
+                return _Resp(json_data={"data": {"total": 0, "totalitem": 0, "items": []}})
+            return _Resp(
+                json_data={
+                    "data": {
+                        "total": 1,
+                        "totalitem": 3,
+                        "items": [
+                            {
+                                "comment_id": 64405812,
+                                "parent_id": 64405812,
+                                "content": "Bài viết xúc động.",
+                                "userid": 1062756791,
+                                "full_name": "thuyquynhsg318",
+                                "creation_time": 1788828547,
+                                "replys": {"total": 2, "items": []},
+                            }
+                        ],
+                    }
+                }
+            )
+        html_doc = (
+            '<title>Lời hứa trưởng thành - VnExpress</title>'
+            '<div class="box_comment_vne" id="box_comment_vne" '
+            'data-component-input=\'{"type":"comment","article_id":5117416,"article_type":8,"site_id":1000000,"category_id":1001005,"sign":"abc"}\'></div>'
+        )
+        return _Resp(text=html_doc)
+
+    monkeypatch.setattr(plt_mod.requests, "get", _mock_vne_ot8)
+    post8, cmts8 = plt_mod.fetch_url_thread(
+        "https://vnexpress.net/loi-hua-truong-thanh-cua-nhung-dua-tre-mo-coi-5117416.html",
+        max_comments=3,
+    )
+    assert post8["id"] == "vne_5117416"
+    assert seen_ots and all(ot == 8 for ot in seen_ots)
+    assert len(cmts8) == 3
+    assert cmts8[1]["parent_id"] == "t1_64405812"
+    assert cmts8[1]["author_hash"] != cmts8[2]["author_hash"]  # userid=0 must not collapse users
+
+    # 2. VnExpress empty box config falls back cleanly across (objecttype, siteid=1000000) pairs
+    def _mock_vne_probe(url: str, params: Any = None, headers: Any = None, timeout: int = 15, **kwargs: Any) -> _Resp:
+        del headers, timeout, kwargs
+        if "index/getreplay" in url:
+            return _Resp(json_data={"data": {"items": []}})
+        if "usi-saas.vnexpress.net/index/get" in url:
+            ot = int((params or {}).get("objecttype") or 1)
+            sid = str((params or {}).get("siteid") or "")
+            if ot == 3 and sid == "1000000":
+                return _Resp(
+                    json_data={
+                        "data": {
+                            "total": 1,
+                            "totalitem": 1,
+                            "items": [
+                                {"comment_id": 7001, "content": "Ảnh quá đẹp.", "userid": 88, "creation_time": 1788830000}
+                            ],
+                        }
+                    }
+                )
+            return _Resp(json_data={"data": {"total": 0, "totalitem": 0, "items": []}})
+        return _Resp(text='<title>Video mẫu - VnExpress</title><meta name="tt_site_id" content="1003834"/>')
+
+    monkeypatch.setattr(plt_mod.requests, "get", _mock_vne_probe)
+    _, cmts_probe = plt_mod.fetch_url_thread("https://video.vnexpress.net/video-mau-5149640.html")
+    assert len(cmts_probe) == 1 and cmts_probe[0]["body"] == "Ảnh quá đẹp."
+
+    # 3. Tuoi Tre pagination continues past <50 only when page_size (50) is filled, not stopped at 20
+    tt_pages_called: list[int] = []
+
+    def _mock_tt_pages(url: str, params: Any = None, headers: Any = None, timeout: int = 15, **kwargs: Any) -> _Resp:
+        del headers, timeout, kwargs
+        if "getlist-comment.api" in url:
+            pidx = int((params or {}).get("pageindex") or 1)
+            tt_pages_called.append(pidx)
+            if pidx == 1:
+                items = [
+                    {"id": f"tt{i}", "parent_id": "0", "content": f"Ý kiến số {i}", "user_id": f"u{i}", "published_date": "2026-11-28T09:00:00"}
+                    for i in range(1, 51)
+                ]
+                return _Resp(json_data={"Success": True, "Data": json.dumps(items)})
+            items2 = [
+                {"id": f"tt{i}", "parent_id": "0", "content": f"Ý kiến số {i}", "user_id": f"u{i}", "published_date": "2026-11-28T09:01:00"}
+                for i in range(51, 57)
+            ]
+            return _Resp(json_data={"Success": True, "Data": json.dumps(items2)})
+        return _Resp(text="<title>Tin nhiều trang - Tuổi Trẻ Online</title>")
+
+    monkeypatch.setattr(plt_mod.requests, "get", _mock_tt_pages)
+    _, tt_cmts = plt_mod.fetch_url_thread("https://tuoitre.vn/tin-nhieu-trang-100261128095247352.htm")
+    assert tt_pages_called == [1, 2]
+    assert len(tt_cmts) == 56
+
+    # 4. Static checks: frontend separates pendingScanJobId from activeScanJobId, zoom/modal controls, and CSS scroll containment
+    app_js = (Path(__file__).resolve().parents[1] / "web_demo" / "app.js").read_text(encoding="utf-8")
+    index_html = (Path(__file__).resolve().parents[1] / "web_demo" / "index.html").read_text(encoding="utf-8")
+    styles_css = (Path(__file__).resolve().parents[1] / "web_demo" / "styles.css").read_text(encoding="utf-8")
+    assert "pendingScanJobId" in app_js and "scanRunSeq" in app_js and "clearPrefilledNewsMeta" in app_js
+    assert "setGraphZoom" in app_js and "fitGraphZoom" in app_js
+    assert 'id="prefilled-meta-bar"' in index_html and 'id="btn-clear-prefilled-meta"' in index_html
+    assert 'id="btn-graph-zoom-in"' in index_html and 'id="btn-graph-fullscreen"' in index_html
+    assert 'id="graph-fullscreen-dialog"' in index_html and 'id="forecast-explain-note"' in index_html
+    assert "overscroll-behavior: contain" in styles_css
+
+
