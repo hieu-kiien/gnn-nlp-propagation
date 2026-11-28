@@ -205,6 +205,27 @@
     return s.slice(0, Math.max(0, maxLen - 1)).trimEnd() + "…";
   }
 
+  function fmtHumanDelay(sec) {
+    const s = Math.max(0, Math.round(Number(sec || 0)));
+    if (s < 60) return "vừa xong";
+    if (s < 3600) return `${Math.round(s / 60)} phút`;
+    if (s < 86400) return `${Math.round(s / 3600)} giờ`;
+    return `${Math.round(s / 86400)} ngày`;
+  }
+
+  function buildUserDisplayMap(uNodes) {
+    const map = new Map();
+    let idx = 1;
+    for (const u of uNodes || []) {
+      if (u.is_op) {
+        map.set(u.user_id, "Tác giả bài");
+      } else {
+        map.set(u.user_id, `Người #${idx++}`);
+      }
+    }
+    return map;
+  }
+
   async function apiGet(url) {
     const resp = await fetch(url, { headers: { Accept: "application/json" } });
     const data = await resp.json();
@@ -462,11 +483,11 @@
     clearEl(list);
     const triggers = payload.top_trigger_edges || [];
     if (!triggers.length) {
-      list.appendChild(el("li", { className: "muted-note" }, "Chưa có cạnh kích hoạt."));
+      list.appendChild(el("li", { className: "muted-note" }, "Chưa có bình luận nổi bật."));
       return;
     }
 
-    for (const tr of triggers) {
+    triggers.forEach((tr, idx) => {
       const li = el("li");
       const btn = el("button", { type: "button", className: "trigger-btn" });
       const top = el("div", { className: "trigger-btn-top" });
@@ -476,11 +497,7 @@
         el("span", { className: `badge-tag badge-${tr.stance_class || "neutral"}` }, stInfo.label)
       );
       top.appendChild(
-        el(
-          "span",
-          { className: "tabular" },
-          `γ=${fmtSigned(tr.gamma_td, 3)} · |γ|=${fmtNum(tr.importance, 3)}`
-        )
+        el("span", {}, idx < 2 ? `#${idx + 1} · Tác động mạnh` : `#${idx + 1} · Đáng chú ý`)
       );
       btn.appendChild(top);
       btn.appendChild(
@@ -498,7 +515,7 @@
           renderTreeNodeInspector({
             node_id: tr.target_id,
             parent_id: tr.source_id,
-            author_hash: "— (ngoài nhánh đang xem)",
+            author_hash: "Ngoài nhánh đang xem",
             depth: "1..K",
             time_delay_sec: 0,
             text: tr.reply_text_snippet || tr.target_id,
@@ -514,7 +531,7 @@
       });
       li.appendChild(btn);
       list.appendChild(li);
-    }
+    });
   }
 
   function renderTreeNodeInspector(node) {
@@ -522,7 +539,7 @@
     clearEl(box);
     if (!node) {
       box.appendChild(
-        el("p", { className: "muted-note" }, "Nhấn vào một nút trên sơ đồ để xem chi tiết.")
+        el("p", { className: "muted-note" }, "Nhấn vào một ô trên sơ đồ để đọc chi tiết.")
       );
       return;
     }
@@ -530,24 +547,31 @@
     const tags = el("div", { className: "meta-pills" });
     const stInfo = STANCE_COLORS[node.stance_class] || STANCE_COLORS.neutral;
     tags.appendChild(el("span", { className: `badge-tag badge-${node.stance_class}` }, stInfo.label));
+    if (!node.is_root) {
+      tags.appendChild(el("span", { className: "pill" }, fmtHumanDelay(node.time_delay_sec)));
+    }
     if (node.relinked) {
-      tags.appendChild(el("span", { className: "badge-tag badge-relink" }, "Nối nhánh (Contracted)"));
+      tags.appendChild(el("span", { className: "badge-tag badge-relink" }, "Nối nhánh"));
     }
     if (state.showProfanityBadge && node.is_uncivil) {
-      tags.appendChild(el("span", { className: "badge-tag badge-uncivil" }, "Công kích / Thô tục"));
+      tags.appendChild(el("span", { className: "badge-tag badge-uncivil" }, "Công kích"));
     }
     box.appendChild(tags);
 
     box.appendChild(el("blockquote", { className: "detail-quote" }, node.text || "(Trống)"));
+    box.appendChild(
+      el("div", { className: "muted-note" }, `Sắc thái: ${BEHAVIOR_VI[node.behavior_label] || "Bình thường"}`)
+    );
 
+    const techDetails = el("details", { className: "mini-tech-details" });
+    techDetails.appendChild(el("summary", {}, "Thông số kỹ thuật"));
     const kv = el("div", { className: "detail-kv-grid" });
     const entries = [
-      ["Tác giả (SHA-256)", node.author_hash || "—"],
-      ["Độ sâu / Độ trễ", `d=${node.depth} · +${Math.round(node.time_delay_sec || 0)}s`],
-      ["Lập trường s_uv", node.is_root ? "Bài gốc (+1.0)" : fmtSigned(node.s_uv, 4)],
-      ["Gay gắt h_uv", node.is_root ? "—" : fmtNum(node.h_uv, 4)],
-      ["Cổng SBi-FAGAT γ_uv", node.is_root ? "—" : (node.gamma_td !== null && node.gamma_td !== undefined ? fmtSigned(node.gamma_td, 4) : "— (Top 5 bên dưới)")],
-      ["Nhóm diễn ngôn 2D", BEHAVIOR_VI[node.behavior_label] || node.behavior_label || "—"],
+      ["Mã ẩn danh", node.author_hash || "—"],
+      ["Tầng / Độ trễ", `Tầng ${node.depth} · +${Math.round(node.time_delay_sec || 0)}s`],
+      ["Điểm lập trường", node.is_root ? "Bài gốc (+1.0)" : fmtSigned(node.s_uv, 3)],
+      ["Độ gay gắt", node.is_root ? "—" : fmtNum(node.h_uv, 3)],
+      ["Trọng số cổng γ", node.is_root ? "—" : (node.gamma_td !== null && node.gamma_td !== undefined ? fmtSigned(node.gamma_td, 3) : "—")],
     ];
     for (const [k, v] of entries) {
       const cell = el("div", { className: "kv-cell" });
@@ -555,35 +579,49 @@
       cell.appendChild(el("div", { className: "kv-v tabular" }, v));
       kv.appendChild(cell);
     }
-    box.appendChild(kv);
+    techDetails.appendChild(kv);
+    box.appendChild(techDetails);
   }
 
   function renderUserInspector(userNode) {
     const box = $("node-inspector-body");
     clearEl(box);
     if (!userNode) {
-      box.appendChild(el("p", { className: "muted-note" }, "Nhấn vào một nút người dùng để xem chi tiết."));
+      box.appendChild(el("p", { className: "muted-note" }, "Nhấn vào một vòng tròn để xem các bình luận."));
       return;
     }
 
+    const uMap = buildUserDisplayMap(state.currentPayload?.user_graph?.nodes || []);
+    const displayName = uMap.get(userNode.user_id) || "Người dùng";
+
     const tags = el("div", { className: "meta-pills" });
     const campBadgeClass = userNode.camp === 0 ? "badge-support" : "badge-oppose";
-    const campLabel = userNode.camp === 0 ? "Phe 0 · Gốc / Đồng thuận" : "Phe 1 · Đối lập / Phản biện";
+    const campLabel = userNode.camp === 0 ? "Phe Đồng thuận" : "Phe Phản biện";
     tags.appendChild(el("span", { className: `badge-tag ${campBadgeClass}` }, campLabel));
-    if (userNode.is_op) {
-      tags.appendChild(el("span", { className: "badge-tag badge-root" }, "Tác giả bài gốc (OP)"));
-    }
+    tags.appendChild(el("span", { className: "pill" }, `${displayName} · ${userNode.reply_count} lượt`));
     if (state.showProfanityBadge && userNode.is_uncivil) {
-      tags.appendChild(el("span", { className: "badge-tag badge-uncivil" }, "Có phát ngôn công kích"));
+      tags.appendChild(el("span", { className: "badge-tag badge-uncivil" }, "Có công kích"));
     }
     box.appendChild(tags);
 
+    const nodes = (state.currentPayload?.tree?.nodes || []).filter(
+      (n) => n.author_hash === userNode.user_id
+    );
+    if (nodes.length) {
+      for (const n of nodes) {
+        const stInfo = STANCE_COLORS[n.stance_class] || STANCE_COLORS.neutral;
+        box.appendChild(el("div", { className: "detail-quote" }, `[${stInfo.label}] ${n.text}`));
+      }
+    }
+
+    const techDetails = el("details", { className: "mini-tech-details" });
+    techDetails.appendChild(el("summary", {}, "Thông số kỹ thuật"));
     const kv = el("div", { className: "detail-kv-grid" });
     const entries = [
-      ["Định danh ẩn danh", userNode.user_id],
-      ["Số lượt tham gia", `${userNode.reply_count} nút`],
-      ["Cân bằng lập trường", fmtSigned(userNode.stance_balance, 4)],
-      ["Phân cụm trong thread", `Camp ${userNode.camp}`],
+      ["Mã ẩn danh", userNode.user_id],
+      ["Số bình luận", `${userNode.reply_count} nút`],
+      ["Cân bằng", fmtSigned(userNode.stance_balance, 3)],
+      ["Nhóm cụm", `Phe ${userNode.camp}`],
     ];
     for (const [k, v] of entries) {
       const cell = el("div", { className: "kv-cell" });
@@ -591,19 +629,8 @@
       cell.appendChild(el("div", { className: "kv-v tabular" }, v));
       kv.appendChild(cell);
     }
-    box.appendChild(kv);
-
-    const nodes = (state.currentPayload?.tree?.nodes || []).filter(
-      (n) => n.author_hash === userNode.user_id
-    );
-    if (nodes.length) {
-      box.appendChild(el("div", { className: "field-label" }, "Các bình luận trong cửa sổ quan sát:"));
-      for (const n of nodes) {
-        const stInfo = STANCE_COLORS[n.stance_class] || STANCE_COLORS.neutral;
-        const item = el("div", { className: "detail-quote" }, `[${stInfo.label}] ${n.text}`);
-        box.appendChild(item);
-      }
-    }
+    techDetails.appendChild(kv);
+    box.appendChild(techDetails);
   }
 
   function selectTreeNode(nodeId) {
@@ -836,12 +863,12 @@
         y: p.y + 18,
         "font-size": "10.5",
         "font-weight": "700",
-        "font-family": "var(--font-mono)",
+        "font-family": "var(--font-sans)",
         fill: stInfo.text,
       });
       headerTxt.textContent = n.is_root
-        ? `${n.author_hash} · GỐC`
-        : `${n.author_hash} · +${Math.round(n.time_delay_sec || 0)}s`;
+        ? "Bài gốc"
+        : `${stInfo.label} · ${fmtHumanDelay(n.time_delay_sec)}`;
       g.appendChild(headerTxt);
 
       const bodyTxt = svgEl("text", {
@@ -1031,18 +1058,20 @@
       );
     }
 
+    const uMap = buildUserDisplayMap(uNodes);
     for (const u of uNodes) {
       const p = pos.get(u.user_id);
       if (!p) continue;
       const fill = u.camp === 0 ? "#ECFDF5" : "#FEF2F2";
       const stroke = u.is_op ? "#0F172A" : (u.camp === 0 ? "#059669" : "#DC2626");
       const textCol = u.camp === 0 ? "#065F46" : "#991B1B";
+      const friendlyName = uMap.get(u.user_id) || "Người dùng";
 
       const g = svgEl("g", {
         class: `svg-node-group${state.selectedUserId === u.user_id ? " is-selected" : ""}`,
         tabindex: "0",
         role: "button",
-        "aria-label": `${u.label}, Phe ${u.camp}, ${u.reply_count} bình luận`,
+        "aria-label": `${friendlyName}, Phe ${u.camp}, ${u.reply_count} bình luận`,
         "data-user-id": u.user_id,
       });
 
@@ -1074,12 +1103,12 @@
         x: p.x,
         y: p.y + p.r + 14,
         "text-anchor": "middle",
-        "font-size": "10.5",
+        "font-size": "11",
         "font-weight": "600",
-        "font-family": "var(--font-mono)",
+        "font-family": "var(--font-sans)",
         fill: "#1E293B",
       });
-      lblTxt.textContent = u.label;
+      lblTxt.textContent = friendlyName;
       g.appendChild(lblTxt);
 
       if (state.showProfanityBadge && u.is_uncivil) {
@@ -1345,29 +1374,41 @@
   }
 
   function appendArgumentGroup(container, titleText, items, emptyText, openByDefault, tone = "neutral") {
-    const details = createNode("details", "arguments-details");
-    details.dataset.tone = tone;
-    if (openByDefault) details.open = true;
-    const summary = createNode("summary", "arguments-summary", `${titleText} (${items.length})`);
-    details.appendChild(summary);
-    if (items.length === 0) {
-      details.appendChild(createNode("p", "arguments-empty", emptyText));
-    } else {
+    const buildList = () => {
+      if (items.length === 0) {
+        return createNode("p", "arguments-empty", emptyText);
+      }
       const ul = createNode("ul", "arguments-list");
-      items.forEach((entry) => {
+      items.slice(0, 3).forEach((entry) => {
         const li = createNode("li", "arguments-item");
         if (typeof entry === "string") {
           li.textContent = entry;
         } else {
           const text = entry.text || entry.snippet || entry.summary || "";
-          const replyHint = entry.child_replies ? ` — (${entry.child_replies} phản hồi)` : "";
+          const replyHint = entry.child_replies ? ` (${entry.child_replies} phản hồi)` : "";
           li.textContent = `${text}${replyHint}`;
         }
         ul.appendChild(li);
       });
-      details.appendChild(ul);
+      return ul;
+    };
+
+    if (tone === "flash") {
+      if (items.length === 0) return;
+      const details = createNode("details", "arguments-details");
+      details.dataset.tone = tone;
+      const summary = createNode("summary", "arguments-summary", `${titleText} (${items.length})`);
+      details.appendChild(summary);
+      details.appendChild(buildList());
+      container.appendChild(details);
+      return;
     }
-    container.appendChild(details);
+
+    const panel = createNode("div", "arg-panel");
+    panel.dataset.tone = tone;
+    panel.appendChild(createNode("h3", "arg-panel-title", titleText));
+    panel.appendChild(buildList());
+    container.appendChild(panel);
   }
 
   function renderLargePostUnderstanding(payload) {
@@ -1553,27 +1594,32 @@
     $("mega-next-page").disabled = state.megaPage >= state.megaTotalPages;
 
     clearEl(tbody);
+    const startIdx = (state.megaPage - 1) * 50;
     const items = data.items || [];
     if (!items.length) {
       const tr = el("tr");
-      const td = el("td", { colSpan: "5" }, "Không tìm thấy bình luận nào phù hợp bộ lọc.");
+      const td = el("td", { colSpan: "3" }, "Không tìm thấy bình luận nào phù hợp bộ lọc.");
       tr.appendChild(td);
       tbody.appendChild(tr);
       return;
     }
-    for (const item of items) {
+    items.forEach((item, idx) => {
       const tr = el("tr");
-      tr.appendChild(el("td", { className: "tabular" }, `${item.node_id} (d=${item.depth})`));
-      tr.appendChild(el("td", { className: "tabular" }, item.author_hash || "—"));
+      tr.appendChild(el("td", { className: "tabular" }, String(startIdx + idx + 1)));
       const stanceKey = item.is_scored === false ? "unscored" : item.stance_class;
       const stInfo = STANCE_COLORS[stanceKey] || STANCE_COLORS.neutral;
-      const stLabel = item.is_uncivil ? `${stInfo.label} · Gay gắt` : stInfo.label;
-      tr.appendChild(el("td", {}, stLabel));
-      const scoreTxt = item.is_scored ? `${Number(item.s_uv).toFixed(2)} / ${Number(item.h_uv).toFixed(2)}` : "Chưa chấm";
-      tr.appendChild(el("td", { className: "tabular" }, scoreTxt));
+      const stTd = el("td");
+      stTd.appendChild(
+        el(
+          "span",
+          { className: `badge-tag badge-${stanceKey === "unscored" ? "neutral" : stanceKey}` },
+          item.is_uncivil ? `${stInfo.label} · Gay gắt` : stInfo.label
+        )
+      );
+      tr.appendChild(stTd);
       tr.appendChild(el("td", {}, item.text || ""));
       tbody.appendChild(tr);
-    }
+    });
   }
 
   function renderPayload(payload) {
@@ -1624,8 +1670,8 @@
     const realBtn = $("mode-real-btn");
     if (realBtn) {
       realBtn.textContent = idx.is_synthetic_fallback
-        ? "Kiểm chứng Mẫu Offline (Có đáp án)"
-        : "Kiểm chứng 10 bài thật (Có đáp án)";
+        ? "Mẫu thử Offline"
+        : "10 bài mẫu thật";
     }
 
     const select = $("thread-select");
@@ -1633,10 +1679,9 @@
     if ($("thread-count-label")) $("thread-count-label").textContent = String(idx.count || 0);
 
     (idx.threads || []).forEach((item, i) => {
-      const pTier = polarTierInfo(item.actual_y_polar ?? item.early_y_polar);
       const label =
-        `Bài #${i + 1} · Thực tế ${item.actual_total_replies} BL (AI đoán sớm ~${Math.round(item.predicted_total_replies)} BL) · ` +
-        `Chia rẽ: ${pTier.label} — ${truncText(item.title_snippet, 64)}`;
+        `Bài #${i + 1} · ${item.actual_total_replies} BL (đoán sớm ~${Math.round(item.predicted_total_replies)}) — ` +
+        `${truncText(item.title_snippet, 68)}`;
       select.appendChild(el("option", { value: item.cascade_id }, label));
     });
 
@@ -1758,62 +1803,54 @@
       m.largest_signed_wcc_ratio_active ??
       (activeUsers ? Number(m.largest_signed_wcc_nodes || 0) / Number(activeUsers) : m.largest_signed_wcc_ratio);
 
-    $("tier2-source-pill").textContent = `edge_label_source: ${m.edge_label_source || "teacher"}`;
-    $("tier2-wcc-pill").textContent =
-      `WCC: ${fmtInt(m.largest_signed_wcc_nodes)} / ${fmtInt(activeUsers)} active (${fmtPct(wccRatioActive, 1)})`;
+    if ($("tier2-source-pill")) {
+      $("tier2-source-pill").textContent = `edge_label_source: ${m.edge_label_source || "teacher"}`;
+    }
+    if ($("tier2-wcc-pill")) {
+      $("tier2-wcc-pill").textContent =
+        `WCC: ${fmtInt(m.largest_signed_wcc_nodes)} / ${fmtInt(activeUsers)} active (${fmtPct(wccRatioActive, 1)})`;
+    }
 
-    $("t2-q-signed").textContent = fmtNum(pol.signed_modularity, 4);
-    const qZ = pol.q_signed_z_score;
-    const qP = pol.q_signed_p_value;
-    const nullTag =
-      qZ !== undefined && qP !== undefined
-        ? ` · z=${fmtSigned(qZ, 2)} (p=${Number(qP).toFixed(3)})`
-        : "";
-    $("t2-q-sub").textContent = `Q+: ${fmtNum(pol.q_pos, 4)} · Q-: ${fmtNum(pol.q_neg, 4)}${nullTag}`;
+    $("t2-q-signed").textContent = fmtNum(pol.signed_modularity, 3);
+    $("t2-q-sub").textContent = "Càng gần 1 càng chia rẽ 2 phe";
 
-    $("t2-rwc").textContent = fmtNum(pol.rwc, 4);
+    $("t2-rwc").textContent = fmtNum(pol.rwc, 3);
     const camps = m.camp_sizes || [0, 0];
-    $("t2-camps").textContent = `Phe 0: ${fmtInt(camps[0])} · Phe 1: ${fmtInt(camps[1])}`;
+    $("t2-camps").textContent = `Hai nhóm: ${fmtInt(camps[0])} vs ${fmtInt(camps[1])} người`;
 
     $("t2-z-score").textContent = fmtSigned(sb.balance_z_score, 2);
-    const weakTag =
-      sb.weak_balance_ratio !== undefined
-        ? ` · Davis yếu: ${fmtPct(sb.weak_balance_ratio, 1)}`
-        : "";
-    $("t2-triads").textContent =
-      `Cân bằng: ${fmtPct(sb.balanced_ratio, 1)} vs Null: ${fmtPct(sb.null_balanced_mean, 1)} (${fmtInt(sb.num_triangles)} tam giác)${weakTag}`;
+    $("t2-triads").textContent = `Tam giác cân bằng: ${fmtPct(sb.balanced_ratio, 1)}`;
 
     const withinNeg = Number(pol.within_camp_neg_rate || 0);
     const crossNeg = Number(pol.cross_camp_neg_rate || 0);
     const deltaPp = (crossNeg - withinNeg) * 100;
     $("t2-cross-delta").textContent = `${deltaPp >= 0 ? "+" : ""}${deltaPp.toFixed(1)} pp`;
-    $("t2-neg-rates").textContent = `Liên phe: ${fmtPct(crossNeg, 1)} · Trong phe: ${fmtPct(withinNeg, 1)}`;
+    $("t2-neg-rates").textContent = `Liên phe ${fmtPct(crossNeg, 1)} · Trong phe ${fmtPct(withinNeg, 1)}`;
 
     const plainSum = $("tier2-plain-summary-text");
     if (plainSum) {
       clearEl(plainSum);
-      plainSum.appendChild(el("strong", {}, "Kết luận 5 giây: "));
+      plainSum.appendChild(el("strong", {}, "Tóm tắt: "));
       if (corpusKey === "vn") {
         plainSum.appendChild(
           document.createTextNode(
-            `Cộng đồng Reddit Việt Nam không đóng kín thành 2 "phòng vang" biệt lập (RWC = ${fmtNum(pol.rwc, 3)}), mà tranh luận chéo rất mạnh (${fmtPct(crossNeg, 1)} đối đầu nằm giữa các phe, tam giác cân bằng chỉ ${fmtPct(sb.balanced_ratio, 1)}).`
+            `Cộng đồng Việt Nam không đóng kín thành 2 "phòng vang" biệt lập, mà tranh luận chéo rất mạnh (${fmtPct(crossNeg, 1)} tương tác đối đầu nằm giữa các phe).`
           )
         );
       } else {
         plainSum.appendChild(
           document.createTextNode(
-            `Trên mạng tin đồn Twitter (PHEME), người dùng chia 2 phe đối đầu rõ hơn nhiều (liên phe ${fmtPct(crossNeg, 1)} so với trong phe ${fmtPct(withinNeg, 1)}), SBiFAGAT-Link dự đoán chính xác 91,1% (Trans. ROC-AUC).`
+            `Trên Twitter (PHEME), người dùng phân hóa 2 phe rõ rệt hơn nhiều (đối đầu liên phe ${fmtPct(crossNeg, 1)} gấp 10 lần trong phe ${fmtPct(withinNeg, 1)}).`
           )
         );
       }
     }
 
-    $("fig5-title").textContent = `Hình 5 · ${corp.label}: Cấu trúc 2 Phe & Tam giác Có dấu`;
+    $("fig5-title").textContent = `Bản đồ 2 phe · ${corp.label}`;
     $("fig5-img").src = corp.figure_url;
     $("dialog-fig-img").src = corp.figure_url;
     $("fig5-caption").textContent =
-      `Tập ${corp.label}: ${fmtInt(activeUsers)} người dùng hoạt động trong đồ thị (${fmtInt(m.num_users)} tổng cohort), ` +
-      `${fmtInt(m.num_interactions)} tương tác, ${fmtInt(m.signed_strong_pairs)} cặp có dấu mạnh.`;
+      `${corp.label}: ${fmtInt(activeUsers)} người dùng hoạt động, ${fmtInt(m.num_interactions)} tương tác.`;
 
     renderSignedLinkTable(corp.signed_link);
   }
@@ -2462,10 +2499,10 @@
       const txt = $("health-text");
       if (health.real_vn_data_available && health.gnn_checkpoint_loaded) {
         dot.dataset.ready = "true";
-        txt.textContent = "Sẵn sàng · Tập Test VN + Checkpoint thật";
+        txt.textContent = "AI sẵn sàng";
       } else {
         dot.dataset.ready = "warn";
-        txt.textContent = "Ngoại tuyến · Chế độ Mẫu tổng hợp";
+        txt.textContent = "Chế độ mẫu thử";
       }
       await loadRealThreads();
     } catch (err) {
