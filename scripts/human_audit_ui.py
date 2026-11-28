@@ -58,7 +58,7 @@ ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
         subtitle="Chấm mù độc lập Thái độ (stance) + Khiếm nhã/Công kích nhị phân (clean vs. uncivil) trên tập Test VN.",
         kappa_command=(
             "python -m scripts.compute_kappa --input data/interim/human_audit_vi_120.csv "
-            "--strict-adjudication --output-json paper/results_human_audit_vi.json"
+            "--strict-adjudication --output-json results/results_human_audit_vi.json"
         ),
     ),
     DatasetSpec(
@@ -69,7 +69,7 @@ ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
         kappa_command=(
             "python -m scripts.audit_vn_50_trees --evaluate --strict-adjudication "
             "--audit-csv data/interim/human_audit_vn_30_trees.csv "
-            "--output-json paper/results_human_audit_vn_30_trees.json"
+            "--output-json results/results_human_audit_vn_30_trees.json"
         ),
     ),
     DatasetSpec(
@@ -86,7 +86,7 @@ ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
         subtitle="Bộ kiểm định cũ 300 cặp (giữ tương thích kiểm thử cũ).",
         kappa_command=(
             "python -m scripts.compute_kappa --input data/interim/human_audit_vi_300.csv "
-            "--strict-adjudication --output-json paper/results_human_audit_vi.json"
+            "--strict-adjudication --output-json results/results_human_audit_vi.json"
         ),
     ),
     DatasetSpec(
@@ -97,24 +97,41 @@ ALLOWLISTED_SPECS: tuple[DatasetSpec, ...] = (
         kappa_command=(
             "python -m scripts.audit_vn_50_trees --evaluate --strict-adjudication "
             "--audit-csv data/interim/human_audit_vn_50_trees.csv "
-            "--output-json paper/results_human_audit_vn_50_trees.json"
+            "--output-json results/results_human_audit_vn_50_trees.json"
+        ),
+    ),
+    DatasetSpec(
+        filename="pilot_calibration_en_20.csv",
+        mode="pair",
+        title="Tùy chọn: Pilot EN PHEME (20 cặp)",
+        subtitle="Tùy chọn: 20 cặp tiếng Anh PHEME (EN pair validation ưu tiên dùng RumourEval SDQC làm chuẩn chính).",
+        kappa_command="python -m scripts.compute_kappa --input data/interim/pilot_calibration_en_20.csv",
+    ),
+    DatasetSpec(
+        filename="human_audit_en_120.csv",
+        mode="pair",
+        title="Tùy chọn: Kiểm định EN PHEME (120 cặp)",
+        subtitle="Tùy chọn: 120 cặp tiếng Anh PHEME (clean vs. uncivil + 3-class stance).",
+        kappa_command=(
+            "python -m scripts.compute_kappa --input data/interim/human_audit_en_120.csv "
+            "--strict-adjudication --output-json results/results_human_audit_en.json"
         ),
     ),
     DatasetSpec(
         filename="pilot_calibration_en_30.csv",
         mode="pair",
-        title="Tuỳ chọn: Pilot EN PHEME (30 cặp)",
-        subtitle="Tuỳ chọn: 30 cặp tiếng Anh PHEME (EN pair validation sử dụng RumourEval SDQC làm chuẩn chính).",
+        title="Tuỳ chọn: Pilot EN PHEME (30 cặp cũ)",
+        subtitle="Tuỳ chọn: 30 cặp tiếng Anh PHEME (tương thích ngược).",
         kappa_command="python -m scripts.compute_kappa --input data/interim/pilot_calibration_en_30.csv",
     ),
     DatasetSpec(
         filename="human_audit_en_300.csv",
         mode="pair",
-        title="Tuỳ chọn: Kiểm định EN PHEME (300 cặp)",
-        subtitle="Tuỳ chọn: 300 cặp tiếng Anh PHEME.",
+        title="Tuỳ chọn: Kiểm định EN PHEME (300 cặp cũ)",
+        subtitle="Tuỳ chọn: 300 cặp tiếng Anh PHEME (tương thích ngược).",
         kappa_command=(
             "python -m scripts.compute_kappa --input data/interim/human_audit_en_300.csv "
-            "--strict-adjudication --output-json paper/results_human_audit_en.json"
+            "--strict-adjudication --output-json results/results_human_audit_en.json"
         ),
     ),
 )
@@ -1442,6 +1459,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <p style="margin:0;">
         <strong>Nguyên tắc vàng:</strong> Khi chấm cặp bình luận, hãy hỏi xem <em>Bình luận cần chấm</em> đang phản ứng thế nào với <strong>Bình luận cha</strong> ngay phía trên nó (bài gốc chỉ để hiểu ngữ cảnh).
       </p>
+
+      <div style="padding:10px 12px;border:1px solid var(--border-strong);border-radius:8px;background:var(--amber-bg);color:#78350F;font-size:13.5px;">
+        <strong>Quy tắc "Chửi ai?" (Target-of-Profanity Rule):</strong> Luôn tách bạch <strong>Thái độ (Stance)</strong> nhắm vào quan điểm của <em>Bình luận cha</em> khỏi <strong>Công kích (Incivility)</strong>:
+        <ul style="margin:6px 0 0 18px;padding:0;">
+          <li>Chửi/mạt sát <strong>trực tiếp Bình luận cha</strong> (vd: <em>"Khuyên như cl"</em>) &rarr; <code>oppose</code> + <code>uncivil</code>.</li>
+          <li>Chửi/mạt sát <strong>bên thứ ba</strong> để bênh vực/đồng tình với Bình luận cha (vd: <em>"Thằng súc vật đấy thì hiếu j"</em>, <em>"Thằng chồng quá súc vật"</em>) &rarr; <code>support</code> + <code>uncivil</code>.</li>
+          <li>Khẩu ngữ/từ lóng cảm thán không nhắm xúc phạm cá nhân hay đối phương (vd: <em>"ngại bỏ mẹ ra"</em>, <em>"Ngu j..."</em>) &rarr; <code>clean</code> (chấm <code>stance</code> thuần túy theo quan điểm với cha).</li>
+        </ul>
+      </div>
 
       <table class="guide-table">
         <thead>

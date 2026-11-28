@@ -241,10 +241,11 @@ def test_v3_models_persistence_single_camp_dipole_and_val_selection() -> None:
         assert "polar_logvar" in out and "confidence_score" in out
         assert torch.isfinite(out["y_polar_pred"]).all()
 
-    # Latent-edge and ablate-stance auto-disable persistence anchor
+    # Latent-edge auto-disables persistence anchor; ablate_stance stays orthogonal unless overridden
     assert EdgeGATv2(use_latent_edge_mlp=True).use_polar_persistence_anchor is False
     assert BiEdgeGATv2(use_latent_edge_mlp=True).use_polar_persistence_anchor is False
-    assert SBiFAGAT(ablate_stance=True).use_polar_persistence_anchor is False
+    assert SBiFAGAT(ablate_stance=True).use_polar_persistence_anchor is True
+    assert SBiFAGAT(ablate_stance=True, use_polar_persistence_anchor=False).use_polar_persistence_anchor is False
     assert SBiFAGAT(use_latent_edge_mlp=True).use_polar_persistence_anchor is False
     assert getattr(TextMLP().head, "persist_ep_logit_ref", None) is None
     anchor_m = SBiFAGAT(in_dim=TOTAL_NODE_FEATURE_DIM, hidden_dim=32, edge_dim=2, predict_uncertainty=False)

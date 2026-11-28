@@ -7,29 +7,40 @@ Accepts:
   - `--demo-offline` (self-contained realistic 24-reply Vietnamese debate for testing)
 
 Strictly truncates model inputs to the first `K` (default 20) chronological comments,
-labels each reply across the 5 behavioral categories (`support`, `neutral`,
-`constructive_oppose`, `irrational_fallacy`, `hostile_conflict`), runs `SBiFAGAT`,
+labels each reply across the unified 2D `[s_uv, h_uv]` behavioral categories
+(`support`, `neutral`, `constructive_oppose`, `hostile_conflict`), runs `SBiFAGAT`,
 and if the live thread already has `> K` replies, compares the early forecast against
-the true full-thread outcome WITHOUT ever leaking post-K data into the model.
+the true future (`t > K`, `future_only`) outcome WITHOUT ever leaking post-K data into the model.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import html as html_lib
+import ipaddress
 import json
 import math
 import re
+import socket
 import sys
+import threading
+import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
+from urllib.parse import urljoin, urlparse
 
 import numpy as np
 import requests
 import torch
-from transformers import AutoModel
+from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerFast
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.arctic_shift_vn import (
     ARCTIC_SHIFT_API_BASE,
@@ -47,11 +58,7 @@ from src.data.pyg_dataset import (
     compute_early_cascade_burst_stats,
 )
 from src.models.sbi_fagat import SBiFAGAT
-from src.nlp.discourse_labels import (
-    BEHAVIOR_LABEL_VI,
-    DISCOURSE_BEHAVIOR_LABELS,
-    _heuristic_behavior_fallback,
-)
+from src.nlp.discourse_labels import _heuristic_behavior_fallback
 from src.nlp.dual_edge_scorer import (
     DualHeadCrossEncoder,
     STANCE_LABELS,
@@ -64,8 +71,76 @@ from src.nlp.extract_features import (
     encode_edges_with_cross_encoder,
     encode_node_embeddings,
 )
+from src.nlp.topic_post_analyzer import (
+    PHEME_POLAR_Q50,
+    PHEME_POLAR_Q75,
+    PHEME_POLAR_Q90,
+    VN_POLAR_Q50,
+    VN_POLAR_Q75,
+    VN_POLAR_Q90,
+    analyze_large_thread_dynamics,
+    classify_post_topics,
+    get_polar_quantiles,
+)
 
-_REDDIT_POST_ID_RE = re.compile(r"/comments/([A-Za-z0-9_]+)")
+_REDDIT_POST_ID_RE = re.compile(r"/comments/([^/?#]+)")
+_REDDIT_SHARE_PATH_RE = re.compile(r"/(?:r|u|user)/[^/?#]+/s/[A-Za-z0-9_-]{4,32}", re.IGNORECASE)
+_REDDIT_ALLOWED_HOSTS: frozenset[str] = frozenset(
+    {
+        "reddit.com",
+        "www.reddit.com",
+        "old.reddit.com",
+        "m.reddit.com",
+        "np.reddit.com",
+        "redd.it",
+        "www.redd.it",
+    }
+)
+_VNEXPRESS_URL_RE = re.compile(
+    r"^https?://(?:[a-z0-9-]+\.)?vnexpress\.net/.+-(\d{6,9})\.html(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+_DANTRI_URL_RE = re.compile(
+    r"^https?://(?:[a-z0-9-]+\.)?dantri\.com\.vn/.+-(\d{12,20})\.htm(?:l)?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+_TUOITRE_URL_RE = re.compile(
+    r"^https?://(?:[a-z0-9-]+\.)?tuoitre\.vn/.+-(\d{12,20})\.htm(?:l)?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+_VALID_POST_ID_RE = re.compile(r"[A-Za-z0-9]{4,12}")
+_REQUIRED_CE_FILES: tuple[str, ...] = (
+    "dual_head_weights.pt",
+    "dual_head_meta.json",
+    "config.json",
+)
+_UNIFIED_BEHAVIOR_LABELS: tuple[str, ...] = (
+    "support",
+    "neutral",
+    "constructive_oppose",
+    "hostile_conflict",
+)
+_BEHAVIOR_LABEL_VI_2D: dict[str, str] = {
+    "support": "Tán thành / Ủng hộ",
+    "neutral": "Trung lập / Hỏi thông tin",
+    "constructive_oppose": "Phản biện ôn hòa",
+    "hostile_conflict": "Xung đột / Gay gắt cao",
+}
+
+VN_QUANTILE_CALIBRATION_NOTE: str = (
+    "Regime thresholds calibrated strictly on VN Train split "
+    "(N=1,050 cascades, K=20, min_total_replies=25, UTC 2025-06-15 to 2026-06-04); zero Val/Test leakage."
+)
+PHEME_QUANTILE_CALIBRATION_NOTE: str = (
+    "Regime thresholds calibrated strictly on PHEME Train split "
+    "(N=1,786 cascades, K=10, min_total_replies=15, 6 Train events); zero Val/Test leakage."
+)
+TRAINING_MAX_REPLIES_REF: int = 345
+OOD_SCALE_THRESHOLD: int = 350
+
+
+class ScanCancelledError(RuntimeError):
+    """Raised when an asynchronous Mega-Thread scan job is cancelled by the user."""
 
 
 def _make_demo_offline_thread() -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -126,178 +201,1516 @@ def _make_demo_offline_thread() -> tuple[dict[str, Any], list[dict[str, Any]]]:
     return post, comments
 
 
-def _extract_post_id_from_url(url: str) -> str:
-    m = _REDDIT_POST_ID_RE.search(url)
-    if m:
-        return m.group(1)
-    cleaned = url.rstrip("/").split("/")[-1]
-    if cleaned.startswith("t3_"):
-        return cleaned[3:]
+def _validate_reddit_post_id(post_id: str, *, source: str = "input") -> str:
+    """Validate that a Reddit submission ID contains only safe alphanumeric characters."""
+    cleaned = str(post_id or "").strip()
+    if not _VALID_POST_ID_RE.fullmatch(cleaned):
+        raise ValueError(
+            f"Invalid Reddit post_id {cleaned!r} from {source}: expected [A-Za-z0-9]{{4,12}}."
+        )
     return cleaned
 
 
-def _fetch_reddit_thread(post_id: str, timeout: int = 20) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def is_vnexpress_url(url: str) -> bool:
+    """Return True if URL points to a public VnExpress article page."""
+    return bool(_VNEXPRESS_URL_RE.match(str(url or "").strip()))
+
+
+def is_dantri_url(url: str) -> bool:
+    """Return True if URL points to a public Dan Tri article page."""
+    return bool(_DANTRI_URL_RE.match(str(url or "").strip()))
+
+
+def is_tuoitre_url(url: str) -> bool:
+    """Return True if URL points to a public Tuoi Tre article page."""
+    return bool(_TUOITRE_URL_RE.match(str(url or "").strip()))
+
+
+def is_supported_news_url(url: str) -> bool:
+    """Return True if URL targets any supported Vietnamese news portal with a public comment API."""
+    return is_vnexpress_url(url) or is_dantri_url(url) or is_tuoitre_url(url)
+
+
+def _parse_iso_or_epoch_ts(raw_val: Any, fallback: float) -> float:
+    """Parse Unix epoch or ISO-8601 date strings (assuming UTC+7 if tz-naive) to UTC seconds."""
+    if raw_val is None or isinstance(raw_val, bool):
+        return float(fallback)
+    if isinstance(raw_val, (int, float)):
+        fv = float(raw_val)
+        return fv if math.isfinite(fv) and fv > 0 else float(fallback)
+    s = str(raw_val).strip()
+    if not s:
+        return float(fallback)
+    try:
+        fv = float(s)
+        if math.isfinite(fv) and fv > 0:
+            return fv
+    except ValueError:
+        pass
+    s_norm = s.replace("Z", "+00:00")
+    for fmt in (None, "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
+        try:
+            dt = datetime.fromisoformat(s_norm) if fmt is None else datetime.strptime(s_norm, fmt)
+            if dt.tzinfo is None:
+                from datetime import timedelta
+
+                dt = dt.replace(tzinfo=timezone(timedelta(hours=7)))
+            return float(dt.timestamp())
+        except ValueError:
+            continue
+    return float(fallback)
+
+
+def _extract_html_article_meta(
+    page_html: str,
+    *,
+    default_title: str,
+    strip_brand_re: str = "",
+) -> tuple[str, str, float | None]:
+    """Extract clean title, meta description/sapo, and publish timestamp from a news HTML document."""
+    title = default_title
+    desc = ""
+    pub_ts: float | None = None
+    m_title = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.IGNORECASE | re.DOTALL)
+    if m_title:
+        raw_t = _strip_html_text(m_title.group(1))
+        if strip_brand_re:
+            raw_t = re.sub(strip_brand_re, "", raw_t, flags=re.IGNORECASE).strip()
+        if raw_t:
+            title = raw_t
+    for pat in (
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
+        r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description["\']',
+    ):
+        m_desc = re.search(pat, page_html, re.IGNORECASE)
+        if m_desc:
+            cand = _strip_html_text(m_desc.group(1))
+            if cand:
+                desc = cand
+                break
+    for pat in (
+        r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']article:published_time["\']',
+        r'<meta[^>]+name=["\'](?:pubdate|publishdate|article_date_original)["\'][^>]+content=["\']([^"\']+)["\']',
+        r'"datePublished"\s*:\s*"([^"]+)"',
+    ):
+        m_pub = re.search(pat, page_html, re.IGNORECASE)
+        if m_pub:
+            parsed_ts = _parse_iso_or_epoch_ts(m_pub.group(1), -1.0)
+            if parsed_ts > 0:
+                pub_ts = parsed_ts
+                break
+    return title, desc, pub_ts
+
+
+def _resolve_reddit_share_url(url: str, timeout: int = 8) -> str:
+    """Resolve Reddit /r/.../s/<token> share links safely with strict host allowlist (anti-SSRF)."""
+    cur = str(url or "").strip()
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SBiFAGAT/2.1"}
+    for _hop in range(4):
+        parsed = urlparse(cur)
+        host = (parsed.hostname or "").lower()
+        if host not in _REDDIT_ALLOWED_HOSTS:
+            raise ValueError(f"Tên miền chuyển hướng không nằm trong danh sách Reddit hợp lệ: {host!r}")
+        if _REDDIT_POST_ID_RE.search(cur):
+            return cur
+        try:
+            resp = requests.get(cur, allow_redirects=False, timeout=timeout, headers=headers)
+        except Exception as exc:
+            raise ValueError(
+                "Link chia sẻ rút gọn (/s/...) của Reddit cần chuyển hướng qua reddit.com nhưng kết nối bị nhà mạng chặn "
+                "hoặc quá thời gian. Hãy mở link đó trên trình duyệt rồi copy địa chỉ đầy đủ có '/comments/<mã_bài>/', "
+                "hoặc dán link bài báo VnExpress / Dân Trí / Tuổi Trẻ."
+            ) from exc
+        if resp.status_code in (301, 302, 303, 307, 308):
+            loc = resp.headers.get("location") or resp.headers.get("Location")
+            if not loc:
+                break
+            cur = urljoin(cur, loc.strip())
+            continue
+        m_rel = re.search(r"https?://(?:www\.|old\.|m\.)?reddit\.com/r/[^\"'\s>]+/comments/[A-Za-z0-9]{4,12}", resp.text or "")
+        if m_rel:
+            return m_rel.group(0)
+        break
+    raise ValueError(
+        "Không tự giải mã được link chia sẻ Reddit (/s/...) này do Reddit chặn truy cập tự động. "
+        "Hãy mở link trên trình duyệt để lấy đường dẫn đầy đủ chứa '/comments/<mã_bài>/', "
+        "hoặc dán trực tiếp link bài báo VnExpress / Dân Trí / Tuổi Trẻ."
+    )
+
+
+def _extract_post_id_from_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw or "\\" in raw or any(ch.isspace() for ch in raw):
+        raise ValueError("Đường dẫn hoặc mã bài viết không hợp lệ (chứa khoảng trắng hoặc ký tự lỗi).")
+
+    m = _REDDIT_POST_ID_RE.search(raw)
+    if m:
+        return _validate_reddit_post_id(m.group(1), source=raw)
+
+    if _REDDIT_SHARE_PATH_RE.search(raw):
+        resolved = _resolve_reddit_share_url(raw)
+        m_res = _REDDIT_POST_ID_RE.search(resolved)
+        if m_res:
+            return _validate_reddit_post_id(m_res.group(1), source=resolved)
+
+    if "://" in raw:
+        try:
+            parsed = urlparse(raw)
+            host = (parsed.hostname or "").lower()
+            parts = [p for p in (parsed.path or "").split("/") if p]
+            if host in {"redd.it", "www.redd.it"} and len(parts) == 1 and ".." not in parts[0]:
+                return _validate_reddit_post_id(parts[0], source=raw)
+        except Exception:
+            pass
+
+    if "/" in raw or "://" in raw or ".." in raw:
+        raise ValueError(
+            "Link chưa đúng định dạng bài viết được hỗ trợ trực tiếp. "
+            "Hãy dán link bài báo VnExpress, Dân Trí, Tuổi Trẻ, link Reddit đầy đủ (/comments/<mã_bài>/), "
+            "hoặc mở mục 'Hoặc dán trực tiếp nội dung'."
+        )
+
+    candidate = raw[3:] if raw.startswith("t3_") else raw
+    return _validate_reddit_post_id(candidate, source=raw)
+
+
+def _normalize_arctic_comment(c: Mapping[str, Any], *, post_id: str) -> dict[str, Any]:
+    cid = str(c.get("id") or "").removeprefix("t1_")
+    raw_author = c.get("author")
+    return {
+        "fullname": f"t1_{cid}",
+        "id": cid,
+        "link_id": str(c.get("link_id") or f"t3_{post_id}"),
+        "parent_id": str(c.get("parent_id") or f"t3_{post_id}"),
+        "body": str(c.get("body") or c.get("text") or ""),
+        "text": str(c.get("body") or c.get("text") or ""),
+        "created_utc": c.get("created_utc"),
+        "author": raw_author,
+        "author_is_bot": isinstance(raw_author, str) and raw_author.strip().lower() == "automoderator",
+        "author_hash": hash_author_sha256(str(raw_author) if raw_author is not None else None),
+    }
+
+
+def _http_get_json_with_backoff(
+    url: str,
+    *,
+    params: Mapping[str, Any] | None = None,
+    headers: Mapping[str, str],
+    timeout: int = 20,
+    max_retries: int = 4,
+    cancel_event: threading.Event | None = None,
+) -> Any:
+    backoff = 1.0
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelledError("Đã hủy tác vụ tải dữ liệu.")
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+            if getattr(resp, "status_code", 200) == 429:
+                reset_hdr = getattr(resp, "headers", {}).get("x-ratelimit-reset")
+                try:
+                    wait_s = float(reset_hdr) if reset_hdr is not None else backoff
+                except (TypeError, ValueError):
+                    wait_s = backoff
+                sleep_s = min(max(0.05, wait_s), 16.0)
+                if cancel_event is not None:
+                    if cancel_event.wait(sleep_s):
+                        raise ScanCancelledError("Đã hủy tác vụ trong lúc chờ rate-limit.")
+                else:
+                    time.sleep(sleep_s)
+                backoff *= 2.0
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except ScanCancelledError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                sleep_s = min(backoff, 4.0)
+                if cancel_event is not None:
+                    if cancel_event.wait(sleep_s):
+                        raise ScanCancelledError("Đã hủy tác vụ trong lúc chờ thử lại.") from exc
+                else:
+                    time.sleep(sleep_s)
+                backoff *= 2.0
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"Failed GET {url}")
+
+
+def _extract_tree_items(items: Sequence[Mapping[str, Any]], *, post_id: str, out: list[dict[str, Any]]) -> None:
+    """Iteratively extract comment nodes from Arctic Shift /comments/tree payloads, skipping 'more' stubs."""
+    stack: list[Any] = list(reversed(items))
+    while stack:
+        item = stack.pop()
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("kind") == "more":
+            continue
+        data = item.get("data") if isinstance(item.get("data"), Mapping) else item
+        cid = str(data.get("id") or "").removeprefix("t1_")
+        if cid and not ("children" in data and "body" not in data and "text" not in data):
+            out.append(_normalize_arctic_comment(data, post_id=post_id))
+        replies = data.get("replies")
+        if isinstance(replies, Mapping):
+            sub = replies.get("data", {}).get("children") or replies.get("children") or []
+            if isinstance(sub, Sequence) and not isinstance(sub, (str, bytes)):
+                stack.extend(reversed(sub))
+        elif isinstance(replies, Sequence) and not isinstance(replies, (str, bytes)):
+            stack.extend(reversed(replies))
+
+
+def _fetch_reddit_public_json(
+    post_id: str,
+    *,
+    headers: Mapping[str, str],
+    timeout: int = 20,
+    cap: int | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+    """Fetch Reddit public thread JSON iteratively with strict structure checks."""
+    json_url = f"https://www.reddit.com/comments/{post_id}.json?limit=500"
+    resp = requests.get(json_url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    payload = resp.json()
+    if (
+        not isinstance(payload, list)
+        or len(payload) < 2
+        or not isinstance(payload[0], Mapping)
+        or not isinstance(payload[1], Mapping)
+    ):
+        raise ValueError(f"Reddit public JSON payload invalid for post_id={post_id!r}")
+    post_children = (payload[0].get("data") or {}).get("children") or []
+    if not post_children or not isinstance(post_children[0], Mapping) or "data" not in post_children[0]:
+        raise ValueError(f"Reddit public JSON missing root post data for post_id={post_id!r}")
+    post_raw = dict(post_children[0]["data"])
+    root_children = (payload[1].get("data") or {}).get("children") or []
+    if not isinstance(root_children, Sequence):
+        root_children = []
+
+    flat_comments: list[dict[str, Any]] = []
+    truncated = False
+    stack: list[Any] = list(reversed(root_children))
+    while stack:
+        child = stack.pop()
+        if not isinstance(child, Mapping):
+            continue
+        kind = child.get("kind")
+        if kind == "more":
+            truncated = True
+            continue
+        if kind != "t1":
+            continue
+        d = child.get("data")
+        if not isinstance(d, Mapping):
+            continue
+        cid = str(d.get("id") or "").removeprefix("t1_")
+        raw_author = d.get("author")
+        body_txt = str(d.get("body") or "")
+        flat_comments.append(
+            {
+                "fullname": f"t1_{cid}",
+                "id": cid,
+                "link_id": f"t3_{post_id}",
+                "parent_id": str(d.get("parent_id") or f"t3_{post_id}"),
+                "body": body_txt,
+                "text": body_txt,
+                "created_utc": d.get("created_utc"),
+                "author": raw_author,
+                "author_is_bot": isinstance(raw_author, str) and raw_author.strip().lower() == "automoderator",
+                "author_hash": hash_author_sha256(str(raw_author) if raw_author is not None else None),
+            }
+        )
+        if cap is not None and len(flat_comments) >= cap:
+            truncated = True
+            break
+        replies = d.get("replies")
+        if isinstance(replies, Mapping):
+            sub_children = (replies.get("data") or {}).get("children") or []
+            if isinstance(sub_children, Sequence) and not isinstance(sub_children, (str, bytes)):
+                stack.extend(reversed(sub_children))
+    return post_raw, flat_comments, truncated
+
+
+def fetch_reddit_thread_paginated(
+    post_id: str,
+    *,
+    max_comments: int = 10000,
+    timeout: int = 20,
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Fetch submission + up to `max_comments` via paginated Arctic Shift search with backoff and fallbacks."""
+    post_id = _validate_reddit_post_id(post_id, source="fetch")
+    cap = max(1, min(10000, int(max_comments)))
+    headers = {"User-Agent": "SBi-FAGAT-LiveCheck/2.1"}
+
+    post: dict[str, Any] | None = None
+    comments: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for endpoint in ("/posts/ids", "/posts/search"):
+        try:
+            sub_payload = _http_get_json_with_backoff(
+                f"{ARCTIC_SHIFT_API_BASE}{endpoint}",
+                params={"ids": post_id},
+                headers=headers,
+                timeout=timeout,
+                max_retries=3 if endpoint == "/posts/ids" else 1,
+                cancel_event=cancel_event,
+            )
+            sub_data = (sub_payload or {}).get("data") or []
+            if sub_data:
+                post = sub_data[0]
+                break
+        except ScanCancelledError:
+            raise
+        except Exception:
+            continue
+
+    if post is not None:
+        cursor_after: int | None = None
+        consecutive_empty_adds = 0
+        # Arctic Shift /comments/search hard-caps limit at 100 per page
+        max_pages = max(25, math.ceil(cap / 100) + 10)
+        for page_idx in range(max_pages):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelledError("Đã hủy tác vụ tải bình luận.")
+            page_limit = min(100, cap - len(comments))
+            if page_limit <= 0:
+                break
+            params: dict[str, Any] = {"link_id": f"t3_{post_id}", "limit": page_limit, "sort": "asc"}
+            if cursor_after is not None:
+                params["after"] = cursor_after
+            try:
+                com_payload = _http_get_json_with_backoff(
+                    f"{ARCTIC_SHIFT_API_BASE}/comments/search",
+                    params=params,
+                    headers=headers,
+                    timeout=timeout,
+                    max_retries=4,
+                    cancel_event=cancel_event,
+                )
+            except ScanCancelledError:
+                raise
+            except Exception:
+                break
+
+            raw_comments = (com_payload or {}).get("data") or []
+            if not raw_comments:
+                break
+
+            added_this_page = 0
+            max_ts_seen: float | None = None
+            for raw_c in raw_comments:
+                if not isinstance(raw_c, Mapping):
+                    continue
+                norm = _normalize_arctic_comment(raw_c, post_id=post_id)
+                cid = norm["id"]
+                ts_val = norm.get("created_utc")
+                try:
+                    ts_f = float(ts_val) if ts_val is not None else None
+                except (TypeError, ValueError):
+                    ts_f = None
+                if ts_f is not None and math.isfinite(ts_f) and (max_ts_seen is None or ts_f > max_ts_seen):
+                    max_ts_seen = ts_f
+                if cid and cid not in seen_ids:
+                    seen_ids.add(cid)
+                    comments.append(norm)
+                    added_this_page += 1
+                    if len(comments) >= cap:
+                        break
+
+            if added_this_page == 0:
+                consecutive_empty_adds += 1
+                if (
+                    consecutive_empty_adds >= 2
+                    or max_ts_seen is None
+                    or (cursor_after is not None and int(max_ts_seen) < cursor_after)
+                ):
+                    break
+            else:
+                consecutive_empty_adds = 0
+                if progress_cb is not None:
+                    progress_cb(
+                        {
+                            "stage": "fetching_comments",
+                            "page": page_idx + 1,
+                            "processed": len(comments),
+                            "total": cap,
+                            "percent": min(99.0, round(100.0 * len(comments) / max(1, cap), 1)),
+                        }
+                    )
+
+            if len(comments) >= cap or len(raw_comments) < page_limit:
+                break
+            if max_ts_seen is None:
+                break
+            next_after = int(max_ts_seen) if added_this_page > 0 else int(max_ts_seen) + 1
+            if cursor_after is not None and next_after <= cursor_after:
+                next_after = cursor_after + 1
+            cursor_after = next_after
+
+        if not comments:
+            try:
+                tree_payload = _http_get_json_with_backoff(
+                    f"{ARCTIC_SHIFT_API_BASE}/comments/tree",
+                    params={"link_id": f"t3_{post_id}", "limit": 9999},
+                    headers=headers,
+                    timeout=max(timeout, 30),
+                    max_retries=3,
+                    cancel_event=cancel_event,
+                )
+                tree_out: list[dict[str, Any]] = []
+                _extract_tree_items((tree_payload or {}).get("data") or [], post_id=post_id, out=tree_out)
+                for row in tree_out:
+                    cid = row["id"]
+                    if cid and cid not in seen_ids:
+                        seen_ids.add(cid)
+                        comments.append(row)
+                        if len(comments) >= cap:
+                            break
+            except ScanCancelledError:
+                raise
+            except Exception:
+                pass
+
+        if comments:
+            return post, comments[:cap]
+
+    # Fallback: official public Reddit thread JSON endpoint (returns up to ~500 expanded comments)
+    post_raw, flat_comments, _truncated = _fetch_reddit_public_json(
+        post_id, headers=headers, timeout=timeout, cap=cap
+    )
+    return post_raw, flat_comments[:cap]
+
+
+def _fetch_reddit_thread(
+    post_id: str,
+    timeout: int = 20,
+    max_comments: int = 500,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Fetch submission + comments via Arctic Shift API with Reddit public JSON fallback."""
+    if int(max_comments) > 500:
+        return fetch_reddit_thread_paginated(post_id, max_comments=int(max_comments), timeout=timeout)
+
+    post_id = _validate_reddit_post_id(post_id, source="fetch")
     headers = {"User-Agent": "SBi-FAGAT-LiveCheck/2.0"}
     try:
-        sub_resp = requests.get(
-            f"{ARCTIC_SHIFT_API_BASE}/posts/search",
-            params={"ids": post_id},
-            headers=headers,
-            timeout=timeout,
-        )
-        sub_resp.raise_for_status()
-        sub_data = sub_resp.json().get("data") or []
+        sub_data: list[Any] = []
+        for endpoint in ("/posts/ids", "/posts/search"):
+            sub_resp = requests.get(
+                f"{ARCTIC_SHIFT_API_BASE}{endpoint}",
+                params={"ids": post_id},
+                headers=headers,
+                timeout=timeout,
+            )
+            if sub_resp.status_code == 400 and endpoint == "/posts/ids":
+                continue
+            sub_resp.raise_for_status()
+            sub_data = sub_resp.json().get("data") or []
+            if sub_data:
+                break
         if sub_data:
             post = sub_data[0]
             com_resp = requests.get(
                 f"{ARCTIC_SHIFT_API_BASE}/comments/search",
-                params={"link_id": f"t3_{post_id}", "limit": 500, "sort": "asc"},
+                params={"link_id": f"t3_{post_id}", "limit": min(100, int(max_comments)), "sort": "asc"},
                 headers=headers,
                 timeout=timeout,
             )
             com_resp.raise_for_status()
             raw_comments = com_resp.json().get("data") or []
-            comments = []
-            for c in raw_comments:
-                cid = str(c.get("id") or "").removeprefix("t1_")
-                raw_author = c.get("author")
-                comments.append(
-                    {
-                        "fullname": f"t1_{cid}",
-                        "id": cid,
-                        "link_id": str(c.get("link_id") or f"t3_{post_id}"),
-                        "parent_id": str(c.get("parent_id") or f"t3_{post_id}"),
-                        "body": str(c.get("body") or c.get("text") or ""),
-                        "text": str(c.get("body") or c.get("text") or ""),
-                        "created_utc": c.get("created_utc"),
-                        "author": raw_author,
-                        "author_is_bot": isinstance(raw_author, str)
-                        and raw_author.strip().lower() == "automoderator",
-                        "author_hash": hash_author_sha256(
-                            str(raw_author) if raw_author is not None else None
-                        ),
-                    }
-                )
+            comments = [_normalize_arctic_comment(c, post_id=post_id) for c in raw_comments]
+            if len(comments) < int(max_comments) and len(raw_comments) == 100:
+                return fetch_reddit_thread_paginated(post_id, max_comments=int(max_comments), timeout=timeout)
             return post, comments
     except Exception:
         pass
 
-    # Fallback: official public Reddit thread JSON endpoint
-    json_url = f"https://www.reddit.com/comments/{post_id}.json?limit=500"
-    resp = requests.get(json_url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    payload = resp.json()
-    post_raw = payload[0]["data"]["children"][0]["data"]
+    post_raw, flat_comments, _ = _fetch_reddit_public_json(
+        post_id, headers=headers, timeout=timeout, cap=int(max_comments)
+    )
+    return post_raw, flat_comments
 
-    flat_comments: list[dict[str, Any]] = []
 
-    def _walk_listing(children: Sequence[Mapping[str, Any]]) -> None:
-        for child in children:
-            if child.get("kind") != "t1":
+def _strip_html_text(raw_html: str) -> str:
+    txt = re.sub(r"<br\s*/?>", "\n", str(raw_html or ""), flags=re.IGNORECASE)
+    txt = re.sub(r"<[^>]+>", " ", txt)
+    return " ".join(html_lib.unescape(txt).split())
+
+
+def fetch_vnexpress_thread(
+    url: str,
+    *,
+    max_comments: int = 2000,
+    timeout: int = 15,
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Fetch a public VnExpress article and its multi-level reply tree with real parent_id and timestamps."""
+    clean_url = str(url or "").strip()
+    m_vne = _VNEXPRESS_URL_RE.match(clean_url)
+    if not m_vne:
+        raise ValueError(f"Link VnExpress không hợp lệ: {url!r}")
+    article_id = m_vne.group(1)
+    cap = max(1, min(5000, int(max_comments)))
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SBiFAGAT/2.1"}
+
+    title = f"Bài viết VnExpress #{article_id}"
+    selftext = ""
+    published_ts: float | None = None
+    site_id = "1000000"
+    object_type = 1
+    try:
+        page_resp = requests.get(clean_url, headers=headers, timeout=timeout)
+        page_resp.raise_for_status()
+        page_html = page_resp.text or ""
+        title, selftext, published_ts = _extract_html_article_meta(
+            page_html,
+            default_title=title,
+            strip_brand_re=r"\s*[-|–]\s*(?:Báo\s+)?VnExpress.*$",
+        )
+        m_site = re.search(r'tt_site_id["\']?\s*(?:content=|[:=])\s*["\']?(\d+)', page_html, re.IGNORECASE)
+        if m_site:
+            site_id = m_site.group(1)
+        m_ot = re.search(r'tt_object_type["\']?\s*(?:content=|[:=])\s*["\']?(\d+)', page_html, re.IGNORECASE)
+        if m_ot:
+            object_type = max(1, int(m_ot.group(1)))
+    except Exception:
+        pass
+
+    post_id = f"vne_{article_id}"
+    comments: list[dict[str, Any]] = []
+    seen_cids: set[str] = set()
+    reply_parents: list[tuple[str, int]] = []
+    offset = 0
+    total_reported: int | None = None
+    sort_mode = "time"
+
+    def _add_reply_item(rit: Mapping[str, Any], *, fallback_parent_cid: str) -> bool:
+        rcid = str(rit.get("comment_id") or "").strip()
+        rbody = _strip_html_text(str(rit.get("content") or ""))
+        if not rcid or rcid in seen_cids or not rbody:
+            return False
+        seen_cids.add(rcid)
+        raw_pid = str(rit.get("parent_id") or fallback_parent_cid).strip()
+        pid_norm = raw_pid if (raw_pid and raw_pid != rcid and raw_pid in seen_cids) else fallback_parent_cid
+        author_raw = str(rit.get("userid") or rit.get("full_name") or f"vne_u_{rcid}")
+        ts_val = _parse_iso_or_epoch_ts(rit.get("creation_time"), time.time())
+        comments.append(
+            {
+                "fullname": f"t1_{rcid}",
+                "id": rcid,
+                "link_id": f"t3_{post_id}",
+                "parent_id": f"t1_{pid_norm}",
+                "body": rbody,
+                "text": rbody,
+                "created_utc": ts_val,
+                "author": author_raw,
+                "author_is_bot": False,
+                "author_hash": hash_author_sha256(author_raw),
+            }
+        )
+        return True
+
+    while len(comments) < cap:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelledError("Đã hủy tác vụ tải bình luận VnExpress.")
+        limit = min(50, cap - len(comments))
+        payload = _http_get_json_with_backoff(
+            "https://usi-saas.vnexpress.net/index/get",
+            params={
+                "offset": offset,
+                "limit": limit,
+                "objectid": article_id,
+                "objecttype": object_type,
+                "siteid": site_id,
+                "sort_by": sort_mode,
+            },
+            headers=headers,
+            timeout=timeout,
+            max_retries=3,
+            cancel_event=cancel_event,
+        )
+        data = (payload or {}).get("data") or {}
+        if offset == 0 and not (data.get("items") or []) and sort_mode == "time":
+            sort_mode = "like"
+            continue
+        if total_reported is None:
+            try:
+                total_reported = int(data.get("totalitem") or data.get("total") or cap)
+            except (TypeError, ValueError):
+                total_reported = cap
+        items = data.get("items") or []
+        if not items:
+            break
+        added_top = 0
+        for it in items:
+            if not isinstance(it, Mapping):
                 continue
-            d = child.get("data", {})
-            cid = str(d.get("id") or "")
+            cid = str(it.get("comment_id") or "").strip()
+            body = _strip_html_text(str(it.get("content") or ""))
+            if not cid or cid in seen_cids or not body:
+                continue
+            seen_cids.add(cid)
+            added_top += 1
+            author_raw = str(it.get("userid") or it.get("full_name") or f"vne_u_{cid}")
+            ts_val = _parse_iso_or_epoch_ts(it.get("creation_time"), time.time())
+            comments.append(
+                {
+                    "fullname": f"t1_{cid}",
+                    "id": cid,
+                    "link_id": f"t3_{post_id}",
+                    "parent_id": f"t3_{post_id}",
+                    "body": body,
+                    "text": body,
+                    "created_utc": ts_val,
+                    "author": author_raw,
+                    "author_is_bot": False,
+                    "author_hash": hash_author_sha256(author_raw),
+                }
+            )
+            rep_obj = it.get("replys") or {}
+            try:
+                rep_tot = int(rep_obj.get("total") or 0) if isinstance(rep_obj, Mapping) else 0
+            except (TypeError, ValueError):
+                rep_tot = 0
+            inline_reps = rep_obj.get("items") if isinstance(rep_obj, Mapping) else None
+            inline_added = 0
+            if isinstance(inline_reps, list):
+                for rit in inline_reps:
+                    if isinstance(rit, Mapping) and len(comments) < cap:
+                        if _add_reply_item(rit, fallback_parent_cid=cid):
+                            inline_added += 1
+            if rep_tot > inline_added:
+                reply_parents.append((cid, rep_tot))
+            if len(comments) >= cap:
+                break
+
+        if progress_cb is not None:
+            denom = max(1, min(cap, int(total_reported or cap)))
+            progress_cb(
+                {
+                    "stage": "fetching_comments",
+                    "processed": len(comments),
+                    "total": denom,
+                    "percent": min(92.0, round(100.0 * len(comments) / denom, 1)),
+                }
+            )
+        offset += len(items)
+        try:
+            top_total = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            top_total = 0
+        if added_top == 0 or (top_total > 0 and offset >= top_total):
+            break
+
+    for root_cid, rep_tot in reply_parents:
+        if len(comments) >= cap:
+            break
+        rep_offset = 0
+        while rep_offset < min(rep_tot, 500) and len(comments) < cap:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelledError("Đã hủy tác vụ tải phản hồi VnExpress.")
+            try:
+                rep_payload = _http_get_json_with_backoff(
+                    "https://usi-saas.vnexpress.net/index/getreplay",
+                    params={
+                        "id": root_cid,
+                        "objectid": article_id,
+                        "objecttype": object_type,
+                        "siteid": site_id,
+                        "limit": 50,
+                        "offset": rep_offset,
+                    },
+                    headers=headers,
+                    timeout=timeout,
+                    max_retries=2,
+                    cancel_event=cancel_event,
+                )
+            except ScanCancelledError:
+                raise
+            except Exception:
+                break
+            rep_items = ((rep_payload or {}).get("data") or {}).get("items") or []
+            if not rep_items:
+                break
+            added_rep = 0
+            for rit in rep_items:
+                if not isinstance(rit, Mapping):
+                    continue
+                if _add_reply_item(rit, fallback_parent_cid=root_cid):
+                    added_rep += 1
+                if len(comments) >= cap:
+                    break
+            rep_offset += len(rep_items)
+            if added_rep == 0 or rep_offset >= rep_tot:
+                break
+
+    if not comments:
+        raise ValueError("Bài báo VnExpress này hiện chưa có bình luận công khai nào (0 bình luận) nên chưa thể phân tích tranh luận.")
+
+    comments.sort(key=lambda c: float(c.get("created_utc") or 0.0))
+    earliest_ts = float(comments[0].get("created_utc") or time.time())
+    root_ts_val = float(published_ts) if (published_ts is not None and published_ts <= earliest_ts) else (earliest_ts - 60.0)
+    post = {
+        "id": post_id,
+        "title": title,
+        "selftext": selftext or title,
+        "subreddit": "vnexpress",
+        "author": "vnexpress_editorial",
+        "created_utc": root_ts_val,
+        "source_platform": "vnexpress",
+        "domain_type": "news_portal",
+        "has_real_publish_time": published_ts is not None,
+        "api_total_reported": int(total_reported or len(comments)),
+    }
+    return post, comments
+
+
+def fetch_dantri_thread(
+    url: str,
+    *,
+    max_comments: int = 2000,
+    timeout: int = 15,
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Fetch a public Dan Tri article and its nested reader comments from webapi.dantri.com.vn."""
+    clean_url = str(url or "").strip()
+    m_dt = _DANTRI_URL_RE.match(clean_url)
+    if not m_dt:
+        raise ValueError(f"Link Dân Trí không hợp lệ: {url!r}")
+    article_id = m_dt.group(1)
+    cap = max(1, min(5000, int(max_comments)))
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36",
+        "Referer": "https://dantri.com.vn/",
+    }
+
+    title = f"Bài viết Dân Trí #{article_id}"
+    selftext = ""
+    published_ts: float | None = None
+    try:
+        page_resp = requests.get(clean_url, headers=headers, timeout=timeout)
+        page_resp.raise_for_status()
+        page_html = page_resp.text or ""
+        title, selftext, published_ts = _extract_html_article_meta(
+            page_html,
+            default_title=title,
+            strip_brand_re=r"\s*\|\s*Báo\s+Dân\s+trí.*$",
+        )
+        m_oid = re.search(r'data-objectid=["\'](\d+)["\']', page_html, re.IGNORECASE)
+        if m_oid:
+            article_id = m_oid.group(1)
+    except Exception:
+        pass
+
+    post_id = f"dt_{article_id}"
+    comments: list[dict[str, Any]] = []
+    seen_cids: set[str] = set()
+    reply_parents: list[tuple[str, int]] = []
+    offset = 0
+    total_reported: int | None = None
+
+    while len(comments) < cap:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelledError("Đã hủy tác vụ tải bình luận Dân Trí.")
+        limit = min(50, cap - len(comments))
+        payload = _http_get_json_with_backoff(
+            "https://webapi.dantri.com.vn/listcomment",
+            params={"objectId": article_id, "objectType": 1, "offset": offset, "limit": limit},
+            headers=headers,
+            timeout=timeout,
+            max_retries=3,
+            cancel_event=cancel_event,
+        )
+        if not isinstance(payload, Mapping):
+            break
+        if total_reported is None:
+            try:
+                total_reported = int(payload.get("count") or 0)
+            except (TypeError, ValueError):
+                total_reported = 0
+        items = payload.get("items") or []
+        if not items:
+            break
+        added = 0
+        for it in items:
+            if not isinstance(it, Mapping):
+                continue
+            cid = str(it.get("commentId") or "").strip()
+            body = _strip_html_text(str(it.get("commentContent") or it.get("content") or ""))
+            if not cid or cid in seen_cids or not body:
+                continue
+            seen_cids.add(cid)
+            added += 1
+            user_obj = it.get("user") if isinstance(it.get("user"), Mapping) else {}
+            author_raw = str(it.get("userId") or user_obj.get("name") or f"dt_u_{cid}")
+            ts_val = _parse_iso_or_epoch_ts(it.get("createdDate"), time.time())
+            comments.append(
+                {
+                    "fullname": f"t1_{cid}",
+                    "id": cid,
+                    "link_id": f"t3_{post_id}",
+                    "parent_id": f"t3_{post_id}",
+                    "body": body,
+                    "text": body,
+                    "created_utc": ts_val,
+                    "author": author_raw,
+                    "author_is_bot": False,
+                    "author_hash": hash_author_sha256(author_raw),
+                }
+            )
+            try:
+                rep_tot = int(it.get("replyCount") or 0)
+            except (TypeError, ValueError):
+                rep_tot = 0
+            if rep_tot > 0:
+                reply_parents.append((cid, rep_tot))
+            if len(comments) >= cap:
+                break
+
+        if progress_cb is not None:
+            denom = max(1, min(cap, int(total_reported or cap)))
+            progress_cb(
+                {
+                    "stage": "fetching_comments",
+                    "processed": len(comments),
+                    "total": denom,
+                    "percent": min(92.0, round(100.0 * len(comments) / denom, 1)),
+                }
+            )
+        offset += len(items)
+        if added == 0 or (total_reported and offset >= total_reported):
+            break
+
+    for root_cid, rep_tot in reply_parents:
+        if len(comments) >= cap:
+            break
+        rep_offset = 0
+        while rep_offset < min(rep_tot, 500) and len(comments) < cap:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelledError("Đã hủy tác vụ tải phản hồi Dân Trí.")
+            try:
+                rep_payload = _http_get_json_with_backoff(
+                    "https://webapi.dantri.com.vn/listcomment",
+                    params={
+                        "objectId": root_cid,
+                        "objectType": 1,
+                        "offset": rep_offset,
+                        "limit": 50,
+                        "isReply": "true",
+                    },
+                    headers=headers,
+                    timeout=timeout,
+                    max_retries=2,
+                    cancel_event=cancel_event,
+                )
+            except ScanCancelledError:
+                raise
+            except Exception:
+                break
+            rep_items = (rep_payload or {}).get("items") or [] if isinstance(rep_payload, Mapping) else []
+            if not rep_items:
+                break
+            added_rep = 0
+            for rit in rep_items:
+                if not isinstance(rit, Mapping):
+                    continue
+                rcid = str(rit.get("commentId") or "").strip()
+                rbody = _strip_html_text(str(rit.get("commentContent") or rit.get("content") or ""))
+                if not rcid or rcid in seen_cids or not rbody:
+                    continue
+                seen_cids.add(rcid)
+                added_rep += 1
+                raw_pid = str(rit.get("parentId") or root_cid).strip()
+                pid_norm = raw_pid if (raw_pid and raw_pid != rcid and raw_pid in seen_cids) else root_cid
+                user_obj = rit.get("user") if isinstance(rit.get("user"), Mapping) else {}
+                author_raw = str(rit.get("userId") or user_obj.get("name") or f"dt_u_{rcid}")
+                ts_val = _parse_iso_or_epoch_ts(rit.get("createdDate"), time.time())
+                comments.append(
+                    {
+                        "fullname": f"t1_{rcid}",
+                        "id": rcid,
+                        "link_id": f"t3_{post_id}",
+                        "parent_id": f"t1_{pid_norm}",
+                        "body": rbody,
+                        "text": rbody,
+                        "created_utc": ts_val,
+                        "author": author_raw,
+                        "author_is_bot": False,
+                        "author_hash": hash_author_sha256(author_raw),
+                    }
+                )
+                if len(comments) >= cap:
+                    break
+            rep_offset += len(rep_items)
+            if added_rep == 0 or rep_offset >= rep_tot:
+                break
+
+    if not comments:
+        raise ValueError(
+            "Bài báo Dân Trí này hiện chưa có bình luận công khai nào (0 bình luận) nên chưa thể phân tích tranh luận. "
+            "Hãy thử bài báo khác đã có bình luận bạn đọc."
+        )
+
+    comments.sort(key=lambda c: float(c.get("created_utc") or 0.0))
+    earliest_ts = float(comments[0].get("created_utc") or time.time())
+    root_ts_val = float(published_ts) if (published_ts is not None and published_ts <= earliest_ts) else (earliest_ts - 60.0)
+    post = {
+        "id": post_id,
+        "title": title,
+        "selftext": selftext or title,
+        "subreddit": "dantri",
+        "author": "dantri_editorial",
+        "created_utc": root_ts_val,
+        "source_platform": "dantri",
+        "domain_type": "news_portal",
+        "has_real_publish_time": published_ts is not None,
+        "api_total_reported": int(total_reported or len(comments)),
+    }
+    return post, comments
+
+
+def fetch_tuoitre_thread(
+    url: str,
+    *,
+    max_comments: int = 2000,
+    timeout: int = 15,
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Fetch a public Tuoi Tre article and its nested comment tree from id.tuoitre.vn."""
+    clean_url = str(url or "").strip()
+    m_tt = _TUOITRE_URL_RE.match(clean_url)
+    if not m_tt:
+        raise ValueError(f"Link Tuổi Trẻ không hợp lệ: {url!r}")
+    article_id = m_tt.group(1)
+    cap = max(1, min(5000, int(max_comments)))
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0 Safari/537.36"}
+
+    title = f"Bài viết Tuổi Trẻ #{article_id}"
+    selftext = ""
+    published_ts: float | None = None
+    try:
+        page_resp = requests.get(clean_url, headers=headers, timeout=timeout)
+        page_resp.raise_for_status()
+        title, selftext, published_ts = _extract_html_article_meta(
+            page_resp.text or "",
+            default_title=title,
+            strip_brand_re=r"\s*[-|–]\s*Tuổi\s*Trẻ\s*Online.*$",
+        )
+    except Exception:
+        pass
+
+    post_id = f"tt_{article_id}"
+    comments: list[dict[str, Any]] = []
+    seen_cids: set[str] = set()
+
+    def _collect_item(it: Mapping[str, Any], *, fallback_parent_ref: str) -> int:
+        if len(comments) >= cap:
+            return 0
+        cid = str(it.get("id") or "").strip()
+        body = _strip_html_text(str(it.get("content") or ""))
+        added_here = 0
+        node_ref = fallback_parent_ref
+        if cid and cid not in seen_cids and body:
+            seen_cids.add(cid)
+            raw_pid = str(it.get("parent_id") or "").strip()
+            if raw_pid and raw_pid not in {"0", cid} and raw_pid in seen_cids:
+                parent_ref = f"t1_{raw_pid}"
+            else:
+                parent_ref = fallback_parent_ref
+            author_raw = str(it.get("user_id") or it.get("sender_fullname") or f"tt_u_{cid}")
+            ts_val = _parse_iso_or_epoch_ts(it.get("published_date") or it.get("created_date"), time.time())
+            comments.append(
+                {
+                    "fullname": f"t1_{cid}",
+                    "id": cid,
+                    "link_id": f"t3_{post_id}",
+                    "parent_id": parent_ref,
+                    "body": body,
+                    "text": body,
+                    "created_utc": ts_val,
+                    "author": author_raw,
+                    "author_is_bot": False,
+                    "author_hash": hash_author_sha256(author_raw),
+                }
+            )
+            node_ref = f"t1_{cid}"
+            added_here += 1
+        children = it.get("child_comments") or []
+        if isinstance(children, list):
+            for ch in children:
+                if isinstance(ch, Mapping) and len(comments) < cap:
+                    added_here += _collect_item(ch, fallback_parent_ref=node_ref)
+        return added_here
+
+    page_idx = 1
+    while len(comments) < cap and page_idx <= 40:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelledError("Đã hủy tác vụ tải bình luận Tuổi Trẻ.")
+        payload = _http_get_json_with_backoff(
+            "https://id.tuoitre.vn/api/getlist-comment.api",
+            params={"objId": article_id, "objType": 1, "pageindex": page_idx, "pagesize": 50, "sort": 2},
+            headers=headers,
+            timeout=timeout,
+            max_retries=3,
+            cancel_event=cancel_event,
+        )
+        raw_data = (payload or {}).get("Data") if isinstance(payload, Mapping) else None
+        if isinstance(raw_data, str):
+            try:
+                items = json.loads(raw_data)
+            except Exception:
+                items = []
+        elif isinstance(raw_data, list):
+            items = raw_data
+        else:
+            items = []
+        if not items:
+            break
+        added_page = 0
+        for it in items:
+            if isinstance(it, Mapping):
+                added_page += _collect_item(it, fallback_parent_ref=f"t3_{post_id}")
+        if progress_cb is not None:
+            progress_cb(
+                {
+                    "stage": "fetching_comments",
+                    "processed": len(comments),
+                    "total": cap,
+                    "percent": min(92.0, round(min(92.0, float(page_idx) * 15.0), 1)),
+                }
+            )
+        if added_page == 0 or len(items) < 20:
+            break
+        page_idx += 1
+
+    if not comments:
+        raise ValueError(
+            "Bài báo Tuổi Trẻ này hiện chưa có bình luận công khai nào (0 bình luận) nên chưa thể phân tích tranh luận. "
+            "Hãy thử bài báo khác đã có bình luận bạn đọc."
+        )
+
+    comments.sort(key=lambda c: float(c.get("created_utc") or 0.0))
+    earliest_ts = float(comments[0].get("created_utc") or time.time())
+    root_ts_val = float(published_ts) if (published_ts is not None and published_ts <= earliest_ts) else (earliest_ts - 60.0)
+    post = {
+        "id": post_id,
+        "title": title,
+        "selftext": selftext or title,
+        "subreddit": "tuoitre",
+        "author": "tuoitre_editorial",
+        "created_utc": root_ts_val,
+        "source_platform": "tuoitre",
+        "domain_type": "news_portal",
+        "has_real_publish_time": published_ts is not None,
+        "api_total_reported": len(comments),
+    }
+    return post, comments
+
+
+def fetch_generic_article_meta(url: str, *, timeout: int = 8) -> dict[str, Any]:
+    """Safely fetch public article title/description from any external HTTP(S) URL with SSRF protection."""
+    clean_url = str(url or "").strip()
+    if not clean_url or "\\" in clean_url or any(ch.isspace() for ch in clean_url):
+        raise ValueError("Đường dẫn bài báo không hợp lệ.")
+    parsed = urlparse(clean_url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Đường dẫn phải bắt đầu bằng http:// hoặc https://.")
+    host = parsed.hostname.lower().strip(".")
+    if host in {"localhost", "127.0.0.1", "::1"} or host.endswith((".local", ".internal")):
+        raise ValueError("Không cho phép truy cập địa chỉ nội bộ.")
+    try:
+        addr_infos = socket.getaddrinfo(host, None)
+    except Exception as exc:
+        raise ValueError(f"Không thể phân giải tên miền {host!r}.") from exc
+    for info in addr_infos:
+        ip_str = str(info[4][0]).split("%")[0]
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+            if not ip_obj.is_global:
+                raise ValueError(f"Không cho phép truy cập địa chỉ IP nội bộ ({ip_str}).")
+        except ValueError as exc:
+            if "Không cho phép" in str(exc):
+                raise
+            continue
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0 Safari/537.36"}
+    resp = requests.get(clean_url, headers=headers, timeout=timeout, stream=True)
+    resp.raise_for_status()
+    chunks: list[bytes] = []
+    total_read = 0
+    for chunk in resp.iter_content(chunk_size=32768):
+        if not chunk:
+            continue
+        chunks.append(chunk)
+        total_read += len(chunk)
+        if total_read >= 524288:
+            break
+    html_text = b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
+    title, desc, pub_ts = _extract_html_article_meta(html_text, default_title=f"Bài viết từ {host}")
+    return {
+        "url": clean_url,
+        "hostname": host,
+        "title": title,
+        "description": desc,
+        "published_ts": pub_ts,
+    }
+
+
+def fetch_url_thread(
+    url: str,
+    *,
+    max_comments: int = 2000,
+    timeout: int = 20,
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Unified public URL dispatcher supporting VN news portals (VnExpress, Dan Tri, Tuoi Tre) and Reddit threads."""
+    clean_url = str(url or "").strip()
+    if is_vnexpress_url(clean_url):
+        return fetch_vnexpress_thread(
+            clean_url,
+            max_comments=max_comments,
+            timeout=timeout,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+        )
+    if is_dantri_url(clean_url):
+        return fetch_dantri_thread(
+            clean_url,
+            max_comments=max_comments,
+            timeout=timeout,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+        )
+    if is_tuoitre_url(clean_url):
+        return fetch_tuoitre_thread(
+            clean_url,
+            max_comments=max_comments,
+            timeout=timeout,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+        )
+    post_id = _extract_post_id_from_url(clean_url)
+    return fetch_reddit_thread_paginated(
+        post_id,
+        max_comments=max_comments,
+        timeout=timeout,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+    )
+
+
+def compute_gnn_structural_probe(
+    gnn_model: SBiFAGAT,
+    data: Any,
+    *,
+    checkpoint_loaded: bool,
+    k_horizon: int = 20,
+    gnn_nodes: Sequence[Mapping[str, Any]] | None = None,
+    delays_gnn: Sequence[float] | None = None,
+) -> dict[str, Any]:
+    """Run a fast (<15 ms) live counterfactual probe testing whether SBiFAGAT uses tree structure and signed stance."""
+    if not checkpoint_loaded:
+        return {"available": False, "reason": "Chưa nạp checkpoint GNN đã huấn luyện."}
+    edge_td = getattr(data, "edge_index_td", None)
+    num_edges = int(edge_td.size(1)) if edge_td is not None and edge_td.numel() > 0 else 0
+    if num_edges == 0:
+        return {"available": False, "reason": "Bài viết chưa có đủ bình luận."}
+    multi_hop_edges = int((edge_td[0] != 0).sum().item())
+
+    with torch.no_grad():
+        d_base = gnn_model.predict_with_diagnostics(data, top_k_edges=1)
+
+        data_flat = data.clone()
+        flat_td = data_flat.edge_index_td.clone()
+        flat_td[0] = 0
+        data_flat.edge_index_td = flat_td
+        data_flat.edge_index_bu = flat_td.flip(0)
+        eff_k = max(1, int(k_horizon))
+        flat_d_norm = min(1.0, 1.0 / float(eff_k))
+        if getattr(data_flat, "x", None) is not None and data_flat.x.size(0) > 1 and data_flat.x.size(1) >= 770:
+            x_flat = data_flat.x.clone()
+            x_flat[1:, 769] = flat_d_norm
+            data_flat.x = x_flat
+        if gnn_nodes is not None and delays_gnn is not None and len(gnn_nodes) > 0:
+            root_nid = str(gnn_nodes[0]["node_id"])
+            flat_nodes = [
+                {**dict(n), "parent_id": None if bool(n.get("is_root")) else root_nid}
+                for n in gnn_nodes
+            ]
+            flat_depth = {str(n["node_id"]): (0 if idx == 0 else 1) for idx, n in enumerate(flat_nodes)}
+            data_flat.struct_x = compute_causal_structural_node_features(
+                kept_nodes=flat_nodes,
+                delays_k=delays_gnn,
+                depth_map=flat_depth,
+                k_horizon=eff_k,
+            )
+            ea_rows = (
+                data_flat.edge_attr[:, :2].detach().cpu().tolist()
+                if getattr(data_flat, "edge_attr", None) is not None and data_flat.edge_attr.numel() > 0
+                else []
+            )
+            data_flat.cascade_stats = compute_early_cascade_burst_stats(
+                kept_nodes=flat_nodes,
+                delays_k=delays_gnn,
+                depth_map=flat_depth,
+                edge_attr_rows=ea_rows,
+                k_horizon=eff_k,
+            )
+        else:
+            if getattr(data_flat, "struct_x", None) is not None and data_flat.struct_x.size(0) > 1:
+                sx = data_flat.struct_x.clone()
+                if sx.size(1) > 7:
+                    sx[1:, 4] = flat_d_norm
+                    sx[0, 6] = min(1.0, float(num_edges) / float(eff_k))
+                    sx[1:, 6] = 0.0
+                    sx[0, 7] = 0.0
+                    sx[1:, 7] = 1.0
+                data_flat.struct_x = sx
+            if getattr(data_flat, "cascade_stats", None) is not None and data_flat.cascade_stats.numel() >= 5:
+                cs = data_flat.cascade_stats.clone().view(1, -1)
+                cs[:, 3] = 1.0
+                cs[:, 4] = flat_d_norm
+                data_flat.cascade_stats = cs.view_as(data_flat.cascade_stats)
+        if getattr(data_flat, "edge_attr", None) is not None and data_flat.edge_attr.numel() > 0:
+            raw_s_list = data_flat.edge_attr[:, 0].detach().cpu().tolist()
+            flat_early_polar = float(_compute_full_tree_polarization(raw_s_list, lambda_polar=0.5))
+            if getattr(data_flat, "early_y_polar", None) is not None:
+                data_flat.early_y_polar = torch.full_like(data_flat.early_y_polar, flat_early_polar)
+        d_flat = gnn_model.predict_with_diagnostics(data_flat, top_k_edges=1)
+
+        data_no_stance = data.clone()
+        if getattr(data_no_stance, "edge_attr", None) is not None and data_no_stance.edge_attr.numel() > 0:
+            ea = data_no_stance.edge_attr.clone()
+            ea[:, 0] = 0.0
+            data_no_stance.edge_attr = ea
+        if getattr(data_no_stance, "edge_stance", None) is not None and data_no_stance.edge_stance.numel() > 0:
+            data_no_stance.edge_stance = torch.zeros_like(data_no_stance.edge_stance)
+        if getattr(data_no_stance, "early_y_polar", None) is not None:
+            data_no_stance.early_y_polar = torch.zeros_like(data_no_stance.early_y_polar)
+        d_zero = gnn_model.predict_with_diagnostics(data_no_stance, top_k_edges=1)
+
+    base_polar = round(float(d_base["y_polar_pred"].view(-1)[0].item()), 4)
+    flat_polar = round(float(d_flat["y_polar_pred"].view(-1)[0].item()), 4)
+    zero_polar = round(float(d_zero["y_polar_pred"].view(-1)[0].item()), 4)
+    base_rep = round(float(d_base["predicted_total_replies"].view(-1)[0].item()), 1)
+    flat_rep = round(float(d_flat["predicted_total_replies"].view(-1)[0].item()), 1)
+
+    return {
+        "available": True,
+        "has_multi_hop": multi_hop_edges > 0,
+        "multi_hop_edges": multi_hop_edges,
+        "total_gnn_edges": num_edges,
+        "k_window_evaluated": int(k_horizon),
+        "base_polar": base_polar,
+        "flat_polar": flat_polar,
+        "zero_stance_polar": zero_polar,
+        "delta_polar_structure": round(base_polar - flat_polar, 4),
+        "delta_polar_stance": round(base_polar - zero_polar, 4),
+        "base_replies": base_rep,
+        "flat_replies": flat_rep,
+        "delta_replies_structure": round(base_rep - flat_rep, 1),
+    }
+
+
+def _coerce_finite_float(val: Any, *, field_name: str, source_name: str) -> float:
+    if isinstance(val, bool):
+        raise ValueError(f"Invalid boolean for numeric field '{field_name}' in {source_name}")
+    try:
+        out = float(val)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid numeric field '{field_name}'={val!r} in {source_name}") from exc
+    if not math.isfinite(out):
+        raise ValueError(f"Non-finite value for '{field_name}' in {source_name}")
+    return out
+
+
+def load_thread_from_json_payload(
+    raw: Any,
+    *,
+    max_comments: int = 10000,
+    source_name: str = "payload",
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Parse either Reddit listing JSON or SBi-FAGAT object JSON up to `max_comments` iteratively."""
+    cap = max(1, min(10000, int(max_comments)))
+    if isinstance(raw, list) and len(raw) >= 2 and isinstance(raw[0], Mapping) and "data" in raw[0]:
+        root_data = raw[0].get("data")
+        if not isinstance(root_data, Mapping):
+            raise ValueError(f"Invalid Reddit listing root data in {source_name}")
+        root_children = root_data.get("children") or []
+        if not isinstance(root_children, Sequence) or not root_children or not isinstance(root_children[0], Mapping):
+            raise ValueError(f"Missing root post in Reddit listing {source_name}")
+        post_data = root_children[0].get("data")
+        if not isinstance(post_data, Mapping):
+            raise ValueError(f"Invalid root post entry in Reddit listing {source_name}")
+        post = dict(post_data)
+        post_id = str(post.get("id") or "local_thread")
+
+        listing_1 = raw[1]
+        if not isinstance(listing_1, Mapping) or not isinstance(listing_1.get("data"), Mapping):
+            raise ValueError(f"Invalid Reddit comment listing in {source_name}")
+        top_children = listing_1["data"].get("children") or []
+        if not isinstance(top_children, Sequence) or isinstance(top_children, (str, bytes)):
+            raise ValueError(f"Invalid Reddit comment children sequence in {source_name}")
+
+        flat: list[dict[str, Any]] = []
+        stack: list[Any] = list(reversed(top_children))
+        while stack and len(flat) < cap:
+            ch = stack.pop()
+            if not isinstance(ch, Mapping) or ch.get("kind") != "t1":
+                continue
+            d = ch.get("data")
+            if not isinstance(d, Mapping):
+                continue
+            cid = str(d.get("id") or "").removeprefix("t1_")
             raw_author = d.get("author")
-            flat_comments.append(
+            body_txt = str(d.get("body") or "")
+            flat.append(
                 {
                     "fullname": f"t1_{cid}",
                     "id": cid,
                     "link_id": f"t3_{post_id}",
                     "parent_id": str(d.get("parent_id") or f"t3_{post_id}"),
-                    "body": str(d.get("body") or ""),
-                    "text": str(d.get("body") or ""),
+                    "text": body_txt,
+                    "body": body_txt,
                     "created_utc": d.get("created_utc"),
                     "author": raw_author,
-                    "author_is_bot": isinstance(raw_author, str)
-                    and raw_author.strip().lower() == "automoderator",
-                    "author_hash": hash_author_sha256(
-                        str(raw_author) if raw_author is not None else None
-                    ),
+                    "author_is_bot": isinstance(raw_author, str) and raw_author.strip().lower() == "automoderator",
+                    "author_hash": hash_author_sha256(str(raw_author) if raw_author is not None else None),
                 }
             )
-            replies = d.get("replies")
-            if isinstance(replies, Mapping):
-                _walk_listing(replies.get("data", {}).get("children", []))
-
-    _walk_listing(payload[1]["data"]["children"])
-    return post_raw, flat_comments
-
-
-def _load_thread_from_json(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    if isinstance(raw, list) and len(raw) >= 2:
-        # Raw Reddit listing JSON
-        post = raw[0]["data"]["children"][0]["data"]
-        flat: list[dict[str, Any]] = []
-        post_id = str(post.get("id") or "local_thread")
-
-        def _walk(children: Sequence[Mapping[str, Any]]) -> None:
-            for ch in children:
-                if ch.get("kind") != "t1":
-                    continue
-                d = ch.get("data", {})
-                cid = str(d.get("id") or "")
-                raw_author = d.get("author")
-                flat.append(
-                    {
-                        "fullname": f"t1_{cid}",
-                        "id": cid,
-                        "link_id": f"t3_{post_id}",
-                        "parent_id": str(d.get("parent_id") or f"t3_{post_id}"),
-                        "text": str(d.get("body") or ""),
-                        "created_utc": d.get("created_utc"),
-                        "author": raw_author,
-                        "author_is_bot": isinstance(raw_author, str)
-                        and raw_author.strip().lower() == "automoderator",
-                        "author_hash": hash_author_sha256(
-                            str(raw_author) if raw_author is not None else None
-                        ),
-                    }
-                )
-                rep = d.get("replies")
-                if isinstance(rep, Mapping):
-                    _walk(rep.get("data", {}).get("children", []))
-
-        _walk(raw[1]["data"]["children"])
-        return post, flat
+            rep = d.get("replies")
+            if isinstance(rep, Mapping):
+                sub_c = (rep.get("data") or {}).get("children") or []
+                if isinstance(sub_c, Sequence) and not isinstance(sub_c, (str, bytes)):
+                    stack.extend(reversed(sub_c))
+        return post, flat[:cap]
 
     if isinstance(raw, Mapping):
-        post_id = str(raw.get("id") or "custom_live")
-        base_ts = float(raw.get("created_utc") or 1763200000.0)
+        post_id = str(raw.get("id") or "custom_live").removeprefix("t3_")
+        raw_base_ts = raw.get("created_utc")
+        base_ts = (
+            _coerce_finite_float(raw_base_ts, field_name="created_utc", source_name=source_name)
+            if raw_base_ts is not None
+            else 1763200000.0
+        )
         post = {
             "id": post_id,
             "title": str(raw.get("title") or ""),
-            "selftext": str(raw.get("text") or raw.get("selftext") or ""),
+            "selftext": str(raw.get("text") or raw.get("selftext") or raw.get("root_text") or ""),
             "subreddit": str(raw.get("subreddit") or "custom"),
             "author": str(raw.get("author") or "op"),
             "created_utc": base_ts,
         }
-        comments = []
-        for idx, c in enumerate(raw.get("comments", []), start=1):
-            cid = str(c.get("id") or f"c{idx}")
-            pid = str(c.get("parent_id") or f"t3_{post_id}")
-            if not pid.startswith(("t3_", "t1_")):
-                pid = f"t3_{post_id}" if pid == post_id else f"t1_{pid}"
+        raw_comments = raw.get("comments", [])
+        if raw_comments is None:
+            raw_comments = []
+        if not isinstance(raw_comments, Sequence) or isinstance(raw_comments, (str, bytes)):
+            raise ValueError(f"Invalid 'comments' list in {source_name}")
+        comments: list[dict[str, Any]] = []
+        for idx, c in enumerate(raw_comments, start=1):
+            if not isinstance(c, Mapping):
+                raise ValueError(f"Comment #{idx} is not a JSON object in {source_name}")
+            cid = str(c.get("id") or f"c{idx}").removeprefix("t1_")
+            pid = str(c.get("parent_id") or f"t3_{post_id}").strip()
+            if pid.lower() in {"root", post_id, f"t3_{post_id}"}:
+                pid = f"t3_{post_id}"
+            elif not pid.startswith(("t3_", "t1_")):
+                pid = f"t1_{pid}"
             raw_author = c["author"] if "author" in c else f"u_{idx}"
             author_str = str(raw_author) if raw_author is not None else None
+            text_val = str(c.get("text") or c.get("body") or "")
+            raw_delay = c.get("time_delay_sec")
+            ts_c = c.get("created_utc")
+            if ts_c is None:
+                delay_val = (
+                    _coerce_finite_float(raw_delay, field_name="time_delay_sec", source_name=source_name)
+                    if raw_delay is not None
+                    else idx * 45.0
+                )
+                ts_val = base_ts + delay_val
+            else:
+                ts_val = _coerce_finite_float(ts_c, field_name="created_utc", source_name=source_name)
             comments.append(
                 {
-                    "fullname": f"t1_{cid.removeprefix('t1_')}",
-                    "id": cid.removeprefix("t1_"),
+                    "fullname": f"t1_{cid}",
+                    "id": cid,
                     "link_id": f"t3_{post_id}",
                     "parent_id": pid,
-                    "text": str(c.get("text") or c.get("body") or ""),
-                    "created_utc": float(c.get("created_utc") or (base_ts + idx * 45.0)),
+                    "body": text_val,
+                    "text": text_val,
+                    "created_utc": ts_val,
                     "author": author_str,
-                    "author_is_bot": isinstance(author_str, str)
-                    and author_str.strip().lower() == "automoderator",
+                    "author_is_bot": bool(c.get("author_is_bot"))
+                    or (isinstance(author_str, str) and author_str.strip().lower() == "automoderator"),
                     "author_hash": hash_author_sha256(author_str),
                 }
             )
+            if len(comments) >= cap:
+                break
         return post, comments
 
-    raise ValueError(f"Unsupported thread JSON structure in {path}")
+    raise ValueError(f"Unsupported thread JSON structure in {source_name}")
+
+
+def load_thread_from_text(
+    text: str,
+    *,
+    max_comments: int = 10000,
+    source_name: str = "input",
+    is_jsonl_hint: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Parse either standard JSON or line-delimited JSONL discussion text."""
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        raise ValueError(f"Empty JSON/JSONL content in {source_name}")
+    if not is_jsonl_hint:
+        try:
+            raw = json.loads(cleaned)
+            return load_thread_from_json_payload(raw, max_comments=max_comments, source_name=source_name)
+        except json.JSONDecodeError:
+            pass
+    records = [json.loads(line) for line in cleaned.splitlines() if line.strip()]
+    if not records:
+        raise ValueError(f"Empty JSONL content in {source_name}")
+    first = records[0]
+    if isinstance(first, Mapping) and "comments" in first and len(records) == 1:
+        return load_thread_from_json_payload(first, max_comments=max_comments, source_name=source_name)
+    if not isinstance(first, Mapping):
+        raise ValueError(f"First JSONL record must be an object in {source_name}")
+    root_row = dict(first)
+    extra_comments = [r for r in records[1:] if isinstance(r, Mapping)]
+    if "comments" in root_row and isinstance(root_row.get("comments"), list):
+        root_row["comments"] = list(root_row["comments"]) + extra_comments
+    else:
+        root_row["comments"] = extra_comments
+    return load_thread_from_json_payload(root_row, max_comments=max_comments, source_name=source_name)
+
+
+def load_thread_from_file(path: Path, *, max_comments: int = 10000) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Load a local JSON or JSONL social discussion file (up to `max_comments`)."""
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    return load_thread_from_text(
+        text,
+        max_comments=max_comments,
+        source_name=str(p),
+        is_jsonl_hint=(p.suffix.lower() == ".jsonl"),
+    )
+
+
+def _load_thread_from_json(path: Path, *, max_comments: int = 10000) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return load_thread_from_file(path, max_comments=max_comments)
 
 
 def _deterministic_text_projection(text: str, dim: int = 768) -> torch.Tensor:
@@ -315,28 +1728,393 @@ def _deterministic_text_projection(text: str, dim: int = 768) -> torch.Tensor:
     return torch.from_numpy(vec)
 
 
+def _resolve_local_hf_snapshot(repo_or_path: str) -> str | None:
+    """Resolve a local directory or cached Hugging Face snapshot without network calls."""
+    if Path(repo_or_path).is_dir():
+        return str(repo_or_path)
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(repo_or_path, local_files_only=True)
+    except Exception:
+        return None
+
+
+def _load_local_model_from_pretrained(backbone_id: str, *, allow_network: bool) -> Any | None:
+    """Load an AutoModel locally without triggering unexpected downloads or Hub threads."""
+    local_dir = _resolve_local_hf_snapshot(backbone_id)
+    if local_dir is not None:
+        try:
+            return AutoModel.from_pretrained(local_dir, local_files_only=True)
+        except TypeError:
+            try:
+                return AutoModel.from_pretrained(local_dir)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    is_real_hf = getattr(AutoModel.from_pretrained, "__module__", "").startswith("transformers.")
+    if allow_network or not is_real_hf:
+        try:
+            return AutoModel.from_pretrained(backbone_id)
+        except Exception:
+            return None
+    return None
+
+
+def _load_fast_tokenizer_json(target_dir: Path) -> Any | None:
+    """Load `tokenizer.json` directly via PreTrainedTokenizerFast when AutoTokenizer hits SentencePiece/Protobuf errors."""
+    tok_json = target_dir / "tokenizer.json"
+    if not tok_json.is_file():
+        return None
+    cfg_path = target_dir / "tokenizer_config.json"
+    cfg: dict[str, Any] = {}
+    if cfg_path.is_file():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+    try:
+        return PreTrainedTokenizerFast(
+            tokenizer_file=str(tok_json),
+            bos_token=str(cfg.get("bos_token") or "<s>"),
+            eos_token=str(cfg.get("eos_token") or "</s>"),
+            unk_token=str(cfg.get("unk_token") or "<unk>"),
+            pad_token=str(cfg.get("pad_token") or "<pad>"),
+            cls_token=str(cfg.get("cls_token") or "<s>"),
+            sep_token=str(cfg.get("sep_token") or "</s>"),
+            mask_token=str(cfg.get("mask_token") or "<mask>"),
+        )
+    except Exception:
+        return None
+
+
+def _load_local_tokenizer(
+    backbone_id: str,
+    ce_dir: Path | None,
+    *,
+    lang: str = "vi",
+    node_backbone_overridden: bool,
+    allow_network: bool,
+) -> Any | None:
+    """Load tokenizer from local cache or CE directory with SentencePiece/FastJSON fallback."""
+    local_dir = _resolve_local_hf_snapshot(backbone_id)
+    targets: list[Path] = [Path(local_dir)] if local_dir is not None else []
+    if ce_dir is not None and ce_dir.is_dir() and not node_backbone_overridden:
+        targets.append(ce_dir)
+    if not node_backbone_overridden:
+        default_dirs = (
+            (Path("checkpoints/dual_ce_vn"), Path("checkpoints/visobert_vihsd"))
+            if lang == "vi"
+            else (Path("checkpoints/dual_ce_pheme"),)
+        )
+        for d in default_dirs:
+            if d.is_dir() and d not in targets:
+                targets.append(d)
+
+    for target in targets:
+        has_tok = any(
+            (target / fname).is_file()
+            for fname in ("tokenizer_config.json", "tokenizer.json", "vocab.json", "sentencepiece.bpe.model")
+        )
+        if not has_tok:
+            continue
+        for use_fast in (True, False):
+            kw: dict[str, Any] = {"local_files_only": True}
+            if not use_fast:
+                kw["use_fast"] = False
+            try:
+                return AutoTokenizer.from_pretrained(str(target), **kw)
+            except TypeError:
+                try:
+                    return AutoTokenizer.from_pretrained(str(target))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        fast_tok = _load_fast_tokenizer_json(target)
+        if fast_tok is not None:
+            return fast_tok
+
+    is_real_hf = getattr(AutoTokenizer.from_pretrained, "__module__", "").startswith("transformers.")
+    if allow_network or not is_real_hf:
+        try:
+            return load_tokenizer_safe(backbone_id)
+        except Exception:
+            return None
+    return None
+
+
+def _resolve_nlp_backends(
+    *,
+    cross_encoder_ckpt: Path | None,
+    node_backbone: str | None,
+    lang: str,
+    is_demo: bool,
+    preloaded_ce: tuple[DualHeadCrossEncoder, Any] | None = None,
+) -> tuple[DualHeadCrossEncoder | None, Any | None, Any | None, Any | None, bool, str]:
+    """Load available Cross-Encoder & SpanPool backends without unwanted offline downloads."""
+    ce_dir = Path(cross_encoder_ckpt) if cross_encoder_ckpt is not None else None
+    ce_model: DualHeadCrossEncoder | None = None
+    ce_tok: Any | None = None
+
+    if preloaded_ce is not None:
+        ce_model, ce_tok = preloaded_ce
+        if ce_model is not None:
+            ce_model.eval()
+    else:
+        has_all_ce_files = bool(
+            ce_dir is not None
+            and ce_dir.is_dir()
+            and all((ce_dir / fname).is_file() for fname in _REQUIRED_CE_FILES)
+        )
+        if has_all_ce_files and ce_dir is not None:
+            try:
+                ce_model, ce_tok = DualHeadCrossEncoder.load_checkpoint(ce_dir, map_location="cpu")
+                ce_model.eval()
+            except Exception:
+                ce_model = None
+                ce_tok = None
+
+    backbone_id = node_backbone or (
+        VISOBERT_MODEL_NAME if lang == "vi" else TWITTER_ROBERTA_MODEL_NAME
+    )
+    # Only allow network backbone download when explicitly requested via --node-backbone in live mode;
+    # otherwise prefer local HF cache and fall back seamlessly to local ce_model.encoder.
+    allow_net = bool(ce_model is not None and not is_demo and node_backbone is not None)
+    frozen_node_encoder = _load_local_model_from_pretrained(backbone_id, allow_network=allow_net)
+    frozen_node_tok: Any | None = None
+
+    if frozen_node_encoder is not None:
+        frozen_node_tok = _load_local_tokenizer(
+            backbone_id,
+            ce_dir,
+            lang=lang,
+            node_backbone_overridden=node_backbone is not None,
+            allow_network=allow_net,
+        )
+        if frozen_node_tok is None and ce_tok is not None and node_backbone is None:
+            frozen_node_tok = ce_tok
+        if frozen_node_tok is None:
+            frozen_node_encoder = None
+
+    if frozen_node_encoder is None and ce_model is not None and ce_tok is not None:
+        frozen_node_encoder = ce_model.encoder
+        frozen_node_tok = ce_tok
+
+    if frozen_node_encoder is not None:
+        frozen_node_encoder.eval()
+        for p in frozen_node_encoder.parameters():
+            p.requires_grad_(False)
+
+    spanpool_ready = frozen_node_encoder is not None and frozen_node_tok is not None
+    ce_ready = ce_model is not None and ce_tok is not None and spanpool_ready
+    if ce_ready:
+        return ce_model, ce_tok, frozen_node_encoder, frozen_node_tok, True, "full_2d_cross_encoder"
+    if spanpool_ready:
+        return None, None, frozen_node_encoder, frozen_node_tok, False, "visobert_spanpool_heuristic_edges"
+    return None, None, None, None, False, "heuristic_hash_sandbox"
+
+
+def _classify_2d_behavior_label(s_uv: float, h_uv: float) -> str:
+    """Map unified 2D `[s_uv, h_uv]` edge scores to the 4 clean behavioral categories."""
+    if s_uv > 0.1:
+        return "support"
+    if h_uv > 0.6:
+        return "hostile_conflict"
+    if s_uv < -0.1:
+        return "constructive_oppose"
+    return "neutral"
+
+
+def _classify_calibrated_regime(
+    pred_polar: float,
+    behavior_counts: Mapping[str, int] | None = None,
+    *,
+    lang: str = "vi",
+) -> str:
+    """Classify cascade polarization regime calibrated strictly against Train quantiles."""
+    del behavior_counts  # Retained for signature compatibility; counts never override quantiles.
+    lang_norm: Literal["vi", "en"] = "en" if str(lang).lower() == "en" else "vi"
+    q50, q75, q90 = get_polar_quantiles(lang_norm)
+    tag = "PHEME Train" if lang_norm == "en" else "VN Train"
+    if pred_polar >= q90:
+        return f"Phân cực xung đột gay gắt (>= Q90 {tag})"
+    if pred_polar >= q75:
+        return f"Phân hóa khá cao (Q75-Q90 {tag})"
+    if pred_polar >= q50:
+        return f"Phân hóa trung bình (Q50-Q75 {tag})"
+    return f"Tương đối đồng thuận / ít chia rẽ (< Q50 {tag})"
+
+
+def _select_stratified_edges(
+    *,
+    root_id: str,
+    gnn_nodes: Sequence[Mapping[str, Any]],
+    candidate_non_roots: Sequence[Mapping[str, Any]],
+    edge_records: Sequence[Mapping[str, Any]],
+    depth_map: Mapping[str, int],
+    sample_budget: int,
+) -> set[str]:
+    """Deterministically sample edges uniformly across 10 chronological deciles with full ancestor closure."""
+    del depth_map  # Unbiased stratified sampling does not oversample deep subtrees
+    budget = max(1, int(sample_budget))
+    if len(edge_records) <= budget:
+        return {str(e["edge_id"]) for e in edge_records}
+
+    edge_by_dst: dict[str, Mapping[str, Any]] = {}
+    parent_by_dst: dict[str, str] = {}
+    for e in edge_records:
+        dst = str(e["target_id"])
+        edge_by_dst[dst] = e
+        parent_by_dst[dst] = str(e["source_id"])
+
+    selected_eids: set[str] = set()
+    gnn_ids = {str(n["node_id"]) for n in gnn_nodes}
+
+    def _add_with_ancestors(target_id: str, hard_cap: int) -> bool:
+        chain_eids: list[str] = []
+        curr = target_id
+        seen_c: set[str] = set()
+        while curr and curr != root_id and curr not in seen_c:
+            seen_c.add(curr)
+            e_row = edge_by_dst.get(curr)
+            if e_row is None:
+                return False
+            eid = str(e_row["edge_id"])
+            if eid not in selected_eids:
+                chain_eids.append(eid)
+            curr = parent_by_dst.get(curr, "")
+        if curr != root_id or not chain_eids:
+            return False
+        if len(selected_eids) + len(chain_eids) <= hard_cap:
+            selected_eids.update(chain_eids)
+            return True
+        return False
+
+    for e in edge_records:
+        dst_g = str(e["target_id"])
+        if dst_g in gnn_ids:
+            _add_with_ancestors(dst_g, len(edge_records))
+
+    remaining_nodes = [
+        n for n in candidate_non_roots
+        if str(n["node_id"]) not in gnn_ids and str(n["node_id"]) in edge_by_dst
+    ]
+    if not remaining_nodes or len(selected_eids) >= budget:
+        return selected_eids
+
+    n_deciles = 10
+    buckets: list[list[Mapping[str, Any]]] = [[] for _ in range(n_deciles)]
+    total_rem = len(remaining_nodes)
+    for idx_r, node in enumerate(remaining_nodes):
+        b_idx = min(n_deciles - 1, (idx_r * n_deciles) // max(1, total_rem))
+        buckets[b_idx].append(node)
+
+    # Uniform seeded permutation inside each chronological decile preserves unbiased coverage
+    rng = np.random.default_rng(42)
+    for b_idx in range(n_deciles):
+        b_list = buckets[b_idx]
+        if len(b_list) > 1:
+            perm = rng.permutation(len(b_list))
+            buckets[b_idx] = [b_list[int(pos)] for pos in perm]
+
+    hard_cap = max(len(selected_eids), budget + int(budget * 0.15))
+    cursor_in_bucket = [0] * n_deciles
+    made_progress = True
+    while len(selected_eids) < budget and made_progress:
+        made_progress = False
+        for b_idx in range(n_deciles):
+            if len(selected_eids) >= budget:
+                break
+            b_list = buckets[b_idx]
+            while cursor_in_bucket[b_idx] < len(b_list):
+                cand = b_list[cursor_in_bucket[b_idx]]
+                cursor_in_bucket[b_idx] += 1
+                if _add_with_ancestors(str(cand["node_id"]), hard_cap):
+                    made_progress = True
+                    break
+
+    return selected_eids
+
+
+def _bootstrap_polar_ci_95(
+    aligned_stances: Sequence[float],
+    *,
+    n_resamples: int = 200,
+    seed: int = 42,
+) -> list[float] | None:
+    """Compute deterministic 95% bootstrap confidence interval for `y_polar` on stratified samples."""
+    arr = np.asarray(list(aligned_stances), dtype=np.float64)
+    if arr.size < 4:
+        return None
+    rng = np.random.default_rng(seed)
+    vals: list[float] = []
+    n = arr.size
+    for _ in range(n_resamples):
+        sample = arr[rng.integers(0, n, size=n)]
+        vals.append(float(_compute_full_tree_polarization(sample.tolist(), lambda_polar=0.5)))
+    lo = float(np.percentile(vals, 2.5))
+    hi = float(np.percentile(vals, 97.5))
+    return [round(lo, 4), round(hi, 4)]
+
+
 def predict_live_cascade(
     post: Mapping[str, Any],
     comments: Sequence[Mapping[str, Any]],
     *,
     k_horizon: int = 20,
+    analysis_mode: Literal["early", "full"] = "early",
+    max_full_comments: int = 500,
+    scan_strategy: Literal["full", "stratified"] = "full",
+    sample_budget: int = 600,
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    custom_topics: str | Sequence[str] | None = None,
+    topic_backend: Literal["auto", "nli", "embedding", "lexical"] = "auto",
+    allow_nli_topic_download: bool = False,
     cross_encoder_ckpt: Path | None = None,
+    preloaded_ce: tuple[DualHeadCrossEncoder, Any] | None = None,
     gnn_ckpt: Path | None = None,
     node_backbone: str | None = None,
     lang: str = "vi",
+    junk_mode: Literal["prune", "contract"] = "prune",
     allow_untrained: bool = False,
     is_demo: bool = False,
+    inference_lock: threading.RLock | None = None,
 ) -> dict[str, Any]:
-    """Build cascade graph, score early behavior, run SBiFAGAT, and emit live forecast report."""
+    """Build cascade graph, score behavior & topics, run SBiFAGAT (early K) + scalable post-hoc scan (up to 10k)."""
+    t_scan_start = time.perf_counter()
+    if isinstance(k_horizon, bool) or int(k_horizon) < 1:
+        raise ValueError(f"k_horizon must be >= 1, got {k_horizon!r}")
+    if analysis_mode not in {"early", "full"}:
+        raise ValueError(f"analysis_mode must be 'early' or 'full', got {analysis_mode!r}")
+    if isinstance(max_full_comments, bool) or int(max_full_comments) < 1:
+        raise ValueError(f"max_full_comments must be >= 1, got {max_full_comments!r}")
+    if scan_strategy not in {"full", "stratified"}:
+        raise ValueError(f"scan_strategy must be 'full' or 'stratified', got {scan_strategy!r}")
+    if isinstance(sample_budget, bool) or int(sample_budget) < 1:
+        raise ValueError(f"sample_budget must be >= 1, got {sample_budget!r}")
+    if cancel_event is not None and cancel_event.is_set():
+        raise ScanCancelledError("Tác vụ quét đã bị hủy trước khi khởi chạy.")
+
+    k_horizon = int(k_horizon)
+    max_full_comments = int(max_full_comments)
+    sample_budget = int(sample_budget)
+    raw_comment_count = len(comments)
+    junk_stats: dict[str, Any] = {}
     built = build_vn_cascade_from_thread(
         post,
         comments,
         min_comments=1,
         min_depth=1,
         min_vi_ratio=0.0,
+        junk_mode=junk_mode,
+        stats_out=junk_stats,
     )
     if built is None:
-        raise ValueError("Thread has insufficient valid comments after spam/deleted filtering.")
+        raise ValueError("Bài viết không có đủ bình luận hợp lệ sau khi lọc bình luận rác/đã xóa.")
     node_records, edge_records, _meta = built
 
     node_by_id = {str(n["node_id"]): n for n in node_records}
@@ -362,132 +2140,234 @@ def predict_live_cascade(
 
     non_roots = [n for n in node_records if not bool(n["is_root"])]
     non_roots.sort(key=lambda n: (n["created_at_utc"], depth_map.get(str(n["node_id"]), 999), str(n["node_id"])))
+    ood_scale_warning = len(non_roots) > OOD_SCALE_THRESHOLD
 
-    kept_nodes = [root_row] + non_roots[:k_horizon]
-    kept_ids = {str(n["node_id"]) for n in kept_nodes}
-    kept_id_to_idx = {str(n["node_id"]): idx for idx, n in enumerate(kept_nodes)}
+    # Keep GNN early-warning inference strictly in-distribution on V_K (k_horizon),
+    # while full mode expands visualization + large-thread discourse analysis up to max_full_comments.
+    gnn_nodes = [root_row] + non_roots[:k_horizon]
+    display_limit = min(len(non_roots), max_full_comments) if analysis_mode == "full" else k_horizon
+    display_nodes = [root_row] + non_roots[:display_limit]
+    horizon_for_features = k_horizon
+    gnn_id_to_idx = {str(n["node_id"]): idx for idx, n in enumerate(gnn_nodes)}
+    display_id_to_idx = {str(n["node_id"]): idx for idx, n in enumerate(display_nodes)}
 
-    # Score edges (all edges for post-hoc check; strictly isolated from model features beyond K)
-    ce_model: DualHeadCrossEncoder | None = None
-    ce_tok: Any | None = None
-    frozen_node_encoder: Any | None = None
-    frozen_node_tok: Any | None = None
-    if cross_encoder_ckpt is not None and Path(cross_encoder_ckpt).exists():
-        ce_model, ce_tok = DualHeadCrossEncoder.load_checkpoint(Path(cross_encoder_ckpt), map_location="cpu")
-        ce_model.eval()
-        # Use frozen pre-trained backbone + SpanPool matching extract_features.py
-        backbone_id = node_backbone or (
-            VISOBERT_MODEL_NAME if lang == "vi" else TWITTER_ROBERTA_MODEL_NAME
+    # Resolve NLP backends once
+    ce_model, ce_tok, frozen_node_encoder, frozen_node_tok, cross_encoder_loaded, nlp_backend = (
+        _resolve_nlp_backends(
+            cross_encoder_ckpt=cross_encoder_ckpt,
+            node_backbone=node_backbone,
+            lang=lang,
+            is_demo=is_demo,
+            preloaded_ce=preloaded_ce,
         )
-        try:
-            frozen_node_encoder = AutoModel.from_pretrained(backbone_id)
-            frozen_node_encoder.eval()
-            for p in frozen_node_encoder.parameters():
-                p.requires_grad_(False)
-            frozen_node_tok = load_tokenizer_safe(backbone_id)
-        except Exception:
-            frozen_node_encoder = ce_model.encoder
-            frozen_node_tok = ce_tok
+    )
 
     use_root_ctx = bool(getattr(ce_model, "include_root_context", False)) if ce_model is not None else False
     root_text_str = str(root_row["text"])
-    edge_scores: dict[str, dict[str, Any]] = {}
-    all_edge_ids = [str(e["edge_id"]) for e in edge_records]
-    all_parent_texts = [str(node_by_id[str(e["source_id"])]["text"]) for e in edge_records]
-    all_reply_texts = [str(node_by_id[str(e["target_id"])]["text"]) for e in edge_records]
+    live_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if all_edge_ids and ce_model is not None and ce_tok is not None:
-        ce_out = encode_edges_with_cross_encoder(
-            all_parent_texts,
-            all_reply_texts,
-            cross_encoder=ce_model,
-            tokenizer=ce_tok,
-            root_texts=[root_text_str] * len(edge_records),
-            include_root_context=use_root_ctx,
-            lang=lang,
-            batch_size=32,
-            device=torch.device("cpu"),
-        )
-        for pos, eid in enumerate(all_edge_ids):
-            s_v = float(ce_out["s_uv"][pos])
-            h_v = float(ce_out["h_uv"][pos])
-            r_v = float(ce_out["r_uv"][pos]) if "r_uv" in ce_out else 0.10
-            c_v = float(ce_out["c_uv"][pos]) if "c_uv" in ce_out else 0.50
-            if "behavior_label" in ce_out:
-                blbl = str(ce_out["behavior_label"][pos])
-            else:
-                blbl = "support" if s_v > 0.1 else ("hostile_conflict" if h_v > 0.6 else ("constructive_oppose" if s_v < -0.1 else "neutral"))
-            edge_scores[eid] = {"s_uv": s_v, "h_uv": h_v, "r_uv": r_v, "c_uv": c_v, "behavior_label": blbl}
+    # Select edges to score (capped cleanly in early/full non-stratified runs; stratified sampling when budget < edges)
+    if analysis_mode == "full":
+        display_id_set = {str(n["node_id"]) for n in display_nodes}
+        scope_edges = [
+            e for e in edge_records
+            if str(e["source_id"]) in display_id_set and str(e["target_id"]) in display_id_set
+        ]
+    elif scan_strategy == "full" and len(non_roots) > max_full_comments:
+        capped_id_set = {root_id} | {str(n["node_id"]) for n in non_roots[:max_full_comments]}
+        scope_edges = [
+            e for e in edge_records
+            if str(e["source_id"]) in capped_id_set and str(e["target_id"]) in capped_id_set
+        ]
     else:
-        for eid, r_txt in zip(all_edge_ids, all_reply_texts):
-            heur = _heuristic_behavior_fallback(r_txt)
-            edge_scores[eid] = {
-                "s_uv": float(heur["s_uv"]),
-                "h_uv": float(heur["h_uv"]),
-                "r_uv": float(heur["r_uv"]),
-                "c_uv": float(heur["c_uv"]),
-                "behavior_label": str(heur["label"]),
-            }
+        scope_edges = list(edge_records)
 
-    # Build early PyG CascadeData restricted strictly to V_K
-    delays_k = [max(0.0, (n["created_at_utc"] - root_ts).total_seconds()) for n in kept_nodes]
+    is_stratified_subsampled = bool(scan_strategy == "stratified" and len(scope_edges) > sample_budget)
+    if is_stratified_subsampled:
+        scored_eid_set = _select_stratified_edges(
+            root_id=root_id,
+            gnn_nodes=gnn_nodes,
+            candidate_non_roots=display_nodes[1:] if analysis_mode == "full" else non_roots,
+            edge_records=scope_edges,
+            depth_map=depth_map,
+            sample_budget=sample_budget,
+        )
+        edges_to_score = [e for e in scope_edges if str(e["edge_id"]) in scored_eid_set]
+    else:
+        edges_to_score = scope_edges
+        scored_eid_set = {str(e["edge_id"]) for e in edges_to_score}
+
+    edge_scores: dict[str, dict[str, Any]] = {}
+    score_edge_ids = [str(e["edge_id"]) for e in edges_to_score]
+    score_parent_texts = [str(node_by_id[str(e["source_id"])]["text"]) for e in edges_to_score]
+    score_reply_texts = [str(node_by_id[str(e["target_id"])]["text"]) for e in edges_to_score]
+
+    total_to_score = len(score_edge_ids)
+    batch_sz = 64 if live_device.type == "cuda" else 32
+    t_score_start = time.perf_counter()
+
+    if progress_cb is not None:
+        progress_cb(
+            {
+                "stage": "scoring_edges",
+                "processed": 0,
+                "total": total_to_score,
+                "percent": 0.0 if total_to_score > 0 else 100.0,
+                "edges_per_sec": 0.0,
+                "eta_sec": None,
+            }
+        )
+
+    if total_to_score > 0 and ce_model is not None and ce_tok is not None:
+        for b_start in range(0, total_to_score, batch_sz):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelledError("Tác vụ quét đã bị hủy trong quá trình chấm cạnh.")
+            b_end = min(total_to_score, b_start + batch_sz)
+            with (inference_lock if inference_lock is not None else contextlib.nullcontext()):
+                ce_out = encode_edges_with_cross_encoder(
+                    score_parent_texts[b_start:b_end],
+                    score_reply_texts[b_start:b_end],
+                    cross_encoder=ce_model,
+                    tokenizer=ce_tok,
+                    root_texts=[root_text_str] * (b_end - b_start),
+                    include_root_context=use_root_ctx,
+                    lang=lang,
+                    batch_size=batch_sz,
+                    device=live_device,
+                )
+            for rel_pos, eid in enumerate(score_edge_ids[b_start:b_end]):
+                s_v = float(ce_out["s_uv"][rel_pos])
+                h_v = float(ce_out["h_uv"][rel_pos])
+                raw_blbl = str(ce_out["behavior_label"][rel_pos]) if "behavior_label" in ce_out else ""
+                blbl = raw_blbl if raw_blbl in _UNIFIED_BEHAVIOR_LABELS else _classify_2d_behavior_label(s_v, h_v)
+                edge_scores[eid] = {"s_uv": s_v, "h_uv": h_v, "behavior_label": blbl, "is_scored": True}
+
+            if progress_cb is not None:
+                elapsed_s = max(1e-6, time.perf_counter() - t_score_start)
+                eps = float(b_end) / elapsed_s
+                eta_s = float(total_to_score - b_end) / max(eps, 1e-6) if b_end < total_to_score else 0.0
+                progress_cb(
+                    {
+                        "stage": "scoring_edges",
+                        "processed": b_end,
+                        "total": total_to_score,
+                        "percent": round(100.0 * b_end / float(total_to_score), 1),
+                        "edges_per_sec": round(eps, 1),
+                        "eta_sec": round(eta_s, 1),
+                    }
+                )
+    else:
+        for idx_s, (eid, r_txt) in enumerate(zip(score_edge_ids, score_reply_texts), start=1):
+            if cancel_event is not None and (idx_s % 128 == 0) and cancel_event.is_set():
+                raise ScanCancelledError("Tác vụ quét đã bị hủy trong quá trình chấm cạnh.")
+            heur = _heuristic_behavior_fallback(r_txt)
+            s_v = float(heur["s_uv"])
+            h_v = float(heur["h_uv"])
+            edge_scores[eid] = {
+                "s_uv": s_v,
+                "h_uv": h_v,
+                "behavior_label": _classify_2d_behavior_label(s_v, h_v),
+                "is_scored": True,
+            }
+            if progress_cb is not None and (idx_s % 256 == 0 or idx_s == total_to_score):
+                elapsed_s = max(1e-6, time.perf_counter() - t_score_start)
+                eps = float(idx_s) / elapsed_s
+                progress_cb(
+                    {
+                        "stage": "scoring_edges",
+                        "processed": idx_s,
+                        "total": total_to_score,
+                        "percent": round(100.0 * idx_s / float(max(1, total_to_score)), 1),
+                        "edges_per_sec": round(eps, 1),
+                        "eta_sec": 0.0 if idx_s == total_to_score else round(float(total_to_score - idx_s) / max(eps, 1e-6), 1),
+                    }
+                )
+
+    for e in edge_records:
+        eid_all = str(e["edge_id"])
+        if eid_all not in edge_scores:
+            edge_scores[eid_all] = {"s_uv": 0.0, "h_uv": 0.0, "behavior_label": "unscored", "is_scored": False}
+
+    # Build early PyG CascadeData restricted strictly to V_K (in-distribution for SBi-FAGAT)
+    delays_gnn = [max(0.0, (n["created_at_utc"] - root_ts).total_seconds()) for n in gnn_nodes]
+    delays_display = [max(0.0, (n["created_at_utc"] - root_ts).total_seconds()) for n in display_nodes]
     denom_t = math.log1p(TEMPORAL_REF_SECONDS)
     x_rows = []
     if frozen_node_encoder is not None and frozen_node_tok is not None:
-        kept_texts = [str(n["text"]) for n in kept_nodes]
-        kept_parents = [
+        gnn_texts = [str(n["text"]) for n in gnn_nodes]
+        gnn_parents = [
             None
             if (bool(n["is_root"]) or n.get("parent_id") is None)
             else str(node_by_id.get(str(n["parent_id"]), {}).get("text", ""))
-            for n in kept_nodes
+            for n in gnn_nodes
         ]
-        kept_roots = [
+        gnn_roots = [
             None
             if (bool(n["is_root"]) or n.get("parent_id") is None)
             else root_text_str
-            for n in kept_nodes
+            for n in gnn_nodes
         ]
-        emb_mat = encode_node_embeddings(
-            kept_texts,
-            encoder=frozen_node_encoder,
-            tokenizer=frozen_node_tok,
-            parent_texts=kept_parents,
-            root_texts=kept_roots,
-            lang=lang,
-            batch_size=32,
-            device=torch.device("cpu"),
-        )
-        for idx_n, (n, dt_sec) in enumerate(zip(kept_nodes, delays_k)):
+        with (inference_lock if inference_lock is not None else contextlib.nullcontext()):
+            emb_mat = encode_node_embeddings(
+                gnn_texts,
+                encoder=frozen_node_encoder,
+                tokenizer=frozen_node_tok,
+                parent_texts=gnn_parents,
+                root_texts=gnn_roots,
+                lang=lang,
+                batch_size=32,
+                device=live_device,
+            )
+        for idx_n, (n, dt_sec) in enumerate(zip(gnn_nodes, delays_gnn)):
             nid = str(n["node_id"])
             t_norm = min(1.0, math.log1p(dt_sec) / denom_t)
-            d_norm = min(1.0, float(depth_map.get(nid, 0)) / float(max(1, k_horizon)))
+            d_norm = min(1.0, float(depth_map.get(nid, 0)) / float(max(1, horizon_for_features)))
             x_rows.append(torch.cat([emb_mat[idx_n].cpu(), torch.tensor([t_norm, d_norm], dtype=torch.float32)], dim=0))
     else:
-        for n, dt_sec in zip(kept_nodes, delays_k):
+        for n, dt_sec in zip(gnn_nodes, delays_gnn):
             nid = str(n["node_id"])
             emb_768 = _deterministic_text_projection(str(n["text"]), 768)
             t_norm = min(1.0, math.log1p(dt_sec) / denom_t)
-            d_norm = min(1.0, float(depth_map.get(nid, 0)) / float(max(1, k_horizon)))
+            d_norm = min(1.0, float(depth_map.get(nid, 0)) / float(max(1, horizon_for_features)))
             x_rows.append(torch.cat([emb_768.cpu(), torch.tensor([t_norm, d_norm], dtype=torch.float32)], dim=0))
     x = torch.stack(x_rows, dim=0)
 
     td_src, td_dst = [], []
     edge_attr_rows: list[list[float]] = []
-    kept_pairs: list[tuple[str, str]] = []
-    kept_edge_details: list[dict[str, Any]] = []
-    for n in kept_nodes[1:]:
+    gnn_pairs: list[tuple[str, str]] = []
+    gnn_edge_details: list[dict[str, Any]] = []
+    for n in gnn_nodes[1:]:
         dst_id = str(n["node_id"])
         src_id = str(n["parent_id"])
-        if src_id not in kept_id_to_idx:
+        if src_id not in gnn_id_to_idx:
             continue
         edge_row = edge_lookup.get((src_id, dst_id))
         eid = str(edge_row["edge_id"]) if edge_row is not None else f"{src_id}->{dst_id}"
         sc = edge_scores[eid]
-        td_src.append(kept_id_to_idx[src_id])
-        td_dst.append(kept_id_to_idx[dst_id])
-        edge_attr_rows.append([sc["s_uv"], sc["h_uv"], sc["r_uv"], sc["c_uv"]])
-        kept_pairs.append((src_id, dst_id))
-        kept_edge_details.append(
+        td_src.append(gnn_id_to_idx[src_id])
+        td_dst.append(gnn_id_to_idx[dst_id])
+        edge_attr_rows.append([sc["s_uv"], sc["h_uv"]])
+        gnn_pairs.append((src_id, dst_id))
+        gnn_edge_details.append(
+            {
+                "edge_id": eid,
+                "parent_id": src_id,
+                "node_id": dst_id,
+                "reply_text": str(n["text"]),
+                **sc,
+            }
+        )
+
+    display_edge_details: list[dict[str, Any]] = []
+    for n in display_nodes[1:]:
+        dst_id = str(n["node_id"])
+        src_id = str(n["parent_id"])
+        if src_id not in display_id_to_idx:
+            continue
+        edge_row = edge_lookup.get((src_id, dst_id))
+        eid = str(edge_row["edge_id"]) if edge_row is not None else f"{src_id}->{dst_id}"
+        sc = edge_scores[eid]
+        display_edge_details.append(
             {
                 "edge_id": eid,
                 "parent_id": src_id,
@@ -499,25 +2379,25 @@ def predict_live_cascade(
 
     edge_index_td = torch.tensor([td_src, td_dst], dtype=torch.long) if td_src else torch.empty((2, 0), dtype=torch.long)
     edge_index_bu = edge_index_td[[1, 0], :] if edge_index_td.numel() > 0 else edge_index_td
-    edge_attr = torch.tensor(edge_attr_rows, dtype=torch.float32) if edge_attr_rows else torch.empty((0, 4), dtype=torch.float32)
+    edge_attr = torch.tensor(edge_attr_rows, dtype=torch.float32) if edge_attr_rows else torch.empty((0, 2), dtype=torch.float32)
     struct_x = compute_causal_structural_node_features(
-        kept_nodes=kept_nodes,
-        delays_k=delays_k,
+        kept_nodes=gnn_nodes,
+        delays_k=delays_gnn,
         depth_map=depth_map,
-        k_horizon=k_horizon,
+        k_horizon=horizon_for_features,
     )
     cascade_stats = compute_early_cascade_burst_stats(
-        kept_nodes=kept_nodes,
-        delays_k=delays_k,
+        kept_nodes=gnn_nodes,
+        delays_k=delays_gnn,
         depth_map=depth_map,
         edge_attr_rows=edge_attr_rows,
-        k_horizon=k_horizon,
+        k_horizon=horizon_for_features,
     )
 
     early_children_adj: dict[str, list[str]] = {}
     early_edge_lookup: dict[tuple[str, str], dict[str, Any]] = {}
     early_stance_map: dict[str, float] = {}
-    for d_e in kept_edge_details:
+    for d_e in gnn_edge_details:
         pu = str(d_e["parent_id"])
         cv = str(d_e["node_id"])
         eid_e = str(d_e["edge_id"])
@@ -530,7 +2410,7 @@ def predict_live_cascade(
         edge_lookup=early_edge_lookup,
         stance_map=early_stance_map,
     )
-    early_y_polar_val = _compute_full_tree_polarization(early_aligned) if early_aligned else 0.0
+    early_y_polar_val = _compute_full_tree_polarization(early_aligned, lambda_polar=0.5) if early_aligned else 0.0
 
     data = CascadeData(
         x=x,
@@ -543,7 +2423,7 @@ def predict_live_cascade(
         early_y_polar=torch.tensor([early_y_polar_val], dtype=torch.float32),
         cascade_stats=cascade_stats,
         root_index=torch.tensor([0], dtype=torch.long),
-        edge_pairs=kept_pairs,
+        edge_pairs=gnn_pairs,
     )
 
     # Load GNN checkpoint if present; otherwise check authorization before untuned inspection
@@ -602,38 +2482,229 @@ def predict_live_cascade(
     else:
         data.edge_attr = torch.empty((0, target_edge_dim), dtype=torch.float32)
 
-    diag = gnn_model.predict_with_diagnostics(data, top_k_edges=5)
+    with (inference_lock if inference_lock is not None else contextlib.nullcontext()):
+        diag = gnn_model.predict_with_diagnostics(data, top_k_edges=5)
+        gnn_structural_probe = compute_gnn_structural_probe(
+            gnn_model,
+            data,
+            checkpoint_loaded=checkpoint_loaded,
+            k_horizon=k_horizon,
+            gnn_nodes=gnn_nodes,
+            delays_gnn=delays_gnn,
+        )
 
-    behavior_counts = {lbl: 0 for lbl in DISCOURSE_BEHAVIOR_LABELS}
-    for d in kept_edge_details:
-        behavior_counts[d["behavior_label"]] = behavior_counts.get(d["behavior_label"], 0) + 1
+    behavior_counts = {lbl: 0 for lbl in _UNIFIED_BEHAVIOR_LABELS}
+    for d in gnn_edge_details:
+        lbl_d = d["behavior_label"]
+        if lbl_d in behavior_counts:
+            behavior_counts[lbl_d] += 1
+        else:
+            mapped_lbl = _classify_2d_behavior_label(float(d["s_uv"]), float(d["h_uv"]))
+            behavior_counts[mapped_lbl] += 1
+
+    total_early_edges = max(1, len(gnn_edge_details))
+    early_behavior_summary = {
+        lbl: {
+            "count": int(behavior_counts[lbl]),
+            "ratio": round(float(behavior_counts[lbl]) / float(total_early_edges), 4),
+        }
+        for lbl in _UNIFIED_BEHAVIOR_LABELS
+    }
 
     # Combine model prediction with interpretable early polarization indicator when checkpoint isn't loaded
     raw_pred_polar = float(diag["y_polar_pred"].view(-1)[0].item())
     raw_pred_replies = float(diag["predicted_total_replies"].view(-1)[0].item())
+    raw_conf = diag.get("confidence_score")
+    conf_score: float | None = float(raw_conf.view(-1)[0].item()) if raw_conf is not None else None
+    uncertainty_available = bool(diag.get("uncertainty_available", conf_score is not None))
 
     actual_total_replies = len(non_roots)
+    has_future = actual_total_replies > (len(gnn_nodes) - 1)
+    gnn_pair_set = {(str(d_e["parent_id"]), str(d_e["node_id"])) for d_e in gnn_edge_details}
+    scored_edges_only = [e for e in edges_to_score if bool(edge_scores.get(str(e["edge_id"]), {}).get("is_scored", True))]
+    is_partial_scoring = bool(is_stratified_subsampled or len(scored_edges_only) < len(edge_records))
     stance_map = {eid: sc["s_uv"] for eid, sc in edge_scores.items()}
-    actual_aligned = _compute_root_aligned_stances(
-        root_id=root_id,
-        children_adj=children_adj,
-        edge_lookup=edge_lookup,
-        stance_map=stance_map,
-    )
-    actual_full_polar = _compute_full_tree_polarization(actual_aligned) if actual_aligned else 0.0
+    if has_future:
+        if is_partial_scoring:
+            sc_adj: dict[str, list[str]] = {}
+            sc_lookup: dict[tuple[str, str], Mapping[str, Any]] = {}
+            for e_sc in scored_edges_only:
+                sc_src, sc_dst = str(e_sc["source_id"]), str(e_sc["target_id"])
+                sc_adj.setdefault(sc_src, []).append(sc_dst)
+                sc_lookup[(sc_src, sc_dst)] = e_sc
+            actual_aligned = _compute_root_aligned_stances(
+                root_id=root_id,
+                children_adj=sc_adj,
+                edge_lookup=sc_lookup,
+                stance_map=stance_map,
+                excluded_pairs=gnn_pair_set,
+            )
+        else:
+            actual_aligned = _compute_root_aligned_stances(
+                root_id=root_id,
+                children_adj=children_adj,
+                edge_lookup=edge_lookup,
+                stance_map=stance_map,
+                excluded_pairs=gnn_pair_set,
+            )
+        actual_full_polar: float | None = (
+            _compute_full_tree_polarization(actual_aligned, lambda_polar=0.5)
+            if actual_aligned
+            else 0.0
+        )
+        if is_stratified_subsampled:
+            actual_polar_mode = "stratified_sample_future_only"
+        elif is_partial_scoring:
+            actual_polar_mode = "capped_full_future_only"
+        else:
+            actual_polar_mode = "future_only"
+    else:
+        actual_aligned = []
+        actual_full_polar = None
+        actual_polar_mode = "no_future_replies"
+    bootstrap_ci_95 = _bootstrap_polar_ci_95(actual_aligned) if is_stratified_subsampled and actual_aligned else None
 
     stats_vec = cascade_stats.view(-1).tolist()
-    regimes_polar = (
-        "Phân cực xung đột gay gắt"
-        if raw_pred_polar >= 0.55 or (behavior_counts["hostile_conflict"] + behavior_counts["irrational_fallacy"]) >= 3
-        else ("Tranh luận đa chiều văn minh" if behavior_counts["constructive_oppose"] >= 2 else "Tương đối đồng thuận / ít chia rẽ")
+    lang_lit: Literal["vi", "en"] = "en" if str(lang).lower() == "en" else "vi"
+    regimes_polar = _classify_calibrated_regime(raw_pred_polar, behavior_counts, lang=lang_lit)
+    q50_ref, q75_ref, q90_ref = get_polar_quantiles(lang_lit)
+    calib_note = PHEME_QUANTILE_CALIBRATION_NOTE if lang_lit == "en" else VN_QUANTILE_CALIBRATION_NOTE
+
+    relinked_pair_set: set[tuple[str, str]] = set()
+    for item in junk_stats.get("relinked_edge_ids", []):
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            relinked_pair_set.add((str(item[0]), str(item[1])))
+
+    serialized_kept_nodes = [
+        {
+            "node_id": str(n["node_id"]),
+            "parent_id": str(n["parent_id"]) if n.get("parent_id") is not None else None,
+            "author_hash": str(n["user_id_hash"]) if n.get("user_id_hash") is not None else None,
+            "depth": int(depth_map.get(str(n["node_id"]), 0)),
+            "time_delay_sec": float(dt_sec),
+            "text": str(n["text"]),
+        }
+        for n, dt_sec in zip(display_nodes, delays_display)
+    ]
+    serialized_kept_edges = []
+    for d_e in display_edge_details:
+        s_val = float(d_e["s_uv"])
+        is_sc = bool(d_e.get("is_scored", True))
+        stance_cls = (
+            "unscored"
+            if not is_sc
+            else ("support" if s_val > 0.1 else ("oppose" if s_val < -0.1 else "neutral"))
+        )
+        src_s = str(d_e["parent_id"])
+        dst_s = str(d_e["node_id"])
+        serialized_kept_edges.append(
+            {
+                "source_id": src_s,
+                "target_id": dst_s,
+                "s_uv": s_val,
+                "h_uv": float(d_e["h_uv"]),
+                "stance_class": stance_cls,
+                "behavior_label": str(d_e["behavior_label"]),
+                "relinked": (src_s, dst_s) in relinked_pair_set,
+                "is_scored": is_sc,
+            }
+        )
+
+    imp_by_target: dict[str, float] = {}
+    for trig in diag["top_trigger_edges"]:
+        pair = trig.get("pair")
+        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+            imp_by_target[str(pair[1])] = float(trig.get("importance", 0.0))
+
+    topic_snippets = [
+        str(n.get("text") or "")
+        for n in (display_nodes[1:12] if analysis_mode == "full" else gnn_nodes[1:6])
+    ]
+    with (inference_lock if inference_lock is not None else contextlib.nullcontext()):
+        topic_analysis = classify_post_topics(
+            str(post.get("title") or ""),
+            str(post.get("selftext") or post.get("body") or root_row.get("text") or ""),
+            reply_snippets=topic_snippets,
+            custom_topics=custom_topics,
+            lang=lang_lit,
+            backend=topic_backend,
+            node_encoder=frozen_node_encoder,
+            node_tokenizer=frozen_node_tok,
+            allow_nli_download=allow_nli_topic_download,
+            device=live_device,
+        )
+
+    if is_partial_scoring:
+        scored_node_ids = (
+            {root_id}
+            | {str(e["source_id"]) for e in scored_edges_only}
+            | {str(e["target_id"]) for e in scored_edges_only}
+        )
+        analysis_nodes = [n for n in node_records if str(n["node_id"]) in scored_node_ids]
+        analysis_edges = scored_edges_only
+    else:
+        analysis_nodes = node_records
+        analysis_edges = edge_records
+
+    large_thread_analysis = analyze_large_thread_dynamics(
+        root_node=root_row,
+        all_nodes=analysis_nodes,
+        all_edges=analysis_edges,
+        edge_scores=edge_scores,
+        depth_map=depth_map,
+        topic_analysis=topic_analysis,
+        trigger_importance_by_target=imp_by_target,
+        k_early_ref=k_horizon,
+        lang=lang_lit,
+        scope="full_analysis" if analysis_mode == "full" else "early_post_hoc",
+        full_tree_nodes=node_records,
+        full_tree_edges=edge_records,
     )
+
+    if is_stratified_subsampled:
+        large_thread_analysis["is_stratified_estimate"] = True
+        large_thread_analysis["bootstrap_ci_95"] = bootstrap_ci_95
+    if is_partial_scoring:
+        large_thread_analysis["total_replies_kept_tree"] = len(non_roots)
+
+    total_scope_edges = max(len(scope_edges), len(edges_to_score))
+    coverage_ratio = round(float(len(edges_to_score)) / float(max(1, total_scope_edges)), 4)
+    elapsed_ms = round((time.perf_counter() - t_scan_start) * 1000.0, 2)
+    mega_scan_summary = {
+        "scan_strategy": scan_strategy,
+        "max_full_comments_cap": max_full_comments,
+        "sample_budget": sample_budget if scan_strategy == "stratified" else None,
+        "total_raw_comments": raw_comment_count,
+        "kept_comments": len(non_roots),
+        "analyzed_display_comments": len(display_nodes) - 1,
+        "scored_edges": len(edges_to_score),
+        "total_edges": total_scope_edges,
+        "coverage_ratio": coverage_ratio,
+        "bootstrap_ci_95": bootstrap_ci_95,
+        "ood_scale_warning": ood_scale_warning,
+        "training_max_replies_ref": TRAINING_MAX_REPLIES_REF,
+        "elapsed_ms": elapsed_ms,
+        "hotspot_branches": list(large_thread_analysis.get("hotspot_branches") or []),
+    }
 
     return {
         "root_title": str(post.get("title") or root_row["text"][:120]),
-        "k_observed": len(kept_nodes) - 1,
+        "lang": lang_lit,
+        "analysis_mode": analysis_mode,
+        "scan_strategy": scan_strategy,
+        "gnn_k_horizon": len(gnn_nodes) - 1,
+        "forecast_scope": "early_k_in_distribution",
+        "k_observed": len(display_nodes) - 1,
         "edge_dim": int(target_edge_dim),
         "checkpoint_loaded": checkpoint_loaded,
+        "cross_encoder_loaded": cross_encoder_loaded,
+        "nlp_backend": nlp_backend,
+        "junk_mode": junk_mode,
+        "junk_filter_stats": dict(junk_stats),
+        "ood_scale_warning": ood_scale_warning,
+        "training_max_replies_ref": TRAINING_MAX_REPLIES_REF,
+        "kept_nodes": serialized_kept_nodes,
+        "kept_edges": serialized_kept_edges,
         "early_burst_metrics": {
             "elapsed_span_norm": stats_vec[0],
             "mean_interarrival_norm": stats_vec[1],
@@ -645,25 +2716,38 @@ def predict_live_cascade(
             "one_sided_hostility_index": stats_vec[7],
         },
         "behavior_counts": behavior_counts,
+        "early_behavior_summary": early_behavior_summary,
+        "early_y_polar": float(early_y_polar_val),
         "predicted_total_replies": raw_pred_replies,
         "predicted_polarization_score": raw_pred_polar,
         "predicted_regime": regimes_polar,
-        "confidence_score": float(diag["confidence_score"].view(-1)[0].item()),
+        "regime_thresholds": {
+            "q50": q50_ref,
+            "q75": q75_ref,
+            "q90": q90_ref,
+        },
+        "note": calib_note,
+        "confidence_score": conf_score,
+        "uncertainty_available": uncertainty_available,
         "low_signal_warning": bool(diag["low_signal_warning"].view(-1)[0].item()),
         "top_trigger_edges": diag["top_trigger_edges"],
-        "flagged_irrational_or_hostile": [
-            d for d in kept_edge_details if d["behavior_label"] in {"irrational_fallacy", "hostile_conflict"}
+        "flagged_hostile": [
+            d for d in gnn_edge_details if d["behavior_label"] == "hostile_conflict"
         ],
+        "topic_analysis": topic_analysis,
+        "large_thread_analysis": large_thread_analysis,
+        "mega_scan_summary": mega_scan_summary,
+        "gnn_structural_probe": gnn_structural_probe,
         "actual_post_hoc_comparison": {
-            "has_future_replies": actual_total_replies > (len(kept_nodes) - 1),
+            "has_future_replies": has_future,
             "actual_total_replies": actual_total_replies,
             "actual_full_polarization": actual_full_polar,
+            "actual_full_polarization_mode": actual_polar_mode,
         },
     }
 
 
 def _format_report_vi(result: Mapping[str, Any]) -> str:
-    is_2d = int(result.get("edge_dim", 2)) == 2 and bool(result.get("checkpoint_loaded"))
     lines = [
         "=" * 78,
         "BAO CAO DU BAO SOM & PHAN TICH HANH VI TRANH LUAN (SBi-FAGAT Unified 2D)",
@@ -676,32 +2760,32 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
     lines.extend(
         [
             f"Bai goc      : {result['root_title']}",
-            f"Cua so quan sat (V_K): {result['k_observed']} binh luan dau tien",
-            f"Trang thai GNN       : {'Da nap checkpoint huan luyen (2D [s_uv, h_uv])' if is_2d else ('Da nap checkpoint huan luyen' if result['checkpoint_loaded'] else 'CHE DO KIEM THU CAU TRUC (CHUA NAP CHECKPOINT - KHONG CO GIA TRI DU BAO)')}",
+            f"Cua so GNN du bao som (V_K): {result.get('gnn_k_horizon', result['k_observed'])} binh luan dau (in-distribution)",
+            f"Pham vi hien thi & phan tich: {result['k_observed']} binh luan ({result.get('analysis_mode', 'early')})",
+            f"Trang thai GNN       : {'Da nap checkpoint huan luyen (2D [s_uv, h_uv])' if result['checkpoint_loaded'] else 'CHE DO KIEM THU CAU TRUC (CHUA NAP CHECKPOINT - KHONG CO GIA TRI DU BAO)'}",
+            f"Backend NLP          : {result.get('nlp_backend', 'unknown')} (cross_encoder_loaded={result.get('cross_encoder_loaded', False)})",
+            f"Che do loc rac       : {result.get('junk_mode', 'prune')}",
             "",
-            (
-                "[1] PHAN BO LAP TRUONG & GAY GAT 2D [s_uv, h_uv] TRONG 20 BINH LUAN DAU:"
-                if is_2d
-                else "[1] PHAN LOAI 5 NHOM HANH VI TRONG 20 BINH LUAN DAU:"
-            ),
+            "[1] PHAN BO LAP TRUONG & GAY GAT 2D [s_uv, h_uv] TRONG 20 BINH LUAN DAU:",
         ]
     )
-    if is_2d:
-        bc = result["behavior_counts"]
-        lines.append(f"  - Ung ho / dong tinh (s > 0.1)           : {bc.get('support', 0)} binh luan")
-        lines.append(f"  - Trung lap / hoi dap                    : {bc.get('neutral', 0)} binh luan")
-        lines.append(f"  - Phan bien on hoa (s < -0.1, h <= 0.6)  : {bc.get('constructive_oppose', 0)} binh luan")
-        lines.append(f"  - Xung dot / gay gat cao (h > 0.6)       : {bc.get('hostile_conflict', 0)} binh luan")
-    else:
-        for lbl in DISCOURSE_BEHAVIOR_LABELS:
-            cnt = result["behavior_counts"].get(lbl, 0)
-            lines.append(f"  - {BEHAVIOR_LABEL_VI.get(lbl, lbl):38s}: {cnt} binh luan")
+    bc = result["behavior_counts"]
+    lines.append(f"  - {_BEHAVIOR_LABEL_VI_2D['support']} (s > 0.1)           : {bc.get('support', 0)} binh luan")
+    lines.append(f"  - {_BEHAVIOR_LABEL_VI_2D['neutral']}                    : {bc.get('neutral', 0)} binh luan")
+    lines.append(f"  - {_BEHAVIOR_LABEL_VI_2D['constructive_oppose']} (s < -0.1, h <= 0.6)  : {bc.get('constructive_oppose', 0)} binh luan")
+    lines.append(f"  - {_BEHAVIOR_LABEL_VI_2D['hostile_conflict']} (h > 0.6)       : {bc.get('hostile_conflict', 0)} binh luan")
 
     bm = result["early_burst_metrics"]
     sec3_header = (
         "[3] DU BAO TUONG LAI & DO TU TIN:"
         if result["checkpoint_loaded"]
         else "[3] DU BAO TUONG LAI: [CANH BAO: CHUA NAP CHECKPOINT - CAC CHI SO BEN DUOI LA NGAU NHIEN]"
+    )
+    conf_val = result.get("confidence_score")
+    conf_str = (
+        f"{float(conf_val):.1%}"
+        if conf_val is not None
+        else "N/A (uncertainty disabled)"
     )
     lines.extend(
         [
@@ -715,45 +2799,64 @@ def _format_report_vi(result: Mapping[str, Any]) -> str:
             f"  - Quy mo binh luan cuoi ky du kien         : ~{result['predicted_total_replies']:.1f} binh luan",
             f"  - Chi so phan cuc du kien [0..1]           : {result['predicted_polarization_score']:.4f}",
             f"  - Danh gia cuc dien                        : {result['predicted_regime']}",
-            f"  - Do tu tin du bao                         : {result['confidence_score']:.1%}",
+            f"  - Do tu tin du bao                         : {conf_str}",
         ]
     )
     if result["low_signal_warning"]:
         lines.append("  [!] CANH BAO TIN HIEU THAP: Binh luan dau nhat/thieu du kien -> Khuyen nghi cho them den moc K=35-50.")
 
-    flagged = result.get("flagged_irrational_or_hostile") or []
+    flagged = result.get("flagged_hostile") or []
     lines.append("")
-    if is_2d:
-        lines.append(f"[4] DIEM MAT BINH LUAN GAY GAT / XUNG DOT CAO ({len(flagged)} cau):")
-        for idx, item in enumerate(flagged[:5], start=1):
-            lines.append(
-                f"  {idx}. [Xung dot gay gat] (s_uv={item['s_uv']:+.2f}, h_uv={item['h_uv']:.2f})"
-            )
-            lines.append(f"     \"{item['reply_text'][:160]}\"")
-    else:
-        lines.append(f"[4] DIEM MAT BINH LUAN VO LY / CHONG DOI NGUY HIEM NHAT ({len(flagged)} cau):")
-        for idx, item in enumerate(flagged[:5], start=1):
-            lbl_vi = BEHAVIOR_LABEL_VI.get(item["behavior_label"], item["behavior_label"])
-            lines.append(
-                f"  {idx}. [{lbl_vi}] (s={item['s_uv']:+.2f}, gay_gat={item['h_uv']:.2f}, vo_ly={item['r_uv']:.2f})"
-            )
-            lines.append(f"     \"{item['reply_text'][:160]}\"")
+    lines.append(f"[4] DIEM MAT BINH LUAN GAY GAT / XUNG DOT CAO ({len(flagged)} cau):")
+    for idx, item in enumerate(flagged[:5], start=1):
+        lines.append(
+            f"  {idx}. [Xung dot gay gat] (s_uv={item['s_uv']:+.2f}, h_uv={item['h_uv']:.2f})"
+        )
+        lines.append(f"     \"{item['reply_text'][:160]}\"")
 
     act = result["actual_post_hoc_comparison"]
-    polar_note = (
-        "(toan bo cay chua nhieu binh luan hon K)"
-        if act.get("has_future_replies")
-        else "(do so binh luan thuc te <= K nen E[y_polar | stances quan sat])"
-    )
+    early_pol = result.get("early_y_polar")
+    early_pol_str = f"{float(early_pol):.4f}" if early_pol is not None else "N/A"
+    act_pol = act.get("actual_full_polarization")
+    if act.get("has_future_replies") and act_pol is not None:
+        act_mode = str(act.get("actual_full_polarization_mode") or "future_only")
+        act_pol_str = f"{float(act_pol):.4f} ({act_mode}, t > K)"
+    else:
+        act_pol_str = "N/A (chua co binh luan t > K)"
     lines.extend(
         [
             "",
             "[5] DOI CHIEU THUC TE (KHONG LOT VAO DAU VAO MO HINH):",
             f"  - Tong so binh luan thuc te toan bai       : {act['actual_total_replies']} binh luan",
-            f"  - Do phan cuc quan sat/cuoi ky thuc te     : {act['actual_full_polarization']:.4f} {polar_note}",
-            "=" * 78,
+            f"  - Do phan cuc quan sat som (1..K)          : {early_pol_str}",
+            f"  - Do phan cuc tuong lai thuc te (t > K)    : {act_pol_str}",
         ]
     )
+    topic_info = result.get("topic_analysis") or {}
+    large_info = result.get("large_thread_analysis") or {}
+    sem_info = large_info.get("semantic_understanding") or {}
+    if topic_info:
+        sec_str = ", ".join(topic_info.get("secondary_topics") or ()) or "Không"
+        lines.extend(
+            [
+                "",
+                "[6] PHAN LOAI CHU DE & HIEU BAI LON (AI):",
+                f"  - Chu de chinh ({topic_info.get('topic_backend', 'lexical')}) : "
+                f"{topic_info.get('primary_topic', 'N/A')} ({float(topic_info.get('primary_confidence', 0.0)):.1%})",
+                f"  - Chu de phu                             : {sec_str}",
+            ]
+        )
+    if large_info:
+        lines.extend(
+            [
+                f"  - Quy mo & Pham vi ({large_info.get('scope', 'full')})   : "
+                f"{large_info.get('scale_label_vi', '')} ({large_info.get('total_replies_analyzed', 0)} binh luan, {large_info.get('unique_authors_total', 0)} tac gia)",
+                f"  - Tinh chat thao luan                    : {large_info.get('post_archetype_label_vi', '')}",
+                f"  - Xu huong tien hoa                      : {large_info.get('evolution_trend_label_vi', '')}",
+                f"  - Tong hop trich xuat (Extractive)       : {sem_info.get('summary_vi', '')}",
+            ]
+        )
+    lines.append("=" * 78)
     return "\n".join(lines)
 
 
@@ -763,7 +2866,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Live social thread early polarization & virality forecast.")
     parser.add_argument("--reddit-url", "--url", dest="reddit_url", type=str, default=None)
     parser.add_argument("--thread-id", type=str, default=None)
-    parser.add_argument("--input-json", type=Path, default=None)
+    parser.add_argument("--input-json", "--input-file", dest="input_json", type=Path, default=None)
     parser.add_argument("--demo-offline", action="store_true")
     parser.add_argument(
         "--allow-untrained",
@@ -774,17 +2877,48 @@ def main() -> None:
     parser.add_argument("--gnn-ckpt", "--checkpoint", dest="gnn_ckpt", type=Path, default=None)
     parser.add_argument("--node-backbone", type=str, default=None)
     parser.add_argument("--k-horizon", type=int, default=20)
+    parser.add_argument("--analysis-mode", choices=["early", "full"], default="early")
+    parser.add_argument("--max-full-comments", type=int, default=500)
+    parser.add_argument("--scan-strategy", choices=["full", "stratified"], default="full")
+    parser.add_argument("--sample-budget", type=int, default=600)
+    parser.add_argument("--topics", type=str, default=None, help="Danh sach chu de tuy chinh (ngan cach bang dau phay).")
+    parser.add_argument("--topic-backend", choices=["auto", "nli", "embedding", "lexical"], default="auto")
+    parser.add_argument(
+        "--allow-nli-topic-download",
+        action="store_true",
+        help="Cho phep tai mDeBERTa-v3-xnli tu HuggingFace neu chua co trong cache cuc bo.",
+    )
     parser.add_argument("--lang", choices=["vi", "en"], default="vi")
+    parser.add_argument("--junk-mode", choices=["prune", "contract"], default="prune")
     parser.add_argument("--output-json", type=Path, default=None)
     args = parser.parse_args()
+
+    if args.k_horizon < 1:
+        raise ValueError(f"k_horizon must be >= 1, got {args.k_horizon}")
+    if args.max_full_comments < 1 or args.max_full_comments > 10000:
+        raise ValueError(f"max_full_comments must be in [1, 10000], got {args.max_full_comments}")
+    if args.sample_budget < 1:
+        raise ValueError(f"sample_budget must be >= 1, got {args.sample_budget}")
+    if (args.reddit_url or args.thread_id) and args.gnn_ckpt is None and not args.allow_untrained:
+        raise RuntimeError(
+            "Không tìm thấy checkpoint mô hình GNN (--gnn-ckpt). "
+            "Không chạy suy luận trên bài đăng thật bằng trọng số khởi tạo ngẫu nhiên; "
+            "hãy truyền --gnn-ckpt hoặc --allow-untrained."
+        )
 
     if args.demo_offline:
         post, comments = _make_demo_offline_thread()
     elif args.input_json is not None:
-        post, comments = _load_thread_from_json(args.input_json)
-    elif args.reddit_url or args.thread_id:
-        pid = args.thread_id or _extract_post_id_from_url(str(args.reddit_url))
-        post, comments = _fetch_reddit_thread(pid)
+        post, comments = load_thread_from_file(args.input_json, max_comments=args.max_full_comments)
+    elif args.thread_id:
+        pid = _validate_reddit_post_id(args.thread_id, source="--thread-id")
+        post, comments = (
+            fetch_reddit_thread_paginated(pid, max_comments=args.max_full_comments)
+            if args.max_full_comments > 500
+            else _fetch_reddit_thread(pid)
+        )
+    elif args.reddit_url:
+        post, comments = fetch_url_thread(str(args.reddit_url), max_comments=args.max_full_comments)
     else:
         raise ValueError("Provide one of --demo-offline, --input-json, --reddit-url, or --thread-id")
 
@@ -792,10 +2926,18 @@ def main() -> None:
         post,
         comments,
         k_horizon=args.k_horizon,
+        analysis_mode=args.analysis_mode,
+        max_full_comments=args.max_full_comments,
+        scan_strategy=args.scan_strategy,
+        sample_budget=args.sample_budget,
+        custom_topics=args.topics,
+        topic_backend=args.topic_backend,
+        allow_nli_topic_download=args.allow_nli_topic_download,
         cross_encoder_ckpt=args.cross_encoder_ckpt,
         gnn_ckpt=args.gnn_ckpt,
         node_backbone=args.node_backbone,
         lang=args.lang,
+        junk_mode=args.junk_mode,
         allow_untrained=args.allow_untrained,
         is_demo=args.demo_offline,
     )

@@ -22,7 +22,7 @@ import warnings
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import pyarrow.parquet as pq
 import requests
@@ -182,9 +182,162 @@ def is_invalid_or_spam_text(text: str, author_raw: str | None = None) -> bool:
     return False
 
 
+_EXPLICIT_FILLER_PHRASES: frozenset[str] = frozenset(
+    {
+        "hong",
+        "hóng",
+        "cham",
+        "chấm",
+        "up",
+        "bump",
+        "cmt",
+        "ke",
+        "ké",
+        "xin slot",
+        "cham hong",
+        "chấm hóng",
+        "hong ke",
+        "hóng ké",
+        "lot dep",
+        "lót dép",
+        "lot dep hong",
+        "lót dép hóng",
+        "dau chan",
+        "dấu chân",
+        "dat gach",
+        "đặt gạch",
+        "ok",
+        "oke",
+    }
+)
+
+
+def is_filler_junk_text(text: str, author_raw: str | None = None) -> bool:
+    """Return True for invalid/spam comments, punctuation/emoji-only noise, or explicit fillers.
+
+    Preserves meaningful short Vietnamese stances (e.g., ``Đồng ý``, ``Phản đối``,
+    ``Không nên``, ``Chuẩn bác``, ``Đúng rồi``, ``Sai rồi``, ``+1``, ``Đồng tình``,
+    ``Ủng hộ``, ``Tào lao``) instead of applying a blind token-length cutoff.
+    """
+    if is_invalid_or_spam_text(text, author_raw=author_raw):
+        return True
+
+    norm = normalize_social_text_nfc(text).strip()
+    if not norm:
+        return True
+    if norm in {"+1", "-1"}:
+        return False
+    if not any(ch.isalnum() for ch in norm):
+        return True
+
+    stripped = re.sub(r"[^\w\s]", " ", norm.lower(), flags=re.UNICODE)
+    collapsed = " ".join(stripped.split())
+    if not collapsed:
+        return True
+    return collapsed in _EXPLICIT_FILLER_PHRASES
+
+
+def resolve_contracted_parent_id(
+    node_id: str,
+    raw_parent_map: Mapping[str, str],
+    kept_ids: set[str],
+    root_id: str,
+    *,
+    traversed_junk_out: set[str] | None = None,
+    traversed_chain_out: list[str] | None = None,
+    truncated_orphans_out: set[str] | None = None,
+    drop_truncated_orphans: bool = False,
+) -> str | None:
+    """Climb ``raw_parent_map`` from ``node_id`` to nearest kept ancestor or ``root_id`` with cycle & orphan guards.
+
+    Distinguishes deleted/filler intermediates (present in ``raw_parent_map``) from
+    truncated-API orphans (ancestor ``curr != root_id`` absent from ``raw_parent_map``).
+    When a truncated ancestor is encountered, adds ``node_id`` to ``truncated_orphans_out``
+    and returns ``None`` if ``drop_truncated_orphans=True`` (otherwise falls back to ``root_id``).
+    """
+    seen: set[str] = {node_id}
+    traversed_junk: list[str] = []
+    curr = str(raw_parent_map.get(node_id) or "").strip()
+    while curr:
+        if curr == root_id or curr in seen:
+            if traversed_junk_out is not None:
+                traversed_junk_out.update(traversed_junk)
+            if traversed_chain_out is not None:
+                traversed_chain_out.extend(traversed_junk)
+            return root_id
+        if curr in kept_ids:
+            probe = curr
+            probe_seen: set[str] = set(seen)
+            has_cycle = False
+            hit_missing = False
+            while probe and probe != root_id:
+                if probe in probe_seen:
+                    has_cycle = True
+                    break
+                if probe not in raw_parent_map:
+                    hit_missing = True
+                    break
+                probe_seen.add(probe)
+                probe = str(raw_parent_map.get(probe) or "").strip()
+            if hit_missing:
+                if drop_truncated_orphans:
+                    if truncated_orphans_out is not None:
+                        truncated_orphans_out.add(node_id)
+                    return None
+                if traversed_junk_out is not None:
+                    traversed_junk_out.update(traversed_junk)
+                if traversed_chain_out is not None:
+                    traversed_chain_out.extend(traversed_junk)
+                return root_id if has_cycle else curr
+            if traversed_junk_out is not None:
+                traversed_junk_out.update(traversed_junk)
+            if traversed_chain_out is not None:
+                traversed_chain_out.extend(traversed_junk)
+            return root_id if has_cycle else curr
+        if curr not in raw_parent_map:
+            if truncated_orphans_out is not None:
+                truncated_orphans_out.add(node_id)
+            if traversed_junk_out is not None:
+                traversed_junk_out.update(traversed_junk)
+            if traversed_chain_out is not None:
+                traversed_chain_out.extend(traversed_junk)
+            return None if drop_truncated_orphans else root_id
+        seen.add(curr)
+        traversed_junk.append(curr)
+        curr = str(raw_parent_map.get(curr) or "").strip()
+
+    if traversed_junk_out is not None:
+        traversed_junk_out.update(traversed_junk)
+    if traversed_chain_out is not None:
+        traversed_chain_out.extend(traversed_junk)
+    return root_id
+
+
+def compose_contracted_edge_stance(
+    chain_stances: Sequence[float | None],
+    child_stance: float,
+) -> tuple[float, int, bool]:
+    """Compose signed stance across contracted intermediates: ``(effective_stance, parity, inversion_risk)``.
+
+    Neutral fillers (``|s| <= 0.1``) preserve parity (``+1``); opposing intermediates
+    (``s < -0.1``) flip parity (``-1``); any opaque/unknown intermediate (``None``, e.g.
+    ``[deleted]`` without prior stance) returns ``(float(child_stance), 0, True)``.
+    """
+    parity = 1
+    for s in chain_stances:
+        if s is None:
+            return float(child_stance), 0, True
+        s_val = float(s)
+        if abs(s_val) <= 0.1:
+            parity *= 1
+        else:
+            parity *= 1 if s_val > 0.0 else -1
+    return float(parity) * float(child_stance), parity, False
+
+
 def contains_vietnamese_chars(text: str) -> bool:
     """Return True if text contains Vietnamese diacritic vowels or `đ/Đ`."""
-    return bool(_VN_DIACRITIC_RE.search(text))
+    return bool(_VN_DIACRITIC_RE.search(normalize_social_text_nfc(str(text or ""))))
 
 
 def _ensure_prefixed_id(raw_id: Any, prefix: str) -> str:
@@ -450,8 +603,18 @@ def build_vn_cascade_from_thread(
     min_comments: int = 25,
     min_depth: int = 3,
     min_vi_ratio: float = 0.65,
+    junk_mode: Literal["prune", "contract"] = "prune",
+    orphan_mode: Literal["prune", "flag_root"] = "prune",
+    preserve_opaque_deleted_bridges: bool = False,
+    prior_edge_stances: Mapping[str, float] | None = None,
+    stats_out: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]] | None:
     """Validate and convert one Reddit thread into SBi-FAGAT node/edge record lists."""
+    if junk_mode not in {"prune", "contract"}:
+        raise ValueError(f"Unsupported junk_mode {junk_mode!r}; expected 'prune' or 'contract'")
+    if orphan_mode not in {"prune", "flag_root"}:
+        raise ValueError(f"Unsupported orphan_mode {orphan_mode!r}; expected 'prune' or 'flag_root'")
+
     post_id = _strip_id_prefix(post.get("id") or post.get("name") or "")
     if not post_id:
         return None
@@ -482,10 +645,9 @@ def build_vn_cascade_from_thread(
     subreddit = str(post.get("subreddit") or "unknown").strip()
     topic_id = _compute_topic_id(post, title_nfc or root_text)
 
-    # Filter candidate comments (pre-cleaned text, valid link_id & parent_id, non-spam)
-    valid_comments: dict[str, dict[str, Any]] = {}
-    children_adj: dict[str, list[str]] = {root_fullname: []}
-
+    # Pass 1: Map every raw comment's node_id -> raw parent_id before filtering junk.
+    raw_comments_map: dict[str, Mapping[str, Any]] = {}
+    raw_parent_map: dict[str, str] = {}
     for c in comments:
         fullname = str(c.get("fullname") or "")
         if not fullname.startswith("t1_"):
@@ -496,25 +658,138 @@ def build_vn_cascade_from_thread(
         parent_id = str(c.get("parent_id") or "").strip()
         if not parent_id.startswith(("t3_", "t1_")) or parent_id == fullname:
             continue
-        if bool(c.get("author_is_bot")):
+        if fullname in raw_comments_map:
             continue
-        c_text = normalize_social_text_nfc(str(c.get("text") or ""))
-        if is_invalid_or_spam_text(c_text):
-            continue
-        c_text = redact_pii_text(c_text)
-        c_ts = _to_float_utc(c.get("created_utc"))
-        if c_ts is None:
+        raw_comments_map[fullname] = c
+        raw_parent_map[fullname] = parent_id
+
+    valid_comments: dict[str, dict[str, Any]] = {}
+    junk_ids: set[str] = set()
+    junk_reasons: dict[str, str] = {}
+    raw_prior_stances: dict[str, float] = {}
+    for fullname, c in raw_comments_map.items():
+        if prior_edge_stances is not None and fullname in prior_edge_stances:
+            raw_prior_stances[fullname] = float(prior_edge_stances[fullname])
+        elif c.get("prior_s_uv") is not None:
+            raw_prior_stances[fullname] = float(c["prior_s_uv"])
+
+        raw_author = c.get("author_raw") if c.get("author_raw") is not None else c.get("author")
+        author_str = str(raw_author) if raw_author is not None else None
+        if bool(c.get("author_is_bot")) or (
+            isinstance(author_str, str) and author_str.strip().lower() == "automoderator"
+        ):
+            junk_ids.add(fullname)
+            junk_reasons[fullname] = "bot"
             continue
 
-        if fullname not in valid_comments:
-            valid_comments[fullname] = {
-                "fullname": fullname,
-                "parent_id": parent_id,
-                "text": c_text,
-                "created_utc": c_ts,
-                "author_hash": c.get("author_hash"),
+        c_text = normalize_social_text_nfc(str(c.get("text") or c.get("body") or ""))
+        low_c = c_text.strip().lower()
+        if not low_c or low_c in {"[deleted]", "[removed]"}:
+            junk_ids.add(fullname)
+            junk_reasons[fullname] = "deleted_or_removed"
+            continue
+        if is_invalid_or_spam_text(c_text, author_raw=author_str):
+            junk_ids.add(fullname)
+            junk_reasons[fullname] = "spam"
+            continue
+        if junk_mode == "contract" and is_filler_junk_text(c_text, author_raw=author_str):
+            junk_ids.add(fullname)
+            junk_reasons[fullname] = "filler"
+            continue
+
+        c_ts = _to_float_utc(c.get("created_utc"))
+        if c_ts is None:
+            junk_ids.add(fullname)
+            junk_reasons[fullname] = "invalid_ts"
+            continue
+        valid_comments[fullname] = {
+            "fullname": fullname,
+            "parent_id": raw_parent_map[fullname],
+            "text": redact_pii_text(c_text),
+            "created_utc": c_ts,
+            "author_hash": c.get("author_hash"),
+        }
+
+    if preserve_opaque_deleted_bridges and junk_mode == "contract":
+        bridge_ancestors: set[str] = set()
+        for fn in valid_comments:
+            seen_b: set[str] = {fn}
+            curr_b = raw_parent_map.get(fn, "")
+            while curr_b and curr_b != root_fullname and curr_b not in seen_b:
+                seen_b.add(curr_b)
+                if junk_reasons.get(curr_b) == "deleted_or_removed":
+                    bridge_ancestors.add(curr_b)
+                curr_b = raw_parent_map.get(curr_b, "")
+        for b_fn in sorted(bridge_ancestors):
+            b_raw = raw_comments_map[b_fn]
+            b_ts = _to_float_utc(b_raw.get("created_utc"))
+            valid_comments[b_fn] = {
+                "fullname": b_fn,
+                "parent_id": raw_parent_map[b_fn],
+                "text": "[deleted_bridge]",
+                "created_utc": b_ts if b_ts is not None else root_raw_ts,
+                "author_hash": None,
             }
-            children_adj.setdefault(parent_id, []).append(fullname)
+            junk_ids.discard(b_fn)
+            junk_reasons.pop(b_fn, None)
+
+    # Detect truncated-API orphans (ancestor chain hits a missing parent != root_fullname)
+    truncated_orphan_ids: set[str] = set()
+    for fn in list(valid_comments.keys()):
+        seen_o: set[str] = {fn}
+        curr_o = str(raw_parent_map.get(fn) or "").strip()
+        while curr_o:
+            if curr_o == root_fullname or curr_o in seen_o:
+                break
+            if curr_o not in raw_parent_map:
+                truncated_orphan_ids.add(fn)
+                break
+            seen_o.add(curr_o)
+            curr_o = str(raw_parent_map.get(curr_o) or "").strip()
+
+    # Pass 2: Build adjacency (pruning subtrees in "prune" mode; contracting junk in "contract" mode).
+    children_adj: dict[str, list[str]] = {root_fullname: []}
+    contracted_junk_ids: set[str] = set()
+    relinked_chains: dict[str, list[str]] = {}
+    contract_orphans: set[str] = set()
+    if junk_mode == "contract":
+        if orphan_mode == "prune" and truncated_orphan_ids:
+            for fn in truncated_orphan_ids:
+                valid_comments.pop(fn, None)
+        kept_ids_set = set(valid_comments.keys())
+        for fn in list(valid_comments.keys()):
+            c_obj = valid_comments[fn]
+            chain: list[str] = []
+            resolved_parent = resolve_contracted_parent_id(
+                fn,
+                raw_parent_map,
+                kept_ids_set,
+                root_fullname,
+                traversed_junk_out=contracted_junk_ids,
+                traversed_chain_out=chain,
+                truncated_orphans_out=contract_orphans,
+                drop_truncated_orphans=(orphan_mode == "prune"),
+            )
+            if resolved_parent is None:
+                valid_comments.pop(fn, None)
+                continue
+            c_obj["parent_id"] = resolved_parent
+            if chain:
+                relinked_chains[fn] = chain
+            children_adj.setdefault(resolved_parent, []).append(fn)
+        truncated_orphan_ids.update(contract_orphans)
+    else:
+        for fn, c_obj in valid_comments.items():
+            if orphan_mode == "prune" and fn in truncated_orphan_ids:
+                continue
+            if (
+                orphan_mode == "flag_root"
+                and c_obj["parent_id"] != root_fullname
+                and c_obj["parent_id"] not in raw_parent_map
+            ):
+                c_obj["parent_id"] = root_fullname
+                contract_orphans.add(fn)
+            children_adj.setdefault(c_obj["parent_id"], []).append(fn)
 
     # Sort children chronologically for deterministic BFS traversal
     for parent_key, c_list in children_adj.items():
@@ -524,7 +799,7 @@ def build_vn_cascade_from_thread(
             else (0.0, fn)
         )
 
-    # BFS from root_fullname automatically prunes subtrees beneath deleted/spam parents
+    # BFS from root_fullname computes topological depths, monotonic UTC timestamps, and edges
     root_dt = datetime.fromtimestamp(root_raw_ts, tz=timezone.utc)
     cascade_id = f"vn_{post_id}"
     source_dataset = f"arctic_shift_{subreddit.lower()}"
@@ -535,6 +810,8 @@ def build_vn_cascade_from_thread(
 
     node_records: list[dict[str, Any]] = []
     edge_records: list[dict[str, Any]] = []
+    relinked_edge_ids: list[list[str]] = []
+    relinked_edge_metadata: list[dict[str, Any]] = []
     queue: deque[str] = deque([root_fullname])
     vi_node_count = 0
 
@@ -573,7 +850,7 @@ def build_vn_cascade_from_thread(
             }
         )
 
-        if not is_root and parent_fn is not None:
+        if not is_root and parent_fn is not None and parent_node_id is not None:
             delay_sec = max(
                 0.0,
                 (effective_dt[curr_fn] - effective_dt[parent_fn]).total_seconds(),
@@ -589,6 +866,33 @@ def build_vn_cascade_from_thread(
                     "edge_type": "reply",
                 }
             )
+            if junk_mode == "contract" and parent_fn != raw_parent_map.get(curr_fn):
+                relinked_edge_ids.append([parent_node_id, node_id])
+                chain_fns = relinked_chains.get(curr_fn, [])
+                chain_nids = [f"{cascade_id}_{x}" for x in chain_fns]
+                reasons = [junk_reasons.get(x, "unknown") for x in chain_fns]
+                if curr_fn in contract_orphans:
+                    parity, risk = 0, True
+                else:
+                    chain_stances: list[float | None] = []
+                    for x in chain_fns:
+                        if x in raw_prior_stances:
+                            chain_stances.append(raw_prior_stances[x])
+                        elif junk_reasons.get(x) in {"filler", "bot"}:
+                            chain_stances.append(0.0)
+                        else:
+                            chain_stances.append(None)
+                    _, parity, risk = compose_contracted_edge_stance(chain_stances, 1.0)
+                relinked_edge_metadata.append(
+                    {
+                        "source_id": parent_node_id,
+                        "target_id": node_id,
+                        "contracted_chain": chain_nids,
+                        "chain_reasons": reasons,
+                        "contracted_sign_parity": int(parity),
+                        "stance_inversion_risk": bool(risk),
+                    }
+                )
 
         for child_fn in children_adj.get(curr_fn, []):
             if child_fn in visited or child_fn not in valid_comments:
@@ -606,6 +910,37 @@ def build_vn_cascade_from_thread(
     max_depth = max(depths.values()) if depths else 0
     vi_ratio = vi_node_count / max(1, len(node_records))
 
+    if junk_mode == "contract":
+        contracted_nodes = len(contracted_junk_ids)
+        dropped_set = junk_ids - contracted_junk_ids
+        if orphan_mode == "prune":
+            dropped_set = dropped_set | truncated_orphan_ids
+        dropped_leaves = len(dropped_set)
+    else:
+        contracted_nodes = 0
+        dropped_leaves = len(raw_comments_map) - valid_reply_count
+
+    junk_filter_stats: dict[str, Any] = {
+        "mode": junk_mode,
+        "raw_comments": len(raw_comments_map),
+        "kept_comments": valid_reply_count,
+        "dropped_leaves": dropped_leaves,
+        "contracted_nodes": contracted_nodes,
+        "relinked_edges": len(relinked_edge_ids),
+        "relinked_edge_ids": relinked_edge_ids,
+        "truncated_orphans": len(truncated_orphan_ids),
+        "truncated_orphan_node_ids": sorted(
+            f"{cascade_id}_{fn}" for fn in truncated_orphan_ids
+        ),
+        "stance_inversion_risk_edges": sum(
+            1 for m in relinked_edge_metadata if m["stance_inversion_risk"]
+        ),
+        "relinked_edge_metadata": relinked_edge_metadata,
+    }
+    if stats_out is not None:
+        stats_out.clear()
+        stats_out.update(junk_filter_stats)
+
     if valid_reply_count < min_comments:
         return None
     if max_depth < min_depth:
@@ -619,6 +954,7 @@ def build_vn_cascade_from_thread(
         "num_replies": valid_reply_count,
         "max_depth": max_depth,
         "vi_ratio": vi_ratio,
+        "junk_filter_stats": junk_filter_stats,
     }
     return node_records, edge_records, stats
 
@@ -958,6 +1294,136 @@ def crawl_arctic_shift_discussions(
     nodes_table = build_nodes_table(all_nodes)
     edges_table = build_edges_table(all_edges)
     return save_cascade_parquet(nodes_table, edges_table, output_dir=output_dir, validate=True)
+
+
+def compare_prune_vs_contract_on_threads(
+    threads: Sequence[tuple[Mapping[str, Any], Sequence[Mapping[str, Any]]] | Mapping[str, Any]],
+    *,
+    min_comments: int = 25,
+    min_depth: int = 3,
+    min_vi_ratio: float = 0.65,
+    k_horizon: int = 20,
+) -> dict[str, Any]:
+    """Compare ``junk_mode='prune'`` vs ``junk_mode='contract'`` across raw Reddit threads."""
+    kept_in_prune = 0
+    kept_in_contract = 0
+    rescued_by_contract = 0
+    replies_prune: list[int] = []
+    replies_contract: list[int] = []
+    depths_prune: list[int] = []
+    depths_contract: list[int] = []
+
+    total_contracted_nodes = 0
+    total_relinked_edges = 0
+    total_truncated_orphans = 0
+    total_stance_inversion_risk_edges = 0
+
+    jaccards: list[float] = []
+    shared_nodes_k = 0
+    mismatched_parents_k = 0
+
+    for item in threads:
+        if isinstance(item, Mapping):
+            post = item["post"]
+            comments = item.get("comments", ())
+        else:
+            post, comments = item
+
+        p_stats_out: dict[str, Any] = {}
+        c_stats_out: dict[str, Any] = {}
+        res_p = build_vn_cascade_from_thread(
+            post,
+            comments,
+            min_comments=min_comments,
+            min_depth=min_depth,
+            min_vi_ratio=min_vi_ratio,
+            junk_mode="prune",
+            stats_out=p_stats_out,
+        )
+        res_c = build_vn_cascade_from_thread(
+            post,
+            comments,
+            min_comments=min_comments,
+            min_depth=min_depth,
+            min_vi_ratio=min_vi_ratio,
+            junk_mode="contract",
+            stats_out=c_stats_out,
+        )
+
+        total_contracted_nodes += int(c_stats_out.get("contracted_nodes", 0))
+        total_relinked_edges += int(c_stats_out.get("relinked_edges", 0))
+        total_truncated_orphans += int(c_stats_out.get("truncated_orphans", 0))
+        total_stance_inversion_risk_edges += int(
+            c_stats_out.get("stance_inversion_risk_edges", 0)
+        )
+
+        if res_p is not None:
+            kept_in_prune += 1
+            replies_prune.append(int(res_p[2]["num_replies"]))
+            depths_prune.append(int(res_p[2]["max_depth"]))
+        if res_c is not None:
+            kept_in_contract += 1
+            replies_contract.append(int(res_c[2]["num_replies"]))
+            depths_contract.append(int(res_c[2]["max_depth"]))
+            if res_p is None:
+                rescued_by_contract += 1
+
+        if res_p is not None and res_c is not None:
+            p_nodes = sorted(
+                (r for r in res_p[0] if not bool(r.get("is_root"))),
+                key=lambda r: (r["created_at_utc"], str(r["node_id"])),
+            )[:k_horizon]
+            c_nodes = sorted(
+                (r for r in res_c[0] if not bool(r.get("is_root"))),
+                key=lambda r: (r["created_at_utc"], str(r["node_id"])),
+            )[:k_horizon]
+            p_map = {str(r["node_id"]): r.get("parent_id") for r in p_nodes}
+            c_map = {str(r["node_id"]): r.get("parent_id") for r in c_nodes}
+            p_set, c_set = set(p_map.keys()), set(c_map.keys())
+            union = p_set | c_set
+            inter = p_set & c_set
+            if union:
+                jaccards.append(float(len(inter)) / float(len(union)))
+            for nid in inter:
+                shared_nodes_k += 1
+                if p_map[nid] != c_map[nid]:
+                    mismatched_parents_k += 1
+
+    return {
+        "threads_evaluated": len(threads),
+        "kept_in_prune": kept_in_prune,
+        "kept_in_contract": kept_in_contract,
+        "rescued_by_contract": rescued_by_contract,
+        "mean_replies_prune": (
+            float(sum(replies_prune)) / float(len(replies_prune)) if replies_prune else 0.0
+        ),
+        "mean_replies_contract": (
+            float(sum(replies_contract)) / float(len(replies_contract))
+            if replies_contract
+            else 0.0
+        ),
+        "mean_depth_prune": (
+            float(sum(depths_prune)) / float(len(depths_prune)) if depths_prune else 0.0
+        ),
+        "mean_depth_contract": (
+            float(sum(depths_contract)) / float(len(depths_contract)) if depths_contract else 0.0
+        ),
+        "total_contracted_nodes": total_contracted_nodes,
+        "total_relinked_edges": total_relinked_edges,
+        "total_truncated_orphans": total_truncated_orphans,
+        "total_stance_inversion_risk_edges": total_stance_inversion_risk_edges,
+        "opaque_deleted_relink_rate": (
+            float(total_stance_inversion_risk_edges) / float(total_relinked_edges)
+            if total_relinked_edges > 0
+            else 0.0
+        ),
+        "early_k_jaccard_node_overlap": (
+            float(sum(jaccards)) / float(len(jaccards)) if jaccards else 0.0
+        ),
+        "early_k_parent_mismatch_rate": (
+            float(mismatched_parents_k) / float(shared_nodes_k) if shared_nodes_k > 0 else 0.0
+        ),
+    }
 
 
 def main() -> None:

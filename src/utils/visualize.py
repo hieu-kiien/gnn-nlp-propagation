@@ -1,6 +1,6 @@
 """Publication-quality vector figure exporters (.pdf and .svg) for SBi-FAGAT.
 
-Produces three camera-ready IEEE/Springer figures in `paper/figures/`:
+Produces three camera-ready IEEE/Springer figures in `results/figures/`:
   1. `fig1_umap_polarization.{pdf,svg}`: 2D UMAP node embedding comparison
      between `StandardGCN` and `SBiFAGAT`.
   2. `fig2_early_k_curve.{pdf,svg}`: Early horizon sensitivity curve across
@@ -25,7 +25,6 @@ import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import umap
 from matplotlib.lines import Line2D
 
 
@@ -77,6 +76,8 @@ def _save_vector_pair(fig: plt.Figure, output_dir: Path, stem: str) -> tuple[Pat
 
 
 def _project_umap_2d(embeddings: np.ndarray, random_state: int = 42) -> np.ndarray:
+    import umap
+
     n_samples = embeddings.shape[0]
     if n_samples < 4:
         # Degenerate tiny fallback (safety guard; real graphs have dozens/hundreds of nodes)
@@ -102,7 +103,7 @@ def plot_umap_polarization(
     sbifagat_embeddings: np.ndarray | torch.Tensor,
     node_stances: np.ndarray | torch.Tensor,
     *,
-    output_dir: str | Path = "paper/figures",
+    output_dir: str | Path = "results/figures",
     stem: str = "fig1_umap_polarization",
 ) -> tuple[Path, Path]:
     """Generate Fig 1: UMAP 2D comparison of StandardGCN vs. SBi-FAGAT node embeddings."""
@@ -150,8 +151,9 @@ def plot_umap_polarization(
 def plot_early_k_curve(
     k_results: Mapping[int, Mapping[str, Mapping[str, tuple[float, float]]]],
     *,
-    output_dir: str | Path = "paper/figures",
+    output_dir: str | Path = "results/figures",
     stem: str = "fig2_early_k_curve",
+    target_k: int | None = 20,
 ) -> tuple[Path, Path]:
     """Generate Fig 2: MSLE & RMSE error curves across observation horizons K in {10..50}."""
     _configure_academic_rcparams()
@@ -184,10 +186,11 @@ def plot_early_k_curve(
             )
             ax.fill_between(ks, means - stds, means + stds, color=color, alpha=0.14)
 
-        if 20 in ks:
-            ax.axvline(20, color="#444444", linestyle="--", linewidth=1.1, alpha=0.75)
+        if target_k is not None and int(target_k) in ks:
+            tk = int(target_k)
+            ax.axvline(tk, color="#444444", linestyle="--", linewidth=1.1, alpha=0.75)
             y_top = ax.get_ylim()[1]
-            ax.text(20.6, y_top * 0.96, "$K=20$ (Target)", fontsize=8.5, va="top", color="#333333")
+            ax.text(tk + 0.6, y_top * 0.96, f"$K={tk}$ (Target)", fontsize=8.5, va="top", color="#333333")
 
         ax.set_xticks(ks)
         ax.set_xlabel("Early Observation Horizon $K$ (Replies)")
@@ -262,7 +265,7 @@ def plot_cascade_heatmap(
     edge_importance: np.ndarray | torch.Tensor,
     signed_gamma: np.ndarray | torch.Tensor,
     *,
-    output_dir: str | Path = "paper/figures",
+    output_dir: str | Path = "results/figures",
     stem: str = "fig3_cascade_heatmap",
     top_k_comments: int = 5,
 ) -> tuple[Path, Path, Path]:
@@ -356,8 +359,8 @@ def plot_cascade_heatmap(
         v_id = node_ids[v] if v < len(node_ids) else f"node_{v}"
         v_text = node_texts[v] if v < len(node_texts) else ""
         lines.append(
-            f"#{rank} | node_id={v_id} (parent={u_id}) | |gamma_uv|={float(imp[e_idx]):.4f} "
-            f"| gamma={float(gamma[e_idx]):+.4f} | s_uv={s_uv:+.4f} | h_uv={h_uv:.4f}"
+            f"#{rank} | node_id={v_id} (parent={u_id}) | |gamma_mean|={float(imp[e_idx]):.4f} "
+            f"| gamma_td={float(gamma[e_idx]):+.4f} | s_uv={s_uv:+.4f} | h_uv={h_uv:.4f}"
         )
         lines.append(f"    Text: {v_text}")
     txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -368,7 +371,7 @@ def plot_cascade_heatmap(
 def plot_counterfactual_interventions(
     interventions_summary: Mapping[str, Mapping[str, Any]],
     *,
-    output_dir: str | Path = "paper/figures",
+    output_dir: str | Path = "results/figures",
     stem: str = "fig4_counterfactual_interventions",
 ) -> tuple[Path, Path]:
     """Generate Fig 4: Counterfactual moderation impact on predicted size & polarization."""

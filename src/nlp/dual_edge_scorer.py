@@ -36,7 +36,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, precision_recall_fscore_support
+from sklearn.model_selection import train_test_split
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
@@ -90,6 +91,20 @@ def _cuda_autocast(enabled: bool, *, dtype: torch.dtype = torch.float16) -> Any:
     if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
         return torch.amp.autocast("cuda", dtype=dtype, enabled=bool(enabled))
     return torch.cuda.amp.autocast(dtype=dtype, enabled=bool(enabled))
+
+
+def _should_use_fp16_amp(device: torch.device) -> bool:
+    """Use FP16 AMP on CUDA Tensor-Core GPUs; skip on GTX 16xx/10xx where FP16 emulation is ~5x slower."""
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    try:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        name = str(torch.cuda.get_device_name(idx) or "").lower()
+        if "gtx 16" in name or "gtx 10" in name or "gtx 9" in name:
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def _can_use_dataparallel(device: torch.device, use_multi_gpu: bool) -> bool:
@@ -166,13 +181,105 @@ def _effective_max_length(
     return eff
 
 
+_HF_WEIGHT_FILENAMES: tuple[str, ...] = (
+    "model.safetensors",
+    "pytorch_model.bin",
+    "model.safetensors.index.json",
+    "pytorch_model.bin.index.json",
+    "dual_head_weights.pt",
+)
+
+
+def _has_hf_weight_files(ckpt_dir: str | Path) -> bool:
+    """Return True iff *ckpt_dir* exists and contains at least one non-empty weight file."""
+    path = Path(ckpt_dir)
+    if not path.is_dir():
+        return False
+    for fname in _HF_WEIGHT_FILENAMES:
+        cand = path / fname
+        try:
+            if cand.is_file() and cand.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+    for pattern in ("*.safetensors", "*.bin"):
+        for cand in path.glob(pattern):
+            try:
+                if cand.is_file() and cand.stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _looks_like_local_path(model_name_or_path: str | Path) -> bool:
+    raw = str(model_name_or_path)
+    p = Path(raw)
+    return p.exists() or p.is_absolute() or raw.startswith((".", "/", "\\", "checkpoints")) or "\\" in raw
+
+
+def _extract_special_tok_str(val: Any, default: str) -> str:
+    if isinstance(val, str) and val:
+        return val
+    if isinstance(val, Mapping):
+        c = val.get("content")
+        if isinstance(c, str) and c:
+            return c
+    return default
+
+
+def _load_fast_tokenizer_from_dir(target_dir: Path) -> Any | None:
+    """Load `tokenizer.json` via PreTrainedTokenizerFast when AutoTokenizer hits transformers 5.x/SentencePiece errors."""
+    tok_json = target_dir / "tokenizer.json"
+    if not tok_json.is_file():
+        return None
+    cfg: dict[str, Any] = {}
+    for cfg_name in ("tokenizer_config.json", "special_tokens_map.json"):
+        cfg_path = target_dir / cfg_name
+        if cfg_path.is_file():
+            try:
+                loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    cfg.update(loaded)
+            except Exception:
+                pass
+    try:
+        from transformers import PreTrainedTokenizerFast
+
+        return PreTrainedTokenizerFast(
+            tokenizer_file=str(tok_json),
+            bos_token=_extract_special_tok_str(cfg.get("bos_token"), "<s>"),
+            eos_token=_extract_special_tok_str(cfg.get("eos_token"), "</s>"),
+            unk_token=_extract_special_tok_str(cfg.get("unk_token"), "<unk>"),
+            pad_token=_extract_special_tok_str(cfg.get("pad_token"), "<pad>"),
+            cls_token=_extract_special_tok_str(cfg.get("cls_token"), "<s>"),
+            sep_token=_extract_special_tok_str(cfg.get("sep_token"), "</s>"),
+            mask_token=_extract_special_tok_str(cfg.get("mask_token"), "<mask>"),
+        )
+    except Exception:
+        return None
+
+
 def load_tokenizer_safe(model_name_or_path: str | Path) -> Any:
-    """Load an AutoTokenizer with automatic `use_fast=False` fallback for SentencePiece models."""
+    """Load an AutoTokenizer with `use_fast=False` and `tokenizer.json` fast fallback."""
     target = str(model_name_or_path)
+    last_exc: Exception | None = None
     try:
         return AutoTokenizer.from_pretrained(target)
-    except Exception:
+    except Exception as exc:
+        last_exc = exc
+    try:
         return AutoTokenizer.from_pretrained(target, use_fast=False)
+    except Exception as exc:
+        last_exc = exc
+    target_path = Path(target)
+    if target_path.is_dir():
+        fast_tok = _load_fast_tokenizer_from_dir(target_path)
+        if fast_tok is not None:
+            return fast_tok
+    if last_exc is not None:
+        raise last_exc
+    return AutoTokenizer.from_pretrained(target, use_fast=False)
 
 
 def load_uit_vihsd_dataset(cache_dir: str | None = None) -> Any:
@@ -228,29 +335,78 @@ def finetune_visobert_vihsd(
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     target_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = target_device.type == "cuda"
+    use_amp = _should_use_fp16_amp(target_device)
 
     ds = dataset_dict if dataset_dict is not None else load_uit_vihsd_dataset()
     train_split = ds["train"]
     if "validation" in ds:
         val_split = ds["validation"]
+        val_split_source = "dataset_validation"
+        train_texts = [normalize_social_text(x, lang="vi") for x in train_split["free_text"]]
+        train_labels = [int(x) for x in train_split["label_id"]]
+        val_texts = [normalize_social_text(x, lang="vi") for x in val_split["free_text"]]
+        val_labels = [int(x) for x in val_split["label_id"]]
+    elif "val" in ds:
+        val_split = ds["val"]
+        val_split_source = "dataset_val"
+        train_texts = [normalize_social_text(x, lang="vi") for x in train_split["free_text"]]
+        train_labels = [int(x) for x in train_split["label_id"]]
+        val_texts = [normalize_social_text(x, lang="vi") for x in val_split["free_text"]]
+        val_labels = [int(x) for x in val_split["label_id"]]
+    elif "dev" in ds:
+        val_split = ds["dev"]
+        val_split_source = "dataset_dev"
+        train_texts = [normalize_social_text(x, lang="vi") for x in train_split["free_text"]]
+        train_labels = [int(x) for x in train_split["label_id"]]
+        val_texts = [normalize_social_text(x, lang="vi") for x in val_split["free_text"]]
+        val_labels = [int(x) for x in val_split["label_id"]]
     else:
         warnings.warn(
-            "UIT-ViHSD dataset has no 'validation' split; falling back to 'test' split "
-            "for early-checkpoint selection.",
+            "UIT-ViHSD dataset has no 'validation'/'val'/'dev' split; carving a deterministic "
+            "stratified 15% validation split from 'train' (zero 'test' leakage).",
             UserWarning,
             stacklevel=2,
         )
-        val_split = ds["test"]
+        val_split_source = "stratified_train_holdout"
+        all_tr_texts = [normalize_social_text(x, lang="vi") for x in train_split["free_text"]]
+        all_tr_labels = [int(x) for x in train_split["label_id"]]
+        n_all = len(all_tr_texts)
+        if n_all < 2:
+            raise ValueError("Cannot carve validation split from fewer than 2 training samples")
+        indices = np.arange(n_all)
+        counts_tr = np.bincount(np.asarray(all_tr_labels, dtype=np.int64))
+        nonzero_counts = counts_tr[counts_tr > 0]
+        val_n = max(1, int(round(0.15 * n_all)))
+        can_stratify = (
+            nonzero_counts.size >= 1
+            and int(nonzero_counts.min()) >= 2
+            and val_n >= nonzero_counts.size
+            and (n_all - val_n) >= nonzero_counts.size
+        )
+        try:
+            tr_idx, va_idx = train_test_split(
+                indices,
+                test_size=val_n,
+                random_state=seed,
+                shuffle=True,
+                stratify=all_tr_labels if can_stratify else None,
+            )
+        except ValueError:
+            tr_idx, va_idx = train_test_split(
+                indices,
+                test_size=val_n,
+                random_state=seed,
+                shuffle=True,
+                stratify=None,
+            )
+        train_texts = [all_tr_texts[int(i)] for i in tr_idx]
+        train_labels = [all_tr_labels[int(i)] for i in tr_idx]
+        val_texts = [all_tr_texts[int(i)] for i in va_idx]
+        val_labels = [all_tr_labels[int(i)] for i in va_idx]
 
-    train_texts = [normalize_social_text(x, lang="vi") for x in train_split["free_text"]]
-    train_labels = [int(x) for x in train_split["label_id"]]
     if max_train_samples is not None and len(train_texts) > max_train_samples:
         train_texts = train_texts[:max_train_samples]
         train_labels = train_labels[:max_train_samples]
-
-    val_texts = [normalize_social_text(x, lang="vi") for x in val_split["free_text"]]
-    val_labels = [int(x) for x in val_split["label_id"]]
 
     # Dampened inverse-frequency class weights computed strictly on train_labels
     counts = np.bincount(np.asarray(train_labels, dtype=np.int64), minlength=3)
@@ -376,6 +532,87 @@ def finetune_visobert_vihsd(
             best_state = {k: v.detach().cpu().clone() for k, v in clf.state_dict().items()}
 
     clf.load_state_dict(best_state)
+    clf.eval()
+
+    # Post-hoc scalar temperature & uncivil decision threshold calibration strictly on val_split
+    val_logits_list: list[Tensor] = []
+    with torch.no_grad():
+        for batch_texts, _batch_labels in val_loader:
+            enc = tok(
+                list(batch_texts),
+                padding=True,
+                truncation=True,
+                max_length=eff_max_len,
+                return_tensors="pt",
+            )
+            enc = {k: v.to(target_device) for k, v in enc.items()}
+            with _cuda_autocast(enabled=use_amp):
+                logits = clf(**enc).logits
+            val_logits_list.append(logits.float().cpu())
+
+    if val_logits_list:
+        val_logits_t = torch.cat(val_logits_list, dim=0)
+        val_probs_np = torch.softmax(val_logits_t, dim=-1).numpy()
+        raw_h = np.clip(val_probs_np[:, 1] + val_probs_np[:, 2], 1e-6, 1.0 - 1e-6)
+    else:
+        raw_h = np.zeros((0,), dtype=np.float64)
+
+    y_val_bin = (np.asarray(val_labels, dtype=np.int64) > 0).astype(np.int64)
+    hostility_temperature = 1.0
+    calibrated_threshold = 0.5
+    if raw_h.size > 0 and y_val_bin.size == raw_h.size:
+        raw_bin_logit = np.log(raw_h / (1.0 - raw_h))
+        if np.unique(y_val_bin).size >= 2:
+            best_nll = float("inf")
+            for t_cand in np.linspace(0.5, 4.0, 71):
+                p_cand = 1.0 / (1.0 + np.exp(-np.clip(raw_bin_logit / float(t_cand), -30.0, 30.0)))
+                p_cand = np.clip(p_cand, 1e-6, 1.0 - 1e-6)
+                nll = float(
+                    -np.mean(y_val_bin * np.log(p_cand) + (1.0 - y_val_bin) * np.log(1.0 - p_cand))
+                )
+                if nll < best_nll:
+                    best_nll = nll
+                    hostility_temperature = float(t_cand)
+            lo = max(0.5, hostility_temperature - 0.05)
+            hi = min(4.0, hostility_temperature + 0.05)
+            for t_cand in np.linspace(lo, hi, 21):
+                p_cand = 1.0 / (1.0 + np.exp(-np.clip(raw_bin_logit / float(t_cand), -30.0, 30.0)))
+                p_cand = np.clip(p_cand, 1e-6, 1.0 - 1e-6)
+                nll = float(
+                    -np.mean(y_val_bin * np.log(p_cand) + (1.0 - y_val_bin) * np.log(1.0 - p_cand))
+                )
+                if nll < best_nll:
+                    best_nll = nll
+                    hostility_temperature = float(t_cand)
+
+        cal_h = 1.0 / (
+            1.0 + np.exp(-np.clip(raw_bin_logit / max(1e-3, hostility_temperature), -30.0, 30.0))
+        )
+        if int(y_val_bin.sum()) > 0:
+            best_tau_f1 = -1.0
+            for tau in np.linspace(0.10, 0.95, 86):
+                pred_tau = (cal_h >= float(tau)).astype(np.int64)
+                f1_tau = float(f1_score(y_val_bin, pred_tau, pos_label=1, zero_division=0))
+                if f1_tau > best_tau_f1 + 1e-12 or (
+                    abs(f1_tau - best_tau_f1) <= 1e-12
+                    and abs(float(tau) - 0.5) < abs(calibrated_threshold - 0.5)
+                ):
+                    best_tau_f1 = f1_tau
+                    calibrated_threshold = round(float(tau), 4)
+
+        p05, r05, f05, _ = precision_recall_fscore_support(
+            y_val_bin, (raw_h >= 0.5).astype(np.int64), pos_label=1, average="binary", zero_division=0
+        )
+        pc, rc, fc, _ = precision_recall_fscore_support(
+            y_val_bin,
+            (cal_h >= calibrated_threshold).astype(np.int64),
+            pos_label=1,
+            average="binary",
+            zero_division=0,
+        )
+    else:
+        p05 = r05 = f05 = pc = rc = fc = 0.0
+
     clf.save_pretrained(out_path)
     if hasattr(tok, "save_pretrained"):
         tok.save_pretrained(out_path)
@@ -385,6 +622,15 @@ def finetune_visobert_vihsd(
                 "best_val_macro_f1": best_f1,
                 "class_weights": [float(w) for w in weights.tolist()],
                 "val_macro_f1_history": f1_history,
+                "val_split_source": val_split_source,
+                "calibrated_hostility_threshold": float(calibrated_threshold),
+                "hostility_temperature": float(hostility_temperature),
+                "val_uncivil_precision_at_05": float(p05),
+                "val_uncivil_recall_at_05": float(r05),
+                "val_uncivil_f1_at_05": float(f05),
+                "val_uncivil_precision_at_calibrated": float(pc),
+                "val_uncivil_recall_at_calibrated": float(rc),
+                "val_uncivil_f1_at_calibrated": float(fc),
             },
             indent=2,
         ),
@@ -433,20 +679,51 @@ class HostilityTeacherScorer:
         self.lang = lang
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         default_name = VISOBERT_MODEL_NAME if lang == "vi" else EN_OFFENSIVE_MODEL_NAME
+        self.calibrated_threshold: float = 0.5
+        self.hostility_temperature: float = 1.0
 
-        if model is None and lang == "vi":
-            if model_name_or_path is None:
-                if not allow_untrained_fallback:
-                    raise FileNotFoundError(
-                        "Fine-tuned UIT-ViHSD checkpoint is required for lang='vi' hostility "
-                        "scoring. Run with --train-vihsd first or pass allow_untrained_fallback=True."
-                    )
-            else:
+        if model is None:
+            if lang == "vi":
+                if model_name_or_path is None:
+                    if not allow_untrained_fallback:
+                        raise FileNotFoundError(
+                            "Fine-tuned UIT-ViHSD checkpoint is required for lang='vi' hostility "
+                            "scoring. Run with --train-vihsd first or pass allow_untrained_fallback=True."
+                        )
+                elif str(model_name_or_path) != VISOBERT_MODEL_NAME:
+                    ckpt_path = Path(model_name_or_path)
+                    if not ckpt_path.exists():
+                        raise FileNotFoundError(
+                            f"Missing fine-tuned ViHSD checkpoint directory: {ckpt_path}"
+                        )
+                    if not _has_hf_weight_files(ckpt_path):
+                        raise FileNotFoundError(
+                            f"Missing model weight files (model.safetensors / pytorch_model.bin) "
+                            f"in ViHSD checkpoint directory: {ckpt_path}"
+                        )
+            elif (
+                model_name_or_path is not None
+                and str(model_name_or_path) != EN_OFFENSIVE_MODEL_NAME
+                and _looks_like_local_path(model_name_or_path)
+            ):
                 ckpt_path = Path(model_name_or_path)
-                if str(model_name_or_path) != VISOBERT_MODEL_NAME and not ckpt_path.exists():
+                if not _has_hf_weight_files(ckpt_path):
                     raise FileNotFoundError(
-                        f"Missing fine-tuned ViHSD checkpoint directory: {ckpt_path}"
+                        f"Missing model weight files (model.safetensors / pytorch_model.bin) "
+                        f"in EN hostility checkpoint directory: {ckpt_path}"
                     )
+
+        if model_name_or_path is not None:
+            metrics_file = Path(model_name_or_path) / "vihsd_metrics.json"
+            if metrics_file.is_file():
+                try:
+                    m_data = json.loads(metrics_file.read_text(encoding="utf-8"))
+                    if "calibrated_hostility_threshold" in m_data:
+                        self.calibrated_threshold = float(m_data["calibrated_hostility_threshold"])
+                    if "hostility_temperature" in m_data:
+                        self.hostility_temperature = max(1e-3, float(m_data["hostility_temperature"]))
+                except Exception:
+                    pass
 
         target = str(model_name_or_path or default_name)
 
@@ -506,6 +783,7 @@ class HostilityTeacherScorer:
         *,
         batch_size: int = 32,
         max_length: int = 256,
+        apply_temperature: bool = True,
     ) -> np.ndarray:
         n_texts = len(texts)
         if n_texts == 0:
@@ -555,6 +833,10 @@ class HostilityTeacherScorer:
                         logits = self.model(**enc).logits.float()
             probs = torch.softmax(logits, dim=-1)
             h = self.hostility_from_probs(probs, lang=self.lang, id2label=id2label)
+            host_temp = float(getattr(self, "hostility_temperature", 1.0))
+            if apply_temperature and abs(host_temp - 1.0) > 1e-6:
+                raw_h = h.clamp(1e-6, 1.0 - 1e-6)
+                h = torch.sigmoid(torch.logit(raw_h) / host_temp)
             scores.append(h.cpu())
 
         ordered_np = torch.cat(scores, dim=0).numpy().astype(np.float32)
@@ -579,10 +861,16 @@ class NLIStanceTeacherScorer:
         lang: str = "vi",
         use_stance_verbalizer: bool = True,
         use_multi_gpu: bool = True,
+        temperature: float = 1.0,
+        stance_margin_threshold: float | None = None,
     ) -> None:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.lang = lang
         self.use_stance_verbalizer = bool(use_stance_verbalizer)
+        self.temperature = max(1e-3, float(temperature))
+        self.stance_margin_threshold = (
+            float(stance_margin_threshold) if stance_margin_threshold is not None else None
+        )
         target = str(model_name_or_path)
         self.tokenizer = tokenizer if tokenizer is not None else load_tokenizer_safe(target)
         self.model = (
@@ -711,7 +999,7 @@ class NLIStanceTeacherScorer:
             else:
                 with _cuda_autocast(enabled=False):
                     logits = self.model(**enc).logits.float()
-        raw_probs = torch.softmax(logits, dim=-1)
+        raw_probs = torch.softmax(logits / float(getattr(self, "temperature", 1.0)), dim=-1)
         return torch.stack(
             [
                 raw_probs[:, self.entail_idx],
@@ -861,12 +1149,145 @@ class NLIStanceTeacherScorer:
             for pos, orig_idx in enumerate(order):
                 probs_np[orig_idx] = probs_ordered[pos]
                 s_np[orig_idx] = s_ordered[pos]
-        labels = [STANCE_LABELS[int(idx)] for idx in probs_np.argmax(axis=-1)]
+        labels: list[str] = []
+        margin_thr = getattr(self, "stance_margin_threshold", None)
+        for row_idx in range(probs_np.shape[0]):
+            if margin_thr is not None and abs(float(probs_np[row_idx, 0] - probs_np[row_idx, 2])) < margin_thr:
+                labels.append("neutral")
+            else:
+                labels.append(STANCE_LABELS[int(probs_np[row_idx].argmax())])
         return {
             "s_uv": s_np,
             "stance_probs": probs_np,
             "pred_label": labels,
         }
+
+
+_PARENT_AGREE_RE = re.compile(
+    r"(?<![\w\u0300-\u036f])("
+    r"đồng ý|đồng tình|chuẩn|đúng rồi|chính xác|tán thành|công nhận|"
+    r"bác nói đúng|bạn nói đúng|agree|exactly|you'?re right|true that"
+    r")(?![\w\u0300-\u036f])",
+    flags=re.IGNORECASE | re.UNICODE,
+)
+_THIRD_PARTY_TARGET_RE = re.compile(
+    r"(?<![\w\u0300-\u036f])("
+    r"bọn nó|tụi nó|chúng nó|lũ|bọn kia|tụi kia|bọn|tụi|mấy thằng|mấy con|"
+    r"nhà nước|công ty|chủ đầu tư|chính quyền|ban quản lý|"
+    r"they|them|those people|those guys|corrupt|scammers"
+    r")(?![\w\u0300-\u036f])",
+    flags=re.IGNORECASE | re.UNICODE,
+)
+
+
+class HostilityGatedTargetRouter:
+    """Disambiguate third-party outrage on the hostile (`h_uv >= threshold`) subset."""
+
+    def __init__(
+        self,
+        *,
+        hostility_gate_threshold: float = 0.5,
+        lang: str = "vi",
+        nli_scorer: NLIStanceTeacherScorer | None = None,
+        llm_reranker: Any | None = None,
+    ) -> None:
+        self.hostility_gate_threshold = float(hostility_gate_threshold)
+        self.lang = str(lang)
+        self.nli_scorer = nli_scorer
+        self.llm_reranker = llm_reranker
+
+    def route_pairs(
+        self,
+        pairs: Sequence[Mapping[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        routed: list[dict[str, Any]] = []
+        gated_count = 0
+        rerouted_count = 0
+
+        for pair in pairs:
+            item = dict(pair)
+            h_val = float(item.get("h_uv", 0.0))
+            if h_val < self.hostility_gate_threshold:
+                routed.append(item)
+                continue
+
+            gated_count += 1
+            if self.llm_reranker is not None:
+                upd = self.llm_reranker(item)
+                if isinstance(upd, Mapping):
+                    item.update(upd)
+                    if upd.get("target_attributed") == "third_party":
+                        rerouted_count += 1
+                routed.append(item)
+                continue
+
+            u_txt = normalize_social_text(item.get("parent_text") or "", lang=self.lang)
+            v_txt = normalize_social_text(item.get("reply_text") or "", lang=self.lang)
+            s_val = float(item.get("s_uv", 0.0))
+            is_third_party_agree = bool(
+                _PARENT_AGREE_RE.search(v_txt) and _THIRD_PARTY_TARGET_RE.search(v_txt)
+            )
+
+            if (
+                not is_third_party_agree
+                and self.nli_scorer is not None
+                and hasattr(self.nli_scorer, "_score_premise_hypothesis")
+            ):
+                u_clip = u_txt[:600]
+                v_clip = v_txt[:600]
+                if self.lang == "en":
+                    premise = f"Parent comment: {u_clip}\nReply: {v_clip}"
+                    h_3p = "The reply agrees with the parent commenter while criticizing a third party."
+                    h_direct = "The reply directly attacks or disagrees with the parent commenter."
+                else:
+                    premise = f"Bình luận trước: {u_clip}\nPhản hồi: {v_clip}"
+                    h_3p = "Phản hồi này đồng tình với người bình luận trước nhưng chỉ trích một bên thứ ba."
+                    h_direct = "Phản hồi này phản đối hoặc công kích trực tiếp người bình luận trước."
+                eff_len = _effective_max_length(
+                    384,
+                    encoder=getattr(self.nli_scorer, "model", None),
+                    tokenizer=getattr(self.nli_scorer, "tokenizer", None),
+                )
+                try:
+                    p_3p = self.nli_scorer._score_premise_hypothesis(
+                        [premise], [h_3p], effective_max_len=eff_len
+                    )[0]
+                    p_dir = self.nli_scorer._score_premise_hypothesis(
+                        [premise], [h_direct], effective_max_len=eff_len
+                    )[0]
+                    if float(p_3p[0].item() - p_dir[0].item()) > 0.15:
+                        is_third_party_agree = True
+                except Exception:
+                    pass
+
+            if is_third_party_agree and s_val <= 0.10:
+                new_s = max(0.45, min(0.90, abs(s_val) if abs(s_val) >= 0.45 else 0.65))
+                old_probs = item.get("stance_probs")
+                if isinstance(old_probs, Sequence) and not isinstance(old_probs, (str, bytes)) and len(old_probs) == 3:
+                    p_sup_new = max(float(old_probs[2]), 0.60)
+                    p_neu_new = max(0.0, min(float(old_probs[1]), p_sup_new - 1e-3))
+                    p_opp_new = max(0.0, min(float(old_probs[0]), 0.15, p_sup_new - 1e-3))
+                    tot = max(1e-6, p_sup_new + p_neu_new + p_opp_new)
+                    item["stance_probs"] = [p_sup_new / tot, p_neu_new / tot, p_opp_new / tot]
+                    new_s = max(-1.0, min(1.0, item["stance_probs"][0] - item["stance_probs"][2]))
+                else:
+                    item["stance_probs"] = _build_default_stance_probs(new_s)
+                item["s_uv"] = float(new_s)
+                item["pred_label"] = "support"
+                item["target_attributed"] = "third_party"
+                rerouted_count += 1
+            else:
+                item.setdefault("target_attributed", "parent")
+
+            routed.append(item)
+
+        stats = {
+            "hostility_gate_threshold": self.hostility_gate_threshold,
+            "total_pairs": len(pairs),
+            "gated_count": gated_count,
+            "rerouted_count": rerouted_count,
+        }
+        return routed, stats
 
 
 def _infer_stance_stratum(pair: Mapping[str, Any]) -> str:
@@ -1605,6 +2026,18 @@ class DualHeadCrossEncoder(nn.Module):
         map_location: str | torch.device = "cpu",
     ) -> tuple[DualHeadCrossEncoder, Any | None]:
         ckpt_path = Path(checkpoint_dir)
+        if not ckpt_path.is_dir():
+            raise FileNotFoundError(f"Cross-Encoder checkpoint directory not found: {ckpt_path}")
+        required_files = ("config.json", "dual_head_meta.json", "dual_head_weights.pt")
+        missing = [
+            fname
+            for fname in required_files
+            if not (ckpt_path / fname).is_file() or (ckpt_path / fname).stat().st_size == 0
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"Incomplete Cross-Encoder checkpoint in '{ckpt_path}'; missing or empty: {', '.join(missing)}"
+            )
         meta = json.loads((ckpt_path / "dual_head_meta.json").read_text(encoding="utf-8"))
         config = AutoConfig.from_pretrained(ckpt_path)
         encoder = AutoModel.from_config(config)
@@ -1627,7 +2060,23 @@ class DualHeadCrossEncoder(nn.Module):
             for fname in ("tokenizer_config.json", "tokenizer.json", "vocab.json", "sentencepiece.bpe.model")
         ):
             tokenizer = load_tokenizer_safe(ckpt_path)
+        instance.tokenizer = tokenizer
         return instance, tokenizer
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        checkpoint_dir: str | Path,
+        *,
+        map_location: str | torch.device = "cpu",
+        return_tokenizer: bool = False,
+    ) -> DualHeadCrossEncoder | tuple[DualHeadCrossEncoder, Any | None]:
+        """Load a saved DualHeadCrossEncoder checkpoint (attaching `.tokenizer`)."""
+        instance, tokenizer = cls.load_checkpoint(Path(checkpoint_dir), map_location=map_location)
+        instance.tokenizer = tokenizer
+        if return_tokenizer:
+            return instance, tokenizer
+        return instance
 
 
 class _PairDistillDataset(Dataset):
@@ -1639,6 +2088,45 @@ class _PairDistillDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Mapping[str, Any]:
         return self.records[idx]
+
+
+class _LengthBucketBatchSampler:
+    """Stochastic mega-batch length bucketing to minimize padding waste without bias."""
+
+    def __init__(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        *,
+        batch_size: int,
+        seed: int = 42,
+    ) -> None:
+        self.lengths = [
+            len(str(r.get("parent_text") or ""))
+            + len(str(r.get("reply_text") or ""))
+            + len(str(r.get("root_text") or ""))
+            for r in records
+        ]
+        self.batch_size = max(1, int(batch_size))
+        self.seed = int(seed)
+        self._epoch = 0
+
+    def __len__(self) -> int:
+        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self) -> Any:
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
+        indices = list(range(len(self.lengths)))
+        rng.shuffle(indices)
+        mega_size = self.batch_size * 50
+        batches: list[list[int]] = []
+        for start in range(0, len(indices), mega_size):
+            chunk = indices[start : start + mega_size]
+            chunk.sort(key=lambda i: self.lengths[i])
+            for b_start in range(0, len(chunk), self.batch_size):
+                batches.append(chunk[b_start : b_start + self.batch_size])
+        rng.shuffle(batches)
+        yield from batches
 
 
 def _safe_pearsonr(pred: np.ndarray, target: np.ndarray) -> float:
@@ -1714,7 +2202,7 @@ def distill_dual_cross_encoder(
 
     seed_everything(seed)
     target_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = target_device.type == "cuda"
+    use_amp = _should_use_fp16_amp(target_device)
 
     train_data = [dict(r) for r in train_records]
     val_data = [dict(r) for r in val_records]
@@ -1723,9 +2211,11 @@ def distill_dual_cross_encoder(
     train_root_aug_count = 0
 
     if augment_root_pairs and not sanity_check_shuffle:
-        # Augment Train split with direct (root, deep_reply) pairs matching inference-time root stance queries
+        # Augment Train split with direct (root, deep_reply) pairs matching inference-time root stance queries.
+        # Set `_hostility_loss_weight = 0.0` on augmented duplicates so depth >= 2 replies are not double-weighted in h_loss.
         augmented_rows: list[dict[str, Any]] = []
         for r in train_data:
+            r.setdefault("_hostility_loss_weight", 1.0)
             if r.get("root_s_uv") is None:
                 continue
             root_txt = _normalize_nfc(r.get("root_text") or "")
@@ -1745,6 +2235,7 @@ def distill_dual_cross_encoder(
             aug_row["s_uv"] = root_s
             aug_row["stance_probs"] = r.get("root_stance_probs") or _build_default_stance_probs(root_s)
             aug_row["h_uv"] = float(r["h_uv"])
+            aug_row["_hostility_loss_weight"] = 0.0
             augmented_rows.append(aug_row)
         train_root_aug_count = len(augmented_rows)
         if augmented_rows:
@@ -1800,7 +2291,7 @@ def distill_dual_cross_encoder(
 
     def _collate(
         batch: Sequence[Mapping[str, Any]],
-    ) -> tuple[dict[str, Tensor], Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[dict[str, Tensor], Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         u_texts = [str(item["parent_text"]) for item in batch]
         v_texts = [str(item["reply_text"]) for item in batch]
         r_texts = [item.get("root_text") for item in batch]
@@ -1816,6 +2307,9 @@ def distill_dual_cross_encoder(
         )
         s_tgt = torch.tensor([float(item["s_uv"]) for item in batch], dtype=torch.float32)
         h_tgt = torch.tensor([float(item["h_uv"]) for item in batch], dtype=torch.float32)
+        h_weight = torch.tensor(
+            [float(item.get("_hostility_loss_weight", 1.0)) for item in batch], dtype=torch.float32
+        )
         r_tgt = torch.tensor([float(item.get("r_uv", 0.1)) for item in batch], dtype=torch.float32)
         c_tgt = torch.tensor([float(item.get("c_uv", 0.5)) for item in batch], dtype=torch.float32)
         probs_list = [
@@ -1830,18 +2324,26 @@ def distill_dual_cross_encoder(
         bp_list = [_build_default_behavior_probs(item) for item in batch]
         bp_tgt = torch.tensor(bp_list, dtype=torch.float32).clamp(min=1e-6)
         bp_tgt = bp_tgt / bp_tgt.sum(dim=-1, keepdim=True)
-        return enc, s_tgt, h_tgt, r_tgt, c_tgt, p_tgt, bp_tgt
+        return enc, s_tgt, h_tgt, h_weight, r_tgt, c_tgt, p_tgt, bp_tgt
 
     use_pin_mem = target_device.type == "cuda"
+    train_sampler = _LengthBucketBatchSampler(train_data, batch_size=batch_size, seed=seed)
     train_loader = DataLoader(
         _PairDistillDataset(train_data),
-        batch_size=batch_size,
-        shuffle=True,
+        batch_sampler=train_sampler,
         collate_fn=_collate,
         pin_memory=use_pin_mem,
     )
+    val_sorted = sorted(
+        val_data,
+        key=lambda r: (
+            len(str(r.get("parent_text") or ""))
+            + len(str(r.get("reply_text") or ""))
+            + len(str(r.get("root_text") or ""))
+        ),
+    )
     val_loader = DataLoader(
-        _PairDistillDataset(val_data),
+        _PairDistillDataset(val_sorted),
         batch_size=batch_size,
         shuffle=False,
         collate_fn=_collate,
@@ -1898,6 +2400,7 @@ def distill_dual_cross_encoder(
         out: Mapping[str, Tensor],
         s_tgt_d: Tensor,
         h_tgt_d: Tensor,
+        h_w_d: Tensor,
         r_tgt_d: Tensor,
         c_tgt_d: Tensor,
         p_tgt_d: Tensor,
@@ -1910,10 +2413,16 @@ def distill_dual_cross_encoder(
             reduction="batchmean",
         )
         s_loss = F.smooth_l1_loss(out["s_uv"], s_tgt_d, beta=0.1)
-        h_loss = F.binary_cross_entropy_with_logits(
+        h_bce = F.binary_cross_entropy_with_logits(
             out["hostility_logit"].float(),
             h_tgt_d.clamp(0.0, 1.0),
+            reduction="none",
         )
+        h_w_sum = h_w_d.sum()
+        if float(h_w_sum.item()) > 0.0:
+            h_loss = (h_bce * h_w_d).sum() / h_w_sum.clamp(min=1e-6)
+        else:
+            h_loss = h_bce.new_zeros(())
         loss = kl_loss + 0.5 * s_loss + h_loss
         if student.edge_dim == 4 and "behavior_logits" in out:
             bp_tgt_temp = torch.softmax(torch.log(bp_tgt_d.clamp(min=1e-6)) / temp, dim=-1)
@@ -1938,10 +2447,11 @@ def distill_dual_cross_encoder(
             active_student.train()
             running_loss = 0.0
             step_count = 0
-            for enc, s_tgt, h_tgt, r_tgt, c_tgt, p_tgt, bp_tgt in train_loader:
+            for enc, s_tgt, h_tgt, h_weight, r_tgt, c_tgt, p_tgt, bp_tgt in train_loader:
                 enc_dev = {k: v.to(target_device) for k, v in enc.items()}
                 s_tgt_d = s_tgt.to(target_device)
                 h_tgt_d = h_tgt.to(target_device)
+                h_w_d = h_weight.to(target_device)
                 r_tgt_d = r_tgt.to(target_device)
                 c_tgt_d = c_tgt.to(target_device)
                 p_tgt_d = p_tgt.to(target_device)
@@ -1950,7 +2460,7 @@ def distill_dual_cross_encoder(
                 optimizer.zero_grad(set_to_none=True)
                 with _cuda_autocast(enabled=use_amp):
                     out = active_student(**enc_dev)
-                    loss = _batch_loss(out, s_tgt_d, h_tgt_d, r_tgt_d, c_tgt_d, p_tgt_d, bp_tgt_d)
+                    loss = _batch_loss(out, s_tgt_d, h_tgt_d, h_w_d, r_tgt_d, c_tgt_d, p_tgt_d, bp_tgt_d)
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
@@ -1971,17 +2481,18 @@ def distill_dual_cross_encoder(
             s_preds, s_trues, h_preds, h_trues = [], [], [], []
             r_preds, r_trues, c_preds, c_trues = [], [], [], []
             with torch.no_grad():
-                for enc, s_tgt, h_tgt, r_tgt, c_tgt, p_tgt, bp_tgt in val_loader:
+                for enc, s_tgt, h_tgt, h_weight, r_tgt, c_tgt, p_tgt, bp_tgt in val_loader:
                     enc_dev = {k: v.to(target_device) for k, v in enc.items()}
                     s_tgt_d = s_tgt.to(target_device)
                     h_tgt_d = h_tgt.to(target_device)
+                    h_w_d = h_weight.to(target_device)
                     r_tgt_d = r_tgt.to(target_device)
                     c_tgt_d = c_tgt.to(target_device)
                     p_tgt_d = p_tgt.to(target_device)
                     bp_tgt_d = bp_tgt.to(target_device)
                     with _cuda_autocast(enabled=use_amp):
                         out = active_student(**enc_dev)
-                        vloss = _batch_loss(out, s_tgt_d, h_tgt_d, r_tgt_d, c_tgt_d, p_tgt_d, bp_tgt_d)
+                        vloss = _batch_loss(out, s_tgt_d, h_tgt_d, h_w_d, r_tgt_d, c_tgt_d, p_tgt_d, bp_tgt_d)
 
                     val_loss_sum += float(vloss.cpu().item())
                     val_steps += 1
@@ -2045,6 +2556,7 @@ def distill_dual_cross_encoder(
         "sanity_check_shuffle": bool(sanity_check_shuffle),
         "distill_temperature": temp,
         "train_root_aug_count": train_root_aug_count,
+        "hostility_loss_deweighted_aug": True,
         "train_losses": train_losses,
         "best_epoch": best_epoch,
         "best_val_loss": best_val_loss,
@@ -2193,6 +2705,49 @@ def _append_score_deltas(
         fh.flush()
 
 
+def _has_complete_dual_ce_checkpoint(
+    ckpt_dir: str | Path,
+    *,
+    require_distill_report: bool = False,
+) -> bool:
+    ce_path = Path(ckpt_dir)
+    weights_pt = ce_path / "dual_head_weights.pt"
+    try:
+        has_weights_pt = weights_pt.is_file() and weights_pt.stat().st_size > 0
+    except OSError:
+        has_weights_pt = False
+    ok = (
+        _has_hf_weight_files(ce_path)
+        and has_weights_pt
+        and (ce_path / "dual_head_meta.json").is_file()
+        and (ce_path / "config.json").is_file()
+    )
+    if require_distill_report:
+        ok = ok and (ce_path / "distill_report.json").is_file()
+    return ok
+
+
+def _is_depth1_pair(pair: Mapping[str, Any]) -> bool:
+    if pair.get("depth") is not None:
+        return int(pair["depth"]) == 1
+    root_txt = pair.get("root_text")
+    root_id = str(pair.get("root_id") or "")
+    parent_id = str(pair.get("parent_id") or "")
+    is_deep = bool(root_txt) and (
+        (bool(root_id) and bool(parent_id) and root_id != parent_id)
+        or str(root_txt) != str(pair.get("parent_text") or "")
+    )
+    return not is_deep
+
+
+def _sync_rerouted_depth1_root_scores(pairs: Sequence[dict[str, Any]]) -> None:
+    for p in pairs:
+        if p.get("target_attributed") == "third_party" and _is_depth1_pair(p):
+            p["root_s_uv"] = float(p["s_uv"])
+            if "stance_probs" in p:
+                p["root_stance_probs"] = list(p["stance_probs"])
+
+
 def _score_pairs_with_teachers(
     pairs: list[dict[str, Any]],
     *,
@@ -2203,11 +2758,23 @@ def _score_pairs_with_teachers(
     cache_path: Path | None = None,
     checkpoint_every: int = 250,
     teacher_backend: str = "dual_nli",
+    use_hostility_router: bool = False,
+    hostility_gate_threshold: float | None = None,
     telemetry: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Run dual open-source teachers (Hostility + mDeBERTa Stance Verbalizer) with O(N) JSONL delta checkpointing."""
     if not pairs:
         return pairs
+
+    if teacher_backend == "legacy_nli":
+        warnings.warn(
+            "teacher_backend='legacy_nli' is deprecated and retired; using canonical 'dual_nli'.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        teacher_backend = "dual_nli"
+    elif teacher_backend != "dual_nli":
+        raise ValueError(f"Unsupported teacher_backend {teacher_backend!r}; expected 'dual_nli'")
 
     chunk_size = max(1, int(checkpoint_every))
     cache_file = Path(cache_path) if cache_path is not None else None
@@ -2266,6 +2833,20 @@ def _score_pairs_with_teachers(
                     p[field] = cached[field]
 
     did_compute = False
+    resolved_gate_threshold: float
+    if hostility_gate_threshold is not None:
+        resolved_gate_threshold = float(hostility_gate_threshold)
+    else:
+        resolved_gate_threshold = 0.5
+        if lang == "vi" and vihsd_ckpt is not None:
+            metrics_file = Path(vihsd_ckpt) / "vihsd_metrics.json"
+            if metrics_file.is_file():
+                try:
+                    m_data = json.loads(metrics_file.read_text(encoding="utf-8"))
+                    if "calibrated_hostility_threshold" in m_data:
+                        resolved_gate_threshold = float(m_data["calibrated_hostility_threshold"])
+                except Exception:
+                    pass
 
     # Stage 1: Hostility intensity h_uv
     need_host_idx = [i for i, p in enumerate(pairs) if "h_uv" not in p]
@@ -2276,6 +2857,10 @@ def _score_pairs_with_teachers(
             model_name_or_path=vihsd_ckpt if lang == "vi" else None,
             allow_untrained_fallback=allow_untrained_fallback,
         )
+        if hostility_gate_threshold is None:
+            resolved_gate_threshold = float(
+                getattr(host_scorer, "calibrated_threshold", resolved_gate_threshold)
+            )
         chunk_starts = range(0, len(need_host_idx), chunk_size)
         for start in tqdm(chunk_starts, desc=f"Hostility teacher ({lang})"):
             idx_slice = need_host_idx[start : start + chunk_size]
@@ -2296,6 +2881,7 @@ def _score_pairs_with_teachers(
     need_nli_idx = [
         i for i, p in enumerate(pairs) if "s_uv" not in p or "root_s_uv" not in p
     ]
+    router_stats: dict[str, Any] | None = None
     if need_nli_idx:
         did_compute = True
         nli_scorer = NLIStanceTeacherScorer(lang=lang, use_stance_verbalizer=True)
@@ -2351,10 +2937,29 @@ def _score_pairs_with_teachers(
                     idx_slice,
                     ("s_uv", "stance_probs", "pred_label", "root_s_uv", "root_stance_probs"),
                 )
+        if use_hostility_router:
+            router = HostilityGatedTargetRouter(
+                hostility_gate_threshold=resolved_gate_threshold,
+                lang=lang,
+                nli_scorer=nli_scorer,
+            )
+            pairs, router_stats = router.route_pairs(pairs)
+            _sync_rerouted_depth1_root_scores(pairs)
+            if router_stats.get("rerouted_count", 0) > 0:
+                did_compute = True
         del nli_scorer
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    elif use_hostility_router:
+        router = HostilityGatedTargetRouter(
+            hostility_gate_threshold=resolved_gate_threshold,
+            lang=lang,
+        )
+        pairs, router_stats = router.route_pairs(pairs)
+        _sync_rerouted_depth1_root_scores(pairs)
+        if router_stats.get("rerouted_count", 0) > 0:
+            did_compute = True
 
     if cache_file is not None and (did_compute or not cache_file.exists() or (ckpt_jsonl is not None and ckpt_jsonl.exists())):
         _atomic_write_json(cache_file, pairs)
@@ -2373,6 +2978,9 @@ def _score_pairs_with_teachers(
             else (VISOBERT_MODEL_NAME if lang == "vi" else EN_OFFENSIVE_MODEL_NAME)
         )
         telemetry["use_stance_verbalizer"] = True
+        telemetry["use_hostility_router"] = bool(use_hostility_router)
+        if router_stats is not None:
+            telemetry["hostility_router_stats"] = router_stats
         telemetry["num_pairs"] = len(pairs)
         telemetry["num_deep_pairs"] = int(
             sum(
@@ -2411,11 +3019,19 @@ def main() -> None:
         "--teacher-backend",
         choices=["dual_nli", "legacy_nli"],
         default="dual_nli",
+        help="Canonical NLI stance teacher ('dual_nli'; 'legacy_nli' is deprecated).",
     )
+    parser.add_argument("--hostility-target-router", action="store_true")
+    parser.add_argument("--hostility-gate-threshold", type=float, default=None)
     parser.add_argument("--edge-dim", type=int, choices=[2, 4], default=2)
     parser.add_argument("--student-backbone", type=str, default=None)
     parser.add_argument("--score-only", action="store_true")
     parser.add_argument("--export-audit", action="store_true")
+    parser.add_argument(
+        "--force-export-audit",
+        action="store_true",
+        help="Overwrite existing audit CSVs even when --skip-if-exists or existing audit files are present.",
+    )
     parser.add_argument("--distill", action="store_true")
     parser.add_argument("--skip-if-exists", action="store_true")
     parser.add_argument("--include-root-context", action="store_true")
@@ -2451,7 +3067,11 @@ def main() -> None:
     splits_path = args.topic_splits_json or (args.interim_dir / "topic_splits.json")
 
     if args.train_vihsd:
-        if args.skip_if_exists and (args.vihsd_dir / "vihsd_metrics.json").exists():
+        if (
+            args.skip_if_exists
+            and (args.vihsd_dir / "vihsd_metrics.json").is_file()
+            and _has_hf_weight_files(args.vihsd_dir)
+        ):
             print(f"[SKIP] Fine-tuned ViHSD checkpoint already exists: {args.vihsd_dir}")
         else:
             finetune_visobert_vihsd(
@@ -2494,6 +3114,12 @@ def main() -> None:
             cache_path=args.scored_cache_json,
             checkpoint_every=args.checkpoint_every,
             teacher_backend=args.teacher_backend,
+            use_hostility_router=bool(args.hostility_target_router),
+            hostility_gate_threshold=(
+                float(args.hostility_gate_threshold)
+                if args.hostility_gate_threshold is not None
+                else None
+            ),
             telemetry=telemetry,
         )
         if args.scored_cache_json is not None:
@@ -2506,9 +3132,26 @@ def main() -> None:
                 )
 
         if args.export_audit:
-            pilot_ready = args.pilot_csv is None or args.pilot_csv.exists()
-            if args.skip_if_exists and audit_csv.exists() and machine_key_csv.exists() and pilot_ready:
-                print(f"[SKIP] Blind human audit CSV already exists: {audit_csv}")
+            if not args.force_export_audit and audit_csv.exists():
+                if args.skip_if_exists:
+                    print(f"[SKIP] Blind human audit CSV already exists: {audit_csv}")
+                else:
+                    raise FileExistsError(
+                        f"Refusing to overwrite existing audit CSV '{audit_csv}' without "
+                        "--force-export-audit (or pass --skip-if-exists to keep existing file)."
+                    )
+            elif (
+                not args.force_export_audit
+                and args.pilot_csv is not None
+                and args.pilot_csv.exists()
+            ):
+                if args.skip_if_exists:
+                    print(f"[SKIP] Pilot human audit CSV already exists: {args.pilot_csv}")
+                else:
+                    raise FileExistsError(
+                        f"Refusing to overwrite existing pilot CSV '{args.pilot_csv}' without "
+                        "--force-export-audit (or pass --skip-if-exists to keep existing file)."
+                    )
             else:
                 test_topics = {str(t) for t in canonical_splits.get("test", ())}
                 test_cids = {
@@ -2532,8 +3175,7 @@ def main() -> None:
         if args.distill:
             if (
                 args.skip_if_exists
-                and (out_dir / "dual_head_weights.pt").exists()
-                and (out_dir / "distill_report.json").exists()
+                and _has_complete_dual_ce_checkpoint(out_dir, require_distill_report=True)
             ):
                 print(f"[SKIP] Distilled Student checkpoint already exists: {out_dir}")
             else:

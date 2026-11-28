@@ -259,7 +259,7 @@ def test_trainer_bias_init_ema_best_val_seed_selection_and_comparator() -> None:
 
 
 def test_auto_loop_hidden64_and_bundle_security_exclusions(tmp_path: Path) -> None:
-    assert all(cfg["hidden_dim"] == 64 and cfg["lambda_uncertainty"] == 0.0 for cfg in DEFAULT_V2_CANDIDATES)
+    assert all(cfg["hidden_dim"] == 64 and cfg.get("lambda_uncertainty") is None for cfg in DEFAULT_V2_CANDIDATES)
     graphs = _make_cascade_graphs(num_graphs=4, in_dim=16)
     tr_l = DataLoader(graphs[:2], batch_size=2, shuffle=True)
     va_l = DataLoader(graphs[2:4], batch_size=2, shuffle=False)

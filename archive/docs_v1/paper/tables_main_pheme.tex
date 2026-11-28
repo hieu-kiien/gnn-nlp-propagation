@@ -1,0 +1,27 @@
+\begin{table*}[t]
+\centering
+\caption{English PHEME Early Cascade Size, Polarization, and Rumor Prediction at $K=10, N_{\text{reply}} \ge 15$ (Inductive, Mean $\pm$ Std, using Persistence Anchor and 8-D Burst Stats). Stars indicate fixed-seed cascade-level IID bootstrap significance across the 2 Test events vs.\ EdgeGATv2 ($^{*}p<0.05$, $^{**}p<0.01$; paired 5-seed $t$-test Holm--Bonferroni $p_{\text{adj}} = 1.00$).}
+\label{tab:main_pheme}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lccccccccc}
+\toprule
+Model & MSLE $\downarrow$ & MAE $\downarrow$ & $R^2_{\text{size}}$ $\uparrow$ & RMSE $\downarrow$ & $R^2_{\text{polar}}$ $\uparrow$ & Pearson $r$ $\uparrow$ & Spearman $\rho$ $\uparrow$ & Macro-F1 $\uparrow$ & Acc $\uparrow$ \\
+\midrule
+Early-K Persistence & 0.1166 $\pm$ 0.0000 & 0.2821 $\pm$ 0.0000 & -0.0999 $\pm$ 0.0000 & 0.0562 $\pm$ 0.0000 & -0.3022 $\pm$ 0.0000 & 0.3310 $\pm$ 0.0000 & 0.3951 $\pm$ 0.0000 & -- & -- \\
+TextMLP & 0.1002 $\pm$ 0.0066 & 0.2486 $\pm$ 0.0236 & 0.0545 $\pm$ 0.0620 & \textbf{0.0469 $\pm$ 0.0004} & \textbf{0.0932 $\pm$ 0.0162} & 0.3640 $\pm$ 0.0369 & 0.3893 $\pm$ 0.0657 & 0.3379 $\pm$ 0.0202 & 0.6228 $\pm$ 0.0500 \\
+TemporalStanceMLP & 0.1006 $\pm$ 0.0055 & 0.2371 $\pm$ 0.0219 & 0.0509 $\pm$ 0.0514 & 0.0470 $\pm$ 0.0012 & 0.0861 $\pm$ 0.0460 & 0.3739 $\pm$ 0.0400 & 0.4091 $\pm$ 0.0419 & 0.3440 $\pm$ 0.0187 & \textbf{0.6443 $\pm$ 0.0267} \\
+StandardGCN & 0.1003 $\pm$ 0.0038 & 0.2448 $\pm$ 0.0131 & 0.0538 $\pm$ 0.0354 & 0.0478 $\pm$ 0.0004 & 0.0586 $\pm$ 0.0165 & 0.3033 $\pm$ 0.0537 & 0.3326 $\pm$ 0.0749 & 0.3195 $\pm$ 0.0219 & 0.5790 $\pm$ 0.0733 \\
+StandardGATv2 & 0.0998 $\pm$ 0.0068 & 0.2446 $\pm$ 0.0230 & 0.0585 $\pm$ 0.0638 & 0.0475 $\pm$ 0.0003 & 0.0679 $\pm$ 0.0124 & 0.3115 $\pm$ 0.0125 & 0.3210 $\pm$ 0.0418 & 0.3263 $\pm$ 0.0433 & 0.6210 $\pm$ 0.0547 \\
+EdgeGATv2 & 0.0996 $\pm$ 0.0072 & 0.2410 $\pm$ 0.0220 & 0.0609 $\pm$ 0.0675 & 0.0472 $\pm$ 0.0007 & 0.0803 $\pm$ 0.0260 & \textbf{0.4008 $\pm$ 0.0472} & \textbf{0.4451 $\pm$ 0.0307} & 0.3299 $\pm$ 0.0522 & 0.5988 $\pm$ 0.0988 \\
+FAGCN & \textbf{0.0986 $\pm$ 0.0062} & \textbf{0.2329 $\pm$ 0.0161} & \textbf{0.0697 $\pm$ 0.0584} & 0.0485 $\pm$ 0.0007 & 0.0301 $\pm$ 0.0268 & 0.3171 $\pm$ 0.0589 & 0.3467 $\pm$ 0.0915 & 0.3238 $\pm$ 0.0262 & 0.5605 $\pm$ 0.0221 \\
+BiGCN & 0.1066 $\pm$ 0.0086 & 0.2592 $\pm$ 0.0220 & -0.0054 $\pm$ 0.0813 & 0.0482 $\pm$ 0.0008 & 0.0408 $\pm$ 0.0329 & 0.2830 $\pm$ 0.0475 & 0.2833 $\pm$ 0.0633 & 0.2674 $\pm$ 0.1028 & 0.5563 $\pm$ 0.0939 \\
+SBiFAGAT & 0.1007 $\pm$ 0.0061 & 0.2424 $\pm$ 0.0210 & 0.0499 $\pm$ 0.0575 & 0.0472 $\pm$ 0.0003 & 0.0793 $\pm$ 0.0135 & 0.3755 $\pm$ 0.0505 & 0.3888 $\pm$ 0.0678 & \textbf{0.3541 $\pm$ 0.0261} & 0.6359 $\pm$ 0.0355$^{**}$ \\
+\midrule
+$p$-value (SBiFAGAT vs. EdgeGATv2) & 4.92e-01 & 7.93e-01 & 4.92e-01 & 9.45e-01 & 9.50e-01 & 4.65e-01 & 1.64e-01 & 3.82e-01 & 3.00e-01 \\
+Bootstrap $p$ (SBiFAGAT vs. EdgeGATv2) & 4.34e-01 & 4.02e-01 & 4.31e-01 & 8.32e-01 & 8.48e-01 & 1.25e-01 & 7.20e-03 & 1.28e-02 & 8.00e-04 \\
+Holm-Bonferroni $p$ (SBiFAGAT vs. EdgeGATv2) & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 \\
+Holm-Bonf Bootstrap $p$ (SBiFAGAT vs. EdgeGATv2) & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 7.49e-01 & 5.76e-02 & 8.96e-02 & 7.20e-03 \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}

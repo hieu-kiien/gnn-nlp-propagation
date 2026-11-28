@@ -1,0 +1,66 @@
+[
+  {
+    "model": "TextMLP",
+    "params": 71110,
+    "infer_ms_per_cascade": 0.043987665623035355,
+    "train_ms_per_batch": 4.647566999847186,
+    "peak_mem_mb": 21.08251953125,
+    "mem_label": "Peak VRAM (MB)"
+  },
+  {
+    "model": "TemporalStanceMLP",
+    "params": 88903,
+    "infer_ms_per_cascade": 0.06358104374726281,
+    "train_ms_per_batch": 5.729004900058499,
+    "peak_mem_mb": 21.34375,
+    "mem_label": "Peak VRAM (MB)"
+  },
+  {
+    "model": "StandardGCN",
+    "params": 75398,
+    "infer_ms_per_cascade": 0.091517309374467,
+    "train_ms_per_batch": 9.7122417000719,
+    "peak_mem_mb": 21.50927734375,
+    "mem_label": "Peak VRAM (MB)"
+  },
+  {
+    "model": "StandardGATv2",
+    "params": 83974,
+    "infer_ms_per_cascade": 0.11291280937371084,
+    "train_ms_per_batch": 9.035521800069546,
+    "peak_mem_mb": 23.43603515625,
+    "mem_label": "Peak VRAM (MB)"
+  },
+  {
+    "model": "EdgeGATv2",
+    "params": 84231,
+    "infer_ms_per_cascade": 0.13925175312579086,
+    "train_ms_per_batch": 9.482118999949307,
+    "peak_mem_mb": 23.47509765625,
+    "mem_label": "Peak VRAM (MB)"
+  },
+  {
+    "model": "FAGCN",
+    "params": 67334,
+    "infer_ms_per_cascade": 0.10542473124814933,
+    "train_ms_per_batch": 7.792591899851686,
+    "peak_mem_mb": 22.27490234375,
+    "mem_label": "Peak VRAM (MB)"
+  },
+  {
+    "model": "BiGCN",
+    "params": 116998,
+    "infer_ms_per_cascade": 0.14929719687302168,
+    "train_ms_per_batch": 10.787085800075147,
+    "peak_mem_mb": 23.1728515625,
+    "mem_label": "Peak VRAM (MB)"
+  },
+  {
+    "model": "SBiFAGAT",
+    "params": 137086,
+    "infer_ms_per_cascade": 0.383531284376204,
+    "train_ms_per_batch": 30.585798699939915,
+    "peak_mem_mb": 27.09130859375,
+    "mem_label": "Peak VRAM (MB)"
+  }
+]

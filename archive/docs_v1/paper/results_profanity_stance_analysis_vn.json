@@ -1,0 +1,201 @@
+{
+  "vn_corpus_edges": {
+    "total_edges": 86320,
+    "s_mean": -0.1006,
+    "s_std": 0.163,
+    "h_mean": 0.0596,
+    "h_std": 0.172,
+    "pearson_corr_s_h": -0.1832,
+    "bands": {
+      "h_ge_0.3": {
+        "count": 4965,
+        "pct_of_edges": 5.7519,
+        "s_gt_0.15": 51,
+        "pct_s_gt_0.15": 1.03,
+        "s_neutral": 1785,
+        "pct_s_neutral": 35.95,
+        "s_lt_neg0.15": 3129,
+        "pct_s_lt_neg0.15": 63.02,
+        "s_mean": -0.2009
+      },
+      "h_ge_0.5": {
+        "count": 3597,
+        "pct_of_edges": 4.1671,
+        "s_gt_0.15": 41,
+        "pct_s_gt_0.15": 1.14,
+        "s_neutral": 1291,
+        "pct_s_neutral": 35.89,
+        "s_lt_neg0.15": 2265,
+        "pct_s_lt_neg0.15": 62.97,
+        "s_mean": -0.2009
+      },
+      "h_ge_0.7": {
+        "count": 2626,
+        "pct_of_edges": 3.0422,
+        "s_gt_0.15": 36,
+        "pct_s_gt_0.15": 1.37,
+        "s_neutral": 964,
+        "pct_s_neutral": 36.71,
+        "s_lt_neg0.15": 1626,
+        "pct_s_lt_neg0.15": 61.92,
+        "s_mean": -0.1995
+      }
+    }
+  },
+  "audit_140_pairs": {
+    "quadrant_machine_stance_confusion": {
+      "neutral+clean": {
+        "neutral": 16,
+        "oppose": 16,
+        "support": 10
+      },
+      "oppose+clean": {
+        "oppose": 9,
+        "support": 1,
+        "neutral": 11
+      },
+      "oppose+uncivil": {
+        "oppose": 2,
+        "support": 1,
+        "neutral": 1
+      },
+      "support+clean": {
+        "support": 34,
+        "oppose": 15,
+        "neutral": 17
+      },
+      "support+uncivil": {
+        "oppose": 4,
+        "neutral": 2,
+        "support": 1
+      }
+    },
+    "quadrant_mean_teacher_s": {
+      "neutral+clean": -0.077,
+      "oppose+clean": -0.1594,
+      "oppose+uncivil": -0.0745,
+      "support+clean": 0.0675,
+      "support+uncivil": -0.2495
+    },
+    "visobert_hostility_at_0_5": {
+      "tp": 11,
+      "fp": 42,
+      "tn": 87,
+      "fn": 0,
+      "precision_uncivil": 0.2075,
+      "recall_uncivil": 1.0
+    },
+    "uncivil_cases": [
+      {
+        "sample_id": "pilot_016",
+        "gold_stance": "support",
+        "gold_hostility": "uncivil",
+        "machine_stance": "oppose",
+        "machine_s": -0.5722,
+        "machine_hostility": "uncivil",
+        "machine_h": 0.9909,
+        "reply_snippet": "Thằng súc vật đấy thì hiếu j"
+      },
+      {
+        "sample_id": "audit_015",
+        "gold_stance": "oppose",
+        "gold_hostility": "uncivil",
+        "machine_stance": "oppose",
+        "machine_s": -0.4076,
+        "machine_hostility": "uncivil",
+        "machine_h": 0.8331,
+        "reply_snippet": "Như trên. ko biết OP nói bao phần là đúng sai.\nNhưng mẹ lấy cái ví dụ so sánh ngáo bỏ mẹ còn tỏ ra mình bề trên nhìn xuố"
+      },
+      {
+        "sample_id": "audit_022",
+        "gold_stance": "oppose",
+        "gold_hostility": "uncivil",
+        "machine_stance": "support",
+        "machine_s": 0.2536,
+        "machine_hostility": "uncivil",
+        "machine_h": 0.9978,
+        "reply_snippet": "Khuyên như cl"
+      },
+      {
+        "sample_id": "audit_062",
+        "gold_stance": "oppose",
+        "gold_hostility": "uncivil",
+        "machine_stance": "oppose",
+        "machine_s": -0.101,
+        "machine_hostility": "uncivil",
+        "machine_h": 0.558,
+        "reply_snippet": "hảo quân tử! Bao nhiêu thứ rác rưởi ko chối được gì chỉ lấy cái lương 400tr lên che =))"
+      },
+      {
+        "sample_id": "audit_065",
+        "gold_stance": "support",
+        "gold_hostility": "uncivil",
+        "machine_stance": "neutral",
+        "machine_s": -0.1145,
+        "machine_hostility": "uncivil",
+        "machine_h": 0.9859,
+        "reply_snippet": "ai có nhận thức thì họ cũng là cừu có trí thức. Còn đám cừu ngu, thì 1000 năm nữa nó vẫn ngu vậy thôi"
+      },
+      {
+        "sample_id": "audit_081",
+        "gold_stance": "support",
+        "gold_hostility": "uncivil",
+        "machine_stance": "neutral",
+        "machine_s": -0.1221,
+        "machine_hostility": "uncivil",
+        "machine_h": 0.9568,
+        "reply_snippet": "Thằng chồng quá súc vật"
+      },
+      {
+        "sample_id": "audit_084",
+        "gold_stance": "support",
+        "gold_hostility": "uncivil",
+        "machine_stance": "oppose",
+        "machine_s": -0.3175,
+        "machine_hostility": "uncivil",
+        "machine_h": 0.7912,
+        "reply_snippet": "Uh. Mẹ nó cũng ngu nốt. Hoặc cũng có thể do con gái nó kể chuyện với mẹ kiểu khác."
+      },
+      {
+        "sample_id": "audit_096",
+        "gold_stance": "support",
+        "gold_hostility": "uncivil",
+        "machine_stance": "support",
+        "machine_s": 0.1438,
+        "machine_hostility": "uncivil",
+        "machine_h": 0.9104,
+        "reply_snippet": "thật sự ạ, cho t xin cái linkedin tk chó này"
+      },
+      {
+        "sample_id": "audit_106",
+        "gold_stance": "oppose",
+        "gold_hostility": "uncivil",
+        "machine_stance": "neutral",
+        "machine_s": -0.0429,
+        "machine_hostility": "uncivil",
+        "machine_h": 0.7336,
+        "reply_snippet": "Phá gia chi tử"
+      },
+      {
+        "sample_id": "audit_111",
+        "gold_stance": "support",
+        "gold_hostility": "uncivil",
+        "machine_stance": "oppose",
+        "machine_s": -0.5241,
+        "machine_hostility": "uncivil",
+        "machine_h": 0.9909,
+        "reply_snippet": "cái này là ngu nhưng thích đẻ chứ nuôi dạy cái gì?"
+      },
+      {
+        "sample_id": "audit_114",
+        "gold_stance": "support",
+        "gold_hostility": "uncivil",
+        "machine_stance": "oppose",
+        "machine_s": -0.2398,
+        "machine_hostility": "uncivil",
+        "machine_h": 0.9593,
+        "reply_snippet": "Tháng 400tr mà sống dơ vậy thằng kia đừng có vác mặt lên voz hỏi han hay trò chuyện nữa nhé, sống còn thua bọn “chủ tịt”"
+      }
+    ]
+  }
+}

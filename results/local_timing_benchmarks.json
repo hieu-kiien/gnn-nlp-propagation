@@ -1,0 +1,129 @@
+{
+  "device": "NVIDIA GeForce GTX 1660 SUPER (6143.6 MB VRAM)",
+  "python_executable": "D:\\sbifagat_cuda_venv\\Scripts\\python.exe",
+  "kaggle_cli_available": false,
+  "completed_local_real_data_runs": {
+    "tier2_macro_vn": {
+      "elapsed_sec": 9.12,
+      "output": "results/results_macro_network_vn.json"
+    },
+    "tier2_macro_pheme": {
+      "elapsed_sec": 19.01,
+      "output": "results/results_macro_network_pheme.json"
+    },
+    "tier2_signed_link_1seed_probe_pheme": {
+      "elapsed_sec": 96.62,
+      "batch_size": 2048,
+      "seeds": [42]
+    },
+    "tier2_signed_link_1seed_probe_vn": {
+      "elapsed_sec": 106.25,
+      "batch_size": 2048,
+      "seeds": [42]
+    },
+    "tier2_signed_link_5seed_pheme": {
+      "elapsed_sec": 352.56,
+      "batch_size": 2048,
+      "models": 10,
+      "seeds": [42, 100, 2024, 777, 999],
+      "output": "results/results_signed_link_pheme.json"
+    },
+    "tier2_signed_link_5seed_vn": {
+      "elapsed_sec": 446.84,
+      "batch_size": 2048,
+      "models": 10,
+      "seeds": [42, 100, 2024, 777, 999],
+      "output": "results/results_signed_link_vn.json"
+    },
+    "vn_contraction_1500_cascades": {
+      "elapsed_sec": 30.04,
+      "output": "results/contraction_eval_vn.json"
+    },
+    "efficiency_e2e_vn": {
+      "elapsed_sec": 15.0,
+      "is_partial_without_dual_ce": true,
+      "output": "results/efficiency_e2e.json"
+    },
+    "tier1_tabular_canonical_vn": {
+      "elapsed_sec": 85.77,
+      "models": ["Early-K Persistence", "Calibrated Early-K Persistence", "Ridge", "LightGBM"],
+      "seeds": [42, 100, 2024, 777, 999],
+      "output": "results/tier1_tabular_canonical_vn.json"
+    },
+    "tier1_tabular_cluster_vn": {
+      "elapsed_sec": 95.58,
+      "models": ["Early-K Persistence", "Calibrated Early-K Persistence", "Ridge", "LightGBM"],
+      "seeds": [42, 100, 2024, 777, 999],
+      "output": "results/tier1_tabular_cluster_vn.json"
+    },
+    "tier1_tabular_temporal_vn": {
+      "elapsed_sec": 93.65,
+      "models": ["Early-K Persistence", "Calibrated Early-K Persistence", "Ridge", "LightGBM"],
+      "seeds": [42, 100, 2024, 777, 999],
+      "output": "results/tier1_tabular_temporal_vn.json"
+    },
+    "tier1_tabular_inductive_pheme": {
+      "elapsed_sec": 66.35,
+      "models": ["Early-K Persistence", "Calibrated Early-K Persistence", "Ridge", "LightGBM"],
+      "seeds": [42, 100, 2024, 777, 999],
+      "output": "results/tier1_tabular_inductive_pheme.json"
+    },
+    "tier1_tabular_loo_pheme": {
+      "elapsed_sec": 318.04,
+      "num_folds": 5,
+      "models": ["Early-K Persistence", "Calibrated Early-K Persistence", "Ridge", "LightGBM"],
+      "seeds": [42, 100, 2024, 777, 999],
+      "output": "results/tier1_tabular_loo_pheme.json"
+    }
+  },
+  "cloud_queued_heavy_gpu_sweeps": {
+    "vn_tier1_canonical_16models_5seeds": {
+      "local_eta_min": "70-95",
+      "cloud_t4_eta_min": "25-45",
+      "notebook": "notebooks/colab_gpu_v3_gnn_benchmarks.ipynb",
+      "command": "python -u -m scripts.run_experiments --data-dir data/processed/vn --k-horizon 20 --hidden-dim 64 --edge-dim 2 --use-cascade-stats --include-tier2-prior --min-total-replies 25 --polar-target-mode future_only --epochs 100 --patience 10 --output-json results/results_main_vn.json --output-table results/tables_main_vn.tex --figures-dir results/figures/vn --ckpt-out checkpoints/best_sbifagat_vn.pt"
+    },
+    "vn_tier1_cluster_16models_5seeds": {
+      "local_eta_min": "70-95",
+      "cloud_t4_eta_min": "25-45",
+      "notebook": "notebooks/colab_gpu_v3_gnn_benchmarks.ipynb",
+      "command": "python -u -m scripts.run_experiments --data-dir data/processed/vn --k-horizon 20 --hidden-dim 64 --edge-dim 2 --use-cascade-stats --include-tier2-prior --min-total-replies 25 --polar-target-mode future_only --split-mode embedding_cluster --edge-source teacher --epochs 100 --patience 10 --output-json results/results_cluster_vn.json --output-table results/tables_cluster_vn.tex --skip-figures"
+    },
+    "vn_tier1_temporal_16models_5seeds": {
+      "local_eta_min": "70-95",
+      "cloud_t4_eta_min": "25-45",
+      "notebook": "notebooks/colab_gpu_v3_gnn_benchmarks.ipynb",
+      "command": "python -u -m scripts.run_experiments --data-dir data/processed/vn --k-horizon 20 --hidden-dim 64 --edge-dim 2 --use-cascade-stats --include-tier2-prior --min-total-replies 25 --polar-target-mode future_only --split-mode temporal --edge-source teacher --epochs 100 --patience 10 --output-json results/results_temporal_vn.json --output-table results/tables_temporal_vn.tex --skip-figures"
+    },
+    "pheme_tier1_inductive_16models_5seeds": {
+      "local_eta_min": "110-140",
+      "cloud_t4_eta_min": "45-70",
+      "notebook": "notebooks/colab_gpu_v3_gnn_benchmarks.ipynb",
+      "command": "python -u -m scripts.run_experiments --data-dir data/processed/pheme --k-horizon 10 --hidden-dim 64 --edge-dim 2 --use-cascade-stats --include-tier2-prior --min-total-replies 15 --polar-target-mode future_only --epochs 100 --patience 10 --output-json results/results_main_pheme.json --output-table results/tables_main_pheme.tex --figures-dir results/figures/pheme --ckpt-out checkpoints/best_sbifagat_pheme.pt"
+    },
+    "pheme_tier1_loo_5folds_16models_5seeds": {
+      "local_eta_min": "480-600",
+      "cloud_t4_eta_min": "180-300",
+      "notebook": "notebooks/colab_gpu_v3_gnn_benchmarks.ipynb",
+      "command": "python -u -m scripts.run_experiments --data-dir data/processed/pheme --k-horizon 10 --hidden-dim 64 --edge-dim 2 --use-cascade-stats --include-tier2-prior --min-total-replies 15 --polar-target-mode future_only --eval-protocol loo --edge-source teacher --epochs 100 --patience 10 --output-json results/results_loo_pheme.json --output-table results/tables_loo_pheme.tex --ckpt-out checkpoints/best_sbifagat_pheme_loo.pt --skip-figures"
+    },
+    "ablation_and_k_curve_vn": {
+      "local_eta_min": "150-180",
+      "cloud_t4_eta_min": "60-90",
+      "notebook": "notebooks/colab_gpu_v3_gnn_benchmarks.ipynb",
+      "command": "python -u -m scripts.run_ablation --data-dir data/processed/vn --k-horizon 20 --hidden-dim 64 --edge-dim 2 --use-cascade-stats --min-total-replies 25 --polar-target-mode future_only --epochs 100 --patience 10 --output-json results/results_ablation_vn.json --output-table results/tables_ablation_vn.tex --figures-dir results/figures/vn"
+    },
+    "ablation_and_k_curve_pheme": {
+      "local_eta_min": "210-250",
+      "cloud_t4_eta_min": "90-120",
+      "notebook": "notebooks/colab_gpu_v3_gnn_benchmarks.ipynb",
+      "command": "python -u -m scripts.run_ablation --data-dir data/processed/pheme --k-horizon 10 --hidden-dim 64 --edge-dim 2 --use-cascade-stats --min-total-replies 15 --polar-target-mode future_only --epochs 100 --patience 10 --output-json results/results_ablation_pheme.json --output-table results/tables_ablation_pheme.tex --figures-dir results/figures/pheme"
+    },
+    "dual_ce_distill_recovery_vn_and_pheme": {
+      "local_eta_min": "35-60",
+      "cloud_t4_eta_min": "10-20",
+      "notebook": "notebooks/colab_gpu_v3_gnn_benchmarks.ipynb",
+      "command": "python -u -m scripts.kaggle_parallel_runner --role model_nlp_only --lang vi --distill-from-features --results-dir results --include-heavy-weights"
+    }
+  }
+}

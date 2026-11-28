@@ -1,0 +1,31 @@
+\begin{table*}[t]
+\centering
+\caption{Ablation Study of SBi-FAGAT Components at $K=10$ Across 5 Random Seeds. Separates stance polarity $s_{uv}$, hostility $h_{uv}$, signed $\tanh$ gate, Bottom-Up feedback, Dir-GNN mixing, dual-channel split, Camp Dipole \& Moments readout, Persistence-Residual anchoring, 8-D Burst Stats, and Global Attention Readout against a matched BiEdgeGATv2 (Matched) comparator (significance stars vs. BiEdgeGATv2 (Matched), Holm-Bonferroni adjusted).}
+\label{tab:ablation_pheme}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lccccccccc}
+\toprule
+Model & MSLE $\downarrow$ & MAE $\downarrow$ & $R^2_{\text{size}}$ $\uparrow$ & RMSE $\downarrow$ & $R^2_{\text{polar}}$ $\uparrow$ & Pearson $r$ $\uparrow$ & Spearman $\rho$ $\uparrow$ & Macro-F1 $\uparrow$ & Acc $\uparrow$ \\
+\midrule
+SBiFAGAT (Full) & 0.0995 $\pm$ 0.0040 & 0.2391 $\pm$ 0.0160 & 0.0613 $\pm$ 0.0378 & 0.0472 $\pm$ 0.0006 & 0.0811 $\pm$ 0.0245 & 0.3948 $\pm$ 0.0516 & 0.4291 $\pm$ 0.0784 & 0.3240 $\pm$ 0.0465 & 0.6120 $\pm$ 0.0574 \\
+w/o Stance Score (s\_uv=0) & 0.0987 $\pm$ 0.0046 & 0.2396 $\pm$ 0.0146 & 0.0695 $\pm$ 0.0430 & 0.0472 $\pm$ 0.0008 & 0.0821 $\pm$ 0.0312 & 0.3904 $\pm$ 0.0497 & 0.4213 $\pm$ 0.0771 & 0.3283 $\pm$ 0.0468 & 0.6281 $\pm$ 0.0623 \\
+w/o Hostility Score (h\_uv=0) & 0.0995 $\pm$ 0.0042 & 0.2391 $\pm$ 0.0157 & 0.0616 $\pm$ 0.0397 & 0.0472 $\pm$ 0.0006 & 0.0817 $\pm$ 0.0240 & 0.3933 $\pm$ 0.0519 & 0.4261 $\pm$ 0.0786 & 0.3307 $\pm$ 0.0454 & 0.6222 $\pm$ 0.0565 \\
+w/o Edge Signals (s\_uv=0, h\_uv=0) & 0.0975 $\pm$ 0.0054 & 0.2385 $\pm$ 0.0146 & 0.0802 $\pm$ 0.0511 & 0.0470 $\pm$ 0.0007 & 0.0869 $\pm$ 0.0253 & 0.4032 $\pm$ 0.0487 & 0.4427 $\pm$ 0.0753 & 0.3427 $\pm$ 0.0283 & \textbf{0.6461 $\pm$ 0.0381} \\
+w/o Conflict Gate (Sigmoid) & 0.1015 $\pm$ 0.0048 & 0.2452 $\pm$ 0.0123 & 0.0431 $\pm$ 0.0450 & 0.0470 $\pm$ 0.0006 & 0.0885 $\pm$ 0.0227 & 0.4014 $\pm$ 0.0464 & 0.4470 $\pm$ 0.0749 & 0.3341 $\pm$ 0.0499 & 0.6066 $\pm$ 0.0613 \\
+w/o Bottom-Up & 0.1015 $\pm$ 0.0090 & 0.2468 $\pm$ 0.0234 & 0.0431 $\pm$ 0.0852 & 0.0468 $\pm$ 0.0006 & 0.0947 $\pm$ 0.0244 & 0.4042 $\pm$ 0.0534 & 0.4355 $\pm$ 0.0796 & 0.3392 $\pm$ 0.0334 & 0.6054 $\pm$ 0.0671 \\
+w/o Attention Readout (Mean) & 0.1026 $\pm$ 0.0063 & 0.2534 $\pm$ 0.0171 & 0.0324 $\pm$ 0.0599 & 0.0466 $\pm$ 0.0005 & 0.1051 $\pm$ 0.0176 & 0.4107 $\pm$ 0.0339 & 0.4472 $\pm$ 0.0541 & 0.3321 $\pm$ 0.0376 & 0.6263 $\pm$ 0.0581 \\
+w/o Camp Dipole \& Moments & 0.1067 $\pm$ 0.0155 & 0.2523 $\pm$ 0.0330 & -0.0060 $\pm$ 0.1461 & 0.0476 $\pm$ 0.0008 & 0.0658 $\pm$ 0.0328 & 0.4162 $\pm$ 0.0356 & 0.4491 $\pm$ 0.0484 & 0.3328 $\pm$ 0.0728 & 0.6240 $\pm$ 0.0719 \\
+w/o Dir-GNN Mixing & \textbf{0.0969 $\pm$ 0.0023} & \textbf{0.2351 $\pm$ 0.0078} & \textbf{0.0864 $\pm$ 0.0219} & \textbf{0.0464 $\pm$ 0.0006} & \textbf{0.1106 $\pm$ 0.0245} & 0.4108 $\pm$ 0.0372 & 0.4482 $\pm$ 0.0531 & \textbf{0.3513 $\pm$ 0.0175} & 0.6431 $\pm$ 0.0563 \\
+w/o Dual-Channel Split & 0.0979 $\pm$ 0.0027 & 0.2384 $\pm$ 0.0097 & 0.0767 $\pm$ 0.0254 & 0.0472 $\pm$ 0.0009 & 0.0799 $\pm$ 0.0342 & 0.3832 $\pm$ 0.0507 & 0.4136 $\pm$ 0.0739 & 0.3298 $\pm$ 0.0417 & 0.6281 $\pm$ 0.0563 \\
+w/o Persistence Anchor & 0.0994 $\pm$ 0.0043 & 0.2391 $\pm$ 0.0160 & 0.0622 $\pm$ 0.0402 & 0.0478 $\pm$ 0.0008 & 0.0576 $\pm$ 0.0330 & 0.3382 $\pm$ 0.0446 & 0.3641 $\pm$ 0.0655 & 0.3241 $\pm$ 0.0466 & 0.6096 $\pm$ 0.0578 \\
+BiEdgeGATv2 (Matched) & 0.1043 $\pm$ 0.0133 & 0.2563 $\pm$ 0.0308 & 0.0160 $\pm$ 0.1251 & 0.0467 $\pm$ 0.0009 & 0.0986 $\pm$ 0.0364 & \textbf{0.4307 $\pm$ 0.0133} & \textbf{0.4723 $\pm$ 0.0179} & 0.3414 $\pm$ 0.0492 & 0.5994 $\pm$ 0.1130 \\
+w/o Burst Stats & 0.0997 $\pm$ 0.0049 & 0.2441 $\pm$ 0.0165 & 0.0594 $\pm$ 0.0462 & 0.0471 $\pm$ 0.0008 & 0.0841 $\pm$ 0.0300 & 0.4145 $\pm$ 0.0392 & 0.4510 $\pm$ 0.0597 & 0.2955 $\pm$ 0.0810 & 0.5784 $\pm$ 0.0852 \\
+\midrule
+$p$-value (SBiFAGAT (Full) vs. BiEdgeGATv2 (Matched)) & 4.79e-01 & 2.65e-01 & 4.79e-01 & 5.10e-01 & 5.14e-01 & 2.57e-01 & 3.31e-01 & 2.84e-01 & 7.70e-01 \\
+Cluster-Insufficient (<6 events) $p$ (SBiFAGAT (Full) vs. BiEdgeGATv2 (Matched)) & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+Holm-Bonferroni $p$ (SBiFAGAT (Full) vs. BiEdgeGATv2 (Matched)) & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 & 1.00e+00 \\
+Holm-Bonf Cluster-Insufficient (<6 events) $p$ (SBiFAGAT (Full) vs. BiEdgeGATv2 (Matched)) & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}

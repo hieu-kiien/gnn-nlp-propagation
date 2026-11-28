@@ -45,6 +45,7 @@ from src.nlp.dual_edge_scorer import (
     _cuda_autocast,
     _effective_max_length,
     _encode_no_specials,
+    _has_hf_weight_files,
     _inspect_pair_tokenizer,
     _normalize_nfc,
     _truncate_head_tail,
@@ -436,6 +437,24 @@ def compute_leakage_free_node_metadata(
     return meta
 
 
+def _validate_edge_attr_bounds(ea_tensor: Tensor, *, prefix: str) -> None:
+    if ea_tensor.numel() == 0:
+        return
+    s_vals = ea_tensor[:, 0]
+    h_vals = ea_tensor[:, 1]
+    if bool((s_vals < -1.0 - 1e-5).any() or (s_vals > 1.0 + 1e-5).any()):
+        raise ValueError(f"{prefix}_stance values out of bounds [-1, 1]")
+    if bool((h_vals < -1e-5).any() or (h_vals > 1.0 + 1e-5).any()):
+        raise ValueError(f"{prefix}_hostility values out of bounds [0, 1]")
+    if ea_tensor.size(1) == 4:
+        r_vals = ea_tensor[:, 2]
+        c_vals = ea_tensor[:, 3]
+        if bool((r_vals < -1e-5).any() or (r_vals > 1.0 + 1e-5).any()):
+            raise ValueError(f"{prefix}_irrationality values out of bounds [0, 1]")
+        if bool((c_vals < -1e-5).any() or (c_vals > 1.0 + 1e-5).any()):
+            raise ValueError(f"{prefix}_constructive values out of bounds [0, 1]")
+
+
 def validate_feature_tensors(payload: Mapping[str, Any]) -> None:
     """Strictly verify zero NaN/Inf values, tensor shapes, and value bounds."""
     node_emb = payload["node_embeddings"]
@@ -450,6 +469,22 @@ def validate_feature_tensors(payload: Mapping[str, Any]) -> None:
         ("node_embeddings", node_emb),
         ("edge_attr", edge_attr),
     ]
+    if "teacher_edge_attr" in payload:
+        teacher_edge_attr = payload["teacher_edge_attr"]
+        if (
+            not isinstance(teacher_edge_attr, Tensor)
+            or teacher_edge_attr.ndim != 2
+            or teacher_edge_attr.size(1) not in {2, 4}
+        ):
+            shape_str = (
+                tuple(teacher_edge_attr.shape)
+                if isinstance(teacher_edge_attr, Tensor)
+                else type(teacher_edge_attr).__name__
+            )
+            raise ValueError(
+                f"teacher_edge_attr must have shape [E, 2] or [E, 4], got {shape_str}"
+            )
+        tensors_to_check.append(("teacher_edge_attr", teacher_edge_attr))
     if "node_features_770" in payload:
         node_770 = payload["node_features_770"]
         if not isinstance(node_770, Tensor) or node_770.ndim != 2 or node_770.size(1) != 770:
@@ -458,40 +493,95 @@ def validate_feature_tensors(payload: Mapping[str, Any]) -> None:
             raise ValueError("node_embeddings and node_features_770 must share the same row count")
         tensors_to_check.append(("node_features_770", node_770))
 
+    if "node_embedding_valid_mask" in payload:
+        valid_mask = payload["node_embedding_valid_mask"]
+        if (
+            not isinstance(valid_mask, Tensor)
+            or valid_mask.dtype != torch.bool
+            or valid_mask.ndim != 1
+            or valid_mask.size(0) != node_emb.size(0)
+        ):
+            raise ValueError(
+                f"node_embedding_valid_mask must be BoolTensor of shape [{node_emb.size(0)}], "
+                f"got {type(valid_mask).__name__}({tuple(valid_mask.shape) if isinstance(valid_mask, Tensor) else 'N/A'})"
+            )
+
+    if "eligible_edge_mask" in payload:
+        edge_mask = payload["eligible_edge_mask"]
+        if (
+            not isinstance(edge_mask, Tensor)
+            or edge_mask.dtype != torch.bool
+            or edge_mask.ndim != 1
+            or edge_mask.size(0) != edge_attr.size(0)
+        ):
+            raise ValueError(
+                f"eligible_edge_mask must be BoolTensor of shape [{edge_attr.size(0)}], "
+                f"got {type(edge_mask).__name__}({tuple(edge_mask.shape) if isinstance(edge_mask, Tensor) else 'N/A'})"
+            )
+
     for name, tensor in tensors_to_check:
         if not torch.isfinite(tensor).all():
             raise ValueError(f"Detected non-finite (NaN/Inf) entries inside '{name}'")
 
-    if edge_attr.numel() > 0:
-        s_vals = edge_attr[:, 0]
-        h_vals = edge_attr[:, 1]
-        if bool((s_vals < -1.0 - 1e-5).any() or (s_vals > 1.0 + 1e-5).any()):
-            raise ValueError("edge_stance values out of bounds [-1, 1]")
-        if bool((h_vals < -1e-5).any() or (h_vals > 1.0 + 1e-5).any()):
-            raise ValueError("edge_hostility values out of bounds [0, 1]")
-        if edge_attr.size(1) == 4:
-            r_vals = edge_attr[:, 2]
-            c_vals = edge_attr[:, 3]
-            if bool((r_vals < -1e-5).any() or (r_vals > 1.0 + 1e-5).any()):
-                raise ValueError("edge_irrationality values out of bounds [0, 1]")
-            if bool((c_vals < -1e-5).any() or (c_vals > 1.0 + 1e-5).any()):
-                raise ValueError("edge_constructive values out of bounds [0, 1]")
+    _validate_edge_attr_bounds(edge_attr, prefix="edge")
+    if "teacher_edge_attr" in payload:
+        _validate_edge_attr_bounds(payload["teacher_edge_attr"], prefix="teacher_edge")
 
-    for dict_name in ("edge_stance", "edge_hostility", "edge_irrationality", "edge_constructive"):
-        mapping = payload.get(dict_name, {})
+    for idx_map_name, upper_bound in (
+        ("node_id_to_idx", int(node_emb.size(0))),
+        ("edge_id_to_idx", int(edge_attr.size(0))),
+    ):
+        if idx_map_name not in payload:
+            continue
+        idx_map = payload[idx_map_name]
+        if not isinstance(idx_map, Mapping):
+            raise ValueError(f"{idx_map_name} must be a mapping")
+        for key, idx_val in idx_map.items():
+            if isinstance(idx_val, bool) or not isinstance(idx_val, (int, np.integer)):
+                raise ValueError(
+                    f"Index in '{idx_map_name}' for '{key}' must be a non-bool integer, got {idx_val!r}"
+                )
+            idx_int = int(idx_val)
+            if idx_int < 0 or idx_int >= upper_bound:
+                raise ValueError(
+                    f"Out-of-range index in '{idx_map_name}' for '{key}': {idx_int} not in [0, {upper_bound})"
+                )
+
+    for dict_name, (lo, hi) in (
+        ("edge_stance", (-1.0 - 1e-5, 1.0 + 1e-5)),
+        ("edge_hostility", (-1e-5, 1.0 + 1e-5)),
+        ("edge_irrationality", (-1e-5, 1.0 + 1e-5)),
+        ("edge_constructive", (-1e-5, 1.0 + 1e-5)),
+        ("teacher_edge_stance", (-1.0 - 1e-5, 1.0 + 1e-5)),
+        ("teacher_edge_hostility", (-1e-5, 1.0 + 1e-5)),
+        ("teacher_edge_irrationality", (-1e-5, 1.0 + 1e-5)),
+        ("teacher_edge_constructive", (-1e-5, 1.0 + 1e-5)),
+    ):
+        if dict_name not in payload:
+            continue
+        mapping = payload[dict_name]
+        if not isinstance(mapping, Mapping):
+            raise ValueError(f"{dict_name} must be a mapping")
         for key, val in mapping.items():
+            if isinstance(val, bool):
+                raise ValueError(f"Boolean value not allowed in '{dict_name}' for '{key}': {val!r}")
             fval = float(val)
             if not math.isfinite(fval):
                 raise ValueError(f"Non-finite value in '{dict_name}' for '{key}': {val!r}")
+            if fval < lo or fval > hi:
+                raise ValueError(f"Out-of-bounds value in '{dict_name}' for '{key}': {val!r}")
 
-    if "node_root_stance" in payload:
-        nrs = payload["node_root_stance"]
-        if not isinstance(nrs, Mapping):
-            raise ValueError("node_root_stance must be a mapping")
-        for key, val in nrs.items():
-            fval = float(val)
-            if not math.isfinite(fval) or fval < -1.0 - 1e-5 or fval > 1.0 + 1e-5:
-                raise ValueError(f"Invalid node_root_stance value for '{key}': {val!r}")
+    for nrs_name in ("node_root_stance", "teacher_node_root_stance"):
+        if nrs_name in payload:
+            nrs = payload[nrs_name]
+            if not isinstance(nrs, Mapping):
+                raise ValueError(f"{nrs_name} must be a mapping")
+            for key, val in nrs.items():
+                if isinstance(val, bool):
+                    raise ValueError(f"Boolean value not allowed in '{nrs_name}' for '{key}': {val!r}")
+                fval = float(val)
+                if not math.isfinite(fval) or fval < -1.0 - 1e-5 or fval > 1.0 + 1e-5:
+                    raise ValueError(f"Invalid {nrs_name} value for '{key}': {val!r}")
 
 
 def extract_and_save_features(
@@ -618,6 +708,11 @@ def extract_and_save_features(
         active_tok = load_tokenizer_safe(default_backbone)
 
     hidden_dim = int(getattr(getattr(active_encoder, "config", None), "hidden_size", 768))
+    node_embedding_valid_mask = torch.zeros(len(node_rows), dtype=torch.bool)
+    eligible_edge_mask = torch.zeros(len(edge_rows), dtype=torch.bool)
+    if eligible_edge_indices:
+        eligible_edge_mask[torch.tensor(eligible_edge_indices, dtype=torch.long)] = True
+
     if int(min_total_replies) > 0 and len(eligible_node_indices) < len(node_rows):
         node_embeddings = torch.zeros((len(node_rows), hidden_dim), dtype=torch.float32)
         if eligible_node_indices:
@@ -640,7 +735,9 @@ def extract_and_save_features(
                 max_length=max_length,
                 device=target_device,
             )
-            node_embeddings[torch.tensor(eligible_node_indices, dtype=torch.long)] = sub_emb
+            idx_t = torch.tensor(eligible_node_indices, dtype=torch.long)
+            node_embeddings[idx_t] = sub_emb
+            node_embedding_valid_mask[idx_t] = True
     else:
         node_embeddings = encode_node_embeddings(
             node_texts,
@@ -653,6 +750,8 @@ def extract_and_save_features(
             max_length=max_length,
             device=target_device,
         )
+        if len(node_rows) > 0:
+            node_embedding_valid_mask.fill_(True)
     if owns_node_encoder:
         active_encoder.cpu()
         del active_encoder
@@ -842,80 +941,93 @@ def extract_and_save_features(
             root_s_clamped = max(-1.0, min(1.0, float(root_s_raw)))
             node_root_stance[edge_target_ids[idx]] = root_s_clamped
     else:
-        # Sequential teacher inference keeps peak VRAM minimal on 16GB GPUs
-        if hostility_scorer is not None:
-            h_arr = hostility_scorer.score_texts(
-                reply_texts, batch_size=batch_size, max_length=max_length
-            )
-        else:
-            if lang == "vi" and (vihsd_ckpt is None or not Path(vihsd_ckpt).exists()):
-                raise FileNotFoundError(
-                    f"Fine-tuned ViHSD checkpoint required for dataset='vn': {vihsd_ckpt}"
-                )
-            host_path = str(vihsd_ckpt) if lang == "vi" and vihsd_ckpt is not None else None
-            tmp_host = HostilityTeacherScorer(lang=lang, model_name_or_path=host_path, device=target_device)
-            h_arr = tmp_host.score_texts(reply_texts, batch_size=batch_size, max_length=max_length)
-            del tmp_host
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        # Sequential teacher inference keeps peak VRAM minimal on 16GB GPUs; scoped to eligible_edge_indices
+        s_arr = np.zeros(len(edge_ids), dtype=np.float32)
+        h_arr = np.zeros(len(edge_ids), dtype=np.float32)
+        pred_labels = ["neutral"] * len(edge_ids)
+        target_edge_idx = eligible_edge_indices if int(min_total_replies) > 0 else list(range(len(edge_ids)))
+        target_parent_texts = [parent_texts[i] for i in target_edge_idx]
+        target_reply_texts = [reply_texts[i] for i in target_edge_idx]
 
-        deep_idx = [
-            i for i, r in enumerate(edge_rows) if str(r["source_id"]) != edge_root_ids[i]
-        ]
-        if stance_scorer is not None:
-            nli_out = stance_scorer.score_pairs(
-                parent_texts,
-                reply_texts,
-                batch_size=max(1, batch_size // 2),
-                max_length=max_length,
-                lang=lang,
-            )
-            root_nli_out = (
-                stance_scorer.score_pairs(
-                    [edge_root_texts[i] for i in deep_idx],
-                    [reply_texts[i] for i in deep_idx],
+        if target_edge_idx:
+            if hostility_scorer is not None:
+                h_sub = hostility_scorer.score_texts(
+                    target_reply_texts, batch_size=batch_size, max_length=max_length
+                )
+            else:
+                if lang == "vi" and (vihsd_ckpt is None or not _has_hf_weight_files(Path(vihsd_ckpt))):
+                    raise FileNotFoundError(
+                        f"Fine-tuned ViHSD checkpoint weights (model.safetensors / pytorch_model.bin) "
+                        f"required for dataset='vn': {vihsd_ckpt}"
+                    )
+                host_path = str(vihsd_ckpt) if lang == "vi" and vihsd_ckpt is not None else None
+                tmp_host = HostilityTeacherScorer(lang=lang, model_name_or_path=host_path, device=target_device)
+                h_sub = tmp_host.score_texts(target_reply_texts, batch_size=batch_size, max_length=max_length)
+                del tmp_host
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            for pos, i in enumerate(target_edge_idx):
+                h_arr[i] = float(h_sub[pos])
+
+            deep_idx = [
+                i for i in target_edge_idx if str(edge_rows[i]["source_id"]) != edge_root_ids[i]
+            ]
+            if stance_scorer is not None:
+                nli_out = stance_scorer.score_pairs(
+                    target_parent_texts,
+                    target_reply_texts,
                     batch_size=max(1, batch_size // 2),
                     max_length=max_length,
                     lang=lang,
                 )
-                if deep_idx
-                else None
-            )
-        else:
-            tmp_nli = NLIStanceTeacherScorer(lang=lang, device=target_device)
-            nli_out = tmp_nli.score_pairs(
-                parent_texts,
-                reply_texts,
-                batch_size=max(1, batch_size // 2),
-                max_length=max_length,
-                lang=lang,
-            )
-            root_nli_out = (
-                tmp_nli.score_pairs(
-                    [edge_root_texts[i] for i in deep_idx],
-                    [reply_texts[i] for i in deep_idx],
+                root_nli_out = (
+                    stance_scorer.score_pairs(
+                        [edge_root_texts[i] for i in deep_idx],
+                        [reply_texts[i] for i in deep_idx],
+                        batch_size=max(1, batch_size // 2),
+                        max_length=max_length,
+                        lang=lang,
+                    )
+                    if deep_idx
+                    else None
+                )
+            else:
+                tmp_nli = NLIStanceTeacherScorer(lang=lang, device=target_device)
+                nli_out = tmp_nli.score_pairs(
+                    target_parent_texts,
+                    target_reply_texts,
                     batch_size=max(1, batch_size // 2),
                     max_length=max_length,
                     lang=lang,
                 )
-                if deep_idx
-                else None
-            )
-            del tmp_nli
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        s_arr = nli_out["s_uv"]
-        pred_labels = nli_out["pred_label"]
-        for i in range(len(edge_ids)):
-            node_root_stance[edge_target_ids[i]] = max(-1.0, min(1.0, float(s_arr[i])))
-        if deep_idx and root_nli_out is not None:
-            for pos, i in enumerate(deep_idx):
-                node_root_stance[edge_target_ids[i]] = max(
-                    -1.0, min(1.0, float(root_nli_out["s_uv"][pos]))
+                root_nli_out = (
+                    tmp_nli.score_pairs(
+                        [edge_root_texts[i] for i in deep_idx],
+                        [reply_texts[i] for i in deep_idx],
+                        batch_size=max(1, batch_size // 2),
+                        max_length=max_length,
+                        lang=lang,
+                    )
+                    if deep_idx
+                    else None
                 )
+                del tmp_nli
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            for pos, i in enumerate(target_edge_idx):
+                s_val = float(nli_out["s_uv"][pos])
+                s_arr[i] = s_val
+                pred_labels[i] = str(nli_out["pred_label"][pos])
+                node_root_stance[edge_target_ids[i]] = max(-1.0, min(1.0, s_val))
+            if deep_idx and root_nli_out is not None:
+                for pos, i in enumerate(deep_idx):
+                    node_root_stance[edge_target_ids[i]] = max(
+                        -1.0, min(1.0, float(root_nli_out["s_uv"][pos]))
+                    )
 
     if len(edge_ids) > 0:
         s_t = torch.as_tensor(s_arr, dtype=torch.float32).clamp(-1.0, 1.0)
@@ -968,6 +1080,11 @@ def extract_and_save_features(
         "node_backbone": default_backbone,
         "node_pooling": "ancestor_span_pool" if use_ancestor_span_pool else "standalone_mean",
         "node_embeddings": node_embeddings,
+        "node_embedding_valid_mask": node_embedding_valid_mask,
+        "eligible_edge_mask": eligible_edge_mask,
+        "eligible_cascade_ids": sorted(eligible_cascades),
+        "num_eligible_nodes": len(eligible_node_indices),
+        "num_zero_placeholder_nodes": len(node_rows) - len(eligible_node_indices),
         "node_id_to_idx": node_id_to_idx,
         "edge_attr": edge_attr,
         "edge_id_to_idx": edge_id_to_idx,
@@ -1059,7 +1176,7 @@ def main() -> None:
         "--min-total-replies",
         type=int,
         default=0,
-        help="Scope Transformer encoding & 100% Teacher coverage check to cascades >= N replies (0 = all).",
+        help="Scope Transformer encoding & 100%% Teacher coverage check to cascades >= N replies (0 = all).",
     )
     parser.add_argument("--include-node-features-770", action="store_true")
     args = parser.parse_args()

@@ -621,8 +621,8 @@ def test_b7_nli_double_contradiction_neutral_joint_audit_and_vn_50_tree_audit(tm
 
 
 def test_b8_direction_aware_stars_exact_loo_permutation_and_topic_cluster_bootstrap(tmp_path: Path) -> None:
-    """B8: Zero stars when ref is worse; exact F=4 permutation p=0.125; topic-cluster bootstrap works."""
-    # 1. Direction-aware significance markers
+    """B8: Transparent directional (-)** / (+)** stars; exact F=4 permutation p=0.125; topic-cluster bootstrap works."""
+    # 1. Direction-aware two-sided significance markers (display both wins (+)** and losses (-)**)
     worse_bench = {
         "reference_model": "SBiFAGAT",
         "comparator_model": "BiGCN",
@@ -635,12 +635,12 @@ def test_b8_direction_aware_stars_exact_loo_permutation_and_topic_cluster_bootst
     }
     subset_metrics = (("msle", "MSLE $\\downarrow$", True), ("pearson_r", "Pearson $r$ $\\uparrow$", False))
     md_worse = build_markdown_table(worse_bench, subset_metrics)
-    assert "**" not in md_worse.splitlines()[2].replace("**0.9000", "")  # No significance star on worse row
-    assert "*" not in md_worse.splitlines()[2]
+    assert "(-)**" in md_worse.splitlines()[2]
+    assert "(+)**" not in md_worse.splitlines()[2]
     tex_worse = export_latex_table(
         worse_bench, tmp_path / "worse.tex", caption="Worse", label="tab:w", metrics=subset_metrics
     ).read_text(encoding="utf-8")
-    assert "$^{**}$" not in tex_worse and "$^{*}$" not in tex_worse
+    assert "$^{-**}$" in tex_worse and "$^{+**}$" not in tex_worse
 
     # 2. Exact small-sample LOO permutation (F=4 all-positive diffs -> exact 2/16 = 0.125, NOT 0.0!)
     p_loo4 = compute_paired_bootstrap_pvalue([0.80, 0.85, 0.90, 0.95], [0.50, 0.55, 0.60, 0.65])

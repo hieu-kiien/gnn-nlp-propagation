@@ -1,0 +1,26 @@
+\begin{table*}[t]
+\centering
+\caption{Zero-Shot Event Topic Classification on PHEME (9 Real Events, $N=2{,}664$) and $K=20$ Early-Warning Detection on VN Test ($N=225$).}
+\label{tab:large_post_topic}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+\multicolumn{7}{l}{\textbf{Panel A: PHEME 9-Event Zero-Shot Topic Classification (Full Tier-2A Cohort, $N=2{,}664$)}} \\
+\midrule
+Backend & Accuracy $\uparrow$ & Macro-F1 $\uparrow$ & Weighted-F1 $\uparrow$ & Top-2 Acc $\uparrow$ & Latency (ms/post) $\downarrow$ & Notes \\
+\midrule
+Lexical N-gram Fallback & 0.4388 & 0.2536 & 0.4403 & 0.5770 & 2.98 & Offline surface keywords \\
+RoBERTa Cosine (Student Enc.) & 0.3690 & 0.1318 & 0.2794 & 0.4474 & 73.54 & Frozen 768-D cosine \\
+mDeBERTa-v3-XNLI (Zero-Shot) & 0.5800 & 0.4424 & 0.6655 & 0.7155 & 556.69 & GPU FP16 NLI entailment \\
+\midrule
+\multicolumn{7}{l}{\textbf{Panel B: VN Test ($N=225$) $K=20$ Early-Warning Classification (High Future Polar. $\ge Q_{75}^{\text{train}}$, Large $\ge 50$, Viral $\ge 100$)}} \\
+\midrule
+Model (from $K=20$ prefix) & Polar ROC-AUC $\uparrow$ & Polar PR-AUC $\uparrow$ & Large ($\ge 50$) ROC $\uparrow$ & Large PR $\uparrow$ & Viral ($\ge 100$) ROC $\uparrow$ & Viral PR $\uparrow$ \\
+\midrule
+Early-K Persistence & 0.5490 & 0.2435 & 0.5000 & 0.3422 & 0.5000 & 0.0844 \\
+Ridge & 0.6234 & 0.3607 & 0.8083 & 0.6483 & 0.9024 & 0.3750 \\
+SBiFAGAT & 0.6600 & 0.3928 & 0.8040 & 0.6769 & 0.8728 & 0.3911 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}

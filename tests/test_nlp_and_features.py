@@ -170,6 +170,13 @@ def test_dual_head_cross_encoder_forward_and_checkpoint_roundtrip(tmp_path: Path
 
     assert torch.allclose(out_before["e_uv"], out_after["e_uv"], atol=1e-6)
 
+    fp_model = DualHeadCrossEncoder.from_pretrained(ckpt_dir)
+    fp_model.eval()
+    assert getattr(fp_model, "tokenizer", None) is not None
+    with torch.no_grad():
+        out_fp = fp_model(batch["input_ids"], batch["attention_mask"])
+    assert torch.allclose(out_before["e_uv"], out_fp["e_uv"], atol=1e-6)
+
 
 def test_stratified_human_audit_csv_blind_and_kappa(tmp_path: Path) -> None:
     pairs = []

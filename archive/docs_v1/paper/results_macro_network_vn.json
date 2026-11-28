@@ -1,0 +1,44 @@
+{
+  "dataset": "vn",
+  "edge_label_source": "teacher",
+  "num_users": 13718,
+  "active_graph_users": 13718,
+  "multi_thread_users": 6541,
+  "active_5plus_users": 2567,
+  "num_interactions": 85398,
+  "unique_directed_pairs": 72406,
+  "unique_undirected_pairs": 58041,
+  "signed_strong_pairs": 32787,
+  "pos_interactions": 10200,
+  "neg_interactions": 39499,
+  "uncivil_interactions": 3816,
+  "largest_signed_wcc_nodes": 10475,
+  "largest_signed_wcc_ratio": 0.763595276279341,
+  "camp_sizes": [
+    5668,
+    4807
+  ],
+  "structural_balance": {
+    "num_triangles": 5143,
+    "n_ppp": 70,
+    "n_ppn": 306,
+    "n_pnn": 1232,
+    "n_nnn": 3535,
+    "balanced_ratio": 0.2531596344545985,
+    "null_balanced_mean": 0.3696033443515459,
+    "null_balanced_std": 0.007674038816554186,
+    "balance_z_score": -15.173719169332172
+  },
+  "polarization": {
+    "rwc": 0.09569888179105068,
+    "signed_modularity": 0.42801279314738905,
+    "q_pos": 0.23674885408042118,
+    "q_neg": -0.19126393906696787,
+    "within_camp_mean_stance": -0.05380459120962074,
+    "cross_camp_mean_stance": -0.14251893222705478,
+    "within_camp_neg_rate": 0.3788704627159921,
+    "cross_camp_neg_rate": 0.5696898053895493,
+    "within_camp_uncivil_rate": 0.03954540183230894,
+    "cross_camp_uncivil_rate": 0.05085265208730107
+  }
+}

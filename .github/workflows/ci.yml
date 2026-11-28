@@ -2,9 +2,9 @@ name: CI Verification
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'results/**']
   pull_request:
-    branches: [main]
+    branches: [main, 'results/**']
   workflow_dispatch:
 
 permissions:
@@ -28,13 +28,19 @@ jobs:
       - name: Forbidden Binary, Dataset & Secret File Gate
         run: |
           set -euo pipefail
-          forbidden=$(git ls-files | grep -E '(\.(pt|pth|ckpt|bin|safetensors|parquet|zip|secret)|\.tar(\.[[:alnum:]]+)?|_machine_key\.csv)$|^paper/.*smoke' || true)
-          if [ -n "$forbidden" ]; then
+          forbidden=$(git ls-files | grep -E '(\.(pt|pth|ckpt|bin|safetensors|parquet|zip|secret|jsonl|bak|docx)|\.tar(\.[[:alnum:]]+)?|_machine_key\.csv)$|(^|/)\.env(\.|$)|^runner_summary_.*\.json$|^(paper|results|archive/docs_v1/paper)/.*smoke|^(checkpoints|outputs)/' || true)
+          forbidden_data=$(git ls-files 'data/raw/**' 'data/interim/**' 'data/processed/**' | grep -vE '(^|/)\.gitkeep$' || true)
+          if [ -n "$forbidden" ] || [ -n "$forbidden_data" ]; then
             echo "ERROR: Forbidden tracked files detected in Git:"
             echo "$forbidden"
+            echo "$forbidden_data"
             exit 1
           fi
           echo "Forbidden file gate passed cleanly."
+
+      - name: Verify Paper LaTeX Underscore Escaping
+        run: |
+          python -c "import pathlib, sys; from scripts.assemble_paper_artifacts import find_unescaped_underscores_in_latex; targets = sorted(pathlib.Path('results').glob('tables_*.tex')) + sorted(pathlib.Path('archive/docs_v1/paper').glob('tables_*.tex')) + ([pathlib.Path('archive/docs_v1/paper/main.tex')] if pathlib.Path('archive/docs_v1/paper/main.tex').is_file() else []); issues = {str(p): find_unescaped_underscores_in_latex(p.read_text(encoding='utf-8')) for p in targets}; issues = {k: v for k, v in issues.items() if v}; print('LaTeX issues:', issues); sys.exit(1 if issues else 0)"
 
       - name: Install CPU PyTorch and Project Dependencies
         run: |
@@ -51,3 +57,4 @@ jobs:
           python -m scripts.demo_research_walkthrough
           python -m scripts.predict_live_thread --demo-offline
           python -m scripts.kaggle_parallel_runner --role member1_vn --smoke-test
+          python -m scripts.run_macro_signed_network --smoke-test

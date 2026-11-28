@@ -23,6 +23,10 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from scripts.compute_kappa import (
     evaluate_thread_level_audit_csv,
     format_human_audit_latex,
@@ -302,8 +306,15 @@ def main() -> None:
     parser.add_argument("--polar-target-mode", choices=["future_only", "full"], default="future_only")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--export", action="store_true")
+    parser.add_argument("--skip-if-exists", action="store_true")
+    parser.add_argument(
+        "--force-export-audit",
+        action="store_true",
+        help="Overwrite existing audit CSV even when --skip-if-exists or an existing file is present.",
+    )
     parser.add_argument("--evaluate", action="store_true")
     parser.add_argument("--strict-adjudication", action="store_true")
+    parser.add_argument("--allow-single-gold", action="store_true")
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--output-table", type=Path, default=None)
     args = parser.parse_args()
@@ -314,23 +325,33 @@ def main() -> None:
     key_csv = args.machine_key_csv or args.audit_csv.with_name(f"{args.audit_csv.stem}_machine_key.csv")
 
     if args.export:
-        out_csv, out_key = export_vn_50_tree_audit(
-            data_dir=args.data_dir,
-            output_csv=args.audit_csv,
-            machine_key_csv=key_csv,
-            n_samples=args.n_samples,
-            k_horizon=args.k_horizon,
-            min_total_replies=args.min_total_replies,
-            polar_target_mode=args.polar_target_mode,
-            seed=args.seed,
-        )
-        print(f"Exported blind {args.n_samples}-tree VN audit CSV: {out_csv} (sealed key: {out_key})")
+        if not args.force_export_audit and args.audit_csv.exists():
+            if args.skip_if_exists:
+                print(f"[SKIP] Blind {args.n_samples}-tree VN audit CSV already exists: {args.audit_csv}")
+            else:
+                raise FileExistsError(
+                    f"Refusing to overwrite existing audit CSV '{args.audit_csv}' without "
+                    "--force-export-audit (or pass --skip-if-exists to keep existing file)."
+                )
+        else:
+            out_csv, out_key = export_vn_50_tree_audit(
+                data_dir=args.data_dir,
+                output_csv=args.audit_csv,
+                machine_key_csv=key_csv,
+                n_samples=args.n_samples,
+                k_horizon=args.k_horizon,
+                min_total_replies=args.min_total_replies,
+                polar_target_mode=args.polar_target_mode,
+                seed=args.seed,
+            )
+            print(f"Exported blind {args.n_samples}-tree VN audit CSV: {out_csv} (sealed key: {out_key})")
 
     if args.evaluate:
         report = evaluate_thread_level_audit_csv(
             args.audit_csv,
             machine_key_csv=key_csv if key_csv.is_file() else None,
             strict_adjudication=bool(args.strict_adjudication),
+            allow_single_gold=bool(args.allow_single_gold),
         )
         print(json.dumps(report, indent=2, ensure_ascii=False))
         if args.output_json is not None:

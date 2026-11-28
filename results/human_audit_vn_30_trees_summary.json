@@ -1,0 +1,16 @@
+{
+  "input_csv": "data\\interim\\human_audit_vn_30_trees.csv",
+  "annotation_protocol": "single_verified_gold",
+  "total_matched_rows": 30,
+  "unadjudicated_disagreements": 0,
+  "machine_vs_gold": {
+    "num_threads": 30,
+    "pearson_r": 0.028442372980107183,
+    "spearman_r": 0.0018403218617927641,
+    "kendall_tau_b": 0.0026040871974447603,
+    "roc_auc_ge2": 0.5401785714285714,
+    "cohen_kappa_quadratic": 0.019230769230769273,
+    "landis_koch_band": "Slight (0.00 - 0.20)",
+    "mae_norm": 0.31986726666666665
+  }
+}

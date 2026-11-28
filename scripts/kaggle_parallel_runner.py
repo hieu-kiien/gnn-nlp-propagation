@@ -3,14 +3,18 @@
 Supports 4 clean parallel execution roles across two teammates using the unified 2D NLP + GNN pipeline:
   - `member1_vn`: Vietnamese track end-to-end (Arctic Shift 1,500 VN trees -> ViSoBERT-ViHSD +
     mDeBERTa Stance Verbalizer -> 2D ViSoBERT Cross-Encoder distillation -> Ancestor SpanPool
-    nlp_features.pt -> SBi-FAGAT auto-loop + 5-seed benchmark + ablation + output bundle zip).
+    nlp_features.pt -> 5-seed Tier 1 benchmark across 15+ models + Temporal/Embedding-Cluster
+    splits + Ablation + E2E latency + optional Tier 2 macro/10-model link benchmark -> `results/`
+    and output bundle zip).
   - `member2_en`: International English track end-to-end (PHEME MD5 -> Twitter-RoBERTa-Offensive +
     mDeBERTa Stance Verbalizer -> 2D Twitter-RoBERTa Cross-Encoder distillation -> Ancestor SpanPool
-    nlp_features.pt -> SBi-FAGAT auto-loop + 5-seed Inductive & LOO benchmarks + ablation + UPFD).
-  - `model_nlp_only`: Runs strictly Stage 1-3 NLP teacher scoring, Cross-Encoder distillation, and
-    `.pt` feature extraction so Member 1 can focus on NLP.
-  - `model_gnn_only`: Runs strictly SBi-FAGAT auto-loop + 7 baselines x 5 seeds + ablation + figures
-    from precomputed or bootstrapped features so Member 2 can tune/train GNN models in parallel.
+    nlp_features.pt -> 5-seed Inductive & LOO benchmarks across 15+ models + Ablation + E2E
+    latency + optional Tier 2 macro/10-model link benchmark & UPFD).
+  - `model_nlp_only`: Runs strictly Stage 1-3 NLP teacher scoring, Cross-Encoder distillation
+    (or fast `--distill-from-features` recovery), and `.pt` feature extraction.
+  - `model_gnn_only`: Runs strictly Tier 1 5-seed benchmark (14 comparators + SBi-FAGAT + optional
+    `SBiFAGAT + Tier2Prior` + Early-K Persistence) + ablation + EDA + E2E efficiency + optional
+    Tier 2 macro/link benchmarks into `--results-dir` (default `results/`).
 
 Also provides `--smoke-test` verifying the entire 2D + SpanPool + self-auditing pipeline on CPU in <10s.
 """
@@ -18,6 +22,7 @@ Also provides `--smoke-test` verifying the entire 2D + SpanPool + self-auditing 
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -27,10 +32,14 @@ import tempfile
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 from torch_geometric.loader import DataLoader
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.pyg_dataset import (
     DEFAULT_FORECAST_MIN_REPLIES,
@@ -38,13 +47,15 @@ from src.data.pyg_dataset import (
     TOTAL_NODE_FEATURE_DIM,
     compute_canonical_topic_splits,
 )
-from src.data.schema import build_edges_table, build_nodes_table, save_cascade_parquet
+from src.data.schema import build_edges_table, build_nodes_table, load_cascade_parquet, save_cascade_parquet
 from src.models.baselines import BiGCN, TemporalStanceMLP, TextMLP
 from src.models.sbi_fagat import SBiFAGAT
 from src.nlp.dual_edge_scorer import (
     DualHeadCrossEncoder,
     TWITTER_ROBERTA_MODEL_NAME,
     VISOBERT_MODEL_NAME,
+    _has_complete_dual_ce_checkpoint,
+    _has_hf_weight_files,
     distill_dual_cross_encoder,
     export_stratified_human_audit_csv,
     extract_parent_reply_pairs_from_parquet,
@@ -83,12 +94,18 @@ def _bundle_outputs(
 
     def _should_skip(file_path: Path) -> bool:
         low_name = file_path.name.lower()
-        # Unconditionally exclude blind-audit machine answer keys and secrets
+        # Unconditionally exclude blind-audit machine answer keys, secrets, and transient temp/delta files
         if (
-            low_name.endswith("_machine_key.csv")
+            low_name == "machine_key.csv"
+            or low_name.endswith("_machine_key.csv")
             or low_name.endswith(".secret")
             or low_name == ".env"
+            or low_name.startswith(".env.")
+            or low_name.endswith(".tmp")
+            or low_name.endswith(".checkpoint.jsonl")
         ):
+            return True
+        if low_name == "nlp_features.pt" and not include_nlp_features:
             return True
         if include_heavy_weights:
             return False
@@ -97,8 +114,6 @@ def _bundle_outputs(
             or low_name.endswith(".state.json")
             or file_path.suffix.lower() in heavy_suffixes
         ):
-            return True
-        if low_name == "nlp_features.pt" and not include_nlp_features:
             return True
         if file_path.suffix.lower() == ".pt" and "sbifagat" not in low_name and "nlp_features" not in low_name:
             try:
@@ -497,6 +512,90 @@ def _run_smoke_pipeline(role: str, lang: str, work_dir: Path) -> dict[str, Any]:
     return summary
 
 
+def _nlp_features_match_cohort(feats_path: Path, expected_min_replies: int) -> bool:
+    """Return True only if `nlp_features.pt` exists and matches `expected_min_replies`."""
+    if not feats_path.is_file():
+        return False
+    try:
+        payload = torch.load(feats_path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    ext_min = payload.get("min_total_replies_extracted")
+    if ext_min is None and isinstance(payload.get("_meta"), Mapping):
+        ext_min = payload["_meta"].get("min_total_replies_extracted")
+    if ext_min is None:
+        return int(expected_min_replies) >= int(DEFAULT_FORECAST_MIN_REPLIES)
+    try:
+        return int(ext_min) == int(expected_min_replies)
+    except (TypeError, ValueError):
+        return False
+
+
+def _distill_ce_from_features(
+    processed_dir: Path,
+    *,
+    ce_ckpt: Path,
+    lang: str,
+    student_backbone: str,
+    min_total_replies: int,
+    epochs: int,
+    batch_size: int,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Fast recovery of `dual_head_weights.pt` directly from pre-scored `nlp_features.pt`."""
+    if not force and _has_complete_dual_ce_checkpoint(ce_ckpt, require_distill_report=True):
+        print(f"[KaggleRunner] [SKIP DistillFromFeatures] Complete checkpoint exists: {ce_ckpt}")
+        return {"skipped": True, "checkpoint_dir": str(ce_ckpt)}
+
+    feats_path = processed_dir / "nlp_features.pt"
+    if not feats_path.is_file():
+        raise FileNotFoundError(f"Missing '{feats_path}' required for --distill-from-features.")
+
+    pairs = extract_parent_reply_pairs_from_parquet(processed_dir, min_total_replies=min_total_replies)
+    payload = torch.load(feats_path, map_location="cpu", weights_only=False)
+    if "teacher_edge_stance" not in payload or "teacher_edge_hostility" not in payload:
+        raise KeyError(
+            f"'{feats_path}' lacks 'teacher_edge_stance'/'teacher_edge_hostility' needed for --distill-from-features."
+        )
+    ts_map = payload["teacher_edge_stance"]
+    th_map = payload["teacher_edge_hostility"]
+    tr_map = payload.get("teacher_node_root_stance") or {}
+    for p in pairs:
+        eid = str(p["edge_id"])
+        p["s_uv"] = float(ts_map[eid])
+        p["h_uv"] = float(th_map[eid])
+        p["root_s_uv"] = float(tr_map.get(str(p["target_id"]), p["s_uv"]))
+    del payload
+    gc.collect()
+
+    splits_path = processed_dir / "topic_splits.json"
+    if splits_path.is_file():
+        canonical_splits = json.loads(splits_path.read_text(encoding="utf-8"))
+    else:
+        nodes_tbl, _ = load_cascade_parquet(processed_dir, validate=True)
+        canonical_splits = compute_canonical_topic_splits(nodes_tbl, min_total_replies=min_total_replies)
+
+    topic_splits = split_pairs_by_inductive_topics(pairs, canonical_topic_splits=canonical_splits)
+    return distill_dual_cross_encoder(
+        topic_splits["train"],
+        topic_splits["val"],
+        output_dir=ce_ckpt,
+        lang=lang,
+        model_name=student_backbone,
+        edge_dim=2,
+        include_root_context=True,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=2e-5,
+        max_length=256,
+        distill_temperature=2.0,
+        augment_root_pairs=True,
+        seed=42,
+    )
+
+
 def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
     lang = args.lang or ("en" if args.role == "member2_en" else "vi")
     ds_name = "pheme" if lang == "en" else "vn"
@@ -510,6 +609,16 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
 
     work_dir = Path(args.work_dir or ".").resolve()
     py = sys.executable
+
+    results_dir_arg = getattr(args, "results_dir", None)
+    if results_dir_arg is not None:
+        raw_res_path = Path(results_dir_arg)
+        out_root = raw_res_path if raw_res_path.is_absolute() else (work_dir / raw_res_path)
+        out_rel = raw_res_path.as_posix()
+    else:
+        out_root = work_dir / "results"
+        out_rel = "results"
+    out_root.mkdir(parents=True, exist_ok=True)
 
     salt_file = work_dir / "data" / "interim" / ".author_hash_salt.secret"
     if not os.environ.get("SBIF_HASH_SALT") and not salt_file.is_file():
@@ -529,20 +638,40 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
 
     run_nlp = args.role in {"member1_vn", "member2_en", "model_nlp_only"}
     run_gnn = args.role in {"member1_vn", "member2_en", "model_gnn_only"}
+    distill_from_features = bool(getattr(args, "distill_from_features", False))
+    polar_target_mode = str(getattr(args, "polar_target_mode", "future_only") or "future_only")
+    include_tier2_prior = bool(getattr(args, "include_tier2_prior", False))
+    run_embedding_cluster = bool(getattr(args, "run_embedding_cluster", False))
+    skip_sota = bool(getattr(args, "skip_sota", False))
+    run_tier2 = bool(getattr(args, "run_tier2", False))
+    mp_graph_mode = str(getattr(args, "mp_graph_mode", "coalesced") or "coalesced")
+    skip_e2e_efficiency = bool(getattr(args, "skip_e2e_efficiency", False))
+    hostility_target_router = bool(getattr(args, "hostility_target_router", False))
+    hostility_gate_threshold = getattr(args, "hostility_gate_threshold", None)
 
-    if args.role == "model_gnn_only" and not (processed_dir / "nlp_features.pt").exists():
+    if args.role == "model_gnn_only" and not _nlp_features_match_cohort(
+        processed_dir / "nlp_features.pt", int(args.min_total_replies)
+    ):
         if not args.bootstrap_if_missing:
             raise FileNotFoundError(
-                f"Missing '{processed_dir / 'nlp_features.pt'}' for model_gnn_only. "
-                "Provide --processed-dir from Member 1 or pass --bootstrap-if-missing."
+                f"Missing or cohort-mismatched '{processed_dir / 'nlp_features.pt'}' "
+                f"(expected min_total_replies={int(args.min_total_replies)}) for model_gnn_only. "
+                "Provide matching --processed-dir from Member 1 or pass --bootstrap-if-missing."
             )
         run_nlp = True
 
     force = bool(getattr(args, "force", False))
+    has_ready_processed = (
+        _nlp_features_match_cohort(processed_dir / "nlp_features.pt", int(args.min_total_replies))
+        and (processed_dir / "nodes.parquet").exists()
+        and (processed_dir / "edges.parquet").exists()
+    )
 
     if run_nlp:
         # Stage 1: Real dataset acquisition (skip cleanly if parquet already built and not --force)
-        if not force and (interim_dir / "nodes.parquet").exists() and (interim_dir / "edges.parquet").exists():
+        if distill_from_features and not force and has_ready_processed:
+            print(f"[KaggleRunner] [SKIP Stage 1] Using pre-staged processed cohort for --distill-from-features: {processed_dir}")
+        elif not force and (interim_dir / "nodes.parquet").exists() and (interim_dir / "edges.parquet").exists():
             print(f"[KaggleRunner] [SKIP Stage 1] Validated interim parquet already exists: {interim_dir}")
         elif lang == "en":
             _run_cmd([py, "-m", "src.data.pheme_loader", "--output-dir", str(interim_dir)], cwd=work_dir)
@@ -570,10 +699,29 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             _run_cmd(crawl_cmd, cwd=work_dir)
 
         # Stage 2: Unified 2D Teacher scoring (Hostility + mDeBERTa Stance Verbalizer) -> Cross-Encoder
-        if (
+        ce_weights_pt = ce_ckpt / "dual_head_weights.pt"
+        ce_complete = (
+            _has_complete_dual_ce_checkpoint(ce_ckpt, require_distill_report=True)
+            and _has_hf_weight_files(ce_ckpt)
+            and ce_weights_pt.is_file()
+            and ce_weights_pt.stat().st_size > 0
+        )
+        if distill_from_features and has_ready_processed:
+            _distill_ce_from_features(
+                processed_dir,
+                ce_ckpt=ce_ckpt,
+                lang=lang,
+                student_backbone=student_backbone,
+                min_total_replies=int(args.min_total_replies),
+                epochs=int(args.epochs_nlp),
+                batch_size=int(args.batch_size_nlp),
+                force=force,
+            )
+        elif (
             not force
-            and (processed_dir / "nlp_features.pt").exists()
-            and (ce_ckpt / "dual_head_weights.pt").exists()
+            and _nlp_features_match_cohort(processed_dir / "nlp_features.pt", int(args.min_total_replies))
+            and ce_complete
+            and (lang != "vi" or _has_hf_weight_files(vihsd_dir))
             and audit_csv.exists()
         ):
             print(f"[KaggleRunner] [SKIP Stage 2] Teacher/Student/Audit artifacts already complete: {ce_ckpt}")
@@ -617,6 +765,10 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                 "--export-audit",
                 "--distill",
             ]
+            if hostility_target_router:
+                scorer_cmd.append("--hostility-target-router")
+                if hostility_gate_threshold is not None:
+                    scorer_cmd.extend(["--hostility-gate-threshold", str(float(hostility_gate_threshold))])
             if not force:
                 scorer_cmd.append("--skip-if-exists")
             if lang == "vi":
@@ -624,12 +776,7 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             _run_cmd(scorer_cmd, cwd=work_dir)
 
         # Stage 3: Frozen 768-d Ancestor SpanPool node embeddings + 2D edge attributes
-        if (
-            not force
-            and (processed_dir / "nlp_features.pt").exists()
-            and (processed_dir / "nodes.parquet").exists()
-            and (processed_dir / "edges.parquet").exists()
-        ):
+        if not force and has_ready_processed:
             print(f"[KaggleRunner] [SKIP Stage 3] Processed nlp_features.pt already exists: {processed_dir}")
         else:
             extract_cmd = [
@@ -677,7 +824,7 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             k_horizon=args.k_horizon,
             split="train",
             min_total_replies=args.min_total_replies,
-            polar_target_mode="future_only",
+            polar_target_mode=polar_target_mode,
         )
         inferred_edge_dim = (
             int(train_ds[0].edge_attr.size(1))
@@ -691,7 +838,7 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                 k_horizon=args.k_horizon,
                 split="val",
                 min_total_replies=args.min_total_replies,
-                polar_target_mode="future_only",
+                polar_target_mode=polar_target_mode,
             )
             loop_res = run_self_auditing_validation_loop(
                 DataLoader(train_ds, batch_size=args.batch_size_gnn, shuffle=True),
@@ -707,7 +854,7 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                 output_dir=work_dir / "outputs" / f"auto_loop_{ds_name}",
             )
 
-        # Main 5-seed benchmark (Inductive) — explicit ds_name suffixes preserve naming under model_gnn_only
+        # Main 5-seed benchmark (Inductive) — ALWAYS index [0] for canonical inductive contract
         exp_base_cmd = [
             py,
             "-m",
@@ -718,6 +865,8 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             str(args.k_horizon),
             "--min-total-replies",
             str(args.min_total_replies),
+            "--polar-target-mode",
+            polar_target_mode,
             "--hidden-dim",
             str(best_cfg["hidden_dim"]),
             "--edge-dim",
@@ -736,8 +885,13 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             "--batch-size",
             str(args.batch_size_gnn),
         ]
-        main_json = work_dir / "paper" / f"results_main_{ds_name}.json"
-        main_tex = work_dir / "paper" / f"tables_main_{ds_name}.tex"
+        if include_tier2_prior:
+            exp_base_cmd.append("--include-tier2-prior")
+        if skip_sota:
+            exp_base_cmd.append("--skip-sota")
+
+        main_json = out_root / f"results_main_{ds_name}.json"
+        main_tex = out_root / f"tables_main_{ds_name}.tex"
         if not force and main_json.is_file() and main_tex.is_file():
             print(f"[KaggleRunner] [SKIP Main] Already complete: {main_json}")
         else:
@@ -745,11 +899,11 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                 exp_base_cmd
                 + [
                     "--output-table",
-                    f"paper/tables_main_{ds_name}.tex",
+                    f"{out_rel}/tables_main_{ds_name}.tex",
                     "--output-json",
-                    f"paper/results_main_{ds_name}.json",
+                    f"{out_rel}/results_main_{ds_name}.json",
                     "--figures-dir",
-                    f"paper/figures/{ds_name}",
+                    f"{out_rel}/figures/{ds_name}",
                     "--ckpt-out",
                     f"checkpoints/best_sbifagat_{ds_name}.pt",
                 ],
@@ -757,8 +911,8 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
             )
 
         mech_ckpt = work_dir / "checkpoints" / f"best_sbifagat_{ds_name}.pt"
-        mech_json = work_dir / "paper" / f"results_mechanisms_{ds_name}.json"
-        mech_tex = work_dir / "paper" / f"tables_mechanisms_{ds_name}.tex"
+        mech_json = out_root / f"results_mechanisms_{ds_name}.json"
+        mech_tex = out_root / f"tables_mechanisms_{ds_name}.tex"
         if mech_ckpt.is_file() and (force or not mech_json.is_file() or not mech_tex.is_file()):
             try:
                 _run_cmd(
@@ -774,12 +928,14 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                         str(args.k_horizon),
                         "--min-total-replies",
                         str(args.min_total_replies),
+                        "--polar-target-mode",
+                        polar_target_mode,
                         "--output-json",
-                        f"paper/results_mechanisms_{ds_name}.json",
+                        f"{out_rel}/results_mechanisms_{ds_name}.json",
                         "--output-table",
-                        f"paper/tables_mechanisms_{ds_name}.tex",
+                        f"{out_rel}/tables_mechanisms_{ds_name}.tex",
                         "--figures-dir",
-                        f"paper/figures/{ds_name}",
+                        f"{out_rel}/figures/{ds_name}",
                     ],
                     cwd=work_dir,
                 )
@@ -790,8 +946,8 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                 )
 
         if lang == "en":
-            loo_json = work_dir / "paper" / f"results_loo_{ds_name}.json"
-            loo_tex = work_dir / "paper" / f"tables_loo_{ds_name}.tex"
+            loo_json = out_root / f"results_loo_{ds_name}.json"
+            loo_tex = out_root / f"tables_loo_{ds_name}.tex"
             if not force and loo_json.is_file() and loo_tex.is_file():
                 print(f"[KaggleRunner] [SKIP LOO] Already complete: {loo_json}")
             else:
@@ -806,9 +962,9 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                             "--eval-protocol",
                             "loo",
                             "--output-table",
-                            f"paper/tables_loo_{ds_name}.tex",
+                            f"{out_rel}/tables_loo_{ds_name}.tex",
                             "--output-json",
-                            f"paper/results_loo_{ds_name}.json",
+                            f"{out_rel}/results_loo_{ds_name}.json",
                             "--ckpt-out",
                             f"checkpoints/best_sbifagat_{ds_name}_loo.pt",
                             "--skip-figures",
@@ -849,8 +1005,8 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                         print(f"[WARN] Could not export 30-tree VN blind audit CSV: {exc}")
 
             # Temporal holdout check with isolated teacher edges (zero Student leakage)
-            temp_json = work_dir / "paper" / f"results_temporal_{ds_name}.json"
-            temp_tex = work_dir / "paper" / f"tables_temporal_{ds_name}.tex"
+            temp_json = out_root / f"results_temporal_{ds_name}.json"
+            temp_tex = out_root / f"tables_temporal_{ds_name}.tex"
             if force or not temp_json.is_file() or not temp_tex.is_file():
                 _run_cmd(
                     exp_base_cmd
@@ -860,17 +1016,37 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                         "--edge-source",
                         "teacher",
                         "--output-table",
-                        f"paper/tables_temporal_{ds_name}.tex",
+                        f"{out_rel}/tables_temporal_{ds_name}.tex",
                         "--output-json",
-                        f"paper/results_temporal_{ds_name}.json",
+                        f"{out_rel}/results_temporal_{ds_name}.json",
+                        "--skip-figures",
+                    ],
+                    cwd=work_dir,
+                )
+
+        if run_embedding_cluster:
+            cluster_json = out_root / f"results_cluster_{ds_name}.json"
+            cluster_tex = out_root / f"tables_cluster_{ds_name}.tex"
+            if force or not cluster_json.is_file() or not cluster_tex.is_file():
+                _run_cmd(
+                    exp_base_cmd
+                    + [
+                        "--split-mode",
+                        "embedding_cluster",
+                        "--edge-source",
+                        "teacher",
+                        "--output-table",
+                        f"{out_rel}/tables_cluster_{ds_name}.tex",
+                        "--output-json",
+                        f"{out_rel}/results_cluster_{ds_name}.json",
                         "--skip-figures",
                     ],
                     cwd=work_dir,
                 )
 
         # Full component & K-horizon ablations
-        abl_json = work_dir / "paper" / f"results_ablation_{ds_name}.json"
-        abl_tex = work_dir / "paper" / f"tables_ablation_{ds_name}.tex"
+        abl_json = out_root / f"results_ablation_{ds_name}.json"
+        abl_tex = out_root / f"tables_ablation_{ds_name}.tex"
         if not force and abl_json.is_file() and abl_tex.is_file():
             print(f"[KaggleRunner] [SKIP Ablation] Already complete: {abl_json}")
         else:
@@ -884,6 +1060,8 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                 str(args.k_horizon),
                 "--min-total-replies",
                 str(args.min_total_replies),
+                "--polar-target-mode",
+                polar_target_mode,
                 "--hidden-dim",
                 str(best_cfg["hidden_dim"]),
                 "--edge-dim",
@@ -902,17 +1080,17 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                 "--batch-size",
                 str(args.batch_size_gnn),
                 "--output-table",
-                f"paper/tables_ablation_{ds_name}.tex",
+                f"{out_rel}/tables_ablation_{ds_name}.tex",
                 "--output-json",
-                f"paper/results_ablation_{ds_name}.json",
+                f"{out_rel}/results_ablation_{ds_name}.json",
                 "--figures-dir",
-                f"paper/figures/{ds_name}",
+                f"{out_rel}/figures/{ds_name}",
             ]
             _run_cmd(abl_cmd, cwd=work_dir)
 
         # Export Table 1 Dataset EDA + Early-K Persistence Baseline & Efficiency LaTeX Table
-        eda_json = work_dir / "paper" / f"results_dataset_eda_{ds_name}.json"
-        eda_tex = work_dir / "paper" / f"tables_dataset_eda_{ds_name}.tex"
+        eda_json = out_root / f"results_dataset_eda_{ds_name}.json"
+        eda_tex = out_root / f"tables_dataset_eda_{ds_name}.tex"
         if not force and eda_json.is_file() and eda_tex.is_file():
             print(f"[KaggleRunner] [SKIP EDA] Already complete: {eda_json}")
         else:
@@ -929,17 +1107,19 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                     str(args.k_horizon),
                     "--min-total-replies",
                     str(args.min_total_replies),
+                    "--polar-target-mode",
+                    polar_target_mode,
                     "--edge-dim",
                     str(inferred_edge_dim),
                     "--output-table",
-                    f"paper/tables_dataset_eda_{ds_name}.tex",
+                    f"{out_rel}/tables_dataset_eda_{ds_name}.tex",
                     "--output-json",
-                    f"paper/results_dataset_eda_{ds_name}.json",
+                    f"{out_rel}/results_dataset_eda_{ds_name}.json",
                 ],
                 cwd=work_dir,
             )
-        eff_json = work_dir / "paper" / f"results_efficiency_{ds_name}.json"
-        eff_tex = work_dir / "paper" / f"tables_efficiency_{ds_name}.tex"
+        eff_json = out_root / f"results_efficiency_{ds_name}.json"
+        eff_tex = out_root / f"tables_efficiency_{ds_name}.tex"
         if not force and eff_json.is_file() and eff_tex.is_file():
             print(f"[KaggleRunner] [SKIP Efficiency] Already complete: {eff_json}")
         else:
@@ -955,26 +1135,65 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                 str(inferred_edge_dim),
                 "--use-cascade-stats",
                 "--output-table",
-                f"paper/tables_efficiency_{ds_name}.tex",
+                f"{out_rel}/tables_efficiency_{ds_name}.tex",
                 "--output-json",
-                f"paper/results_efficiency_{ds_name}.json",
+                f"{out_rel}/results_efficiency_{ds_name}.json",
             ]
+            if not skip_e2e_efficiency:
+                eff_cmd.extend(
+                    [
+                        "--include-e2e",
+                        "--ce-ckpt",
+                        str(ce_ckpt),
+                        "--gnn-ckpt",
+                        str(mech_ckpt),
+                    ]
+                )
             _run_cmd(eff_cmd, cwd=work_dir)
+
+        if run_tier2:
+            tier2_json = out_root / f"results_signed_link_{ds_name}.json"
+            if not force and tier2_json.is_file():
+                print(f"[KaggleRunner] [SKIP Tier 2] Already complete: {tier2_json}")
+            else:
+                _run_cmd(
+                    [
+                        py,
+                        "-m",
+                        "scripts.run_macro_signed_network",
+                        "--data-dir",
+                        str(processed_dir),
+                        "--dataset-name",
+                        ds_name,
+                        "--batch-size",
+                        "2048",
+                        "--mp-graph-mode",
+                        mp_graph_mode,
+                        "--paper-dir",
+                        out_rel,
+                        "--figures-dir",
+                        f"{out_rel}/figures/{ds_name}",
+                    ],
+                    cwd=work_dir,
+                )
 
     bundle_sources = [
         processed_dir,
-        work_dir / "paper",
+        out_root,
         work_dir / "outputs",
         work_dir / "data" / "interim",
         work_dir / "checkpoints",
         ce_ckpt,
     ]
-    bundle_nlp_pt = bool(args.bundle_weights or args.role == "model_nlp_only")
+    include_weights_flag = bool(
+        getattr(args, "bundle_weights", False) or getattr(args, "include_heavy_weights", False)
+    )
+    bundle_nlp_pt = bool(include_weights_flag or args.role == "model_nlp_only")
     bundle_zip = _bundle_outputs(
         work_dir / f"sbifagat_{args.role}_bundle.zip",
         source_paths=bundle_sources,
         base_dir=work_dir,
-        include_heavy_weights=bool(args.bundle_weights),
+        include_heavy_weights=include_weights_flag,
         include_nlp_features=bundle_nlp_pt,
     )
     sealed_zip = _bundle_sealed_machine_keys(
@@ -996,6 +1215,10 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                     str(best_cfg["hidden_dim"]),
                     "--epochs",
                     str(args.epochs_gnn),
+                    "--output-table",
+                    f"{out_rel}/tables_upfd.tex",
+                    "--output-json",
+                    f"{out_rel}/results_upfd.json",
                 ],
                 cwd=work_dir,
             )
@@ -1004,7 +1227,7 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
                 work_dir / f"sbifagat_{args.role}_bundle.zip",
                 source_paths=bundle_sources,
                 base_dir=work_dir,
-                include_heavy_weights=bool(args.bundle_weights),
+                include_heavy_weights=include_weights_flag,
                 include_nlp_features=bundle_nlp_pt,
             )
         except Exception as exc:
@@ -1018,6 +1241,7 @@ def run_kaggle_parallel_role(args: argparse.Namespace) -> dict[str, Any]:
         "mode": "unified_2d",
         "role": args.role,
         "lang": lang,
+        "results_dir": str(out_root),
         "best_config": best_cfg,
         "auto_loop": loop_res,
         "upfd_status": upfd_status,
@@ -1038,19 +1262,72 @@ def main() -> None:
     parser.add_argument("--lang", choices=["vi", "en"], default=None)
     parser.add_argument("--work-dir", type=Path, default=None)
     parser.add_argument("--processed-dir", type=Path, default=None)
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=Path("results"),
+        help="Primary output directory for JSON, LaTeX, and figure artifacts (default: results/).",
+    )
     parser.add_argument("--vn-target-count", type=int, default=1500)
     parser.add_argument("--before-epoch", type=int, default=None)
     parser.add_argument("--k-horizon", type=int, default=20)
     parser.add_argument("--min-total-replies", type=int, default=DEFAULT_FORECAST_MIN_REPLIES)
+    parser.add_argument(
+        "--polar-target-mode",
+        choices=["full", "future_only"],
+        default="future_only",
+        help="Leakage-free polarization target definition forwarded to Tier 1 runners.",
+    )
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--epochs-nlp", type=int, default=3)
     parser.add_argument("--epochs-gnn", type=int, default=100)
     parser.add_argument("--batch-size-nlp", type=int, default=16)
     parser.add_argument("--batch-size-gnn", type=int, default=32)
     parser.add_argument("--bootstrap-if-missing", action="store_true")
+    parser.add_argument(
+        "--distill-from-features",
+        action="store_true",
+        help="Fast CE distillation from existing processed nlp_features.pt + topic_splits.json when weights are missing.",
+    )
+    parser.add_argument(
+        "--hostility-target-router",
+        action="store_true",
+        help="Enable calibrated HostilityGatedTargetRouter during Stage 2 teacher scoring.",
+    )
+    parser.add_argument(
+        "--hostility-gate-threshold",
+        type=float,
+        default=None,
+        help="Optional explicit hostility threshold override for HostilityGatedTargetRouter.",
+    )
+    parser.add_argument("--include-tier2-prior", action="store_true", help="Include SBiFAGAT + Tier2Prior in Tier 1.")
+    parser.add_argument(
+        "--run-embedding-cluster",
+        action="store_true",
+        help="Run Tier 1 embedding_cluster domain-shift split (teacher edges).",
+    )
+    parser.add_argument("--skip-sota", action="store_true", help="Skip tabular/SOTA Tier 1 comparators.")
+    parser.add_argument("--run-tier2", action="store_true", help="Run Tier 2 macro & 10-model signed link benchmark.")
+    parser.add_argument(
+        "--mp-graph-mode",
+        choices=["coalesced", "multiedge"],
+        default="coalesced",
+        help="Message-passing edge canonicalization mode for Tier 2 signed GNNs.",
+    )
+    parser.add_argument(
+        "--skip-e2e-efficiency",
+        action="store_true",
+        help="Skip --include-e2e raw-text profiling inside scripts.benchmark_efficiency.",
+    )
     parser.add_argument("--run-auto-loop", action="store_true")
     parser.add_argument("--run-upfd", action="store_true")
-    parser.add_argument("--bundle-weights", action="store_true")
+    parser.add_argument(
+        "--bundle-weights",
+        "--include-heavy-weights",
+        dest="bundle_weights",
+        action="store_true",
+        help="Include heavy NLP/ViHSD/CE weight files and nlp_features.pt in output bundle zip.",
+    )
     parser.add_argument("--force", action="store_true", help="Re-run all stages even if outputs already exist.")
     parser.add_argument("--smoke-test", action="store_true")
     args = parser.parse_args()

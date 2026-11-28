@@ -1,12 +1,16 @@
 """Lightweight 5-class discourse category constants and rule-based fallback helpers.
 
-Extracted cleanly without any heavy generative-LLM (`transformers`/`peft`/`bitsandbytes`)
-dependencies so audit utilities, offline live-thread inspection, and feature extractors
-stay lightweight.
+Note on canonical pipeline:
+  The production SBi-FAGAT pipeline uses the unified 2D edge representation
+  `e_uv = [s_uv, h_uv]` (stance `s_uv in [-1, 1]` + hostility `h_uv in [0, 1]`).
+  `DISCOURSE_BEHAVIOR_LABELS` and `_heuristic_behavior_fallback` are preserved
+  exclusively for offline checkpoint-free demo fallback and backward-compatible
+  5-class / 4D test coverage.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any, Sequence
 
 import numpy as np
@@ -66,7 +70,10 @@ _HOSTILE_CUE_WORDS: tuple[str, ...] = (
     "nao tan",
     "rác",
     "cút",
-    "biến",
+    "biến đi",
+    "biến khỏi",
+    "biến mẹ",
+    "cút biến",
     "súc vật",
     "đồ điên",
     "thằng khùng",
@@ -94,8 +101,18 @@ _IRRATIONAL_CUE_WORDS: tuple[str, ...] = (
     "lmao yeah right",
 )
 _OPPOSE_CUE_WORDS: tuple[str, ...] = (
+    "phản đối",
+    "phản bác",
+    "bác bỏ",
+    "không đồng tình",
+    "không tán thành",
+    "không ủng hộ",
+    "chưa đồng ý",
     "không đồng ý",
     "chưa hợp lý",
+    "không hợp lý",
+    "không chính xác",
+    "chưa chính xác",
     "nhầm rồi",
     "sai ở chỗ",
     "tuy nhiên",
@@ -110,7 +127,6 @@ _OPPOSE_CUE_WORDS: tuple[str, ...] = (
 _SUPPORT_CUE_WORDS: tuple[str, ...] = (
     "đồng ý",
     "chính xác",
-    "chuẩn",
     "ủng hộ",
     "hợp lý",
     "quá đúng",
@@ -120,6 +136,60 @@ _SUPPORT_CUE_WORDS: tuple[str, ...] = (
     "well said",
     "confirmed",
     "true",
+)
+
+
+def _compile_cue_pattern(cue: str) -> re.Pattern[str]:
+    """Compile a Unicode-aware token-boundary regex for word or symbol cues."""
+    norm_cue = normalize_nfc(cue).lower()
+    left = (
+        r"(?<![\w\u0300-\u036f])"
+        if norm_cue and (norm_cue[0].isalnum() or norm_cue[0] == "_")
+        else r"(?:^|(?<=[\s(\[\"'.,:;!?]))"
+    )
+    right = (
+        r"(?![\w\u0300-\u036f])"
+        if norm_cue and (norm_cue[-1].isalnum() or norm_cue[-1] == "_")
+        else r"(?:$|(?=[\s)\]\}\"'.,:;!?]))"
+    )
+    return re.compile(f"{left}{re.escape(norm_cue)}{right}", flags=re.UNICODE)
+
+
+_GAPPED_VI_OPPOSE_RE = re.compile(
+    r"(?<![\w\u0300-\u036f])"
+    r"(?:không|chẳng|chả|chưa|đâu\s+có)\s+"
+    r"(?:[\w\u0300-\u036f]+\s+){0,2}"
+    r"(?:đồng\s+ý|đồng\s+tình|tán\s+thành|ủng\s+hộ|hợp\s+lý|chính\s+xác|chuẩn(?!\s+bị)|đúng)"
+    r"(?![\w\u0300-\u036f])",
+    flags=re.UNICODE,
+)
+_GAPPED_EN_OPPOSE_RE = re.compile(
+    r"(?<![\w\u0300-\u036f])"
+    r"(?:don['’]?t|do\s+not|doesn['’]?t|does\s+not|didn['’]?t|did\s+not|"
+    r"can['’]?t|cannot|can\s+not|won['’]?t|wouldn['’]?t|never|not)\s+"
+    r"(?:[\w\u0300-\u036f]+\s+){0,2}"
+    r"(?:agree|agreed|agreeing|correct|true|exactly|well\s+said|confirmed)"
+    r"(?![\w\u0300-\u036f])",
+    flags=re.UNICODE,
+)
+_CHUAN_SUPPORT_RE = re.compile(
+    r"(?<![\w\u0300-\u036f])chuẩn(?!\s+bị)(?![\w\u0300-\u036f])",
+    flags=re.UNICODE,
+)
+_HOSTILE_CUE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    _compile_cue_pattern(tok) for tok in _HOSTILE_CUE_WORDS
+)
+_IRRATIONAL_CUE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    _compile_cue_pattern(tok) for tok in _IRRATIONAL_CUE_WORDS
+)
+_OPPOSE_CUE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    *(_compile_cue_pattern(tok) for tok in _OPPOSE_CUE_WORDS),
+    _GAPPED_VI_OPPOSE_RE,
+    _GAPPED_EN_OPPOSE_RE,
+)
+_SUPPORT_CUE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    *(_compile_cue_pattern(tok) for tok in _SUPPORT_CUE_WORDS),
+    _CHUAN_SUPPORT_RE,
 )
 
 
@@ -147,21 +217,67 @@ def _default_probs_from_label(label: str) -> list[float]:
     return [v / tot for v in base]
 
 
+_BENIGN_EXCLAMATION_WORDS: frozenset[str] = frozenset(
+    {
+        "ok",
+        "oke",
+        "okay",
+        "okie",
+        "yes",
+        "yeah",
+        "yep",
+        "no",
+        "wow",
+        "cool",
+        "nice",
+        "good",
+        "great",
+        "thanks",
+        "thank",
+        "tks",
+        "ty",
+        "cảm",
+        "ơn",
+        "vâng",
+        "dạ",
+        "ừ",
+        "uh",
+        "nha",
+        "nhé",
+        "ạ",
+        "haha",
+        "hihi",
+        "hehe",
+        "lol",
+    }
+)
+
+
 def _heuristic_behavior_fallback(reply_text: str) -> dict[str, Any]:
     """Heuristic fallback for offline checkpoint-free demo inspection."""
     low = normalize_nfc(reply_text).lower()
-    if any(tok in low for tok in _HOSTILE_CUE_WORDS) or low.count("!") >= 3:
+    low = re.sub(r"https?://\S+|www\.\S+", " ", low)
+    alpha_words = re.findall(r"[^\W\d_]+", low, flags=re.UNICODE)
+    has_substantive_exclamation_text = (
+        len(alpha_words) >= 2
+        and sum(len(w) for w in alpha_words) >= 6
+        and not all(w in _BENIGN_EXCLAMATION_WORDS for w in alpha_words)
+    )
+    if any(pat.search(low) for pat in _HOSTILE_CUE_PATTERNS):
         lbl = "hostile_conflict"
         s_uv, h_uv, r_uv, c_uv = -0.85, 0.88, 0.65, 0.05
-    elif any(tok in low for tok in _IRRATIONAL_CUE_WORDS):
+    elif any(pat.search(low) for pat in _IRRATIONAL_CUE_PATTERNS):
         lbl = "irrational_fallacy"
         s_uv, h_uv, r_uv, c_uv = -0.60, 0.45, 0.85, 0.10
-    elif any(tok in low for tok in _OPPOSE_CUE_WORDS):
+    elif any(pat.search(low) for pat in _OPPOSE_CUE_PATTERNS):
         lbl = "constructive_oppose"
         s_uv, h_uv, r_uv, c_uv = -0.65, 0.10, 0.12, 0.82
-    elif any(tok in low for tok in _SUPPORT_CUE_WORDS):
+    elif any(pat.search(low) for pat in _SUPPORT_CUE_PATTERNS):
         lbl = "support"
         s_uv, h_uv, r_uv, c_uv = 0.75, 0.05, 0.05, 0.78
+    elif low.count("!") >= 3 and has_substantive_exclamation_text:
+        lbl = "hostile_conflict"
+        s_uv, h_uv, r_uv, c_uv = -0.85, 0.88, 0.65, 0.05
     else:
         lbl = "neutral"
         s_uv, h_uv, r_uv, c_uv = 0.0, 0.05, 0.08, 0.45

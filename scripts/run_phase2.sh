@@ -11,6 +11,10 @@ RUN_VN="${RUN_VN:-1}"
 VN_TARGET_COUNT="${VN_TARGET_COUNT:-1500}"
 VN_BEFORE_EPOCH="${VN_BEFORE_EPOCH:-1763164800}"
 MIN_TOTAL_REPLIES="${MIN_TOTAL_REPLIES:-25}"
+PHEME_K_HORIZON="${PHEME_K_HORIZON:-20}"
+PHEME_MIN_REPLIES="${PHEME_MIN_REPLIES:-${MIN_TOTAL_REPLIES}}"
+VN_K_HORIZON="${VN_K_HORIZON:-20}"
+VN_MIN_REPLIES="${VN_MIN_REPLIES:-${MIN_TOTAL_REPLIES}}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 EPOCHS="${EPOCHS:-3}"
 
@@ -38,7 +42,7 @@ if [[ "${RUN_PHEME}" -eq 1 ]]; then
         --pilot-csv data/interim/pilot_calibration_en_20.csv \
         --audit-n-samples 120 \
         --pilot-samples 20 \
-        --min-total-replies "${MIN_TOTAL_REPLIES}" \
+        --min-total-replies "${PHEME_MIN_REPLIES}" \
         --teacher-backend "${TEACHER_BACKEND}" \
         --edge-dim "${EDGE_DIM}" \
         --epochs "${EPOCHS}" \
@@ -57,9 +61,9 @@ if [[ "${RUN_PHEME}" -eq 1 ]]; then
         --scored-cache-json data/interim/pheme/scored_pairs.json \
         --edge-dim "${EDGE_DIM}" \
         --include-root-context \
-        --min-total-replies "${MIN_TOTAL_REPLIES}" \
+        --min-total-replies "${PHEME_MIN_REPLIES}" \
         --batch-size "$((BATCH_SIZE * 2))" \
-        --k-horizon 20
+        --k-horizon "${PHEME_K_HORIZON}"
 fi
 
 if [[ "${RUN_VN}" -eq 1 ]]; then
@@ -67,7 +71,7 @@ if [[ "${RUN_VN}" -eq 1 ]]; then
     CRAWL_ARGS=(
         --output-dir data/interim/vn
         --target-count "${VN_TARGET_COUNT}"
-        --min-comments "${MIN_TOTAL_REPLIES}"
+        --min-comments "${VN_MIN_REPLIES}"
         --min-vi-ratio 0.65
         --max-pages-per-sub 300
         --checkpoint-jsonl data/interim/vn/crawl_checkpoint.jsonl
@@ -89,7 +93,7 @@ if [[ "${RUN_VN}" -eq 1 ]]; then
         --pilot-csv data/interim/pilot_calibration_vi_20.csv \
         --audit-n-samples 120 \
         --pilot-samples 20 \
-        --min-total-replies "${MIN_TOTAL_REPLIES}" \
+        --min-total-replies "${VN_MIN_REPLIES}" \
         --teacher-backend "${TEACHER_BACKEND}" \
         --edge-dim "${EDGE_DIM}" \
         --epochs "${EPOCHS}" \
@@ -110,9 +114,9 @@ if [[ "${RUN_VN}" -eq 1 ]]; then
         --vihsd-dir checkpoints/visobert_vihsd \
         --edge-dim "${EDGE_DIM}" \
         --include-root-context \
-        --min-total-replies "${MIN_TOTAL_REPLIES}" \
+        --min-total-replies "${VN_MIN_REPLIES}" \
         --batch-size "$((BATCH_SIZE * 2))" \
-        --k-horizon 20
+        --k-horizon "${VN_K_HORIZON}"
 fi
 
 echo "Phase 2 data & offline NLP feature extraction completed."

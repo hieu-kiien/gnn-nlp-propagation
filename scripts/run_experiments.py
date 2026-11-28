@@ -11,10 +11,15 @@ import numpy as np
 import torch
 from torch_geometric.loader import DataLoader
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from scripts.export_dataset_stats import compute_early_k_persistence_metrics
 from src.data.pyg_dataset import (
     DEFAULT_FORECAST_MIN_REPLIES,
     EarlyCascadeDataset,
+    TIER2_PRIOR_DIM,
     TOTAL_NODE_FEATURE_DIM,
     compute_embedding_cluster_splits,
     compute_temporal_topic_splits,
@@ -22,6 +27,7 @@ from src.data.pyg_dataset import (
 )
 from src.data.schema import load_cascade_parquet
 from src.models.baselines import (
+    BiEdgeGATv2,
     BiGCN,
     EdgeGATv2,
     FAGCNBaseline,
@@ -31,6 +37,14 @@ from src.models.baselines import (
     TextMLP,
 )
 from src.models.sbi_fagat import SBiFAGAT
+from src.models.sota_cascades import (
+    CalibratedEarlyKPersistence,
+    CasCN,
+    CasFlow,
+    FriedkinJohnsenGNN,
+    LightGBMBaseline,
+    RidgeBaseline,
+)
 from src.training.reporting import (
     MAIN_METRICS,
     VN_MAIN_METRICS,
@@ -56,20 +70,24 @@ def _resolve_output_paths(
     figures_dir: Path | None,
     *,
     split_mode: str = "canonical",
+    eval_protocol: str = "inductive",
 ) -> tuple[Path, Path, Path]:
     ds_name = data_dir.name.lower() if data_dir.name.lower() in {"pheme", "vn"} else ""
     suffix = f"_{ds_name}" if ds_name else ""
-    prefix = (
-        "temporal"
-        if split_mode == "temporal"
-        else ("cluster" if split_mode == "embedding_cluster" else "main")
-    )
-    tbl = output_table or Path(f"paper/tables_{prefix}{suffix}.tex")
-    jsn = output_json or Path(f"paper/results_{prefix}{suffix}.json")
-    if split_mode != "canonical" and figures_dir is None:
-        figs = Path("paper/figures") / (f"{ds_name}_{prefix}" if ds_name else prefix)
+    if split_mode == "temporal":
+        prefix = "temporal"
+    elif split_mode == "embedding_cluster":
+        prefix = "cluster"
+    elif str(eval_protocol).lower() == "loo":
+        prefix = "loo"
     else:
-        figs = figures_dir or (Path("paper/figures") / ds_name if ds_name else Path("paper/figures"))
+        prefix = "main"
+    tbl = output_table or Path(f"results/tables_{prefix}{suffix}.tex")
+    jsn = output_json or Path(f"results/results_{prefix}{suffix}.json")
+    if split_mode != "canonical" and figures_dir is None:
+        figs = Path("results/figures") / (f"{ds_name}_{prefix}" if ds_name else prefix)
+    else:
+        figs = figures_dir or (Path("results/figures") / ds_name if ds_name else Path("results/figures"))
     return tbl, jsn, figs
 
 
@@ -104,10 +122,11 @@ def _build_loaders(
     batch_size: int,
     *,
     min_total_replies: int = 0,
-    polar_target_mode: str = "full",
+    polar_target_mode: str = "future_only",
     label_scheme: str = "veracity4",
     custom_topic_splits: dict[str, set[str]] | None = None,
     edge_source: str = "auto",
+    include_tier2_prior: bool = False,
     nodes_table: Any = None,
     edges_table: Any = None,
     nlp_features: Any = None,
@@ -137,6 +156,7 @@ def _build_loaders(
         "label_scheme": label_scheme,
         "custom_topic_splits": custom_topic_splits,
         "edge_source": edge_source,
+        "include_tier2_prior": bool(include_tier2_prior),
         "nodes_table": nodes_table,
         "edges_table": edges_table,
         "nlp_features": nlp_features,
@@ -206,17 +226,7 @@ def _export_diagnostic_figures(
 
 
 def _infer_edge_dim(data_dir: Path, nlp_features: dict[str, Any] | None = None) -> int:
-    feats = nlp_features
-    if feats is None:
-        feat_path = data_dir / "nlp_features.pt"
-        if feat_path.exists():
-            feats = torch.load(feat_path, map_location="cpu", weights_only=False)
-    if feats is not None:
-        if "edge_dim" in feats:
-            return int(feats["edge_dim"])
-        raw_attr = feats.get("edge_attr")
-        if isinstance(raw_attr, torch.Tensor) and raw_attr.ndim == 2 and raw_attr.size(1) in {2, 4}:
-            return int(raw_attr.size(1))
+    del data_dir, nlp_features
     return 2
 
 
@@ -277,12 +287,14 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--k-horizon", type=int, default=20)
     parser.add_argument("--hidden-dim", type=int, default=64)
-    parser.add_argument("--edge-dim", type=int, choices=[2, 4], default=None)
+    parser.add_argument("--edge-dim", type=int, choices=[2], default=None)
     parser.add_argument("--eps", type=float, default=0.5)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--v2", action="store_true", help="Enable v2 burst stats + uncertainty + 0.05 NLL reg.")
     parser.add_argument("--use-cascade-stats", action="store_true")
     parser.add_argument("--predict-uncertainty", action="store_true")
+    parser.add_argument("--include-tier2-prior", action="store_true", help="Enable strictly causal pre-root_ts Tier 2 user prior bridge.")
+    parser.add_argument("--skip-sota", action="store_true", help="Run only the core 8 neural models without tabular/SOTA cascade baselines.")
     parser.add_argument("--lambda-uncertainty", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -321,9 +333,12 @@ def main() -> None:
         args.output_json,
         args.figures_dir,
         split_mode=args.split_mode,
+        eval_protocol=args.eval_protocol,
     )
     effective_edge_source = (
-        "teacher" if args.split_mode != "canonical" else args.edge_source
+        "teacher"
+        if (args.split_mode != "canonical" or args.eval_protocol == "loo")
+        else args.edge_source
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -338,7 +353,8 @@ def main() -> None:
         else (0.05 if use_unc else 0.0)
     )
     num_cls = 2 if args.label_scheme == "binary" else 4
-    model_factories = {
+    lgb_backend = LightGBMBaseline(num_rumor_classes=num_cls).backend_name
+    model_factories: dict[str, Any] = {
         "TextMLP": lambda: TextMLP(
             in_dim=in_dim,
             hidden_dim=h_dim,
@@ -381,6 +397,16 @@ def main() -> None:
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
         ),
+        "BiEdgeGATv2": lambda: BiEdgeGATv2(
+            in_dim=in_dim,
+            hidden_dim=h_dim,
+            edge_dim=edge_dim,
+            num_rumor_classes=num_cls,
+            eps=args.eps,
+            dropout=args.dropout,
+            use_cascade_stats=use_stats,
+            predict_uncertainty=use_unc,
+        ),
         "FAGCN": lambda: FAGCNBaseline(
             in_dim=in_dim,
             hidden_dim=h_dim,
@@ -398,7 +424,60 @@ def main() -> None:
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
         ),
-        "SBiFAGAT": lambda: SBiFAGAT(
+    }
+    if not args.skip_sota:
+        model_factories.update(
+            {
+                "Calibrated Early-K Persistence": lambda: CalibratedEarlyKPersistence(
+                    num_rumor_classes=num_cls,
+                ),
+                "Ridge": lambda: RidgeBaseline(
+                    num_rumor_classes=num_cls,
+                ),
+                "LightGBM": lambda: LightGBMBaseline(
+                    num_rumor_classes=num_cls,
+                ),
+                "FriedkinJohnsen": lambda: FriedkinJohnsenGNN(
+                    in_dim=in_dim,
+                    hidden_dim=h_dim,
+                    edge_dim=edge_dim,
+                    num_rumor_classes=num_cls,
+                    dropout=args.dropout,
+                    use_cascade_stats=use_stats,
+                    predict_uncertainty=use_unc,
+                ),
+                "CasCN": lambda: CasCN(
+                    in_dim=in_dim,
+                    hidden_dim=h_dim,
+                    num_rumor_classes=num_cls,
+                    dropout=args.dropout,
+                    use_cascade_stats=use_stats,
+                    predict_uncertainty=use_unc,
+                ),
+                "CasFlow": lambda: CasFlow(
+                    in_dim=in_dim,
+                    hidden_dim=h_dim,
+                    edge_dim=edge_dim,
+                    num_rumor_classes=num_cls,
+                    dropout=args.dropout,
+                    use_cascade_stats=use_stats,
+                    predict_uncertainty=use_unc,
+                    tier2_prior_dim=TIER2_PRIOR_DIM,
+                ),
+            }
+        )
+    model_factories["SBiFAGAT"] = lambda: SBiFAGAT(
+        in_dim=in_dim,
+        hidden_dim=h_dim,
+        edge_dim=edge_dim,
+        num_rumor_classes=num_cls,
+        eps=args.eps,
+        dropout=args.dropout,
+        use_cascade_stats=use_stats,
+        predict_uncertainty=use_unc,
+    )
+    if args.include_tier2_prior:
+        model_factories["SBiFAGAT + Tier2Prior"] = lambda: SBiFAGAT(
             in_dim=in_dim,
             hidden_dim=h_dim,
             edge_dim=edge_dim,
@@ -407,8 +486,9 @@ def main() -> None:
             dropout=args.dropout,
             use_cascade_stats=use_stats,
             predict_uncertainty=use_unc,
-        ),
-    }
+            use_tier2_prior=True,
+            tier2_prior_dim=TIER2_PRIOR_DIM,
+        )
 
     if args.eval_protocol == "inductive":
         custom_splits: dict[str, set[str]] | None = None
@@ -444,6 +524,7 @@ def main() -> None:
                 label_scheme=args.label_scheme,
                 custom_topic_splits=custom_splits,
                 edge_source=effective_edge_source,
+                include_tier2_prior=args.include_tier2_prior,
                 nodes_table=nodes_tbl,
                 edges_table=edges_tbl,
                 nlp_features=nlp_feats,
@@ -457,6 +538,7 @@ def main() -> None:
                 polar_target_mode=args.polar_target_mode,
                 label_scheme=args.label_scheme,
                 edge_source=effective_edge_source,
+                include_tier2_prior=args.include_tier2_prior,
             )
         has_rumor_labels = any(int(d.y_rumor.item()) >= 0 for d in test_ds)
         active_metrics = MAIN_METRICS if has_rumor_labels else VN_MAIN_METRICS
@@ -505,6 +587,7 @@ def main() -> None:
         active_metrics = MAIN_METRICS if has_rumor_labels else VN_MAIN_METRICS
         active_keys = [k for k, _, _ in active_metrics]
         fold_raw: dict[str, list[dict[str, float]]] = {m: [] for m in model_factories}
+        fold_val_raw: dict[str, list[dict[str, float]]] = {m: [] for m in model_factories}
         persist_folds: list[dict[str, Any]] = []
         last_bundle: dict[str, Any] = {}
         for fold in folds:
@@ -517,6 +600,7 @@ def main() -> None:
                 label_scheme=args.label_scheme,
                 custom_topic_splits=fold,
                 edge_source="teacher",
+                include_tier2_prior=args.include_tier2_prior,
                 nodes_table=nodes_tbl,
                 edges_table=edges_tbl,
                 nlp_features=nlp_feats,
@@ -545,21 +629,33 @@ def main() -> None:
             )
             for m_name, m_stats in fold_res["summary_stats"].items():
                 fold_raw[m_name].append({k: v[0] for k, v in m_stats.items()})
+            for m_name, vm_stats in (fold_res.get("val_summary_stats") or {}).items():
+                if m_name in fold_val_raw:
+                    fold_val_raw[m_name].append({k: v[0] for k, v in vm_stats.items()})
             test_ds, test_loader, last_bundle = t_ds, te_l, fold_res
 
-        summary_stats: dict[str, dict[str, tuple[float, float]]] = {}
+        def _agg_fold_rows(src_rows: dict[str, list[dict[str, float]]], keys: tuple[str, ...]) -> dict[str, dict[str, tuple[float, float]]]:
+            out_stats: dict[str, dict[str, tuple[float, float]]] = {}
+            for m_name, rows in src_rows.items():
+                agg: dict[str, tuple[float, float]] = {}
+                for k in keys:
+                    arr = np.asarray([r.get(k, float("nan")) for r in rows], dtype=np.float64)
+                    arr = arr[np.isfinite(arr)]
+                    agg[k] = (
+                        (float(np.mean(arr)), float(np.std(arr, ddof=1)) if arr.size >= 2 else 0.0)
+                        if arr.size > 0
+                        else (float("nan"), float("nan"))
+                    )
+                out_stats[m_name] = agg
+            return out_stats
+
         metric_keys = tuple(fold_raw["SBiFAGAT"][0].keys())
-        for m_name, rows in fold_raw.items():
-            agg: dict[str, tuple[float, float]] = {}
-            for k in metric_keys:
-                arr = np.asarray([r[k] for r in rows], dtype=np.float64)
-                arr = arr[~np.isnan(arr)]
-                agg[k] = (
-                    (float(np.mean(arr)), float(np.std(arr, ddof=1)) if arr.size >= 2 else 0.0)
-                    if arr.size > 0
-                    else (float("nan"), float("nan"))
-                )
-            summary_stats[m_name] = agg
+        summary_stats = _agg_fold_rows(fold_raw, metric_keys)
+        val_summary_stats = (
+            _agg_fold_rows(fold_val_raw, metric_keys)
+            if all(len(v) > 0 for v in fold_val_raw.values())
+            else {}
+        )
 
         persist_agg: dict[str, tuple[float, float]] = {}
         for pk in (
@@ -575,7 +671,7 @@ def main() -> None:
             "spearman_polar",
         ):
             parr = np.asarray([float(pf.get(pk, float("nan"))) for pf in persist_folds], dtype=np.float64)
-            parr = parr[~np.isnan(parr)]
+            parr = parr[np.isfinite(parr)]
             persist_agg[pk] = (
                 (float(np.mean(parr)), float(np.std(parr, ddof=1)) if parr.size >= 2 else 0.0)
                 if parr.size > 0
@@ -586,8 +682,9 @@ def main() -> None:
             **summary_stats,
         }
 
+        cmp_pool = val_summary_stats if len(val_summary_stats) == len(fold_raw) else summary_stats
         cmp_name = (
-            select_best_comparator(summary_stats, reference_model="SBiFAGAT")
+            select_best_comparator(cmp_pool, reference_model="SBiFAGAT")
             if args.comparator_model == "auto"
             else args.comparator_model
         )
@@ -671,6 +768,8 @@ def main() -> None:
             "min_total_replies": args.min_total_replies,
             "label_scheme": args.label_scheme,
             "use_cascade_stats": use_stats,
+            "include_tier2_prior": bool(args.include_tier2_prior),
+            "lightgbm_backend": lgb_backend,
             "early_k_persistence": result.get("early_k_persistence"),
         },
     )

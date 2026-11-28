@@ -23,6 +23,9 @@ from torch import Tensor
 from torch_geometric.nn import FAConv, GATv2Conv, GCNConv, global_mean_pool
 from torch_geometric.utils import degree, dropout_edge, scatter, softmax, to_undirected
 
+SIZE_LOGVAR_BOUNDS: tuple[float, float] = (-6.0, 3.0)
+POLAR_LOGVAR_BOUNDS: tuple[float, float] = (-11.0, -2.0)
+
 
 def resolve_root_indices(data: Any, num_nodes: int) -> tuple[Tensor, Tensor]:
     """Resolve per-graph root node indices and batch assignment vector safely."""
@@ -50,6 +53,33 @@ def resolve_root_indices(data: Any, num_nodes: int) -> tuple[Tensor, Tensor]:
 def broadcast_root_features(h: Tensor, root_idx: Tensor, batch_vec: Tensor) -> Tensor:
     """Broadcast each graph's root feature vector to all nodes in that graph."""
     return h[root_idx][batch_vec]
+
+
+def prepare_edge_attr(
+    x: Tensor,
+    edge_index: Tensor,
+    data: Any,
+    *,
+    edge_dim: int = 2,
+    latent_edge_mlp: nn.Module | None = None,
+) -> Tensor:
+    """Extract, pad/slice, or infer edge attributes `[s_uv, h_uv]` aligned with `edge_index`."""
+    if latent_edge_mlp is not None:
+        return latent_edge_mlp(x, edge_index)
+    num_edges = edge_index.size(1)
+    raw_attr = getattr(data, "edge_attr", None)
+    if raw_attr is None:
+        raw_attr = getattr(data, "edge_stance", None)
+    if raw_attr is None:
+        return x.new_zeros((num_edges, edge_dim))
+    attr = raw_attr.to(device=x.device, dtype=x.dtype)
+    if attr.dim() == 1:
+        attr = attr.unsqueeze(-1)
+    if attr.size(1) < edge_dim:
+        attr = F.pad(attr, (0, edge_dim - attr.size(1)))
+    elif attr.size(1) > edge_dim:
+        attr = attr[:, :edge_dim]
+    return attr
 
 
 class TwoStreamNodeStem(nn.Module):
@@ -264,11 +294,13 @@ class MultiTaskHead(nn.Module):
             "node_emb": node_emb,
         }
         if self.uncertainty_head is not None:
-            raw_logvars = -6.0 + 9.0 * torch.sigmoid(self.uncertainty_head(reg_emb.detach()))
-            size_logvar = raw_logvars[:, 0]
-            polar_logvar = raw_logvars[:, 1]
+            raw_unc = torch.sigmoid(self.uncertainty_head(reg_emb.detach()))
+            s_min, s_max = SIZE_LOGVAR_BOUNDS
+            p_min, p_max = POLAR_LOGVAR_BOUNDS
+            size_logvar = s_min + (s_max - s_min) * raw_unc[:, 0]
+            polar_logvar = p_min + (p_max - p_min) * raw_unc[:, 1]
             polar_sigma = torch.exp(0.5 * polar_logvar)
-            confidence = torch.exp(-polar_sigma / 0.25).clamp(0.0, 1.0)
+            confidence = torch.exp(-polar_sigma / 0.15).clamp(0.0, 1.0)
             result["size_logvar"] = size_logvar
             result["polar_logvar"] = polar_logvar
             result["confidence_score"] = confidence
@@ -326,7 +358,7 @@ class TextMLP(nn.Module):
 
 
 class TemporalStanceMLP(nn.Module):
-    """Non-graph ablation baseline fusing node temporal features and pooled 2D/4D edge statistics."""
+    """Non-graph ablation baseline fusing node temporal features and pooled 2D edge statistics."""
 
     def __init__(
         self,
@@ -645,7 +677,7 @@ class BiGCN(nn.Module):
 
 
 class LatentConflictMLP(nn.Module):
-    """Shared 2-layer latent edge inferrer (`[s_hat, h_hat]` or 4D) for text-free graphs (e.g. UPFD)."""
+    """Shared 2-layer latent edge inferrer (`[s_hat, h_hat]`) for text-free graphs (e.g. UPFD)."""
 
     def __init__(
         self,
@@ -679,7 +711,7 @@ _BaselineLatentEdgeMLP = LatentConflictMLP
 
 
 class EdgeGATv2(nn.Module):
-    """Edge-aware GATv2 baseline receiving `[s_uv, h_uv]` or 4D edge features."""
+    """Edge-aware GATv2 baseline receiving 2D `[s_uv, h_uv]` edge features."""
 
     def __init__(
         self,
@@ -749,28 +781,17 @@ class EdgeGATv2(nn.Module):
             use_polar_persistence_anchor=self.use_polar_persistence_anchor,
         )
 
-    def _prepare_edge_attr(self, x: Tensor, edge_index: Tensor, data: Any) -> Tensor:
-        if self.latent_edge_mlp is not None:
-            return self.latent_edge_mlp(x, edge_index)
-        raw_attr = getattr(data, "edge_attr", None)
-        if raw_attr is None:
-            raw_attr = getattr(data, "edge_stance", None)
-        if raw_attr is None:
-            return x.new_zeros((edge_index.size(1), self.edge_dim))
-        attr = raw_attr.float()
-        if attr.dim() == 1:
-            attr = attr.unsqueeze(-1)
-        if attr.size(1) < self.edge_dim:
-            attr = F.pad(attr, (0, self.edge_dim - attr.size(1)))
-        elif attr.size(1) > self.edge_dim:
-            attr = attr[:, : self.edge_dim]
-        return attr
-
     def forward(self, data: Any) -> dict[str, Tensor]:
         x = data.x.float()
         root_idx, batch_vec = resolve_root_indices(data, x.size(0))
         raw_edge_index = getattr(data, "edge_index_td", data.edge_index)
-        raw_edge_attr = self._prepare_edge_attr(x, raw_edge_index, data)
+        raw_edge_attr = prepare_edge_attr(
+            x,
+            raw_edge_index,
+            data,
+            edge_dim=self.edge_dim,
+            latent_edge_mlp=self.latent_edge_mlp,
+        )
         if raw_edge_index.numel() > 0:
             edge_index, edge_attr = to_undirected(
                 raw_edge_index,
@@ -858,8 +879,8 @@ class FAGCNBaseline(nn.Module):
         return self.head(graph_emb, h, cascade_stats=c_stats)
 
 
-class _BaselineAttentionReadout(nn.Module):
-    """Per-graph softmax attention readout used by matched bidirectional baselines."""
+class GlobalAttentionReadout(nn.Module):
+    """Per-graph softmax attention readout over all early nodes in V_K."""
 
     def __init__(self, hidden_dim: int) -> None:
         super().__init__()
@@ -874,12 +895,16 @@ class _BaselineAttentionReadout(nn.Module):
         return out
 
 
+_BaselineAttentionReadout = GlobalAttentionReadout
+
+
 class BiEdgeGATv2(nn.Module):
     """Matched Bidirectional Edge-Aware GATv2 comparator (TD+BU + 2D edge_attr + attention readout).
 
-    Controls for bidirectionality, edge attributes, and attention pooling so ablation
-    gains of `SBiFAGAT` are cleanly attributed to signed frequency-adaptive gating and
-    Camp Dipole readout rather than generic architecture capacity.
+    Runs independent Top-Down and Bottom-Up GATv2 branches merged at readout (no
+    Dir-GNN cross-layer mixing), controlling for bidirectionality, edge attributes,
+    and attention pooling so ablation gains of `SBiFAGAT` are cleanly attributed
+    to signed frequency-adaptive gating and Camp Dipole readout.
     """
 
     def __init__(
@@ -957,8 +982,8 @@ class BiEdgeGATv2(nn.Module):
         )
         self.td_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
         self.bu_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
-        self.td_readout = _BaselineAttentionReadout(hidden_dim)
-        self.bu_readout = _BaselineAttentionReadout(hidden_dim)
+        self.td_readout = GlobalAttentionReadout(hidden_dim)
+        self.bu_readout = GlobalAttentionReadout(hidden_dim)
         self.dropout = nn.Dropout(dropout)
         self.head = MultiTaskHead(
             2 * hidden_dim,
@@ -971,23 +996,6 @@ class BiEdgeGATv2(nn.Module):
             use_polar_persistence_anchor=self.use_polar_persistence_anchor,
         )
 
-    def _prepare_edge_attr(self, x: Tensor, edge_index: Tensor, data: Any) -> Tensor:
-        if self.latent_edge_mlp is not None:
-            return self.latent_edge_mlp(x, edge_index)
-        raw_attr = getattr(data, "edge_attr", None)
-        if raw_attr is None:
-            raw_attr = getattr(data, "edge_stance", None)
-        if raw_attr is None:
-            return x.new_zeros((edge_index.size(1), self.edge_dim))
-        attr = raw_attr.float()
-        if attr.dim() == 1:
-            attr = attr.unsqueeze(-1)
-        if attr.size(1) < self.edge_dim:
-            attr = F.pad(attr, (0, self.edge_dim - attr.size(1)))
-        elif attr.size(1) > self.edge_dim:
-            attr = attr[:, : self.edge_dim]
-        return attr
-
     def forward(self, data: Any) -> dict[str, Tensor]:
         x = data.x.float()
         root_idx, batch_vec = resolve_root_indices(data, x.size(0))
@@ -998,7 +1006,13 @@ class BiEdgeGATv2(nn.Module):
             "edge_index_bu",
             edge_index_td[[1, 0], :] if edge_index_td.numel() > 0 else edge_index_td,
         )
-        edge_attr = self._prepare_edge_attr(x, edge_index_td, data)
+        edge_attr = prepare_edge_attr(
+            x,
+            edge_index_td,
+            data,
+            edge_dim=self.edge_dim,
+            latent_edge_mlp=self.latent_edge_mlp,
+        )
 
         h0 = self.input_proj(x, data, root_idx)
         root_broadcast = self.root_lin(h0[root_idx][batch_vec])

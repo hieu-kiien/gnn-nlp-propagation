@@ -1,0 +1,13 @@
+Cascade ID: pheme_ottawashooting_524966946467749888
+Top-5 Trigger Comments Ranked by |gamma_uv|
+========================================================================
+#1 | node_id=pheme_524966946467749888_524967392372617217 (parent=pheme_524966946467749888_524966946467749888) | |gamma_uv|=0.2166 | gamma=+0.2296 | s_uv=+0.1816 | h_uv=0.0805
+    Text: @waltandperry @lustyfan Deutsch Lernen mit http://t.co/kT9LrG4jFr
+#2 | node_id=pheme_524966946467749888_524974608013737984 (parent=pheme_524966946467749888_524966946467749888) | |gamma_uv|=0.1945 | gamma=+0.2066 | s_uv=+0.1540 | h_uv=0.1174
+    Text: @waltandperry @Nunavut_Tweeter Am very sad to hear of today's events.
+#3 | node_id=pheme_524966946467749888_524968371461160960 (parent=pheme_524966946467749888_524966946467749888) | |gamma_uv|=0.1679 | gamma=-0.1580 | s_uv=-0.1231 | h_uv=0.5830
+    Text: @waltandperry this is what terrorist want to exploit, they focus to kill while civilised ppl focus to save victims,
+#4 | node_id=pheme_524966946467749888_524971404073398273 (parent=pheme_524966946467749888_524970963474337792) | |gamma_uv|=0.1654 | gamma=+0.1749 | s_uv=+0.0274 | h_uv=0.0351
+    Text: @ItsMeIsibalo None taken. That's precisely what stood out to me:)
+#5 | node_id=pheme_524966946467749888_524970963474337792 (parent=pheme_524966946467749888_524966946467749888) | |gamma_uv|=0.1471 | gamma=+0.1598 | s_uv=+0.0599 | h_uv=0.1078
+    Text: @waltandperry Probably one of the many differences between Canadian and US-mentality. No offense :-S

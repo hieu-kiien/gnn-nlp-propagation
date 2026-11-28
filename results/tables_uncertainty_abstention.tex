@@ -1,0 +1,17 @@
+\begin{table*}[t]
+\centering
+\caption{$\beta$-NLL Heteroscedastic Uncertainty Calibration and Selective Abstention on \texttt{SBiFAGAT} ($\beta=0.5, \lambda_u=0.1$, 5 Seeds, Mean $\pm$ Std).}
+\label{tab:uncertainty_abstention}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llccccccc}
+\toprule
+Corpus & Target & $\rho(\hat{\sigma}, |e|)$ $\uparrow$ & PICP@90\% $\uparrow$ & Risk @ 100\% $\downarrow$ & Risk @ 80\% $\downarrow$ & Risk @ 70\% $\downarrow$ & $\Delta$ @ 70\% & E-AURC $\downarrow$ \\
+\midrule
+VN ($K=20$) & Size (MSLE) & 0.328 $\pm$ 0.034 & 0.893 $\pm$ 0.024 & 0.1532 & 0.1249 & 0.1060 & +30.8\% & 0.0563 \\
+VN ($K=20$) & Polar (RMSE) & 0.201 $\pm$ 0.050 & 0.877 $\pm$ 0.038 & 0.0376 & 0.0338 & 0.0325 & +13.5\% & 0.0111 \\
+PHEME ($K=10$) & Size (MSLE) & 0.349 $\pm$ 0.055 & 0.944 $\pm$ 0.018 & 0.1014 & 0.0776 & 0.0744 & +26.6\% & 0.0367 \\
+PHEME ($K=10$) & Polar (RMSE) & 0.021 $\pm$ 0.026 & 0.905 $\pm$ 0.012 & 0.0470 & 0.0423 & 0.0403 & +14.3\% & 0.0173 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}

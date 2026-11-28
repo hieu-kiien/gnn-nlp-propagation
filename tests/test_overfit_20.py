@@ -579,19 +579,25 @@ def test_ablation_integrity_sigmoid_mask_and_graph_agnostic_textmlp(tmp_path: Pa
         o_sig_2 = sig_model(batch_flipped_s)
     assert torch.allclose(o_sig_1["y_polar_pred"], o_sig_2["y_polar_pred"])
 
-    # 2. ablate_stance=True or ablate_hostility=True must mask cascade_stats[:, 7]
+    # 2. Orthogonal ablations: ablate_stance/ablate_hostility must NOT toggle mask_semantic_stats;
+    #    explicit mask_semantic_stats=True masks cascade_stats[:, 7].
     for abl_kwargs in ({"ablate_stance": True}, {"ablate_hostility": True}):
         abl_model = SBiFAGAT(in_dim=770, hidden_dim=64, use_cascade_stats=True, dropout=0.0, **abl_kwargs)
-        assert abl_model.head.mask_semantic_stats is True
-        abl_model.eval()
-        batch_alt = batch.clone()
-        batch_alt.cascade_stats = batch_alt.cascade_stats.clone()
-        batch_alt.cascade_stats[:, 7] = 1.0 - batch_alt.cascade_stats[:, 7]
-        with torch.no_grad():
-            o_a1 = abl_model(batch)
-            o_a2 = abl_model(batch_alt)
-        assert torch.allclose(o_a1["y_size_pred"], o_a2["y_size_pred"])
-        assert torch.allclose(o_a1["y_polar_pred"], o_a2["y_polar_pred"])
+        assert abl_model.head.mask_semantic_stats is False
+
+    stat_masked_model = SBiFAGAT(
+        in_dim=770, hidden_dim=64, use_cascade_stats=True, mask_semantic_stats=True, dropout=0.0
+    )
+    assert stat_masked_model.head.mask_semantic_stats is True
+    stat_masked_model.eval()
+    batch_alt = batch.clone()
+    batch_alt.cascade_stats = batch_alt.cascade_stats.clone()
+    batch_alt.cascade_stats[:, 7] = 1.0 - batch_alt.cascade_stats[:, 7]
+    with torch.no_grad():
+        o_a1 = stat_masked_model(batch)
+        o_a2 = stat_masked_model(batch_alt)
+    assert torch.allclose(o_a1["y_size_pred"], o_a2["y_size_pred"])
+    assert torch.allclose(o_a1["y_polar_pred"], o_a2["y_polar_pred"])
 
     # 3. TextMLP must remain invariant to rewiring edge_index_td and perturbing tree-topology cols [1, 4, 6, 7]
     mlp = TextMLP(in_dim=770, hidden_dim=64, use_cascade_stats=True, dropout=0.0)

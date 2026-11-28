@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.pyg_dataset import (
     DEFAULT_FORECAST_MIN_REPLIES,
@@ -30,6 +35,19 @@ from src.data.pyg_dataset import (
 from src.data.schema import load_cascade_parquet
 from src.training.metrics import evaluate_predictions
 from src.training.reporting import _sanitize_json_value
+
+
+def _resolve_single_root_idx(d: Any, num_nodes: int | None = None) -> int:
+    rt = getattr(d, "root_index", None)
+    if isinstance(rt, torch.Tensor) and rt.dtype != torch.bool and rt.numel() > 0:
+        r_idx = int(rt.view(-1)[0].item())
+    elif isinstance(rt, (int, np.integer)) and not isinstance(rt, bool):
+        r_idx = int(rt)
+    else:
+        r_idx = 0
+    if num_nodes is not None and num_nodes > 0 and not (0 <= r_idx < num_nodes):
+        return 0
+    return r_idx if r_idx >= 0 else 0
 
 
 def compute_early_k_persistence_metrics(
@@ -91,15 +109,27 @@ def compute_early_k_persistence_metrics(
 
         early_rs = getattr(d, "early_node_root_stance", None)
         if early_rs is not None and early_rs.numel() > 1:
-            aligned = [float(v) for v in early_rs.view(-1)[1:].detach().cpu().tolist()]
+            flat_rs = early_rs.view(-1)
+            r_idx = _resolve_single_root_idx(d, int(flat_rs.numel()))
+            aligned = [
+                float(v)
+                for idx_i, v in enumerate(flat_rs.detach().cpu().tolist())
+                if idx_i != r_idx
+            ]
         else:
             edge_index_td = getattr(d, "edge_index_td", getattr(d, "edge_index", None))
             raw_attr = getattr(d, "edge_attr", None)
             if raw_attr is None:
                 raw_attr = getattr(d, "edge_stance", None)
 
-            root_tensor = getattr(d, "root_index", None)
-            root_id = str(int(root_tensor.view(-1)[0].item())) if root_tensor is not None else "0"
+            raw_nn = getattr(d, "num_nodes", None)
+            if raw_nn is not None:
+                num_nodes_d = int(raw_nn)
+            elif getattr(d, "x", None) is not None:
+                num_nodes_d = int(d.x.size(0))
+            else:
+                num_nodes_d = 0
+            root_id = str(_resolve_single_root_idx(d, num_nodes_d if num_nodes_d > 0 else None))
 
             children_adj: dict[str, list[str]] = {}
             stance_map: dict[tuple[str, str], float] = {}
@@ -300,17 +330,41 @@ def compute_dataset_statistics(
 def format_dataset_stats_latex(
     stats_list: Sequence[Mapping[str, Any]] | Mapping[str, Any],
     *,
-    caption: str = (
-        "Exploratory dataset statistics ($K=20$, $N_{\\text{reply}} \\ge 25$ forecasting filter) "
-        "and Early-$K$ Persistence Baseline on Test splits."
-    ),
+    caption: str | None = None,
     label: str = "tab:dataset_eda",
 ) -> str:
     """Render dataset EDA statistics as an IEEEtran `booktabs` LaTeX table."""
     items = [stats_list] if isinstance(stats_list, Mapping) else list(stats_list)
+    cohorts = {
+        (int(it.get("k_horizon", 20) or 20), int(it.get("min_total_replies", 25) or 25))
+        for it in items
+    }
+    uniform_cohort = len(cohorts) == 1
+    if uniform_cohort:
+        k_val, min_rep = next(iter(cohorts))
+        col_elig = f"Forecast ($\\ge {min_rep}$)"
+        resolved_caption = caption or (
+            f"Exploratory dataset statistics ($K={k_val}$, $N_{{\\text{{reply}}}} \\ge {min_rep}$ forecasting filter) "
+            "and Early-$K$ Persistence Baseline on Test splits."
+        )
+    else:
+        col_elig = "Forecast Eligible"
+        cohort_desc = ", ".join(
+            f"{str(it.get('name', 'dataset')).upper()}: $K={int(it.get('k_horizon', 20) or 20)}, N_{{\\text{{reply}}}} \\ge {int(it.get('min_total_replies', 25) or 25)}$"
+            for it in items
+        )
+        resolved_caption = caption or (
+            f"Exploratory dataset statistics ({cohort_desc}) and Early-$K$ Persistence Baseline on Test splits."
+        )
+
     rows: list[str] = []
     for item in items:
-        ds_name = str(item.get("name", "dataset")).replace("_", "\\_")
+        raw_name = str(item.get("name", "dataset"))
+        ds_name = raw_name.replace("_", "\\_")
+        if not uniform_cohort:
+            k_i = int(item.get("k_horizon", 20) or 20)
+            m_i = int(item.get("min_total_replies", 25) or 25)
+            ds_name = f"{ds_name} ($K{{=}}{k_i}, \\ge {m_i}$)"
         raw_c = int(item.get("raw_cascades", 0))
         elig_c = int(item.get("eligible_cascades", 0))
         topics = int(item.get("eligible_topics", item.get("raw_topics", 0)))
@@ -342,12 +396,12 @@ def format_dataset_stats_latex(
         [
             "\\begin{table*}[t]",
             "\\centering",
-            f"\\caption{{{caption}}}",
+            f"\\caption{{{resolved_caption}}}",
             f"\\label{{{label}}}",
             "\\resizebox{\\textwidth}{!}{",
             "\\begin{tabular}{lcccccccc}",
             "\\toprule",
-            "Dataset & Raw & Forecast ($\\ge 25$) & Topics & Train/Val/Test & Med (Mean) Replies & Med Span (h) & Persist RMSE$\\downarrow$ & Persist $r$$\\uparrow$ \\\\",
+            f"Dataset & Raw & {col_elig} & Topics & Train/Val/Test & Med (Mean) Replies & Med Span (h) & Persist RMSE$\\downarrow$ & Persist $r$$\\uparrow$ \\\\",
             "\\midrule",
             *rows,
             "\\bottomrule",
@@ -361,11 +415,27 @@ def format_dataset_stats_latex(
 
 def format_dataset_stats_markdown(stats_list: Sequence[Mapping[str, Any]]) -> str:
     """Render concise Markdown summary table for CLI inspection."""
+    items = list(stats_list)
+    cohorts = {
+        (int(it.get("k_horizon", 20) or 20), int(it.get("min_total_replies", 25) or 25))
+        for it in items
+    }
+    uniform_cohort = len(cohorts) == 1
+    if uniform_cohort and cohorts:
+        _, min_rep = next(iter(cohorts))
+        col_elig = f"Forecast (>={min_rep})"
+    else:
+        col_elig = "Forecast Eligible"
     lines = [
-        "| Dataset | Raw Cascades | Forecast (>=25) | Topics | Train/Val/Test | Med (Mean) Replies | Med Span (h) | Persist RMSE | Persist r |",
+        f"| Dataset | Raw Cascades | {col_elig} | Topics | Train/Val/Test | Med (Mean) Replies | Med Span (h) | Persist RMSE | Persist r |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
-    for item in stats_list:
+    for item in items:
+        ds_label = str(item.get("name", "dataset"))
+        if not uniform_cohort:
+            k_i = int(item.get("k_horizon", 20) or 20)
+            m_i = int(item.get("min_total_replies", 25) or 25)
+            ds_label = f"{ds_label} (K={k_i}, >={m_i})"
         sp = item.get("split_cascade_counts", {})
         split_str = f"{int(sp.get('train', 0))}/{int(sp.get('val', 0))}/{int(sp.get('test', 0))}"
         persist = item.get("early_k_persistence")
@@ -383,7 +453,7 @@ def format_dataset_stats_markdown(stats_list: Sequence[Mapping[str, Any]]) -> st
             p_rmse = "--"
             p_r = "--"
         lines.append(
-            f"| {item.get('name')} | {int(item.get('raw_cascades', 0)):,} | "
+            f"| {ds_label} | {int(item.get('raw_cascades', 0)):,} | "
             f"{int(item.get('eligible_cascades', 0)):,} | {int(item.get('eligible_topics', 0)):,} | "
             f"{split_str} | {float(item.get('median_replies', 0.0)):.1f} ({float(item.get('mean_replies', 0.0)):.1f}) | "
             f"{float(item.get('median_duration_hours', 0.0)):.2f} | {p_rmse} | {p_r} |"
@@ -428,12 +498,12 @@ def main() -> None:
     parser.add_argument(
         "--output-table",
         type=Path,
-        default=Path("paper/tables_dataset_eda.tex"),
+        default=Path("results/tables_dataset_eda.tex"),
     )
     parser.add_argument(
         "--output-json",
         type=Path,
-        default=Path("paper/results_dataset_eda.json"),
+        default=Path("results/results_dataset_eda.json"),
     )
     args = parser.parse_args()
 
