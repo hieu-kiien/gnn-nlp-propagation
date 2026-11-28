@@ -1305,6 +1305,7 @@
       `Đồ thị tương tác người dùng: ${camp0.length} đồng thuận, ${camp2.length} trung lập, ${camp1.length} phản biện`
     );
 
+    const markerPrefix = (svg && svg.id ? svg.id : "graph").replace(/[^a-zA-Z0-9_-]/g, "");
     const defs = svgEl("defs");
     for (const [cls, col] of [
       ["support", "#059669"],
@@ -1312,7 +1313,7 @@
       ["neutral", "#64748B"],
     ]) {
       const marker = svgEl("marker", {
-        id: `arrow-${cls}`,
+        id: `${markerPrefix}-arrow-${cls}`,
         viewBox: "0 0 10 10",
         refX: "8",
         refY: "5",
@@ -1429,7 +1430,7 @@
           stroke: stInfo.edge,
           "stroke-width": strokeW,
           "stroke-opacity": "0.78",
-          "marker-end": `url(#arrow-${e.stance_class || "neutral"})`,
+          "marker-end": `url(#${markerPrefix}-arrow-${e.stance_class || "neutral"})`,
         })
       );
     }
@@ -1580,6 +1581,7 @@
     if (!viewport) return;
     let dragging = false;
     let dragged = false;
+    let activePointerId = null;
     let startX = 0;
     let startY = 0;
     let origLeft = 0;
@@ -1590,11 +1592,17 @@
       if (ev.target.closest && ev.target.closest(".svg-node-group")) return;
       dragging = true;
       dragged = false;
+      activePointerId = ev.pointerId;
       startX = ev.clientX;
       startY = ev.clientY;
       origLeft = viewport.scrollLeft;
       origTop = viewport.scrollTop;
       viewport.classList.add("is-panning");
+      if (typeof viewport.setPointerCapture === "function") {
+        try {
+          viewport.setPointerCapture(ev.pointerId);
+        } catch (_) {}
+      }
     });
     viewport.addEventListener("pointermove", (ev) => {
       if (!dragging) return;
@@ -1608,14 +1616,27 @@
       if (!dragging) return;
       dragging = false;
       viewport.classList.remove("is-panning");
+      if (activePointerId !== null && typeof viewport.releasePointerCapture === "function") {
+        try {
+          if (typeof viewport.hasPointerCapture !== "function" || viewport.hasPointerCapture(activePointerId)) {
+            viewport.releasePointerCapture(activePointerId);
+          }
+        } catch (_) {}
+      }
+      activePointerId = null;
       if (dragged) {
-        // swallow accidental click right after pan
+        dragged = false;
+        // swallow accidental click right after pan, but expire immediately after current tick
         const suppress = (ce) => { ce.stopPropagation(); };
         viewport.addEventListener("click", suppress, { capture: true, once: true });
+        window.setTimeout(() => viewport.removeEventListener("click", suppress, true), 0);
       }
     };
     viewport.addEventListener("pointerup", endPan);
     viewport.addEventListener("pointercancel", endPan);
+    viewport.addEventListener("lostpointercapture", endPan);
+    window.addEventListener("pointerup", endPan);
+    window.addEventListener("pointercancel", endPan);
     viewport.addEventListener("wheel", (ev) => {
       if (!ev.ctrlKey && !ev.metaKey) return;
       ev.preventDefault();
@@ -2438,8 +2459,10 @@
     if (state.megaPollTimer) {
       clearTimeout(state.megaPollTimer);
       state.megaPollTimer = null;
-      setMegaButtonsBusy(false);
     }
+    setMegaButtonsBusy(false);
+    const progBox = $("mega-progress-box");
+    if (progBox) progBox.hidden = true;
     state.tier1Mode = mode;
     const isReal = mode === "real";
     $("mode-real-btn").setAttribute("aria-pressed", String(isReal));
