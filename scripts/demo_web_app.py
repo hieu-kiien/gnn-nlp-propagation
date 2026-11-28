@@ -110,6 +110,60 @@ _EXPLICIT_REPLY_RE = re.compile(
 )
 _BRACKET_PREFIX_RE = re.compile(r"^\s*\[([^\]]+)\]\s*(.+)$")
 _BRACKET_ARROW_RE = re.compile(r"^\s*([A-Za-z0-9_]+)\s*->\s*([A-Za-z0-9_]+)\s*$")
+_TIME_UNIT_PART = (
+    r"(?:\d+\s*(?:giây|giay|phút|phut|giờ|gio|ngày|ngay|tuần|tuan|tháng|thang|năm|nam|"
+    r"seconds?|minutes?|hours?|days?|weeks?|months?|years?|s|m|h|d|w|y)(?:\s+(?:trước|truoc|ago))?)"
+)
+_CHROME_TOKEN_PART = (
+    r"(?:thích|thich|phản\s*hồi|phan\s*hoi|trả\s*lời|tra\s*loi|chia\s*sẻ|chia\s*se|"
+    r"xem\s*thêm|xem\s*them|thu\s*gọn|thu\s*gon|xem\s*bản\s*dịch|xem\s*ban\s*dich|"
+    r"đã\s*chỉnh\s*sửa|da\s*chinh\s*sua|tác\s*giả|tac\s*gia|fan\s*cứng|fan\s*cung|"
+    r"theo\s*dõi|theo\s*doi|tất\s*cả\s*bình\s*luận|tat\s*ca\s*binh\s*luan|"
+    r"phù\s*hợp\s*nhất|phu\s*hop\s*nhat|mới\s*nhất|moi\s*nhat|viết\s*bình\s*luận\.\.\.|"
+    r"like|reply|replies|share|see\s*more|edited|author|top\s*fan|follow|repost|comment|comments|"
+    r"\d+\s*(?:lượt\s*thích|luot\s*thich|phản\s*hồi|phan\s*hoi|bình\s*luận|binh\s*luan|câu\s*trả\s*lời|cau\s*tra\s*loi|chia\s*sẻ|chia\s*se|likes?|replies|comments|shares?|reposts?)|"
+    + _TIME_UNIT_PART
+    + r"|\d+)"
+)
+_SOCIAL_CHROME_LINE_RE = re.compile(
+    rf"^\s*{_CHROME_TOKEN_PART}(?:\s*[·•|,\-]\s*{_CHROME_TOKEN_PART})*\s*$",
+    re.IGNORECASE,
+)
+_SOCIAL_VIEW_REPLIES_RE = re.compile(
+    r"^\s*(?:xem(?:\s+tất\s+cả|\s+thêm)?|view(?:\s+all|\s+more)?|ẩn)\s+\d+\s+"
+    r"(?:phản\s*hồi|phan\s*hoi|câu\s*trả\s*lời|cau\s*tra\s*loi|bình\s*luận|binh\s*luan|replies|comments).*$",
+    re.IGNORECASE,
+)
+_SOCIAL_TIME_ONLY_RE = re.compile(
+    rf"^\s*{_TIME_UNIT_PART}(?:\s*[·•|,\-]\s*{_CHROME_TOKEN_PART})*\s*$",
+    re.IGNORECASE,
+)
+_THREADS_AUTHOR_HEADER_RE = re.compile(
+    rf"^\s*@?([A-Za-z0-9_.]{{2,32}})\s*[·•]\s*{_TIME_UNIT_PART}\s*$",
+    re.IGNORECASE,
+)
+_FB_AUTHOR_NAME_RE = re.compile(
+    r"^[A-ZÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚĂĐĨŨƠƯẠ-ỹ][a-zàáâãèéêìíòóôõùúăđĩũơưạ-ỹ]+"
+    r"(?:\s+[A-ZÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚĂĐĨŨƠƯẠ-ỹ][a-zàáâãèéêìíòóôõùúăđĩũơưạ-ỹ]+){1,3}$"
+)
+_PRESERVED_SHORT_STANCES_LOWER: frozenset[str] = frozenset(
+    {
+        "đồng ý",
+        "dong y",
+        "phản đối",
+        "phan doi",
+        "ủng hộ",
+        "ung ho",
+        "chuẩn",
+        "chuan",
+        "hóng",
+        "hong",
+        ".",
+        "👍",
+        "[deleted]",
+        "[removed]",
+    }
+)
 
 
 def _safe_short_author_hash(raw_hash: Any, fallback_idx: int, *, is_root: bool = False) -> tuple[str, bool]:
@@ -498,17 +552,135 @@ def build_sandbox_preset(preset_id: str) -> tuple[dict[str, Any], list[dict[str,
     return post, comments
 
 
+def _detect_unsupported_social_url(url: str) -> str | None:
+    """Detect gated social platform URLs (Facebook/Threads) so we fail honestly with copy-paste guidance."""
+    raw = str(url or "").strip()
+    if not raw:
+        return None
+    candidate = raw if "://" in raw else f"https://{raw}"
+    try:
+        host = (urlparse(candidate).hostname or "").lower().strip(".")
+    except Exception:
+        return None
+    if host == "facebook.com" or host.endswith(".facebook.com") or host == "fb.com" or host.endswith(".fb.com") or host == "fb.watch" or host.endswith(".fb.watch"):
+        return "Facebook"
+    if host == "threads.net" or host.endswith(".threads.net") or host == "threads.com" or host.endswith(".threads.com"):
+        return "Threads"
+    return None
+
+
+def _is_social_chrome_line(text: str) -> bool:
+    """Return True for copy-pasted Facebook/Threads UI chrome lines (never drop real short stances)."""
+    s = str(text or "").strip()
+    if not s:
+        return True
+    if s.lower() in _PRESERVED_SHORT_STANCES_LOWER:
+        return False
+    if _SOCIAL_VIEW_REPLIES_RE.match(s):
+        return True
+    if _SOCIAL_TIME_ONLY_RE.match(s):
+        return True
+    if _SOCIAL_CHROME_LINE_RE.match(s):
+        return True
+    return False
+
+
+def _split_root_and_comments_from_raw(raw_text: str) -> tuple[str, str, str]:
+    """Split a raw single-box copy-paste into (title, root_text, remaining_comments_raw)."""
+    raw_lines = [ln.rstrip("\r\n") for ln in str(raw_text or "").splitlines() if ln.strip()]
+    has_social = any(
+        _is_social_chrome_line(ln.strip()) or bool(_THREADS_AUTHOR_HEADER_RE.match(ln.strip()))
+        for ln in raw_lines
+    )
+
+    def _next_non_chrome_idx(start: int) -> int | None:
+        j = start
+        while j < len(raw_lines):
+            st = raw_lines[j].strip()
+            if _EXPLICIT_REPLY_RE.match(raw_lines[j]) or _BRACKET_PREFIX_RE.match(raw_lines[j]) or not _is_social_chrome_line(st):
+                return j
+            j += 1
+        return None
+
+    idx = 0
+    while idx < len(raw_lines):
+        ln = raw_lines[idx]
+        s = ln.strip()
+        if _EXPLICIT_REPLY_RE.match(ln) or _BRACKET_PREFIX_RE.match(ln):
+            break
+        if _is_social_chrome_line(s) or _THREADS_AUTHOR_HEADER_RE.match(s):
+            idx += 1
+            continue
+        if has_social and _FB_AUTHOR_NAME_RE.match(s):
+            nxt_i = _next_non_chrome_idx(idx + 1)
+            if nxt_i is not None:
+                nxt = raw_lines[nxt_i].strip()
+                if nxt and not _FB_AUTHOR_NAME_RE.match(nxt) and not _THREADS_AUTHOR_HEADER_RE.match(nxt):
+                    idx += 1
+                    continue
+        break
+
+    if idx >= len(raw_lines):
+        return "", "", ""
+    root_line = raw_lines[idx].strip()
+    remaining_lines = raw_lines[idx + 1 :]
+    if not any(
+        _EXPLICIT_REPLY_RE.match(r) or _BRACKET_PREFIX_RE.match(r) or not _is_social_chrome_line(r.strip())
+        for r in remaining_lines
+    ):
+        return "", "", ""
+    return _clean_title_snippet(root_line, 100), root_line, "\n".join(remaining_lines)
+
+
 def parse_sandbox_raw_text(raw_text: str, post_id: str, base_ts: float) -> list[dict[str, Any]]:
-    """Parse pasted multi-line Vietnamese thread text into reply records cleanly."""
-    lines = [ln.rstrip("\r\n") for ln in str(raw_text or "").splitlines() if ln.strip()]
+    """Parse pasted multi-line Vietnamese thread text (including raw FB/Threads copy-paste) cleanly."""
+    raw_lines = [ln.rstrip("\r\n") for ln in str(raw_text or "").splitlines() if ln.strip()]
+    has_social_chrome = any(
+        _is_social_chrome_line(ln.strip()) or bool(_THREADS_AUTHOR_HEADER_RE.match(ln.strip()))
+        for ln in raw_lines
+    )
+
+    lines: list[str] = []
+    for ln in raw_lines:
+        if _EXPLICIT_REPLY_RE.match(ln) or _BRACKET_PREFIX_RE.match(ln):
+            lines.append(ln)
+            continue
+        if _is_social_chrome_line(ln.strip()):
+            continue
+        lines.append(ln)
+
     comments: list[dict[str, Any]] = []
     indent_stack: list[tuple[int, str]] = [(-1, f"t3_{post_id}")]
     known_ids: set[str] = {f"t3_{post_id}"}
+    pending_author: str | None = None
+    comment_seq = 0
 
-    for idx, line in enumerate(lines, start=1):
+    for line_idx, line in enumerate(lines):
+        stripped = line.strip()
+        is_structured = bool(_EXPLICIT_REPLY_RE.match(line) or _BRACKET_PREFIX_RE.match(line))
+
+        if not is_structured:
+            m_threads = _THREADS_AUTHOR_HEADER_RE.match(stripped)
+            if m_threads:
+                pending_author = m_threads.group(1).strip()
+                continue
+            if has_social_chrome and _FB_AUTHOR_NAME_RE.match(stripped) and (line_idx + 1) < len(lines):
+                nxt = lines[line_idx + 1].strip()
+                if (
+                    nxt
+                    and not _EXPLICIT_REPLY_RE.match(lines[line_idx + 1])
+                    and not _BRACKET_PREFIX_RE.match(lines[line_idx + 1])
+                    and not _THREADS_AUTHOR_HEADER_RE.match(nxt)
+                    and not _FB_AUTHOR_NAME_RE.match(nxt)
+                ):
+                    pending_author = stripped
+                    continue
+
+        comment_seq += 1
+        idx = comment_seq
         cid = f"m{idx}"
         parent_ref = f"t3_{post_id}"
-        body = line.strip()
+        body = stripped
 
         m_exp = _EXPLICIT_REPLY_RE.match(line)
         if m_exp:
@@ -558,7 +730,14 @@ def parse_sandbox_raw_text(raw_text: str, post_id: str, base_ts: float) -> list[
         expanded_indent = len(line.expandtabs(2)) - len(line.expandtabs(2).lstrip(" "))
         indent_stack.append((expanded_indent, fullname))
 
-        author = None if body.lower() in {"[deleted]", "[removed]"} else f"custom_u_{idx}"
+        if body.lower() in {"[deleted]", "[removed]"}:
+            author = None
+        elif pending_author:
+            author = pending_author
+        else:
+            author = f"custom_u_{idx}"
+        pending_author = None
+
         comments.append(
             {
                 "fullname": fullname,
@@ -1805,6 +1984,13 @@ class DemoBackend:
             is_demo = True
         elif mode == "reddit_url":
             reddit_url = str(payload.get("reddit_url") or "").strip()
+            social_platform = _detect_unsupported_social_url(reddit_url)
+            if social_platform:
+                raise ValueError(
+                    f"{social_platform} yêu cầu đăng nhập và chặn truy cập tự động từ công cụ bên ngoài. "
+                    f"Vui lòng mở bài viết trên {social_platform}, sao chép (Ctrl+C) bài gốc cùng bình luận "
+                    "rồi dán thẳng vào ô Văn bản, hoặc tải lên tệp .txt/.json/.jsonl."
+                )
             post_id = _extract_post_id_from_url(reddit_url)
             post, comments = _fetch_reddit_thread(post_id)
             is_demo = False
@@ -1812,6 +1998,14 @@ class DemoBackend:
             post_id = "sandbox_custom"
             title = str(payload.get("title") or "").strip()
             root_text = str(payload.get("root_text") or "").strip()
+            raw_indented = str(payload.get("raw_indented_text") or "")
+            effective_payload: Mapping[str, Any] = payload
+            if not title and not root_text and payload.get("auto_split_root"):
+                split_title, split_root, remaining_raw = _split_root_and_comments_from_raw(raw_indented)
+                if split_root and remaining_raw.strip():
+                    title = split_title
+                    root_text = split_root
+                    effective_payload = {**payload, "raw_indented_text": remaining_raw}
             if not title and not root_text:
                 raise ValueError("Vui lòng nhập tiêu đề hoặc nội dung bài gốc.")
             post = {
@@ -1822,7 +2016,7 @@ class DemoBackend:
                 "author": "op_sandbox",
                 "created_utc": base_ts,
             }
-            comments = self._parse_custom_comments_payload(payload, post_id=post_id, base_ts=base_ts)
+            comments = self._parse_custom_comments_payload(effective_payload, post_id=post_id, base_ts=base_ts)
             if not comments:
                 raise ValueError("Cần ít nhất 1 bình luận để dựng cây hội thoại.")
             is_demo = True
@@ -2143,6 +2337,13 @@ class DemoBackend:
 
         if mode == "reddit_url":
             reddit_url = str(payload.get("reddit_url") or "").strip()
+            social_platform = _detect_unsupported_social_url(reddit_url)
+            if social_platform:
+                raise ValueError(
+                    f"{social_platform} yêu cầu đăng nhập và chặn truy cập tự động từ công cụ bên ngoài. "
+                    f"Vui lòng mở bài viết trên {social_platform}, sao chép (Ctrl+C) bài gốc cùng bình luận "
+                    "rồi dán thẳng vào ô Văn bản, hoặc tải lên tệp .txt/.json/.jsonl."
+                )
             post_id_for_url = _extract_post_id_from_url(reddit_url)
         elif mode == "json_upload":
             raw_thread_json = payload.get("thread_json")
@@ -2177,6 +2378,14 @@ class DemoBackend:
             post_id = "mega_custom"
             title = str(payload.get("title") or "").strip()
             root_text = str(payload.get("root_text") or "").strip()
+            raw_indented = str(payload.get("raw_indented_text") or "")
+            effective_payload: Mapping[str, Any] = payload
+            if not title and not root_text and payload.get("auto_split_root"):
+                split_title, split_root, remaining_raw = _split_root_and_comments_from_raw(raw_indented)
+                if split_root and remaining_raw.strip():
+                    title = split_title
+                    root_text = split_root
+                    effective_payload = {**payload, "raw_indented_text": remaining_raw}
             if not title and not root_text:
                 raise ValueError("Vui lòng nhập tiêu đề hoặc nội dung bài gốc.")
             prepared_post = {
@@ -2187,7 +2396,7 @@ class DemoBackend:
                 "author": "op_sandbox",
                 "created_utc": base_ts,
             }
-            prepared_comments = self._parse_custom_comments_payload(payload, post_id=post_id, base_ts=base_ts)
+            prepared_comments = self._parse_custom_comments_payload(effective_payload, post_id=post_id, base_ts=base_ts)
             if not prepared_comments:
                 raise ValueError("Cần ít nhất 1 bình luận để dựng cây hội thoại.")
 

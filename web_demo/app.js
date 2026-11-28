@@ -22,6 +22,31 @@
 
   const MAX_SVG_NODES = 120;
 
+  const FB_DEMO_SAMPLE_TEXT = [
+    "Đề xuất lắp camera AI phạt nguội xe máy vượt đèn đỏ tại các ngã tư lớn từ tháng tới",
+    "Nguyễn Minh Tuấn",
+    "Ủng hộ mạnh, chứ ra đường thấy vượt đèn đỏ tạt đầu nguy hiểm quá nhiều.",
+    "Thích · Phản hồi · 2 giờ",
+    "Trần Thu Hà",
+    "hóng",
+    "Thích · Phản hồi · 1 giờ",
+    "Lê Quốc Bảo",
+    "Không đồng ý phạt cào bằng ngay, phải sửa lại nhịp đèn vàng và vạch kẻ đường mờ đã.",
+    "Thích · Phản hồi · 55 phút",
+    "Phạm Ngọc Anh",
+    "Đồng ý",
+    "Thích · Phản hồi · 40 phút",
+    "Hoàng Đức Mạnh",
+    "Phản đối, hạ tầng đường hẹp giờ cao điểm dễ gây ùn ứ oan khi nhường xe cứu thương.",
+    "Thích · Phản hồi · 28 phút",
+    "Vũ Thảo Vy",
+    "Chính xác, nên thí điểm trước ở 5 ngã tư trọng điểm rồi công khai tiền phạt minh bạch.",
+    "Thích · Phản hồi · 15 phút",
+    "Đỗ Văn Hùng",
+    "chấm hóng kết quả",
+    "Thích · Phản hồi · 10 phút",
+  ].join("\n");
+
   const state = {
     activeTab: "tier1",
     tier1Mode: "real", // "real" | "sandbox"
@@ -41,10 +66,64 @@
     megaPage: 1,
     megaTotalPages: 1,
     megaUploadedJson: null,
+    megaUploadedTxt: null,
     megaPollTimer: null,
     megaSearchDebounceTimer: null,
     megaCommentsReqSeq: 0,
   };
+
+  function detectUnsupportedSocialUrl(rawText) {
+    const raw = String(rawText || "").trim();
+    if (!raw || /\s/.test(raw)) return null;
+    if (!/^(https?:\/\/)?[a-z0-9.-]+\.[a-z]{2,}(\/|$)/i.test(raw)) return null;
+    try {
+      const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+      const h = (u.hostname || "").toLowerCase();
+      if (
+        h === "facebook.com" ||
+        h.endsWith(".facebook.com") ||
+        h === "fb.com" ||
+        h.endsWith(".fb.com") ||
+        h === "fb.watch" ||
+        h.endsWith(".fb.watch")
+      ) {
+        return "Facebook";
+      }
+      if (
+        h === "threads.net" ||
+        h.endsWith(".threads.net") ||
+        h === "threads.com" ||
+        h.endsWith(".threads.com")
+      ) {
+        return "Threads";
+      }
+    } catch (_err) {
+      return null;
+    }
+    return null;
+  }
+
+  function looksLikeSingleUrl(rawText) {
+    const raw = String(rawText || "").trim();
+    return /^https?:\/\/\S+$/i.test(raw);
+  }
+
+  function polarTierInfo(val) {
+    if (val === null || val === undefined || Number.isNaN(Number(val))) {
+      return { label: "Chưa rõ", badgeClass: "badge-neutral", color: "#64748B" };
+    }
+    const v = Number(val);
+    if (v >= 0.4) {
+      return { label: "Chia rẽ rất cao", badgeClass: "badge-oppose", color: "#DC2626" };
+    }
+    if (v >= 0.25) {
+      return { label: "Tranh cãi cao", badgeClass: "badge-relink", color: "#D97706" };
+    }
+    if (v >= 0.12) {
+      return { label: "Tranh luận vừa", badgeClass: "badge-neutral", color: "#1D4ED8" };
+    }
+    return { label: "Ít chia rẽ / Đồng thuận", badgeClass: "badge-support", color: "#059669" };
+  }
 
   // Safe DOM builders using textContent exclusively (zero dynamic HTML strings)
   const $ = (id) => document.getElementById(id);
@@ -258,22 +337,65 @@
       textEl.appendChild(document.createTextNode(detail));
     }
 
-    $("pill-nlp-backend").textContent = `nlp: ${meta.nlp_backend || "—"}`;
-    $("pill-cascade-id").textContent = `id: ${meta.cascade_id || "—"}`;
+    if ($("pill-nlp-backend")) $("pill-nlp-backend").textContent = `nlp: ${meta.nlp_backend || "—"}`;
+    if ($("pill-cascade-id")) $("pill-cascade-id").textContent = `id: ${meta.cascade_id || "—"}`;
   }
 
   function renderTier1KPIs(payload) {
     const fc = payload.forecast || {};
     const meta = payload.meta || {};
-    $("kpi-pred-replies").textContent = `~${Number(fc.predicted_total_replies || 0).toFixed(1)}`;
-    $("kpi-actual-replies").textContent = fmtInt(fc.actual_total_replies);
+    const srcBadge = $("result-source-badge");
+    if (srcBadge) {
+      if (payload.scan_job_id) {
+        srcBadge.textContent = "Kết quả quét bài lớn (Job nền)";
+      } else if (state.tier1Mode === "sandbox") {
+        srcBadge.textContent = "Kết quả bài bạn vừa dán / thử nhanh";
+      } else {
+        srcBadge.textContent = "Mẫu kiểm chứng thật (Có đáp án đối chiếu)";
+      }
+    }
 
-    $("kpi-pred-polar").textContent = fmtNum(fc.predicted_polarization_score, 4);
-    $("kpi-early-polar").textContent = fmtNum(fc.early_y_polar, 4);
+    const predReplies = Number(fc.predicted_total_replies || 0);
+    const actReplies = Number(fc.actual_total_replies || 0);
+    $("kpi-pred-replies").textContent = `~${predReplies.toFixed(0)}`;
+    $("kpi-actual-replies").textContent = fmtInt(actReplies);
+
+    const proofBadge = $("forecast-proof-badge");
+    if (proofBadge) {
+      if (fc.has_future_replies && actReplies > 0) {
+        const diff = Math.round(predReplies - actReplies);
+        const absDiff = Math.abs(diff);
+        proofBadge.textContent = absDiff <= 8 ? `Khớp sát (lệch ${absDiff} BL)` : `Dự báo vs Thực tế: ${diff >= 0 ? "+" : ""}${diff} BL`;
+        proofBadge.className = `badge-tag ${absDiff <= 8 ? "badge-support" : "badge-neutral"}`;
+      } else {
+        proofBadge.textContent = `Đang xem ${fmtInt(fc.k_observed ?? actReplies)} bình luận`;
+        proofBadge.className = "badge-tag badge-neutral";
+      }
+    }
+
+    const displayPolar = fc.predicted_polarization_score ?? fc.early_y_polar;
+    const tier = polarTierInfo(displayPolar);
+    const score100 = displayPolar !== null && displayPolar !== undefined && !Number.isNaN(Number(displayPolar))
+      ? Math.max(0, Math.min(100, Math.round(Number(displayPolar) * 100)))
+      : 0;
+    const lvlEl = $("verdict-polar-level");
+    if (lvlEl) {
+      lvlEl.textContent = tier.label;
+      lvlEl.className = `badge-tag ${tier.badgeClass}`;
+    }
+    if ($("verdict-polar-100")) $("verdict-polar-100").textContent = String(score100);
+    const meterEl = $("verdict-polar-meter");
+    if (meterEl) {
+      meterEl.style.setProperty("--polar-pct", `${Math.max(4, score100)}%`);
+      meterEl.style.setProperty("--polar-color", tier.color);
+    }
+
+    $("kpi-pred-polar").textContent = fmtNum(fc.predicted_polarization_score, 3);
+    $("kpi-early-polar").textContent = fmtNum(fc.early_y_polar, 3);
     $("kpi-actual-polar").textContent =
       fc.has_future_replies && fc.actual_y_polar !== null && fc.actual_y_polar !== undefined
-        ? fmtNum(fc.actual_y_polar, 4)
-        : "Chưa có (t <= K)";
+        ? fmtNum(fc.actual_y_polar, 3)
+        : "Chưa có (bài mới)";
 
     $("kpi-regime").textContent = fc.predicted_regime || "—";
     $("kpi-confidence").textContent =
@@ -316,6 +438,12 @@
     $("cs-dropped").textContent = fmtInt(stats.dropped_leaves);
     $("cs-contracted").textContent = fmtInt(stats.contracted_nodes);
     $("cs-relinked").textContent = fmtInt(stats.relinked_edges);
+    const plainSum = $("contraction-plain-summary");
+    if (plainSum) {
+      plainSum.textContent =
+        `Từ ${fmtInt(stats.raw_comments)} bình luận gốc, hệ thống dọn ${fmtInt(stats.dropped_leaves)} bình luận rác ` +
+        `và tự động nối lại ${fmtInt(stats.relinked_edges)} nhánh trả lời bên dưới để không đứt mạch tranh luận.`;
+    }
 
     const pills = $("preserved-stances-pills");
     clearEl(pills);
@@ -1209,13 +1337,16 @@
     if (caption) {
       const first = coords[0];
       const last = coords[coords.length - 1];
-      const scaleNote = useLogScale ? " (trục K log1p)" : "";
-      caption.textContent = `Diễn biến y_polar từ K=${first.kVal} (${first.yVal.toFixed(3)}) đến K=${last.kVal} (${last.yVal.toFixed(3)})${scaleNote}.`;
+      const p0 = Math.round(first.yVal * 100);
+      const p1 = Math.round(last.yVal * 100);
+      const dirWord = p1 > p0 + 3 ? "tăng lên" : p1 < p0 - 3 ? "giảm nhẹ" : "khá ổn định";
+      caption.textContent = `Mức chia rẽ ${dirWord}: từ ${p0}/100 (lúc ${first.kVal} BL) đến ${p1}/100 (lúc ${last.kVal} BL).`;
     }
   }
 
-  function appendArgumentGroup(container, titleText, items, emptyText, openByDefault) {
+  function appendArgumentGroup(container, titleText, items, emptyText, openByDefault, tone = "neutral") {
     const details = createNode("details", "arguments-details");
+    details.dataset.tone = tone;
     if (openByDefault) details.open = true;
     const summary = createNode("summary", "arguments-summary", `${titleText} (${items.length})`);
     details.appendChild(summary);
@@ -1229,12 +1360,8 @@
           li.textContent = entry;
         } else {
           const text = entry.text || entry.snippet || entry.summary || "";
-          const metaParts = [];
-          if (entry.depth !== undefined) metaParts.push(`tầng ${entry.depth}`);
-          if (entry.aligned_stance !== undefined) metaParts.push(`stance ${Number(entry.aligned_stance).toFixed(2)}`);
-          if (entry.h_uv !== undefined) metaParts.push(`h=${Number(entry.h_uv).toFixed(2)}`);
-          if (entry.child_replies) metaParts.push(`${entry.child_replies} phản hồi`);
-          li.textContent = metaParts.length > 0 ? `${text} (${metaParts.join(" · ")})` : text;
+          const replyHint = entry.child_replies ? ` — (${entry.child_replies} phản hồi)` : "";
+          li.textContent = `${text}${replyHint}`;
         }
         ul.appendChild(li);
       });
@@ -1260,7 +1387,8 @@
 
     const scaleBadge = $("large-scale-badge");
     if (scaleBadge) {
-      scaleBadge.textContent = `${largeInfo.scale_label_vi || largeInfo.scale_tier || "Chuỗi"} · ${largeInfo.total_replies_analyzed ?? 0} bình luận · ${largeInfo.unique_authors_total ?? 0} tác giả`;
+      scaleBadge.hidden = false;
+      scaleBadge.textContent = `${largeInfo.scale_label_vi || largeInfo.scale_tier || "Chuỗi"} · ${largeInfo.total_replies_analyzed ?? 0} bình luận`;
     }
 
     const archBadge = $("large-archetype-badge");
@@ -1326,9 +1454,9 @@
         : Array.isArray(sem.flashpoints)
           ? sem.flashpoints
           : [];
-      appendArgumentGroup(cols, "Luận điểm Tán thành", proItems, "Chưa ghi nhận bình luận tán thành nổi bật.", true);
-      appendArgumentGroup(cols, "Luận điểm Phản đối", antiItems, "Chưa ghi nhận bình luận phản đối nổi bật.", true);
-      appendArgumentGroup(cols, "Điểm nóng / Đảo chiều", flashItems, "Chưa phát hiện điểm đảo chiều xung đột.", false);
+      appendArgumentGroup(cols, "Phe Tán thành nói gì?", proItems, "Chưa ghi nhận bình luận tán thành nổi bật.", true, "pro");
+      appendArgumentGroup(cols, "Phe Phản đối nói gì?", antiItems, "Chưa ghi nhận bình luận phản đối nổi bật.", true, "anti");
+      appendArgumentGroup(cols, "Điểm nóng / Bình luận đảo chiều", flashItems, "Chưa phát hiện điểm đảo chiều xung đột.", false, "flash");
     }
   }
 
@@ -1494,21 +1622,23 @@
     state.threadsIndex = idx;
 
     const realBtn = $("mode-real-btn");
-    realBtn.textContent = idx.is_synthetic_fallback
-      ? "Mẫu Tổng hợp Offline (CI Fallback)"
-      : "Bài Test VN Thật (Offline GPU)";
+    if (realBtn) {
+      realBtn.textContent = idx.is_synthetic_fallback
+        ? "Kiểm chứng Mẫu Offline (Có đáp án)"
+        : "Kiểm chứng 10 bài thật (Có đáp án)";
+    }
 
     const select = $("thread-select");
     clearEl(select);
-    $("thread-count-label").textContent = String(idx.count || 0);
+    if ($("thread-count-label")) $("thread-count-label").textContent = String(idx.count || 0);
 
-    for (const item of idx.threads || []) {
+    (idx.threads || []).forEach((item, i) => {
+      const pTier = polarTierInfo(item.actual_y_polar ?? item.early_y_polar);
       const label =
-        `${item.cascade_id} | y_polar=${fmtNum(item.actual_y_polar ?? item.early_y_polar, 3)} | ` +
-        `N=${item.actual_total_replies} (dự báo ~${Math.round(item.predicted_total_replies)}) — ` +
-        `${truncText(item.title_snippet, 68)}`;
+        `Bài #${i + 1} · Thực tế ${item.actual_total_replies} BL (AI đoán sớm ~${Math.round(item.predicted_total_replies)} BL) · ` +
+        `Chia rẽ: ${pTier.label} — ${truncText(item.title_snippet, 64)}`;
       select.appendChild(el("option", { value: item.cascade_id }, label));
-    }
+    });
 
     if ((idx.threads || []).length > 0) {
       const firstId = idx.threads[0].cascade_id;
@@ -1535,19 +1665,19 @@
     return checked ? checked.value : "early";
   }
 
-  function getSandboxTopics() {
-    const input = $("sb-custom-topics");
-    return input ? input.value.trim() : "";
+  function getLiveTopics() {
+    const sb = $("sb-custom-topics");
+    return sb ? sb.value.trim() : "";
   }
 
   async function runSandboxRequest(reqBody) {
     showError("");
     const submitBtn = $("btn-run-custom");
-    submitBtn.disabled = true;
+    if (submitBtn) submitBtn.disabled = true;
     try {
       const analysisMode = reqBody.analysis_mode || getSelectedAnalysisMode();
       const customTopics =
-        reqBody.custom_topics !== undefined ? reqBody.custom_topics : getSandboxTopics();
+        reqBody.custom_topics !== undefined ? reqBody.custom_topics : getLiveTopics();
       const finalBody = {
         ...reqBody,
         analysis_mode: analysisMode,
@@ -1562,16 +1692,16 @@
       const stats = payload.junk_filter_stats || {};
       const topicLbl = payload.topic_analysis?.primary_topic || "Chưa phân loại";
       announce(
-        `Đã chạy Sandbox (${analysisMode === "full" ? "Toàn chuỗi" : "Sớm K=20"}): chủ đề ${topicLbl}, giữ ${stats.kept_comments || 0} bình luận, thu gọn ${stats.contracted_nodes || 0} nút giữa.`
+        `Đã phân tích xong: chủ đề ${topicLbl}, giữ ${stats.kept_comments || 0} bình luận, nối lại ${stats.relinked_edges || 0} nhánh.`
       );
     } catch (err) {
       showError(err.message);
     } finally {
-      submitBtn.disabled = false;
+      if (submitBtn) submitBtn.disabled = false;
     }
   }
 
-  function switchTier1Mode(mode) {
+  function switchTier1Mode(mode, runDefaultIfEmpty = false) {
     if (state.megaPollTimer) {
       clearTimeout(state.megaPollTimer);
       state.megaPollTimer = null;
@@ -1590,7 +1720,7 @@
       } else {
         loadRealThreads().catch((e) => showError(e.message));
       }
-    } else {
+    } else if (runDefaultIfEmpty && !state.currentPayload) {
       runSandboxRequest({ mode: "preset_junk_1", junk_mode: getSelectedJunkMode() });
     }
   }
@@ -1658,6 +1788,25 @@
     const deltaPp = (crossNeg - withinNeg) * 100;
     $("t2-cross-delta").textContent = `${deltaPp >= 0 ? "+" : ""}${deltaPp.toFixed(1)} pp`;
     $("t2-neg-rates").textContent = `Liên phe: ${fmtPct(crossNeg, 1)} · Trong phe: ${fmtPct(withinNeg, 1)}`;
+
+    const plainSum = $("tier2-plain-summary-text");
+    if (plainSum) {
+      clearEl(plainSum);
+      plainSum.appendChild(el("strong", {}, "Kết luận 5 giây: "));
+      if (corpusKey === "vn") {
+        plainSum.appendChild(
+          document.createTextNode(
+            `Cộng đồng Reddit Việt Nam không đóng kín thành 2 "phòng vang" biệt lập (RWC = ${fmtNum(pol.rwc, 3)}), mà tranh luận chéo rất mạnh (${fmtPct(crossNeg, 1)} đối đầu nằm giữa các phe, tam giác cân bằng chỉ ${fmtPct(sb.balanced_ratio, 1)}).`
+          )
+        );
+      } else {
+        plainSum.appendChild(
+          document.createTextNode(
+            `Trên mạng tin đồn Twitter (PHEME), người dùng chia 2 phe đối đầu rõ hơn nhiều (liên phe ${fmtPct(crossNeg, 1)} so với trong phe ${fmtPct(withinNeg, 1)}), SBiFAGAT-Link dự đoán chính xác 91,1% (Trans. ROC-AUC).`
+          )
+        );
+      }
+    }
 
     $("fig5-title").textContent = `Hình 5 · ${corp.label}: Cấu trúc 2 Phe & Tam giác Có dấu`;
     $("fig5-img").src = corp.figure_url;
@@ -1740,9 +1889,13 @@
   function setMegaButtonsBusy(busy) {
     const btnStress = $("btn-mega-stress");
     const btnRun = $("btn-mega-run");
+    const btnQuickMega = $("btn-quick-mega");
+    const btnMainRun = $("btn-run-custom");
     const btnCancel = $("btn-mega-cancel");
     if (btnStress) btnStress.disabled = busy;
     if (btnRun) btnRun.disabled = busy;
+    if (btnQuickMega) btnQuickMega.disabled = busy;
+    if (btnMainRun) btnMainRun.disabled = busy;
     if (btnCancel) btnCancel.hidden = !busy;
   }
 
@@ -1810,9 +1963,46 @@
     }
   }
 
+  function showSocialUrlGuide(platform) {
+    const box = $("social-url-guide");
+    const ttl = $("social-guide-title");
+    if (!box) return;
+    if (!platform) {
+      box.hidden = true;
+      return;
+    }
+    if (ttl) {
+      ttl.textContent = `${platform} yêu cầu đăng nhập nên công cụ không tự cào link trực tiếp được`;
+    }
+    box.hidden = false;
+  }
+
+  function runFacebookDemoSample() {
+    showSocialUrlGuide(null);
+    showError("");
+    state.tier1Mode = "sandbox";
+    const urlInput = $("sb-reddit-url");
+    if (urlInput) urlInput.value = "";
+    const titleEl = $("sb-title");
+    const rootEl = $("sb-root-text");
+    if (titleEl) titleEl.value = "";
+    if (rootEl) rootEl.value = "";
+    const rawEl = $("sb-raw-lines");
+    if (rawEl) rawEl.value = FB_DEMO_SAMPLE_TEXT;
+    runSandboxRequest({
+      mode: "custom",
+      title: "",
+      root_text: "",
+      raw_indented_text: FB_DEMO_SAMPLE_TEXT,
+      auto_split_root: true,
+      analysis_mode: "full",
+      junk_mode: getSelectedJunkMode(),
+    });
+  }
+
   function initControls() {
     $("mode-real-btn").addEventListener("click", () => switchTier1Mode("real"));
-    $("mode-sandbox-btn").addEventListener("click", () => switchTier1Mode("sandbox"));
+    $("mode-sandbox-btn").addEventListener("click", () => switchTier1Mode("sandbox", false));
 
     $("thread-select").addEventListener("change", (e) => {
       loadThreadDetail(e.target.value).catch((err) => showError(err.message));
@@ -1831,15 +2021,22 @@
       }
     });
 
-    $("btn-preset-1").addEventListener("click", () => {
-      runSandboxRequest({ mode: "preset_junk_1", junk_mode: getSelectedJunkMode() });
-    });
-    $("btn-preset-2").addEventListener("click", () => {
-      runSandboxRequest({ mode: "preset_junk_2", junk_mode: getSelectedJunkMode() });
-    });
+    if ($("btn-preset-1")) {
+      $("btn-preset-1").addEventListener("click", () => {
+        state.tier1Mode = "sandbox";
+        runSandboxRequest({ mode: "preset_junk_1", junk_mode: getSelectedJunkMode() });
+      });
+    }
+    if ($("btn-preset-2")) {
+      $("btn-preset-2").addEventListener("click", () => {
+        state.tier1Mode = "sandbox";
+        runSandboxRequest({ mode: "preset_junk_2", junk_mode: getSelectedJunkMode() });
+      });
+    }
     const presetLargeBtn = $("btn-preset-large");
     if (presetLargeBtn) {
       presetLargeBtn.addEventListener("click", () => {
+        state.tier1Mode = "sandbox";
         const fullRadio = $("analysis-full");
         if (fullRadio) fullRadio.checked = true;
         runSandboxRequest({
@@ -1848,6 +2045,26 @@
           analysis_mode: "full",
           k_horizon: 20,
           max_full_comments: 500,
+        });
+      });
+    }
+    if ($("btn-demo-fb")) {
+      $("btn-demo-fb").addEventListener("click", runFacebookDemoSample);
+    }
+    if ($("btn-try-fb-sample")) {
+      $("btn-try-fb-sample").addEventListener("click", runFacebookDemoSample);
+    }
+    if ($("btn-quick-mega")) {
+      $("btn-quick-mega").addEventListener("click", () => {
+        state.tier1Mode = "sandbox";
+        const maxC = getSelectedMegaMaxComments();
+        startMegaScanJob({
+          mode: "preset_mega_stress",
+          stress_n_comments: maxC,
+          max_full_comments: maxC,
+          scan_strategy: getSelectedMegaStrategy(),
+          junk_mode: getSelectedJunkMode(),
+          custom_topics: getLiveTopics() || undefined,
         });
       });
     }
@@ -1865,23 +2082,32 @@
     const rawLinesEl = $("sb-raw-lines");
     const urlInputEl = $("sb-reddit-url");
     const titleEl = $("sb-title");
-    const sbTopicsEl = $("sb-custom-topics");
-    const liveTopicsEl = $("live-custom-topics");
+    const liveTopicsEl = $("sb-custom-topics");
     const reclassifyForm = $("topic-reclassify-form");
 
-    rawLinesEl.addEventListener("input", () => rawLinesEl.removeAttribute("aria-invalid"));
-    urlInputEl.addEventListener("input", () => urlInputEl.removeAttribute("aria-invalid"));
-    titleEl.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && (e.isComposing || e.keyCode === 229)) e.preventDefault();
+    rawLinesEl.addEventListener("input", () => {
+      rawLinesEl.removeAttribute("aria-invalid");
+      const trimmed = rawLinesEl.value.trim();
+      const socialInText = detectUnsupportedSocialUrl(trimmed);
+      if (socialInText) {
+        showSocialUrlGuide(socialInText);
+      } else if (!detectUnsupportedSocialUrl(urlInputEl.value)) {
+        showSocialUrlGuide(null);
+      }
     });
-    urlInputEl.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && (e.isComposing || e.keyCode === 229)) e.preventDefault();
+    urlInputEl.addEventListener("input", () => {
+      urlInputEl.removeAttribute("aria-invalid");
+      const socialPlatform = detectUnsupportedSocialUrl(urlInputEl.value);
+      showSocialUrlGuide(socialPlatform);
     });
-    if (sbTopicsEl) {
-      sbTopicsEl.addEventListener("keydown", (e) => {
+    if (titleEl) {
+      titleEl.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && (e.isComposing || e.keyCode === 229)) e.preventDefault();
       });
     }
+    urlInputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.isComposing || e.keyCode === 229)) e.preventDefault();
+    });
     if (liveTopicsEl) {
       liveTopicsEl.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && (e.isComposing || e.keyCode === 229)) e.preventDefault();
@@ -1955,25 +2181,84 @@
 
     $("sandbox-form").addEventListener("submit", (e) => {
       e.preventDefault();
-      const urlVal = urlInputEl.value.trim();
+      state.tier1Mode = "sandbox";
       const junkMode = getSelectedJunkMode();
-      if (urlVal) {
-        runSandboxRequest({ mode: "reddit_url", reddit_url: urlVal, junk_mode: junkMode });
+      const customTopics = getLiveTopics() || undefined;
+      const maxC = getSelectedMegaMaxComments();
+
+      if (state.megaUploadedJson) {
+        startMegaScanJob({
+          mode: "json_upload",
+          thread_json: state.megaUploadedJson,
+          max_full_comments: maxC,
+          scan_strategy: getSelectedMegaStrategy(),
+          junk_mode: junkMode,
+          custom_topics: customTopics,
+        });
         return;
       }
-      const rawLines = rawLinesEl.value.trim();
-      if (!rawLines) {
+
+      const rawLinesInput = rawLinesEl.value.trim();
+      const urlFieldVal = urlInputEl.value.trim();
+      const effectiveUrl = urlFieldVal || (looksLikeSingleUrl(rawLinesInput) ? rawLinesInput : "");
+
+      if (effectiveUrl) {
+        const socialPlatform = detectUnsupportedSocialUrl(effectiveUrl);
+        if (socialPlatform) {
+          showSocialUrlGuide(socialPlatform);
+          showError(
+            `${socialPlatform} chặn cào link tự động do yêu cầu đăng nhập. Vui lòng copy bài viết + bình luận trên ${socialPlatform} rồi dán vào ô văn bản phía trên.`
+          );
+          return;
+        }
+        startMegaScanJob({
+          mode: "reddit_url",
+          reddit_url: effectiveUrl,
+          max_full_comments: maxC,
+          scan_strategy: getSelectedMegaStrategy(),
+          junk_mode: junkMode,
+          custom_topics: customTopics,
+        });
+        return;
+      }
+
+      const effectiveText = rawLinesInput || state.megaUploadedTxt || "";
+      if (!effectiveText) {
         rawLinesEl.setAttribute("aria-invalid", "true");
-        showError("Vui lòng nhập ít nhất 1 bình luận hoặc dán URL Reddit.");
+        showError("Vui lòng dán nội dung bài viết + bình luận (FB/Threads), dán link Reddit hoặc chọn tệp.");
         rawLinesEl.focus();
         return;
       }
+
+      const manualTitle = titleEl ? titleEl.value.trim() : "";
+      const manualRoot = $("sb-root-text") ? $("sb-root-text").value.trim() : "";
+      const autoSplit = !manualTitle && !manualRoot;
+      const nonEmptyCount = effectiveText.split(/\r?\n/).filter((ln) => ln.trim().length > 0).length;
+
+      if (nonEmptyCount > 100) {
+        startMegaScanJob({
+          mode: "custom",
+          title: manualTitle,
+          root_text: manualRoot,
+          raw_indented_text: effectiveText,
+          auto_split_root: autoSplit,
+          max_full_comments: maxC,
+          scan_strategy: nonEmptyCount <= 500 ? "full" : getSelectedMegaStrategy(),
+          junk_mode: junkMode,
+          custom_topics: customTopics,
+        });
+        return;
+      }
+
       runSandboxRequest({
         mode: "custom",
-        title: titleEl.value.trim(),
-        root_text: $("sb-root-text").value.trim(),
-        raw_indented_text: rawLines,
+        title: manualTitle,
+        root_text: manualRoot,
+        raw_indented_text: effectiveText,
+        auto_split_root: autoSplit,
+        analysis_mode: nonEmptyCount > 25 ? "full" : getSelectedAnalysisMode(),
         junk_mode: junkMode,
+        custom_topics: customTopics,
       });
     });
 
@@ -1984,12 +2269,21 @@
         const f = ev.target.files && ev.target.files[0];
         if (!f) {
           state.megaUploadedJson = null;
+          state.megaUploadedTxt = null;
           if (btnClearFile) btnClearFile.hidden = true;
           return;
         }
         const reader = new FileReader();
         reader.onload = () => {
-          state.megaUploadedJson = String(reader.result || "");
+          const content = String(reader.result || "");
+          if (/\.txt$/i.test(f.name)) {
+            state.megaUploadedJson = null;
+            state.megaUploadedTxt = content;
+            rawLinesEl.value = content;
+          } else {
+            state.megaUploadedTxt = null;
+            state.megaUploadedJson = content;
+          }
           if (btnClearFile) btnClearFile.hidden = false;
           announce(`Đã nạp tệp cục bộ: ${f.name}`);
         };
@@ -1999,15 +2293,17 @@
     if (btnClearFile) {
       btnClearFile.addEventListener("click", () => {
         state.megaUploadedJson = null;
+        state.megaUploadedTxt = null;
         if (fileInputEl) fileInputEl.value = "";
         btnClearFile.hidden = true;
-        announce("Đã bỏ chọn tệp JSON/JSONL.");
+        announce("Đã bỏ chọn tệp.");
       });
     }
 
     const btnMegaStress = $("btn-mega-stress");
     if (btnMegaStress) {
       btnMegaStress.addEventListener("click", () => {
+        state.tier1Mode = "sandbox";
         const maxC = getSelectedMegaMaxComments();
         startMegaScanJob({
           mode: "preset_mega_stress",
@@ -2015,7 +2311,7 @@
           max_full_comments: maxC,
           scan_strategy: getSelectedMegaStrategy(),
           junk_mode: getSelectedJunkMode(),
-          custom_topics: getSandboxTopics() || undefined,
+          custom_topics: getLiveTopics() || undefined,
         });
       });
     }
@@ -2023,10 +2319,11 @@
     const btnMegaRun = $("btn-mega-run");
     if (btnMegaRun) {
       btnMegaRun.addEventListener("click", () => {
+        state.tier1Mode = "sandbox";
         const maxC = getSelectedMegaMaxComments();
         const strat = getSelectedMegaStrategy();
         const junkMode = getSelectedJunkMode();
-        const customTopics = getSandboxTopics() || undefined;
+        const customTopics = getLiveTopics() || undefined;
         if (state.megaUploadedJson) {
           startMegaScanJob({
             mode: "json_upload",
@@ -2040,6 +2337,14 @@
         }
         const urlVal = urlInputEl.value.trim();
         if (urlVal) {
+          const socialPlatform = detectUnsupportedSocialUrl(urlVal);
+          if (socialPlatform) {
+            showSocialUrlGuide(socialPlatform);
+            showError(
+              `${socialPlatform} chặn cào link tự động do yêu cầu đăng nhập. Vui lòng copy bài viết + bình luận trên ${socialPlatform} rồi dán vào ô văn bản.`
+            );
+            return;
+          }
           startMegaScanJob({
             mode: "reddit_url",
             reddit_url: urlVal,
@@ -2052,11 +2357,14 @@
         }
         const rawLines = rawLinesEl.value.trim();
         if (rawLines) {
+          const mTitle = titleEl ? titleEl.value.trim() : "";
+          const mRoot = $("sb-root-text") ? $("sb-root-text").value.trim() : "";
           startMegaScanJob({
             mode: "custom",
-            title: titleEl.value.trim(),
-            root_text: $("sb-root-text").value.trim(),
+            title: mTitle,
+            root_text: mRoot,
             raw_indented_text: rawLines,
+            auto_split_root: !mTitle && !mRoot,
             max_full_comments: maxC,
             scan_strategy: strat,
             junk_mode: junkMode,
@@ -2064,7 +2372,7 @@
           });
           return;
         }
-        showError("Vui lòng chọn tệp JSON/JSONL, dán URL Reddit hoặc bấm Chạy mẫu kiểm tải.");
+        showError("Vui lòng chọn tệp JSON/JSONL, dán URL Reddit hoặc bấm Kiểm tải Stress.");
       });
     }
 

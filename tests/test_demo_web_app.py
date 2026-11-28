@@ -425,3 +425,126 @@ def test_static_web_assets_are_offline_and_clean() -> None:
     assert 'createNode("div", "topic-bar-row")' not in js
     assert 'createNode("li", "topic-bar-row")' in js
     assert 'state.tier1Mode === "sandbox"' in js
+    assert 'id="mega-scan-panel"' in html
+    assert 'id="mega-comments-section"' in html
+    assert 'id="hotspot-branch-bar"' in html
+    assert 'id="btn-mega-clear-file"' in html
+    assert 'value="unscored"' in html
+    assert "MAX_SVG_NODES = 120" in js
+    assert "megaCommentsReqSeq" in js
+
+
+def test_parse_facebook_and_threads_copy_paste_cleanly() -> None:
+    """Verify Facebook and Threads UI chrome is stripped while author names hash cleanly and stances survive."""
+    from scripts.demo_web_app import (
+        _detect_unsupported_social_url,
+        _split_root_and_comments_from_raw,
+        parse_sandbox_raw_text,
+    )
+
+    fb_raw = (
+        "Đề xuất lắp camera AI phạt nguội xe máy\n"
+        "Nguyễn Minh Tuấn\n"
+        "Ủng hộ mạnh, chứ vượt đèn đỏ nguy hiểm quá.\n"
+        "Thích · Phản hồi · 2 giờ\n"
+        "Xem tất cả 3 phản hồi\n"
+        "Trần Thu Hà\n"
+        "Đồng ý\n"
+        "Thích · Phản hồi · 1 giờ\n"
+        "Lê Quốc Bảo\n"
+        "hóng\n"
+        "12\n"
+        "Thích · Phản hồi · 30 phút\n"
+    )
+    title, root_text, remaining = _split_root_and_comments_from_raw(fb_raw)
+    assert "camera AI" in title
+    assert "camera AI" in root_text
+    fb_comments = parse_sandbox_raw_text(remaining, post_id="fb_test", base_ts=1763400000.0)
+    bodies = [c["body"] for c in fb_comments]
+    assert bodies == ["Ủng hộ mạnh, chứ vượt đèn đỏ nguy hiểm quá.", "Đồng ý", "hóng"]
+    assert all("Thích" not in b and "Nguyễn Minh Tuấn" not in b for b in bodies)
+    assert len({c["author_hash"] for c in fb_comments}) == 3
+
+    threads_raw = (
+        "minhanh.99 · 3 giờ\n"
+        "Không đồng ý tăng học phí đột ngột khi chưa nâng chất lượng.\n"
+        "12 lượt thích · 4 phản hồi\n"
+        "tuan_dev · 2 giờ\n"
+        "Phản đối\n"
+        "Thích · Trả lời · 1 giờ\n"
+    )
+    th_comments = parse_sandbox_raw_text(threads_raw, post_id="th_test", base_ts=1763400000.0)
+    assert [c["body"] for c in th_comments] == [
+        "Không đồng ý tăng học phí đột ngột khi chưa nâng chất lượng.",
+        "Phản đối",
+    ]
+    assert th_comments[0]["author_hash"] != th_comments[1]["author_hash"]
+
+    assert _detect_unsupported_social_url("https://www.facebook.com/groups/123/posts/456") == "Facebook"
+    assert _detect_unsupported_social_url("https://www.threads.net/@user/post/C9abc") == "Threads"
+    assert _detect_unsupported_social_url("https://www.reddit.com/r/vozforums/comments/1o02m18") is None
+
+
+def test_sandbox_and_scan_jobs_social_url_guard_and_auto_split(tmp_path: Path) -> None:
+    """FB/Threads URLs fail with honest 400 copy-paste guidance; auto_split_root runs end-to-end."""
+    server, thread = _start_server(
+        data_dir=tmp_path / "no_data",
+        ckpt_path=tmp_path / "no_ckpt.pt",
+        ce_dir=tmp_path / "no_ce",
+    )
+    port = server.server_address[1]
+    try:
+        for url in (
+            "https://www.facebook.com/groups/demo/posts/12345",
+            "https://www.threads.com/@demo/post/ABC123",
+        ):
+            st1, _, b1 = _http_json_post(
+                port,
+                "/api/tier1/sandbox",
+                {"mode": "reddit_url", "reddit_url": url, "junk_mode": "contract"},
+            )
+            assert st1 == 400
+            assert "Ctrl+C" in b1["error"]
+
+            st2, _, b2 = _http_json_post(
+                port,
+                "/api/tier1/scan_jobs",
+                {"mode": "reddit_url", "reddit_url": url, "junk_mode": "contract"},
+            )
+            assert st2 == 400
+            assert "Ctrl+C" in b2["error"]
+
+        fb_paste = (
+            "Thử nghiệm bỏ làm việc từ xa để quay lại văn phòng toàn thời gian\n"
+            "Nguyễn Văn An\n"
+            "Đồng ý quay lại văn phòng để trao đổi nhanh hơn.\n"
+            "Thích · Phản hồi · 2 giờ\n"
+            "Trần Thị Bình\n"
+            "hóng\n"
+            "Thích · Phản hồi · 1 giờ\n"
+            "Lê Văn Cường\n"
+            "Phản đối, tốn thời gian kẹt xe lắm.\n"
+            "Thích · Phản hồi · 30 phút\n"
+        )
+        st_auto, _, body_auto = _http_json_post(
+            port,
+            "/api/tier1/sandbox",
+            {
+                "mode": "custom",
+                "title": "",
+                "root_text": "",
+                "raw_indented_text": fb_paste,
+                "auto_split_root": True,
+                "junk_mode": "contract",
+            },
+        )
+        assert st_auto == 200
+        assert "quay lại văn phòng" in body_auto["meta"]["root_title"]
+        kept = [n["text"] for n in body_auto["kept_nodes"]]
+        assert "Đồng ý quay lại văn phòng để trao đổi nhanh hơn." in kept
+        assert "Phản đối, tốn thời gian kẹt xe lắm." in kept
+        assert not any("Thích · Phản hồi" in t for t in kept)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

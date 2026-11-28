@@ -1,690 +1,613 @@
 <!DOCTYPE html>
 <html lang="vi">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SBi-FAGAT · Trình diễn Phân tích Phân cực &amp; Lan truyền Sớm</title>
-  <link rel="icon" href="data:,">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SBi-FAGAT · Phân tích Tranh cãi &amp; Dự báo sớm Mạng xã hội</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <a href="#main-content" class="skip-link visually-hidden">Chuyển tới nội dung chính</a>
+  <a class="skip-link visually-hidden" href="#main-content">Bỏ qua đến nội dung chính</a>
 
   <div class="app-shell">
     <header class="site-header">
       <div class="header-top">
         <div class="brand">
           <div class="brand-mark" aria-hidden="true">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="5" r="2.5"></circle>
-              <circle cx="5.5" cy="18" r="2.5"></circle>
-              <circle cx="18.5" cy="18" r="2.5"></circle>
-              <path d="M10.8 7.2 6.7 15.8"></path>
-              <path d="M13.2 7.2 17.3 15.8"></path>
-              <path d="M8 18h8" stroke-dasharray="2.5 2"></path>
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="5" r="2.2"></circle>
+              <circle cx="6" cy="18" r="2.2"></circle>
+              <circle cx="18" cy="18" r="2.2"></circle>
+              <path d="M10.8 6.9L7.1 16.1"></path>
+              <path d="M13.2 6.9L16.9 16.1"></path>
             </svg>
           </div>
           <div>
-            <h1 id="page-title">SBi-FAGAT · Trình diễn Nghiên cứu Hai tầng</h1>
-            <p class="subtitle">
-              Mô hình hóa sự phân cực quan điểm và lan truyền thông tin trên mạng xã hội (cục bộ 100% ngoại tuyến)
-            </p>
+            <h1>SBi-FAGAT · Phân tích Tranh cãi Mạng xã hội</h1>
+            <p class="subtitle">Chỉ cần dán bài Facebook / Threads hoặc link — AI đọc 20 bình luận đầu để dự báo lan truyền và đo mức độ chia rẽ hai phe</p>
           </div>
         </div>
 
-        <div class="health-strip" id="health-pill" aria-label="Trạng thái hạ tầng cục bộ">
-          <span class="status-dot" id="health-dot" aria-hidden="true"></span>
-          <span id="health-text" class="tabular">Đang khởi tạo...</span>
+        <div class="health-strip" role="status" aria-live="polite">
+          <span class="status-dot" id="health-dot"></span>
+          <span id="health-text">Đang khởi tạo mô hình...</span>
         </div>
       </div>
 
-      <div class="tablist-row">
-        <div class="tablist" role="tablist" aria-label="Phân hệ trình diễn hai tầng">
+      <nav class="tablist-row" aria-label="Chế độ xem chính">
+        <div class="tablist" role="tablist" aria-label="Phân tầng hệ thống">
           <button
             type="button"
             role="tab"
             id="tab-tier1"
             aria-selected="true"
-            tabindex="0"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="12" cy="4" r="2.2"></circle>
-              <circle cx="6" cy="13" r="2.2"></circle>
-              <circle cx="18" cy="13" r="2.2"></circle>
-              <circle cx="18" cy="20" r="2.2"></circle>
-              <path d="M10.7 5.8 7.2 11.2"></path>
-              <path d="M13.3 5.8 16.8 11.2"></path>
-              <path d="M18 15.2v2.6"></path>
-            </svg>
-            <span>Tầng 1 · Cây Thảo luận Sớm (<span class="tabular">K=20</span>)</span>
+            tabindex="0">
+            Phân tích Bài viết (Dự báo sớm &amp; Quét bài lớn)
           </button>
-
           <button
             type="button"
             role="tab"
             id="tab-tier2"
             aria-selected="false"
-            tabindex="-1"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="7" cy="8" r="2.5"></circle>
-              <circle cx="17" cy="7" r="2.5"></circle>
-              <circle cx="16.5" cy="17.5" r="2.5"></circle>
-              <circle cx="6.5" cy="17" r="2.5"></circle>
-              <path d="M9.4 7.7 14.5 7.2"></path>
-              <path d="M7 10.5 6.6 14.5"></path>
-              <path d="M16.8 9.5 16.6 15"></path>
-              <path d="M9 17.2 14 17.4"></path>
-            </svg>
-            <span>Tầng 2 · Bản đồ Phân cực 2 Phe Cộng đồng</span>
+            tabindex="-1">
+            Bản đồ Cộng đồng Vĩ mô (Kết quả toàn tập)
           </button>
         </div>
-      </div>
+      </nav>
     </header>
 
-    <div class="live-announcer visually-hidden" aria-live="polite" id="live-status"></div>
-    <div class="error-banner" role="alert" id="live-error" hidden></div>
+    <main id="main-content">
+      <div id="live-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
+      <div id="live-error" class="error-banner" role="alert" hidden></div>
 
-    <main id="main-content" tabindex="-1">
-      <!-- TAB 1: MICRO EARLY CASCADE (K=20) -->
-      <section role="tabpanel" id="panel-tier1" aria-labelledby="tab-tier1">
+      <!-- TAB 1: MICRO / EARLY CASCADE -->
+      <div id="panel-tier1" role="tabpanel" aria-labelledby="tab-tier1" tabindex="0">
         <div class="panel-body">
-          <!-- Mode Switcher & Scientific Honesty Provenance Banner -->
-          <div class="card control-header-card">
+
+          <!-- REGION 1: UNIFIED USER-FIRST INPUT -->
+          <section class="card hero-input-card" aria-label="Nhập bài viết cần phân tích">
             <div class="mode-row">
-              <div class="segmented-group" role="group" aria-label="Nguồn dữ liệu Tầng 1">
-                <button
-                  type="button"
-                  id="mode-real-btn"
-                  class="seg-btn"
-                  aria-pressed="true"
-                >
-                  Bài Test VN Thật (Offline GPU)
+              <div class="segmented-group" role="group" aria-label="Chọn cách nhập bài">
+                <button type="button" id="mode-sandbox-btn" class="seg-btn" aria-pressed="true">
+                  Dán bài FB / Threads / Link
                 </button>
-                <button
-                  type="button"
-                  id="mode-sandbox-btn"
-                  class="seg-btn"
-                  aria-pressed="false"
-                >
-                  Sandbox Dọn rác &amp; Nhập hội thoại
+                <button type="button" id="mode-real-btn" class="seg-btn" aria-pressed="false">
+                  Kiểm chứng 10 bài thật (Có đáp án)
                 </button>
               </div>
-
-              <div id="mode-meta-badges" class="meta-pills">
-                <span class="pill" id="pill-nlp-backend">backend: —</span>
-                <span class="pill tabular" id="pill-cascade-id">cascade: —</span>
-              </div>
+              <span class="pill" id="result-source-badge">Đang hiện mẫu kiểm chứng #1</span>
             </div>
 
-            <!-- Permanent, non-dismissible provenance / honesty banner -->
-            <div id="honesty-banner" class="honesty-banner" data-tone="neutral" role="note">
-              <svg id="honesty-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <circle cx="12" cy="12" r="9"></circle>
-                <path d="M12 8v5"></path>
-                <circle cx="12" cy="16.5" r="0.6" fill="currentColor"></circle>
-              </svg>
-              <div id="honesty-text">Đang tải thông tin nguồn suy luận...</div>
-            </div>
+            <!-- Primary User Flow: Copy-Paste FB/Threads/Reddit + Link + File -->
+            <div id="sandbox-controls-block" class="sandbox-block">
+              <form id="sandbox-form" class="unified-form">
+                <div class="field-stack">
+                  <label for="sb-raw-lines" class="hero-field-label">
+                    Dán bài viết và bình luận từ Facebook, Threads hoặc diễn đàn
+                  </label>
+                  <textarea
+                    id="sb-raw-lines"
+                    class="textarea-input hero-textarea"
+                    rows="5"
+                    placeholder="Bôi đen bài viết + bình luận trên Facebook hoặc Threads, bấm Ctrl+C rồi dán thẳng vào đây. Dòng đầu là bài gốc, các dòng dưới là bình luận. Hệ thống tự lọc chữ thừa như 'Thích · Phản hồi · 2 giờ' và tự chọn chế độ quét nhanh hoặc quét nền cho bài lớn..."></textarea>
+                </div>
 
-            <!-- Real Test Thread Selector -->
-            <div id="real-selector-block" class="selector-block">
-              <div class="field-stack">
-                <label for="thread-select" class="field-label">
-                  Chọn chuỗi thảo luận tập Test VN (<span class="tabular" id="thread-count-label">10</span> mẫu phân tầng từ đồng thuận đến phân cực cao)
-                </label>
-                <select id="thread-select" class="select-control"></select>
-              </div>
-            </div>
-
-            <!-- Sandbox Form -->
-            <div id="sandbox-controls-block" class="sandbox-block" hidden>
-              <form id="sandbox-form" action="/api/tier1/sandbox" method="post" novalidate>
-                <div class="sandbox-preset-bar">
-                  <div class="preset-actions">
-                    <span class="field-label">Mẫu minh họa dựng sẵn:</span>
-                    <button type="button" class="btn-outline btn-sm" id="btn-preset-1">
-                      Preset 1 · Phạt nguội AI (Path Contraction)
-                    </button>
-                    <button type="button" class="btn-outline btn-sm" id="btn-preset-2">
-                      Preset 2 · Quy định WFH/Văn phòng
-                    </button>
-                    <button type="button" class="btn-outline btn-sm" id="btn-preset-large">
-                      Preset 3 · Bài lớn 42 bình luận (AI &amp; Giáo dục)
-                    </button>
+                <div class="secondary-input-row">
+                  <div class="field-stack url-col">
+                    <label for="sb-reddit-url" class="field-label">Hoặc dán link bài viết</label>
+                    <input
+                      id="sb-reddit-url"
+                      type="url"
+                      class="text-input"
+                      placeholder="https://www.reddit.com/r/... (link FB/Threads sẽ hiện hướng dẫn nhanh)">
                   </div>
 
-                  <div class="sandbox-fieldsets">
-                    <fieldset class="junk-mode-fieldset">
-                      <legend class="field-label">Cơ chế lọc bình luận nhiễu</legend>
-                      <div class="radio-inline-group">
-                        <label class="radio-inline" for="junk-contract">
-                          <input type="radio" id="junk-contract" name="junk_mode" value="contract" checked>
-                          <span>Contract (Thu gọn nút giữa, bảo toàn nhánh con)</span>
-                        </label>
-                        <label class="radio-inline" for="junk-prune">
-                          <input type="radio" id="junk-prune" name="junk_mode" value="prune">
-                          <span>Prune (Cắt bỏ nhánh sau nút rác)</span>
-                        </label>
-                      </div>
-                    </fieldset>
-
-                    <fieldset class="junk-mode-fieldset">
-                      <legend class="field-label">Phạm vi phân tích (Sớm vs Toàn bài lớn)</legend>
-                      <div class="radio-inline-group">
-                        <label class="radio-inline" for="analysis-early">
-                          <input type="radio" id="analysis-early" name="analysis_mode" value="early" checked>
-                          <span>Dự báo sớm (<span class="tabular">K=20</span> bình luận đầu)</span>
-                        </label>
-                        <label class="radio-inline" for="analysis-full">
-                          <input type="radio" id="analysis-full" name="analysis_mode" value="full">
-                          <span>Phân tích toàn bài lớn (tối đa <span class="tabular">500</span> bình luận)</span>
-                        </label>
-                      </div>
-                    </fieldset>
+                  <div class="field-stack file-col">
+                    <label for="mega-json-file" class="field-label">Hoặc tải tệp (.json / .jsonl / .txt)</label>
+                    <div class="mega-file-row">
+                      <input id="mega-json-file" type="file" accept=".json,.jsonl,.txt,application/json,text/plain" class="file-input-control">
+                      <button type="button" id="btn-mega-clear-file" class="btn-outline btn-sm" hidden>Bỏ tệp</button>
+                    </div>
                   </div>
                 </div>
 
-                <details class="custom-input-details" id="custom-editor-details">
-                  <summary class="custom-summary">
-                    Tự nhập hội thoại tiếng Việt hoặc dán URL Reddit để chạy thử
-                  </summary>
-                  <div class="custom-form-grid">
-                    <div class="field-stack">
-                      <label for="sb-title" class="field-label">Tiêu đề bài gốc</label>
-                      <input
-                        type="text"
-                        id="sb-title"
-                        name="title"
-                        class="text-input"
-                        value="Đề xuất lắp camera AI phạt nguội xe máy vượt đèn đỏ tại ngã tư lớn"
-                      >
-                    </div>
-
-                    <div class="field-stack">
-                      <label for="sb-root-text" class="field-label">Nội dung bài đăng gốc</label>
-                      <textarea id="sb-root-text" name="root_text" class="textarea-input" rows="2">Sở Giao thông đề xuất thí điểm camera AI tự động nhận diện biển số xe máy vượt đèn đỏ và gửi thông báo phạt nguội qua ứng dụng định danh.</textarea>
-                    </div>
-
-                    <div class="field-stack">
-                      <label for="sb-raw-lines" class="field-label">
-                        Danh sách bình luận (thụt đầu dòng hoặc dạng <code>c2 (trả lời c1): nội dung</code>)
-                      </label>
-                      <span id="sb-raw-hint" class="field-hint">
-                        Gợi ý thử nút giữa là <code>[deleted]</code>, <code>hóng ké</code>, <code>.</code> và nút con là <code>Đồng ý</code> / <code>Phản đối</code> để kiểm chứng Path Contraction.
-                      </span>
-                      <textarea
-                        id="sb-raw-lines"
-                        name="raw_indented_text"
-                        class="textarea-input mono-textarea"
-                        rows="7"
-                        aria-describedby="sb-raw-hint"
-                      >c1 (trả lời root): Ủng hộ mạnh, có camera tự động thì ý thức chấp hành đèn đỏ sẽ cải thiện rõ rệt.
-c2 (trả lời c1): [deleted]
-c3 (trả lời c2): Đồng ý
-c4 (trả lời c3): Chưa hợp lý nếu không chuẩn hóa vạch dừng trước khi phạt tự động.
-c5 (trả lời root): hóng ké
-c6 (trả lời c5): Không đồng ý với mức phạt cào bằng, cần xem lại hạ tầng ngã tư.
-c7 (trả lời c6): Phản đối
-c8 (trả lời c1): hóng
-c9 (trả lời c4): 👍</textarea>
-                    </div>
-
-                    <div class="field-stack">
-                      <label for="sb-reddit-url" class="field-label">Hoặc nhập URL bài viết Reddit công khai (tùy chọn — cần mạng)</label>
-                      <span id="sb-url-hint" class="field-hint">
-                        Ví dụ: <code>https://www.reddit.com/r/vozforums/comments/&lt;post_id&gt;/...</code> (để trống nếu chạy văn bản nhập tay).
-                      </span>
-                      <input
-                        type="url"
-                        id="sb-reddit-url"
-                        name="reddit_url"
-                        class="text-input"
-                        aria-describedby="sb-url-hint"
-                        autocorrect="off"
-                        autocapitalize="none"
-                        spellcheck="false"
-                        placeholder="https://www.reddit.com/r/vozforums/comments/..."
-                      >
-                    </div>
-
-                    <div class="field-stack">
-                      <label for="sb-custom-topics" class="field-label">
-                        Bộ chủ đề tùy chỉnh đưa cho AI phân loại (tùy chọn)
-                      </label>
-                      <span id="sb-topics-hint" class="field-hint">
-                        Ngăn cách bằng dấu phẩy; để trống để dùng bộ 8 chủ đề chuẩn (Giao thông, Kinh tế, AI, Giáo dục...).
-                      </span>
-                      <input
-                        type="text"
-                        id="sb-custom-topics"
-                        name="custom_topics"
-                        class="text-input"
-                        aria-describedby="sb-topics-hint"
-                        placeholder="Ví dụ: Chính sách giao thông, Công nghệ AI, Giáo dục, Kinh tế"
-                      >
-                    </div>
-
-                    <div class="submit-row">
-                      <button type="submit" class="btn-primary" id="btn-run-custom">
-                        Chạy kiểm thử cây nhập tay / URL
-                      </button>
-                    </div>
-                  </div>
-                </details>
-              </form>
-
-              <!-- Async Mega-Thread Scanner (up to 10,000 comments) -->
-              <section class="mega-scan-panel" id="mega-scan-panel" aria-label="Quét Mega-Thread quy mô tới 10.000 bình luận">
-                <div class="mega-panel-head">
+                <!-- Honest inline guide when pasting FB / Threads links -->
+                <div id="social-url-guide" class="social-guide-box" role="status" hidden>
                   <div>
-                    <h2 class="section-heading">Quét Mega-Thread (tới 10.000 bình luận · Job nền)</h2>
-                    <p class="field-hint">
-                      Giữ nguyên dự báo sớm GNN K=20; mở rộng hậu kiểm quỹ đạo phân cực, Path Contraction và Top 5 nhánh nóng trên toàn bài lớn.
+                    <strong id="social-guide-title">Facebook / Threads yêu cầu đăng nhập nên công cụ không tự cào link được</strong>
+                    <p class="social-guide-text" id="social-guide-desc">
+                      Cách nhanh nhất (5 giây): mở bài viết đó, bôi đen bài gốc + phần bình luận, nhấn <code>Ctrl+C</code> rồi dán vào ô văn bản phía trên. Hệ thống sẽ tự xóa chữ thừa như <em>"Thích · Phản hồi · 2 giờ"</em>.
                     </p>
                   </div>
-                  <span class="pill tabular" id="mega-mode-pill">async /api/tier1/scan_jobs</span>
+                  <div class="social-guide-actions">
+                    <button type="button" id="btn-try-fb-sample" class="btn-outline btn-sm">Dán thử mẫu bài Facebook ngay</button>
+                  </div>
                 </div>
 
-                <div class="mega-controls-row">
-                  <div class="field-stack mega-select-wrap">
-                    <label for="mega-max-comments" class="field-label">Trần bình luận quét</label>
-                    <select id="mega-max-comments" class="select-control">
-                      <option value="500">500 bình luận</option>
-                      <option value="2000" selected>2.000 bình luận</option>
-                      <option value="5000">5.000 bình luận</option>
-                      <option value="10000">10.000 bình luận</option>
-                    </select>
-                  </div>
+                <div class="primary-action-bar">
+                  <button type="submit" id="btn-run-custom" class="btn-primary btn-hero">Phân tích ngay</button>
+                  <span id="auto-route-hint" class="field-hint">
+                    Tự động: bài vừa (&lt;= 100 bình luận) chạy trực tiếp; bài lớn (&gt; 100 bình luận hoặc tệp JSON/JSONL) tự chạy quét nền.
+                  </span>
+                </div>
 
+                <div class="quick-demos-row" aria-label="Mẫu dùng thử một chạm">
+                  <span class="field-label">Thử nhanh 1 chạm:</span>
+                  <button type="button" id="btn-demo-fb" class="chip-btn">Mẫu bài Facebook (copy-paste)</button>
+                  <button type="button" id="btn-preset-large" class="chip-btn">Mẫu bài tranh luận 42 bình luận</button>
+                  <button type="button" id="btn-quick-mega" class="chip-btn">Thử quét bài lớn 2.000 bình luận</button>
+                </div>
+              </form>
+
+              <div id="mega-progress-box" class="mega-progress-box" hidden>
+                <div class="mega-progress-top">
+                  <span id="mega-progress-label" class="field-label">Đang chuẩn bị quét bài lớn...</span>
+                  <div class="progress-right">
+                    <span id="mega-progress-pct" class="tabular field-label">0%</span>
+                    <button type="button" id="btn-mega-cancel" class="btn-outline btn-sm btn-danger-outline" hidden>Hủy quét</button>
+                  </div>
+                </div>
+                <progress id="mega-progress-bar" class="mega-progress-bar" value="0" max="100"></progress>
+                <div id="mega-progress-meta" class="field-hint tabular"></div>
+              </div>
+            </div>
+
+            <!-- Real VN Test Proof Selector -->
+            <div id="real-selector-block" class="real-selector-block" hidden>
+              <label for="thread-select" class="hero-field-label">
+                Chọn 1 trong <span id="thread-count-label">10</span> bài thật trên cộng đồng Việt Nam (đã biết kết quả cuối kỳ để đối chứng với dự báo sớm từ 20 bình luận đầu)
+              </label>
+              <select id="thread-select" class="select-control"></select>
+            </div>
+
+            <!-- Progressive Disclosure: Technical & Examiner Overrides -->
+            <details id="advanced-drawer" class="advanced-drawer">
+              <summary class="advanced-summary">Tùy chọn nâng cao &amp; Thông số kỹ thuật (Dành cho Hội đồng)</summary>
+              <div class="advanced-body">
+                <div class="adv-grid-2">
+                  <div class="field-stack">
+                    <label for="sb-title" class="field-label">Tiêu đề bài gốc (tùy chọn — để trống sẽ tự lấy dòng đầu)</label>
+                    <input id="sb-title" type="text" class="text-input" placeholder="Ví dụ: Đề xuất lắp camera AI phạt nguội xe máy">
+                  </div>
+                  <div class="field-stack">
+                    <label for="sb-root-text" class="field-label">Nội dung chi tiết bài gốc (tùy chọn)</label>
+                    <input id="sb-root-text" type="text" class="text-input" placeholder="Để trống nếu đã gộp chung bài gốc ở ô dán phía trên">
+                  </div>
+                </div>
+
+                <div class="sandbox-fieldsets">
                   <fieldset class="junk-mode-fieldset">
-                    <legend class="field-label">Chiến lược chấm cạnh NLP</legend>
+                    <legend class="field-label">Cách xử lý bình luận rác ("hóng", ".", nhãn dán)</legend>
                     <div class="radio-inline-group">
-                      <label class="radio-inline" for="mega-strat-stratified">
-                        <input type="radio" id="mega-strat-stratified" name="mega_strategy" value="stratified" checked>
-                        <span>Quét nhanh phân tầng (600 mẫu + CI 95%)</span>
+                      <label class="radio-inline">
+                        <input type="radio" name="junk_mode" id="junk-contract" value="contract" checked>
+                        <span>Xóa rác &amp; nối lại mạch trả lời (Path Contraction)</span>
                       </label>
-                      <label class="radio-inline" for="mega-strat-full">
-                        <input type="radio" id="mega-strat-full" name="mega_strategy" value="full">
-                        <span>Quét sâu 100% cạnh</span>
+                      <label class="radio-inline">
+                        <input type="radio" name="junk_mode" id="junk-prune" value="prune">
+                        <span>Cắt bỏ kèm nhánh con (Prune)</span>
                       </label>
                     </div>
                   </fieldset>
 
-                  <div class="field-stack mega-file-wrap">
-                    <label for="mega-json-file" class="field-label">Hoặc nạp tệp JSON/JSONL bài lớn</label>
-                    <div class="mega-file-row">
-                      <input type="file" id="mega-json-file" accept=".json,.jsonl" class="file-input-control">
-                      <button type="button" class="btn-outline btn-sm" id="btn-mega-clear-file" hidden>Bỏ chọn tệp</button>
+                  <fieldset class="junk-mode-fieldset">
+                    <legend class="field-label">Cửa sổ phân tích thủ công</legend>
+                    <div class="radio-inline-group">
+                      <label class="radio-inline">
+                        <input type="radio" name="analysis_mode" id="analysis-early" value="early" checked>
+                        <span>Dự báo sớm (20 bình luận đầu)</span>
+                      </label>
+                      <label class="radio-inline">
+                        <input type="radio" name="analysis_mode" id="analysis-full" value="full">
+                        <span>Đọc toàn chuỗi (tối đa 500 BL)</span>
+                      </label>
+                    </div>
+                  </fieldset>
+                </div>
+
+                <div class="preset-actions">
+                  <span class="field-label">Mẫu kiểm thử cấu trúc nhánh:</span>
+                  <button type="button" id="btn-preset-1" class="btn-outline btn-sm">Mẫu 1: Camera AI phạt nguội</button>
+                  <button type="button" id="btn-preset-2" class="btn-outline btn-sm">Mẫu 2: Làm việc văn phòng 5 ngày</button>
+                </div>
+
+                <!-- Preserved Mega-Thread Technical Panel (required by test suite + examiner overrides) -->
+                <div id="mega-scan-panel" class="mega-scan-panel">
+                  <div class="mega-panel-head">
+                    <div>
+                      <span class="field-label">Cấu hình Quét bài lớn (tới 10.000 bình luận · Job nền)</span>
+                      <div class="field-hint">Tự động dùng khi tải JSON/JSONL hoặc bài &gt; 100 bình luận; có thể kích hoạt thủ công tại đây.</div>
+                    </div>
+                  </div>
+                  <div class="mega-controls-row">
+                    <div class="field-stack mega-select-wrap">
+                      <label for="mega-max-comments" class="field-label">Trần số bình luận nạp</label>
+                      <select id="mega-max-comments" class="select-control">
+                        <option value="500">500 bình luận</option>
+                        <option value="2000" selected>2.000 bình luận</option>
+                        <option value="5000">5.000 bình luận</option>
+                        <option value="10000">10.000 bình luận</option>
+                      </select>
+                    </div>
+                    <fieldset class="junk-mode-fieldset">
+                      <legend class="field-label">Chiến lược chấm NLP cạnh</legend>
+                      <div class="radio-inline-group">
+                        <label class="radio-inline">
+                          <input type="radio" name="mega_strategy" id="mega-strat-stratified" value="stratified" checked>
+                          <span>Phân tầng nhanh (600 mẫu + CI 95%)</span>
+                        </label>
+                        <label class="radio-inline">
+                          <input type="radio" name="mega_strategy" id="mega-strat-full" value="full">
+                          <span>Quét sâu toàn bộ 100%</span>
+                        </label>
+                      </div>
+                    </fieldset>
+                    <div class="mega-actions-row">
+                      <button type="button" id="btn-mega-run" class="btn-outline btn-sm">Chạy Job nền thủ công</button>
+                      <button type="button" id="btn-mega-stress" class="btn-outline btn-sm">Kiểm tải Stress (2k–10k)</button>
                     </div>
                   </div>
                 </div>
 
-                <div class="mega-actions-row">
-                  <button type="button" class="btn-outline btn-sm" id="btn-mega-stress">
-                    Chạy mẫu kiểm tải (2k–10k)
-                  </button>
-                  <button type="button" class="btn-primary btn-sm" id="btn-mega-run">
-                    Quét bài lớn bất đồng bộ (URL / JSON / Nhập tay)
-                  </button>
-                  <button type="button" class="btn-outline btn-sm btn-danger-outline" id="btn-mega-cancel" hidden>
-                    Hủy job đang chạy
-                  </button>
+                <!-- Custom Topic Re-classifier -->
+                <form id="topic-reclassify-form" class="topic-custom-form">
+                  <label for="sb-custom-topics" class="field-label">
+                    Đổi danh sách chủ đề phân loại (ngăn cách bằng dấu phẩy, tùy chọn)
+                  </label>
+                  <div class="topic-input-row">
+                    <input
+                      id="sb-custom-topics"
+                      type="text"
+                      class="text-input"
+                      placeholder="Ví dụ: Giao thông, Luật pháp, Giá xăng dầu, Đời sống">
+                    <button type="submit" id="btn-reclassify-topic" class="btn-outline btn-sm">Phân loại lại</button>
+                  </div>
+                </form>
+
+                <!-- Technical Provenance & Confidence Audit -->
+                <div class="honesty-banner" id="honesty-banner" role="status">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <line x1="12" y1="16" x2="12" y2="12"></line>
+                    <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                  </svg>
+                  <div id="honesty-text">Đang kiểm tra nguồn trọng số AI...</div>
                 </div>
 
-                <div class="mega-progress-box" id="mega-progress-box" hidden>
-                  <div class="mega-progress-top">
-                    <span id="mega-progress-label" class="field-label">Đang khởi tạo job...</span>
-                    <span id="mega-progress-pct" class="tabular field-label">0%</span>
-                  </div>
-                  <progress id="mega-progress-bar" class="mega-progress-bar" max="100" value="0"></progress>
-                  <div id="mega-progress-meta" class="field-hint tabular"></div>
+                <div class="meta-pills adv-meta-row">
+                  <span class="pill tabular" id="pill-nlp-backend">nlp: —</span>
+                  <span class="pill tabular" id="pill-cascade-id">id: —</span>
+                  <span class="pill tabular" id="topic-backend-pill">topic: —</span>
+                  <span class="pill tabular">Cửa sổ: <strong id="kpi-k-obs">—</strong></span>
+                  <span class="pill tabular">Độ tin cậy β-NLL: <strong id="kpi-confidence">—</strong></span>
                 </div>
-              </section>
+              </div>
+            </details>
+          </section>
 
-              <!-- Path Contraction Before/After Strip -->
-              <div id="contraction-strip" class="contraction-strip" hidden>
-                <div class="contraction-header">
-                  <strong>Kiểm chứng Path Contraction: Lọc rác bảo toàn cấu trúc cây</strong>
-                  <span class="pill" id="contraction-mode-tag">mode: contract</span>
-                </div>
-                <div class="contraction-metrics">
-                  <div class="c-stat">
-                    <span class="c-label">Bình luận thô</span>
-                    <span class="c-val tabular" id="cs-raw">0</span>
-                  </div>
-                  <div class="c-arrow" aria-hidden="true">→</div>
-                  <div class="c-stat c-stat-keep">
-                    <span class="c-label">Giữ lại</span>
-                    <span class="c-val tabular" id="cs-kept">0</span>
-                  </div>
-                  <div class="c-stat c-stat-drop">
-                    <span class="c-label">Cắt lá rác</span>
-                    <span class="c-val tabular" id="cs-dropped">0</span>
-                  </div>
-                  <div class="c-stat c-stat-contract">
-                    <span class="c-label">Thu gọn nút giữa</span>
-                    <span class="c-val tabular" id="cs-contracted">0</span>
-                  </div>
-                  <div class="c-stat c-stat-relink">
-                    <span class="c-label">Nối lại cạnh</span>
-                    <span class="c-val tabular" id="cs-relinked">0</span>
-                  </div>
-                </div>
-                <div class="preserved-row" id="preserved-stances-row">
-                  <span class="field-label">Lập trường ngắn được bảo toàn:</span>
-                  <div id="preserved-stances-pills" class="stance-chips"></div>
-                </div>
+          <!-- REGION 2: 3-SECOND VERDICT & PROOF -->
+          <section class="card post-context-bar" aria-label="Bài viết đang phân tích">
+            <div class="post-context-top">
+              <div class="post-context-head">
+                <h2 id="root-title-display" class="post-title-main">—</h2>
+                <p id="root-text-display" class="root-preview-text">—</p>
+              </div>
+              <div class="meta-pills">
+                <span class="badge-tag badge-neutral" id="large-scale-badge" hidden>—</span>
+                <span class="badge-tag badge-ood" id="ood-scale-badge" hidden>Ngoại suy quy mô lớn</span>
+                <span class="badge-tag badge-neutral" id="mega-coverage-badge" hidden>—</span>
               </div>
             </div>
-          </div>
+          </section>
 
-          <!-- KPI Comparison Row -->
-          <section class="kpi-grid" aria-label="Chỉ số dự báo sớm Tầng 1">
-            <article class="card kpi-card">
-              <div class="kpi-label">Quy mô cuối kỳ dự báo (<span class="tabular">K=20</span>)</div>
-              <div class="kpi-value tabular" id="kpi-pred-replies">—</div>
-              <div class="kpi-sub">
-                Thực tế toàn cây: <strong class="tabular" id="kpi-actual-replies">—</strong> bình luận
+          <section class="verdict-grid" aria-label="Kết luận nhanh trong 3 giây">
+            <!-- Verdict Card 1: Polarization & Controversy Level -->
+            <article class="card verdict-card">
+              <div class="verdict-card-head">
+                <h2 class="kpi-label">1. Mức độ Tranh cãi / Chia rẽ</h2>
+                <span class="badge-tag badge-neutral" id="verdict-polar-level">Đang tính...</span>
+              </div>
+              <div class="verdict-big-row">
+                <span class="verdict-big-num tabular" id="verdict-polar-100">—</span>
+                <span class="verdict-unit">/ 100 điểm chia rẽ</span>
+              </div>
+              <div class="polar-meter-track" aria-hidden="true">
+                <div class="polar-meter-fill" id="verdict-polar-meter"></div>
+              </div>
+              <div class="verdict-regime-line" id="kpi-regime">—</div>
+              <div class="verdict-proof-mini">
+                <span>AI dự báo: <strong id="kpi-pred-polar" class="tabular">—</strong></span>
+                <span>Lúc đầu (20 BL): <strong id="kpi-early-polar" class="tabular">—</strong></span>
+                <span>Thực tế sau: <strong id="kpi-actual-polar" class="tabular">—</strong></span>
               </div>
             </article>
 
-            <article class="card kpi-card">
-              <div class="kpi-label">Phân cực dự báo <span class="tabular">y_polar</span></div>
-              <div class="kpi-value tabular" id="kpi-pred-polar">—</div>
-              <div class="kpi-sub">
-                Quan sát sớm (<span class="tabular">1..K</span>): <strong class="tabular" id="kpi-early-polar">—</strong>
+            <!-- Verdict Card 2: Early Forecast vs Actual Proof -->
+            <article class="card verdict-card">
+              <div class="verdict-card-head">
+                <h2 class="kpi-label">2. Theo dõi &amp; Dự báo sớm Quy mô</h2>
+                <span class="badge-tag badge-neutral" id="forecast-proof-badge">Chỉ từ 20 BL đầu</span>
               </div>
-              <div class="kpi-sub">
-                Thực tế tương lai (<span class="tabular">t &gt; K</span>): <strong class="tabular" id="kpi-actual-polar">—</strong>
+              <div class="forecast-compare-row">
+                <div class="fc-box">
+                  <span class="fc-box-lbl">AI dự báo sớm</span>
+                  <div class="fc-box-val tabular"><span id="kpi-pred-replies">—</span> <small>BL</small></div>
+                </div>
+                <div class="fc-vs" aria-hidden="true">vs</div>
+                <div class="fc-box">
+                  <span class="fc-box-lbl">Thực tế hiện có</span>
+                  <div class="fc-box-val tabular"><span id="kpi-actual-replies">—</span> <small>BL</small></div>
+                </div>
               </div>
+              <p class="kpi-sub">
+                Mô hình chỉ đọc bài gốc và tối đa 20 bình luận sớm nhất để ước lượng bài viết có tiếp tục bùng nổ bình luận hay không.
+              </p>
             </article>
 
-            <article class="card kpi-card">
-              <div class="kpi-label">Cục diện (Ngưỡng VN Train Q50/Q75/Q90)</div>
-              <div class="kpi-regime" id="kpi-regime">—</div>
-              <div class="kpi-sub">
-                Độ tin cậy: <strong class="tabular" id="kpi-confidence">—</strong> · Tác giả: <strong class="tabular" id="kpi-authors">—</strong>
+            <!-- Verdict Card 3: 3 Stances & Topic -->
+            <article class="card verdict-card">
+              <div class="verdict-card-head">
+                <h2 class="kpi-label">3. Tỷ lệ Phe &amp; Chủ đề chính</h2>
+                <span class="kpi-sub tabular"><strong id="kpi-authors">—</strong> người tham gia</span>
               </div>
-            </article>
-
-            <article class="card kpi-card">
-              <div class="kpi-label">Phân bố 3 màu Lập trường (<span class="tabular" id="kpi-k-obs">20</span> nút)</div>
+              <div class="topic-primary-row">
+                <span class="badge-tag badge-topic-primary" id="topic-primary-label">—</span>
+                <span class="topic-conf tabular" id="topic-primary-conf">—</span>
+              </div>
               <div class="stance-bar-wrap" aria-hidden="true">
                 <div class="stance-bar-seg seg-support" id="bar-support"></div>
                 <div class="stance-bar-seg seg-neutral" id="bar-neutral"></div>
                 <div class="stance-bar-seg seg-oppose" id="bar-oppose"></div>
               </div>
-              <div class="kpi-sub tabular" id="kpi-stance-counts">
-                Tán thành: — · Trung lập: — · Phản đối: —
-              </div>
+              <div class="kpi-sub" id="kpi-stance-counts">Tán thành: 0 · Trung lập: 0 · Phản đối: 0</div>
+              <div class="topic-secondary-line" id="topic-secondary-line">Đang phân tích chủ đề...</div>
+
+              <details class="topic-bars-details">
+                <summary class="topic-bars-summary">Xem chi tiết phân bố các chủ đề</summary>
+                <ul id="topic-bars-list" class="topic-bars-list"></ul>
+              </details>
             </article>
           </section>
 
-          <!-- AI Topic Classification & Full-Thread Large-Post Understanding -->
-          <section class="card understanding-card" id="ai-understanding-card" aria-label="Phân loại chủ đề AI và phân tích bài lớn">
+          <!-- Path Contraction Proof Strip (Sandbox mode) -->
+          <section class="contraction-strip" id="contraction-strip" hidden aria-label="Kết quả lọc bình luận rác">
+            <div class="contraction-header">
+              <div>
+                <strong>Dọn bình luận rác mà vẫn giữ nguyên mạch trả lời (Path Contraction)</strong>
+                <div id="contraction-plain-summary" class="field-hint">Đang tính toán kết quả lọc rác...</div>
+              </div>
+              <span class="pill tabular" id="contraction-mode-tag">mode: contract</span>
+            </div>
+            <div class="contraction-metrics">
+              <div class="c-stat">
+                <span class="c-label">Bình luận gốc</span>
+                <span class="c-val tabular" id="cs-raw">0</span>
+              </div>
+              <div class="c-stat c-stat-keep">
+                <span class="c-label">Giữ lại phân tích</span>
+                <span class="c-val tabular" id="cs-kept">0</span>
+              </div>
+              <div class="c-stat c-stat-drop">
+                <span class="c-label">Xóa bình luận thừa</span>
+                <span class="c-val tabular" id="cs-dropped">0</span>
+              </div>
+              <div class="c-stat c-stat-contract">
+                <span class="c-label">Nút giữa rút gọn</span>
+                <span class="c-val tabular" id="cs-contracted">0</span>
+              </div>
+              <div class="c-stat c-stat-relink">
+                <span class="c-label">Nhánh được nối lại</span>
+                <span class="c-val tabular" id="cs-relinked">0</span>
+              </div>
+            </div>
+            <div class="preserved-row">
+              <span class="field-label">Các câu ngắn mang lập trường rõ vẫn được giữ lại:</span>
+              <div id="preserved-stances-pills" class="stance-chips"></div>
+            </div>
+          </section>
+
+          <!-- 2-Side Arguments & Trajectory Understanding Card -->
+          <section class="card understanding-card" id="ai-understanding-card" aria-label="Hai luồng ý kiến và diễn biến tranh cãi">
+            <div class="panel-heading-row">
+              <h2 class="section-heading">Hai luồng ý kiến &amp; Diễn biến cuộc tranh cãi</h2>
+              <div class="meta-pills">
+                <span class="badge-tag badge-neutral" id="large-archetype-badge">Thảo luận</span>
+                <span class="badge-tag badge-neutral" id="large-trend-badge">Ổn định</span>
+                <span class="pill" id="large-scope-pill">—</span>
+              </div>
+            </div>
+
+            <p id="large-summary-text" class="understanding-summary">
+              Đang tổng hợp luận điểm hai phe từ các bình luận nổi bật...
+            </p>
+
             <div class="understanding-grid">
-              <div class="topic-panel">
-                <div class="panel-heading-row">
-                  <h2 class="section-heading">Phân loại Chủ đề AI</h2>
-                  <span class="pill" id="topic-backend-pill">topic: —</span>
-                </div>
-                <div class="topic-primary-row">
-                  <span class="badge-tag badge-topic-primary" id="topic-primary-label">—</span>
-                  <span class="tabular topic-conf" id="topic-primary-conf">—</span>
-                </div>
-                <div class="topic-secondary-line" id="topic-secondary-line">Chủ đề phụ: —</div>
-
-                <ul class="topic-bars-list" id="topic-bars-list" aria-label="Xác suất phân loại theo chủ đề"></ul>
-
-                <form id="topic-reclassify-form" action="/api/tier1/classify_topic" method="post" class="topic-custom-form" novalidate>
-                  <div class="field-stack">
-                    <label for="live-custom-topics" class="field-label">
-                      Đưa danh sách chủ đề mới để AI phân loại lại bài hiện tại
-                    </label>
-                    <span id="live-topics-hint" class="field-hint">
-                      Nhập các chủ đề cách nhau bằng dấu phẩy (để trống để quay về 8 chủ đề chuẩn).
-                    </span>
-                    <div class="topic-input-row">
-                      <input
-                        type="text"
-                        id="live-custom-topics"
-                        name="custom_topics"
-                        class="text-input"
-                        aria-describedby="live-topics-hint"
-                        placeholder="Ví dụ: Giao thông đô thị, Kinh tế, Công nghệ AI, Giáo dục"
-                      >
-                      <button type="submit" class="btn-outline btn-sm" id="btn-reclassify-topic">
-                        Phân loại lại
-                      </button>
-                    </div>
-                  </div>
-                </form>
+              <div>
+                <div id="arguments-columns" class="arguments-columns"></div>
               </div>
 
-              <div class="large-post-panel">
-                <div class="panel-heading-row">
-                  <h2 class="section-heading">Tổng hợp Trích xuất &amp; Quỹ đạo Bài lớn</h2>
-                  <span class="pill" id="large-scope-pill">scope: —</span>
-                </div>
-                <div class="meta-pills" id="large-badges-row">
-                  <span class="badge-tag badge-root" id="large-scale-badge">—</span>
-                  <span class="badge-tag badge-neutral" id="large-archetype-badge">—</span>
-                  <span class="badge-tag badge-relink" id="large-trend-badge">—</span>
-                  <span class="badge-tag badge-ood" id="ood-scale-badge" hidden>Ngoại suy quy mô (&gt; 350 cmt)</span>
-                  <span class="badge-tag badge-neutral" id="mega-coverage-badge" hidden></span>
-                </div>
-                <p class="understanding-summary" id="large-summary-text">Đang tổng hợp luận điểm trích xuất toàn bài...</p>
-
+              <div>
+                <h3 class="arg-group-title">Mức độ chia rẽ thay đổi theo thời gian bình luận</h3>
                 <figure class="trajectory-figure">
-                  <svg
-                    id="trajectory-svg"
-                    class="trajectory-svg"
-                    role="img"
-                    aria-label="Biểu đồ tiến hóa độ phân cực y_polar từ K=5 đến toàn bài"
-                  ></svg>
-                  <figcaption class="trajectory-caption" id="trajectory-caption">
-                    Quỹ đạo phân cực y_polar theo số lượng bình luận tích lũy.
+                  <svg id="trajectory-svg" class="trajectory-svg" role="img" aria-label="Biểu đồ diễn biến tranh cãi theo số bình luận"></svg>
+                  <figcaption id="trajectory-caption" class="trajectory-caption">
+                    Chờ dữ liệu diễn biến...
                   </figcaption>
                 </figure>
-
-                <details class="arguments-details" id="arguments-details">
-                  <summary class="custom-summary">Xem luận điểm tiêu biểu 2 phe &amp; điểm nóng xung đột</summary>
-                  <div class="arguments-columns" id="arguments-columns"></div>
-                </details>
               </div>
             </div>
           </section>
 
-          <!-- Main Graph Stage + Node Inspector -->
-          <div class="workspace-grid">
-            <section class="card graph-stage-card" aria-label="Không gian trực quan hóa cây và đồ thị">
+          <!-- REGION 3: CONVERSATION TREE & SEARCHABLE COMMENTS -->
+          <section class="workspace-grid" aria-label="Sơ đồ luồng hội thoại và chi tiết bình luận">
+            <div class="card graph-stage-card">
               <div class="stage-toolbar">
-                <div class="segmented-group" role="group" aria-label="Chế độ hiển thị đồ thị">
+                <div class="segmented-group" role="group" aria-label="Kiểu hiển thị đồ thị">
                   <button type="button" id="view-tree-btn" class="seg-btn" aria-pressed="true">
-                    Sơ đồ Cây Hội thoại
+                    Sơ đồ luồng trả lời
                   </button>
                   <button type="button" id="view-user-btn" class="seg-btn" aria-pressed="false">
-                    Đồ thị Người dùng của Thread
+                    Nhóm người tranh luận (2 phe)
                   </button>
                 </div>
 
-                <div class="safety-toggle-wrap">
+                <label class="safety-toggle-wrap">
                   <input type="checkbox" id="toggle-profanity-badge">
-                  <label for="toggle-profanity-badge" class="safety-label">
-                    Hiện chỉ báo công kích thô tục (Kỹ thuật — cẩn trọng lỗi chửi bên thứ 3)
-                  </label>
-                </div>
+                  <span class="safety-label">Đánh dấu bình luận công kích</span>
+                </label>
               </div>
 
-              <div class="legend-bar" aria-label="Chú giải màu sắc lập trường">
+              <div class="legend-bar" aria-label="Chú giải màu sắc">
                 <span class="legend-item"><span class="swatch swatch-root"></span>Bài gốc</span>
-                <span class="legend-item"><span class="swatch swatch-support"></span>Tán thành (<span class="tabular">s &gt; 0.1</span>)</span>
-                <span class="legend-item"><span class="swatch swatch-oppose"></span>Phản đối (<span class="tabular">s &lt; -0.1</span>)</span>
+                <span class="legend-item"><span class="swatch swatch-support"></span>Tán thành</span>
+                <span class="legend-item"><span class="swatch swatch-oppose"></span>Phản đối</span>
                 <span class="legend-item"><span class="swatch swatch-neutral"></span>Trung lập</span>
-                <span class="legend-item"><span class="swatch swatch-relink"></span>Cạnh nối nhánh [Path Contraction]</span>
-              </div>
-
-              <div class="root-preview-box">
-                <div class="root-preview-title" id="root-title-display">—</div>
-                <p class="root-preview-text" id="root-text-display">—</p>
+                <span class="legend-item"><span class="swatch swatch-relink"></span>Nhánh được nối sau lọc rác</span>
               </div>
 
               <div id="hotspot-branch-bar" class="hotspot-branch-bar" hidden></div>
 
-              <div class="svg-viewport" id="svg-viewport">
-                <svg
-                  id="graph-svg"
-                  class="graph-svg"
-                  role="img"
-                  aria-label="Sơ đồ cây hội thoại và đồ thị tương tác người dùng"
-                ></svg>
+              <div class="svg-viewport">
+                <svg id="graph-svg" class="graph-svg" role="img" aria-label="Sơ đồ luồng hội thoại"></svg>
               </div>
-            </section>
+            </div>
 
-            <aside class="card inspector-card" aria-label="Bảng thanh tra nút và cạnh kích hoạt">
-              <div class="inspector-section">
-                <h2 class="section-heading">Chi tiết Nút / Người dùng đang chọn</h2>
+            <aside class="card inspector-card" aria-label="Chi tiết bình luận và bình luận châm ngòi">
+              <div>
+                <h2 class="section-heading">Chi tiết bình luận đang chọn</h2>
                 <div id="node-inspector-body" class="inspector-detail">
-                  <p class="muted-note">Nhấn vào một nút trên sơ đồ để xem toàn bộ nội dung và trọng số cổng <span class="tabular">|γ_uv|</span>.</p>
+                  <p class="muted-note">Nhấn vào một ô bất kỳ trên sơ đồ bên trái để xem nội dung và điểm lập trường AI chấm.</p>
                 </div>
               </div>
 
-              <div class="inspector-section inspector-divider">
-                <h2 class="section-heading">Top 5 Cạnh Kích hoạt (<span class="tabular">|γ_uv|</span>)</h2>
-                <ul id="trigger-edges-list" class="trigger-list"></ul>
+              <div class="inspector-divider">
+                <h2 class="section-heading">Top 5 bình luận châm ngòi tranh cãi mạnh nhất</h2>
+                <p class="muted-note trigger-sub">Bấm vào từng bình luận để nhảy tới vị trí trên sơ đồ.</p>
+                <ol id="trigger-edges-list" class="trigger-list"></ol>
               </div>
             </aside>
-          </div>
+          </section>
 
-          <!-- Paginated Mega-Thread Comment Explorer -->
-          <section class="card mega-comments-card" id="mega-comments-section" hidden aria-label="Bảng duyệt bình luận phân trang">
+          <!-- Paginated Comments Table (shown automatically when scanning large threads) -->
+          <section class="card mega-comments-card" id="mega-comments-section" hidden aria-label="Tra cứu toàn bộ bình luận đã quét">
             <div class="panel-heading-row">
-              <h2 class="section-heading">Duyệt toàn bộ bình luận bài lớn (Phân trang 50/trang)</h2>
+              <h2 class="section-heading">Tra cứu toàn bộ bình luận trong bài viết lớn</h2>
               <span class="pill tabular" id="mega-comments-total-pill">0 bình luận</span>
             </div>
-            <div class="mega-filter-bar">
-              <select id="mega-stance-filter" class="select-control mega-filter-select" aria-label="Lọc theo lập trường">
-                <option value="all">Tất cả lập trường</option>
-                <option value="support">Tán thành</option>
-                <option value="oppose">Phản đối</option>
-                <option value="neutral">Trung lập</option>
-                <option value="unscored">Chưa chấm NLP</option>
-                <option value="uncivil">Công kích (h ≥ 0.5)</option>
-              </select>
-              <input
-                type="search"
-                id="mega-search-input"
-                class="text-input mega-search-input"
-                placeholder="Tìm từ khóa trong bình luận..."
-                aria-label="Tìm từ khóa trong bình luận"
-              >
-              <div class="mega-pager">
-                <button type="button" class="btn-outline btn-sm" id="mega-prev-page">Trang trước</button>
-                <span id="mega-page-info" class="tabular field-label">Trang 1 / 1</span>
-                <button type="button" class="btn-outline btn-sm" id="mega-next-page">Trang sau</button>
+
+            <search>
+              <div class="mega-filter-bar">
+                <select id="mega-stance-filter" class="select-control mega-filter-select" aria-label="Lọc theo lập trường">
+                  <option value="all">Tất cả lập trường</option>
+                  <option value="support">Tán thành</option>
+                  <option value="oppose">Phản đối</option>
+                  <option value="neutral">Trung lập</option>
+                  <option value="uncivil">Công kích / Gay gắt</option>
+                  <option value="unscored">Chưa chấm NLP</option>
+                </select>
+                <input id="mega-search-input" type="search" class="text-input mega-search-input" placeholder="Tìm nhanh theo từ khóa trong bình luận...">
+                <div class="mega-pager">
+                  <button type="button" id="mega-prev-page" class="btn-outline btn-sm">Trước</button>
+                  <span id="mega-page-info" class="tabular field-label">Trang 1 / 1</span>
+                  <button type="button" id="mega-next-page" class="btn-outline btn-sm">Sau</button>
+                </div>
               </div>
-            </div>
+            </search>
+
             <div class="table-scroll">
               <table class="metrics-table mega-comments-table">
                 <thead>
                   <tr>
-                    <th>ID / Tầng</th>
-                    <th>Tác giả</th>
-                    <th>Lập trường</th>
-                    <th>Điểm (s / h)</th>
-                    <th>Nội dung bình luận</th>
+                    <th scope="col">ID (Tầng)</th>
+                    <th scope="col">Người dùng</th>
+                    <th scope="col">Lập trường</th>
+                    <th scope="col">Điểm (s / h)</th>
+                    <th scope="col">Nội dung bình luận</th>
                   </tr>
                 </thead>
                 <tbody id="mega-comments-tbody"></tbody>
               </table>
             </div>
           </section>
-        </div>
-      </section>
 
-      <!-- TAB 2: MACRO SIGNED SOCIAL NETWORK -->
-      <section role="tabpanel" id="panel-tier2" aria-labelledby="tab-tier2" hidden="until-found">
+        </div>
+      </div>
+
+      <!-- TAB 2: MACRO / SIGNED SOCIAL NETWORK -->
+      <div id="panel-tier2" role="tabpanel" aria-labelledby="tab-tier2" hidden="until-found">
         <div class="panel-body">
-          <div class="card control-header-card">
+
+          <section class="card control-header-card">
             <div class="mode-row">
-              <div class="segmented-group" role="group" aria-label="Chọn tập dữ liệu Tầng 2">
+              <div class="segmented-group" role="group" aria-label="Chọn tập dữ liệu toàn cục">
                 <button type="button" id="corpus-vn-btn" class="seg-btn" aria-pressed="true">
-                  r/vozforums (VN · 85.398 tương tác)
+                  Cộng đồng Việt Nam (r/vozforums)
                 </button>
                 <button type="button" id="corpus-pheme-btn" class="seg-btn" aria-pressed="false">
-                  PHEME (EN · 72.858 tương tác)
+                  Tin đồn Twitter (PHEME Tiếng Anh)
                 </button>
               </div>
-              <div class="meta-pills">
-                <span class="pill" id="tier2-source-pill">edge_label_source: teacher</span>
-                <span class="pill tabular" id="tier2-wcc-pill">WCC: —</span>
+            </div>
+
+            <div id="tier2-plain-summary" class="honesty-banner" data-tone="verified">
+              <div id="tier2-plain-summary-text">
+                <strong>Kết luận 5 giây:</strong> Cộng đồng Reddit Việt Nam không đóng kín thành 2 "phòng vang" tách biệt mà tranh luận chéo rất mạnh (94,1% tương tác đối đầu nằm giữa các phe, tam giác cân bằng chỉ 45,3%).
               </div>
             </div>
-          </div>
+          </section>
 
-          <!-- Tier 2 KPI Cards -->
-          <section class="kpi-grid" aria-label="Chỉ số phân cực mạng vĩ mô Tầng 2">
+          <section class="kpi-grid" aria-label="Chỉ số cấu trúc cộng đồng toàn cục">
             <article class="card kpi-card">
-              <div class="kpi-label">Signed Modularity (<span class="tabular">Q_signed</span>)</div>
+              <h2 class="kpi-label">Độ chia rẽ cộng đồng (Modularity Q_signed)</h2>
               <div class="kpi-value tabular" id="t2-q-signed">—</div>
-              <div class="kpi-sub tabular" id="t2-q-sub">Q+: — · Q-: —</div>
+              <div class="kpi-sub tabular" id="t2-q-sub">—</div>
             </article>
 
             <article class="card kpi-card">
-              <div class="kpi-label">Garimella Random Walk (<span class="tabular">RWC</span>)</div>
+              <h2 class="kpi-label">Độ khép kín "phòng vang" (RWC)</h2>
               <div class="kpi-value tabular" id="t2-rwc">—</div>
-              <div class="kpi-sub tabular" id="t2-camps">Quy mô 2 phe: —</div>
+              <div class="kpi-sub tabular" id="t2-camps">—</div>
             </article>
 
             <article class="card kpi-card">
-              <div class="kpi-label">Cân bằng Cấu trúc (<span class="tabular">z-score</span>)</div>
+              <h2 class="kpi-label">Kiểm định cân bằng 3 người (z-score)</h2>
               <div class="kpi-value tabular" id="t2-z-score">—</div>
-              <div class="kpi-sub tabular" id="t2-triads">Cân bằng: — vs Null: —</div>
+              <div class="kpi-sub tabular" id="t2-triads">—</div>
             </article>
 
             <article class="card kpi-card">
-              <div class="kpi-label">Đối đầu Liên phe vs Trong phe</div>
+              <h2 class="kpi-label">Mức độ chửi/đối đầu giữa 2 phe</h2>
               <div class="kpi-value tabular" id="t2-cross-delta">—</div>
-              <div class="kpi-sub tabular" id="t2-neg-rates">Liên phe: — · Trong phe: —</div>
+              <div class="kpi-sub tabular" id="t2-neg-rates">—</div>
             </article>
           </section>
 
-          <!-- High-res SVG Figure + Caveats -->
-          <div class="tier2-main-grid">
-            <section class="card figure-card" aria-label="Biểu đồ mạng xã hội có dấu Hình 5">
+          <section class="tier2-main-grid">
+            <article class="card">
               <div class="figure-head">
-                <h2 class="section-heading" id="fig5-title">Hình 5 · Cấu trúc Phân cực Hai phe &amp; Cân bằng Tam giác</h2>
-                <button type="button" class="btn-outline btn-sm" id="btn-zoom-fig5">
-                  Phóng to biểu đồ
-                </button>
+                <h2 class="section-heading" id="fig5-title">Hình 5 · Bản đồ cấu trúc 2 phe toàn tập</h2>
+                <button type="button" id="btn-zoom-fig5" class="btn-outline btn-sm">Phóng to hình</button>
               </div>
               <figure class="fig5-figure">
-                <img
-                  id="fig5-img"
-                  src="/assets/fig5_vn.svg"
-                  alt="Biểu đồ phân tách hai phe, tỷ lệ đối đầu trong phe và liên phe, cùng phân bố bộ ba có dấu của mạng người dùng."
-                  class="fig5-img"
-                >
-                <figcaption id="fig5-caption" class="fig5-caption">
-                  Nguồn: số liệu tổng hợp từ đồ thị tương tác người dùng xuyên chủ đề (r/vozforums VN).
-                </figcaption>
+                <img id="fig5-img" class="fig5-img" src="/assets/fig5_vn.svg" width="900" height="520" alt="Đồ thị cấu trúc 2 phe và cân bằng tam giác Tầng 2">
+                <figcaption class="fig5-caption" id="fig5-caption">Đang tải số liệu thực nghiệm...</figcaption>
               </figure>
-            </section>
+            </article>
 
-            <aside class="card caveats-card" aria-label="Diễn giải phương pháp và giới hạn khoa học">
-              <h2 class="section-heading">Phân tích Định lượng &amp; Giới hạn Trung thực</h2>
-              <ul id="tier2-caveats-list" class="caveat-list"></ul>
+            <aside class="card">
+              <h2 class="section-heading">Điểm cần lưu ý về mặt khoa học</h2>
+              <ul class="caveat-list" id="tier2-caveats-list"></ul>
+              <div class="meta-pills adv-meta-row">
+                <span class="pill tabular" id="tier2-source-pill">edge_label_source: —</span>
+                <span class="pill tabular" id="tier2-wcc-pill">WCC: —</span>
+              </div>
             </aside>
-          </div>
+          </section>
 
-          <!-- Signed Link Prediction 10-Model Benchmark Table -->
-          <section class="card table-card" aria-label="Bảng đối chiếu 10 mô hình dự báo liên kết đối đầu">
+          <section class="card">
             <div class="table-scroll">
-              <table class="metrics-table" id="signed-link-table">
-                <caption id="signed-link-caption">
-                  Dự báo Liên kết Đối đầu theo Thời gian chống rò rỉ (5 hạt giống ngẫu nhiên, mean ± std)
-                </caption>
+              <table class="metrics-table" aria-describedby="signed-link-splits-note">
+                <caption>Bảng đối sánh 10 mô hình Dự báo Liên kết Có dấu theo thời gian (5 seeds)</caption>
                 <thead>
                   <tr>
                     <th scope="col">Mô hình</th>
@@ -711,30 +634,26 @@ c9 (trả lời c4): 👍</textarea>
                 <tbody id="signed-link-tbody"></tbody>
               </table>
             </div>
-            <p class="table-footnote tabular" id="signed-link-splits-note">—</p>
+            <p class="table-footnote tabular" id="signed-link-splits-note"></p>
           </section>
+
         </div>
-      </section>
+      </div>
     </main>
 
+    <dialog id="figure-dialog" closedby="any" aria-labelledby="dialog-title">
+      <div class="dialog-header">
+        <h2 id="dialog-title">Hình 5 · Đọc chi tiết Bản đồ Cộng đồng 2 Phe</h2>
+        <button type="button" id="btn-close-dialog" class="btn-outline btn-sm">Đóng</button>
+      </div>
+      <img id="dialog-fig-img" class="dialog-img" src="/assets/fig5_vn.svg" alt="Hình 5 phóng to">
+    </dialog>
+
     <footer class="site-footer">
-      <span>SBi-FAGAT Local Defense Demo · Giao diện chạy cục bộ 127.0.0.1, không CDN, không ghi dữ liệu thực ra kho mã nguồn công khai.</span>
+      SBi-FAGAT · Nhóm 11 SIC-AI-N05 · Chạy hoàn toàn cục bộ, bảo vệ danh tính người dùng bằng băm SHA-256.
     </footer>
   </div>
 
-  <!-- Native <dialog> modal for zooming Figure 5 -->
-  <dialog id="figure-dialog" aria-labelledby="dialog-fig-title">
-    <div class="dialog-header">
-      <h2 id="dialog-fig-title">Biểu đồ Mạng lưới Người dùng Có dấu (Hình 5)</h2>
-      <button type="button" class="btn-outline btn-sm" id="btn-close-dialog" aria-label="Đóng cửa sổ phóng to">
-        Đóng
-      </button>
-    </div>
-    <div class="dialog-body">
-      <img id="dialog-fig-img" src="/assets/fig5_vn.svg" alt="Biểu đồ phóng to Hình 5" class="dialog-img">
-    </div>
-  </dialog>
-
-  <script src="/app.js" defer></script>
+  <script src="/app.js"></script>
 </body>
 </html>
